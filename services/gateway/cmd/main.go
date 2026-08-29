@@ -68,27 +68,18 @@ func main() {
 		defer projectionReader.Close()
 	}
 
-	// 🔴 阶段 3a's two addresses are no longer optional. `services/shared/config`
-	// refuses to load a "gateway" config with either one empty
-	// (`Config.Validate`), so by the time this line runs both are real
-	// addresses — there is no "off" branch left to hold open here. See
-	// rest_upstream.go and TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest:
-	// aenv-node answers 404 on every user-facing REST route and has no
-	// wake-up surface of its own, so an empty value here would only ever have
-	// meant an outage, never a legitimate position.
+	// 🔴 The wake-up rides the scheduler connection rather than one of its own.
+	// Both surfaces are answered by the same process — `agentenv-api` serves
+	// `services/api/proto/scheduler.proto` and the resume service on one gRPC
+	// listener — so a second ClientConn to the same address bought a second
+	// dial-state machine and a second way for the two to disagree, and nothing
+	// else. `gateway.resume_addr` is deleted outright rather than defaulted to
+	// the scheduler address: a knob that may only ever hold one value is a knob
+	// somebody eventually sets to the other one.
 	//
-	// This does not dial here — grpc.NewClient is lazy — because an api half
-	// that is briefly down must delay a wake-up, not stop the gateway from
-	// starting.
-	resumeConn, err := newSchedulerConn(cfg.Gateway.ResumeAddr)
-	if err != nil {
-		logger.Fatal("connect api resume surface failed", zap.Error(err), zap.String("addr", cfg.Gateway.ResumeAddr))
-	}
-	defer resumeConn.Close()
-	resumeClient := resume.New(resumeConn, cfg.Gateway.RequestTimeout)
-	logger.Info("waking paused sandboxes through the api half",
-		zap.String("addr", cfg.Gateway.ResumeAddr),
-	)
+	// Nothing dials here — grpc.NewClient is lazy — because an api half that is
+	// briefly down must delay a wake-up, not stop the gateway from starting.
+	resumeClient := resume.New(conn, cfg.Gateway.RequestTimeout)
 
 	logger.Info("sending user-facing rest to the api half",
 		zap.String("addr", cfg.Gateway.RestUpstreamAddr),
@@ -124,7 +115,6 @@ func main() {
 		zap.String("metrics_addr", cfg.Gateway.MetricsListenAddr),
 		zap.String("scheduler", cfg.Gateway.SchedulerAddr),
 		zap.String("rest_upstream", cfg.Gateway.RestUpstreamAddr),
-		zap.String("resume_addr", cfg.Gateway.ResumeAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
 		zap.String("execution_fencing", string(cfg.Gateway.Routing.ExecutionFencing)),
 		zap.Bool("routing_projection_read", cfg.Gateway.Routing.ProjectionRead),

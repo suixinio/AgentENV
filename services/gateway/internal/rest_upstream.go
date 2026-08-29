@@ -26,8 +26,8 @@ import (
 // and never serve user-facing REST under any configuration — so an empty
 // value would only ever produce a 404 from every node in the fleet, never a
 // working rollback. `services/shared/config`'s `Config.Validate` refuses to
-// load a gateway config with `rest_upstream_addr` (or `resume_addr`) empty
-// for exactly that reason: see
+// load a gateway config with `rest_upstream_addr` empty for exactly that
+// reason: see
 // `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`. By the time a
 // `*Server` exists in this process, `s.restUpstream` is always a real
 // address; the package-level `ServerOptions` type still *accepts* an empty

@@ -149,17 +149,24 @@ report the same label. Two replicas each configured with a *different* non-empty
 seed pass every startup check there is, so comparing this label across the
 replicas is the only place that divergence shows up.
 
-Bringing the Deployment up does not move any traffic. Two switches do, and both
-are read by the gateway:
+Bringing the Deployment up does not move any traffic. One switch does, and the
+gateway reads it:
 
 | Switch | Read by | Flipping it costs |
 |--------|---------|-------------------|
 | `GATEWAY_REST_UPSTREAM_ADDR` (`api-upstream-config`) | the gateway | a gateway roll, seconds |
-| `GATEWAY_RESUME_ADDR` (`api-upstream-config`) | the gateway | a gateway roll, seconds |
 
-Point the gateway at `http://agentenv-api:8000` and `agentenv-api:8002`. Both
-live in one ConfigMap and ride one gateway roll, so there is no ordering to get
-right and no preparatory step to take first.
+Point the gateway at `http://agentenv-api:8000`. It rides one gateway roll, so
+there is no ordering to get right and no preparatory step to take first.
+
+🔴 This used to be a pair: `GATEWAY_RESUME_ADDR` sat beside it in the same
+ConfigMap, naming the api half's gRPC wake-up surface at `agentenv-api:8002`.
+That key is deleted. `SandboxResumeService` and the `Scheduler` service share
+one gRPC listener on `agentenv-api`, so the key could only ever hold
+`GATEWAY_SCHEDULER_ADDR`'s value, and the gateway now reuses that connection
+for the wake-up RPC instead of opening a second one to the same process. A
+manifest that still sets `GATEWAY_RESUME_ADDR` is ignored, not refused — the
+loader reads no such key.
 
 🔴 **There is no node-side switch to throw beforehand.** Earlier revisions of
 this page opened with `AENV_NODE_SERVICE_ENABLED` (`node-service-config`), billed

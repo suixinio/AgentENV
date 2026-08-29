@@ -49,7 +49,6 @@ const (
 	gatewayFenceEnv = "GATEWAY_ROUTING_EXECUTION_FENCING"
 
 	restUpstreamEnv = "GATEWAY_REST_UPSTREAM_ADDR"
-	resumeAddrEnv   = "GATEWAY_RESUME_ADDR"
 )
 
 // projectionEnvs are the two environment variables the gateway's half of the
@@ -228,22 +227,26 @@ func TestTheMountedFilesDoNotUndoTheSwitches(t *testing.T) {
 // nodes back is an image-tag change, which this manifest cannot express as an
 // argument, and an apply against the current image with these keys empty is an
 // outage with no matching half. So the requirement is unconditional now.
+//
+// 🔴 It used to assert the same thing about a second key, GATEWAY_RESUME_ADDR,
+// which named the api half's wake-up surface. That address is deleted: the
+// wake-up RPC rides gateway.scheduler_addr's connection, which is the same
+// api gRPC listener resume_addr always named. One key is left to pin here.
 func TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest(t *testing.T) {
 	upstream := generatedLiteral(t, upstreamConfigMap, restUpstreamEnv)
-	resume := generatedLiteral(t, upstreamConfigMap, resumeAddrEnv)
 
-	if upstream == "" || resume == "" {
-		t.Fatalf("%s ships REST upstream %q and resume %q. The node DaemonSet runs aenv-node, "+
+	if upstream == "" {
+		t.Fatalf("%s ships REST upstream %q. The node DaemonSet runs aenv-node, "+
 			"which answers 404 on the sandboxes routes whatever it is passed, so a gateway with "+
-			"no api upstream has nowhere to send user-facing REST — emptying these two is not a "+
+			"no api upstream has nowhere to send user-facing REST — emptying this is not a "+
 			"rollback of anything, it is an outage",
-			upstreamConfigMap, upstream, resume)
+			upstreamConfigMap, upstream)
 	}
 
-	// Both addresses have to be ones the loader can use, and they have to name
-	// the ports the api Service actually publishes. A REST upstream the gateway
-	// cannot parse stops the process; one that parses and names the wrong port
-	// does not.
+	// The address has to be one the loader can use, and it has to name the port
+	// the api Service actually publishes. A REST upstream the gateway cannot
+	// parse stops the process; one that parses and names the wrong port does
+	// not.
 	parsed, err := ParseRestUpstream(upstream)
 	if err != nil {
 		t.Fatalf("%s/%s does not parse: %v", upstreamConfigMap, restUpstreamEnv, err)
@@ -252,9 +255,8 @@ func TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest(t *testing.T) {
 		t.Fatalf("%s/%s parses to an empty upstream", upstreamConfigMap, restUpstreamEnv)
 	}
 
-	http, grpc := apiServicePorts(t)
+	http, _ := apiServicePorts(t)
 	assertPort(t, restUpstreamEnv, upstream, http)
-	assertPort(t, resumeAddrEnv, resume, grpc)
 }
 
 // assertPort checks that an address — a URL or a bare host:port — names the

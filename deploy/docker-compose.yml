@@ -218,8 +218,9 @@ services:
           > /tmp/agentenv-pg/pg-dsn.toml
         exec /aenv-api
     # 🔴 Also published directly on 8010 for convenience, but the gateway
-    # (`GATEWAY_REST_UPSTREAM_ADDR`/`GATEWAY_RESUME_ADDR` below, matching
-    # `deploy/k8s/base`'s `api-upstream-config`) now sends user-facing REST
+    # (`GATEWAY_REST_UPSTREAM_ADDR` below, matching `deploy/k8s/base`'s
+    # `api-upstream-config`, and `GATEWAY_SCHEDULER_ADDR`, which carries the
+    # wake-up RPC) now sends user-facing REST
     # and paused-sandbox wake-ups here too — point a client at the gateway's
     # own port (8000) for `/sandboxes`, `/snapshots` and `/templates` the same
     # way a k8s deployment would.
@@ -262,13 +263,18 @@ services:
       # all answered in-process by `aenv-api`'s own `NodeRegistryGrpcService`,
       # unconditionally. Same value
       # `deploy/k8s/base/config/gateway.json`'s `gateway.scheduler_addr` uses.
+      #
+      # 🔴 It also carries the wake-up RPC. There used to be a second key here,
+      # `GATEWAY_RESUME_ADDR`, holding this exact value — `SandboxResumeService`
+      # and the `Scheduler` service share one gRPC listener on `aenv-api` — so
+      # the gateway opened two connections to one process. That key is deleted;
+      # the gateway reuses this connection.
       GATEWAY_SCHEDULER_ADDR: agentenv-api:8002
       # 🔴 No longer optional (R9, `services/shared/config`'s `Config.Validate`):
-      # `aenv-node` answers 404 on user-facing REST and has no wake-up surface
-      # of its own, so both addresses must name the api half. Same values
+      # `aenv-node` answers 404 on user-facing REST, so this address must name
+      # the api half. Same value
       # `deploy/k8s/base/kustomization.yaml`'s `api-upstream-config` uses.
       GATEWAY_REST_UPSTREAM_ADDR: http://agentenv-api:8000
-      GATEWAY_RESUME_ADDR: agentenv-api:8002
       GATEWAY_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     ports:
       - "8000:8080"

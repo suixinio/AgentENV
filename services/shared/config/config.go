@@ -203,25 +203,22 @@ type GatewayRoutingConfig struct {
 type GatewayConfig struct {
 	HTTPListenAddr    string `json:"http_listen_addr"`
 	MetricsListenAddr string `json:"metrics_listen_addr"`
-	SchedulerAddr     string `json:"scheduler_addr"`
-	// ResumeAddr is the api half's wake-up surface, asked when the routing
-	// projection has no answer for a sandbox.
+	// SchedulerAddr is whichever process answers
+	// `services/api/proto/scheduler.proto` — `agentenv-api` on every current
+	// deployment.
 	//
-	// 🔴 No longer optional. Empty used to be the switch off — every
-	// projection miss fell through to the scheduler, and the node the request
-	// landed on woke the sandbox itself — while 阶段 3a's rollback was a
-	// ConfigMap change and a gateway restart rather than a DaemonSet roll
-	// (`_sd-impl-phase3-role.md` §11.1, §11.2). That premise is retired: nodes
-	// run `aenv-node` now and have no wake-up surface of their own under any
-	// configuration, so `Validate` refuses a config with this empty rather
-	// than letting a cluster discover it as every resume attempt silently
-	// falling back to the scheduler. See rest_upstream.go and
-	// `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`.
-	ResumeAddr string `json:"resume_addr"`
+	// 🔴 It also carries the wake-up RPC. There used to be a second address,
+	// `resume_addr`, naming the api half's `SandboxResumeService`; it held the
+	// same value as this one on every shipped deployment, because it is the
+	// same gRPC listener, so `cmd/main.go` built two ClientConns to one
+	// process. The field is deleted rather than defaulted to this one —
+	// a knob with exactly one correct value is a knob somebody eventually
+	// sets to a second one — and the gateway reuses this connection for both.
+	SchedulerAddr string `json:"scheduler_addr"`
 	// RestUpstreamAddr is where user-facing REST goes: sandbox, snapshot and
 	// template calls, the routes `aenv-node` answers 404 on.
 	//
-	// 🔴 No longer optional, for the same reason as ResumeAddr above. Empty
+	// 🔴 Not optional. Empty
 	// used to be the switch off — the gateway asked the scheduler which node
 	// should serve the call and forwarded it there, because the nodes were
 	// still the pre-split single process and never stopped being able to
@@ -282,7 +279,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		HTTPListenAddr      *string         `json:"http_listen_addr"`
 		MetricsListenAddr   *string         `json:"metrics_listen_addr"`
 		SchedulerAddr       *string         `json:"scheduler_addr"`
-		ResumeAddr          *string         `json:"resume_addr"`
 		RestUpstreamAddr    *string         `json:"rest_upstream_addr"`
 		RedisAddr           *string         `json:"redis_addr"`
 		RequestTimeout      json.RawMessage `json:"request_timeout"`
@@ -313,9 +309,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.SchedulerAddr != nil {
 		g.SchedulerAddr = *parsed.SchedulerAddr
-	}
-	if parsed.ResumeAddr != nil {
-		g.ResumeAddr = *parsed.ResumeAddr
 	}
 	if parsed.RestUpstreamAddr != nil {
 		g.RestUpstreamAddr = *parsed.RestUpstreamAddr
@@ -456,7 +449,6 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_HTTP_LISTEN_ADDR", &cfg.Gateway.HTTPListenAddr)
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
-	set("GATEWAY_RESUME_ADDR", &cfg.Gateway.ResumeAddr)
 	set("GATEWAY_REST_UPSTREAM_ADDR", &cfg.Gateway.RestUpstreamAddr)
 	set("GATEWAY_REDIS_ADDR", &cfg.Gateway.RedisAddr)
 	// A shared secret, so it arrives the same way the DSN does and never through
@@ -484,8 +476,8 @@ func overrideWithEnv(cfg *Config) error {
 
 	// 🔴 Follows GATEWAY_DEBUG_MODE's shape rather than the mounted-file
 	// pattern the projection switches use below: this one is meant to be
-	// flipped by `kubectl set env` and a restart, the same way ResumeAddr and
-	// RestUpstreamAddr are. Named GATEWAY_COLD_LOOKUP_TIMEOUT, not
+	// flipped by `kubectl set env` and a restart, the same way
+	// RestUpstreamAddr is. Named GATEWAY_COLD_LOOKUP_TIMEOUT, not
 	// GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — see ColdLookupTimeout's own doc for
 	// why the rename. The old name is neither read nor refused any more; a
 	// manifest that still sets it silently keeps the 3s default.
@@ -603,20 +595,19 @@ func (c Config) validate() error {
 		if _, err := ParseRestUpstream(c.Gateway.RestUpstreamAddr); err != nil {
 			return err
 		}
-		// 🔴 阶段 3a no longer has an "off" position for either of its two
-		// addresses. Nodes run aenv-node now and answer 404 on every
-		// user-facing REST route and have no wake-up surface of their own, so
-		// an empty rest_upstream_addr or resume_addr is not a rollback — it is
-		// an outage with no matching half, and refusing it here turns that into
-		// a startup failure instead of a 404/502 discovered per request. See
+		// 🔴 阶段 3a no longer has an "off" position for its REST upstream.
+		// Nodes run aenv-node now and answer 404 on every user-facing REST
+		// route, so an empty rest_upstream_addr is not a rollback — it is an
+		// outage with no matching half, and refusing it here turns that into a
+		// startup failure instead of a 404/502 discovered per request. See
 		// rest_upstream.go and TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest.
+		//
+		// Its former sibling, resume_addr, needs no such check any more: the
+		// wake-up RPC rides scheduler_addr's connection, so there is no second
+		// address left to be emptied independently of it.
 		if strings.TrimSpace(c.Gateway.RestUpstreamAddr) == "" {
 			return errors.New("gateway.rest_upstream_addr is required: aenv-node answers 404 on " +
 				"user-facing REST, so the gateway has nowhere else to send it")
-		}
-		if strings.TrimSpace(c.Gateway.ResumeAddr) == "" {
-			return errors.New("gateway.resume_addr is required: aenv-node has no wake-up surface " +
-				"of its own, so the gateway has nowhere else to ask a paused sandbox to be woken")
 		}
 	}
 	return nil

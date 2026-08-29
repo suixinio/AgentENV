@@ -186,83 +186,12 @@ func nodeIdentityClusterID(t *testing.T) string {
 	return ""
 }
 
-// 🔴 阶段 3a's resume switch is present in the mounted ConfigMap and is
-// mandatory, not off.
-//
-// That the key is *declared* in the file is still worth pinning on its own:
-// it is what lets `api-upstream-config` carry the real value without a
-// manifest edit. But the file no longer ships it empty — nodes run
-// `aenv-node`, which has no wake-up surface of its own under any
-// configuration, so `Config.Validate` refuses to load a gateway config with
-// `resume_addr` empty from any source, file or environment. This test used to
-// pin the opposite: the shadow-phase release shipped the key present and
-// empty, deliberately, and this is the flip side of that decision now that
-// the release has finished. See rest_upstream.go and
-// `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`.
-func TestGatewayResumeAddrIsDeclaredAndRequired(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join(manifestDir, "config", "gateway.json"))
-	if err != nil {
-		t.Fatalf("reading the mounted gateway config failed: %v", err)
-	}
-	var mounted struct {
-		Gateway map[string]json.RawMessage `json:"gateway"`
-	}
-	if err := json.Unmarshal(raw, &mounted); err != nil {
-		t.Fatalf("the mounted gateway config is not valid JSON: %v", err)
-	}
-	if _, declared := mounted.Gateway["resume_addr"]; !declared {
-		t.Fatalf("the mounted gateway config does not name resume_addr, so losing " +
-			"api-upstream-config's ConfigMap means editing the manifest under incident pressure " +
-			"rather than restoring a value")
-	}
-
-	// The mounted file itself still ships this empty, as a deliberate
-	// fail-fast: if api-upstream-config is ever lost, the gateway must refuse
-	// to start rather than falling back to this file and silently degrading
-	// into the outage that emptying it now means.
-	t.Setenv("GATEWAY_RESUME_ADDR", "")
-	if _, err := Load(filepath.Join(manifestDir, "config", "gateway.json"), "gateway"); err == nil {
-		t.Fatal("the mounted gateway config loaded with no resume_addr from either the file or " +
-			"the environment; it must refuse, the same way a deployed gateway would if " +
-			"api-upstream-config were ever lost")
-	}
-
-	// Resolution: the same loader does carry a value through from the file, so
-	// the refusal above is about the mounted file's own empty default and not
-	// about the key being unreadable.
-	path := filepath.Join(t.TempDir(), "gateway.json")
-	if err := os.WriteFile(path, []byte(`{"gateway":{"resume_addr":"agentenv-api:9090"}}`), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	cfg, err := Load(path, "gateway")
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if cfg.Gateway.ResumeAddr != "agentenv-api:9090" {
-		t.Fatalf("resume_addr in a config file came out as %q", cfg.Gateway.ResumeAddr)
-	}
-
-	// ...and so does the environment, which is how one gateway is flipped
-	// without editing the ConfigMap every other gateway shares — and, per
-	// api-upstream-config's real literal, how every gateway gets a value at
-	// all.
-	t.Setenv("GATEWAY_RESUME_ADDR", "agentenv-api-canary:9090")
-	cfg, err = Load(filepath.Join(manifestDir, "config", "gateway.json"), "gateway")
-	if err != nil {
-		t.Fatalf("load config: %v", err)
-	}
-	if cfg.Gateway.ResumeAddr != "agentenv-api-canary:9090" {
-		t.Fatalf("the environment did not override the manifest: got %q", cfg.Gateway.ResumeAddr)
-	}
-}
-
 // 🔴 阶段 3a's REST switch is present in the mounted ConfigMap and is
 // mandatory, not off.
 //
-// The same two halves as the resume switch above, and the same reason for
-// each: the key is declared so a lost ConfigMap is a value away from
-// restoring, but the file no longer ships it empty, because emptying it is no
-// longer a rollback — `aenv-node` answers 404 on every user-facing REST route
+// Two halves, and a reason for each: the key is declared so a lost ConfigMap
+// is a value away from restoring, but the file ships it empty, because
+// emptying it is not a rollback — `aenv-node` answers 404 on every user-facing REST route
 // under any configuration, so `Config.Validate` refuses to load a gateway
 // config with `rest_upstream_addr` empty from any source. Shipping the switch
 // and shipping the traffic move used to be two different days; now there is
@@ -316,7 +245,7 @@ func TestGatewayRestUpstreamIsDeclaredAndRequired(t *testing.T) {
 	}
 }
 
-// 🔴 Why the mounted file has to keep shipping both keys empty, and not only
+// 🔴 Why the mounted file has to keep shipping the key empty, and not only
 // the ConfigMap the Deployment reads through the environment.
 //
 // An environment variable set to the empty string is *ignored* by the loader —
@@ -329,28 +258,30 @@ func TestGatewayRestUpstreamIsDeclaredAndRequired(t *testing.T) {
 // fail-fast this ConfigMap's ordering is meant to guarantee (see
 // `TestGatewayRestUpstreamIsDeclaredAndRequired`) would quietly stop applying.
 //
-// So both keys ship empty in the file and are turned on only through the
+// So the key ships empty in the file and is turned on only through the
 // environment, and this test pins the property that makes that rule necessary
 // rather than merely stating it in a comment.
-func TestAnEmptyEnvironmentValueCannotTurnTheApiUpstreamSwitchesOff(t *testing.T) {
+//
+// It used to cover a second key, resume_addr, under identical reasoning. That
+// address is deleted — the wake-up RPC rides gateway.scheduler_addr's
+// connection — so one key is left to pin.
+func TestAnEmptyEnvironmentValueCannotTurnTheApiUpstreamSwitchOff(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.json")
 	if err := os.WriteFile(path, []byte(
-		`{"gateway":{"rest_upstream_addr":"http://agentenv-api:8000","resume_addr":"agentenv-api:8002"}}`,
+		`{"gateway":{"rest_upstream_addr":"http://agentenv-api:8000"}}`,
 	), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
 	t.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "")
-	t.Setenv("GATEWAY_RESUME_ADDR", "")
 	cfg, err := Load(path, "gateway")
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if cfg.Gateway.RestUpstreamAddr == "" || cfg.Gateway.ResumeAddr == "" {
-		t.Fatalf("an empty environment value cleared a file value (rest=%q resume=%q); if that ever "+
-			"becomes true, the note in kustomization.yaml about where the off position lives is "+
-			"wrong and should be rewritten rather than left to mislead",
-			cfg.Gateway.RestUpstreamAddr, cfg.Gateway.ResumeAddr)
+	if cfg.Gateway.RestUpstreamAddr == "" {
+		t.Fatal("an empty environment value cleared a file value; if that ever " +
+			"becomes true, the note in kustomization.yaml about where the off position lives is " +
+			"wrong and should be rewritten rather than left to mislead")
 	}
 
 	// ...whereas a non-empty one does take, which is how 3a is turned on and —

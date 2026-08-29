@@ -232,7 +232,7 @@ func TestTheApiServiceCarriesTheTwoAddressesTheGatewayIsPointedAt(t *testing.T) 
 		what     string
 	}{
 		{portName: "http", env: "API_ADDR", what: "user-facing REST (gateway.rest_upstream_addr)"},
-		{portName: "grpc", env: "AENV_API_GRPC_ADDR", what: "the wake-up surface (gateway.resume_addr)"},
+		{portName: "grpc", env: "AENV_API_GRPC_ADDR", what: "the Scheduler protocol and the wake-up RPC (gateway.scheduler_addr)"},
 	} {
 		t.Run(tc.portName, func(t *testing.T) {
 			listen, ok := envValue(container, tc.env)
@@ -358,7 +358,7 @@ func TestEachHalfRunsItsOwnImage(t *testing.T) {
 	}
 }
 
-// The gateway's end of both switches: declared on the Deployment, sourced from a
+// The gateway's end of the switch: declared on the Deployment, sourced from a
 // ConfigMap the base layer generates, and generated empty.
 //
 // 🔴 Declared-but-empty and absent are different states, and only the first one
@@ -366,12 +366,16 @@ func TestEachHalfRunsItsOwnImage(t *testing.T) {
 // this list before it can be set turns enabling 3a into a manifest edit, and —
 // the half that actually costs something — turns rolling it back into a manifest
 // edit during an incident.
+//
+// 🔴 This list used to hold two names. GATEWAY_RESUME_ADDR is deleted, not
+// merely unpinned: the wake-up RPC rides gateway.scheduler_addr's connection,
+// which is the same api gRPC listener that key always named.
 func TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest(t *testing.T) {
 	var gateway appsv1.Deployment
 	decodeManifest(t, filepath.Join(manifestDir, "gateway-deployment.yaml"), &gateway)
 	container := onlyContainer(t, "the gateway Deployment", gateway.Spec.Template.Spec.Containers)
 
-	for _, name := range []string{"GATEWAY_REST_UPSTREAM_ADDR", "GATEWAY_RESUME_ADDR"} {
+	for _, name := range []string{"GATEWAY_REST_UPSTREAM_ADDR"} {
 		t.Run(name, func(t *testing.T) {
 			declared, ok := envValue(container, name)
 			if !ok {
@@ -387,9 +391,9 @@ func TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest(t *testing.T)
 				t.Fatalf("%s is a required ConfigMap key; a cluster that has not created that "+
 					"ConfigMap would fail to start its gateway over a switch that is off", name)
 			}
-			// 🔴 Both switches are *on*, and this assertion was flipped with
-			// them. They shipped empty through 阶段 3a because turning them on
-			// was meant to be a deliberate act rather than something that
+			// 🔴 The switch is *on*, and this assertion was flipped with it.
+			// It shipped empty through 阶段 3a because turning it on was
+			// meant to be a deliberate act rather than something that
 			// arrives with an image — and then it was deliberately done. The
 			// DaemonSet has since taken `aenv-node`, so the nodes answer 404
 			// on the sandboxes routes and an empty upstream here is no longer
@@ -402,16 +406,16 @@ func TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest(t *testing.T)
 		})
 	}
 
-	// The control for the two values above: generatedLiteral does tell
+	// The control for the value above: generatedLiteral does tell
 	// "generated empty" from "generated with something in it". Without this,
-	// both assertions would also pass against a lookup that returned a non-empty
+	// the assertion would also pass against a lookup that returned a non-empty
 	// placeholder for everything, including keys that are not there.
 	//
 	// SANDBOX_PROXY_DOMAINS is the empty literal in this tree that is meant to
 	// be empty, so it is the one that proves the lookup can still say so.
 	if value := generatedLiteral(t, "sandbox-proxy-config", "SANDBOX_PROXY_DOMAINS"); value != "" {
-		t.Fatalf("the generator lookup returned %q for a literal that ships empty; the two "+
-			"assertions above are measuring the lookup rather than the manifests", value)
+		t.Fatalf("the generator lookup returned %q for a literal that ships empty; the "+
+			"assertion above is measuring the lookup rather than the manifests", value)
 	}
 }
 

@@ -88,9 +88,9 @@ type ServerOptions struct {
 	// still the pre-split single process and could wake a sandbox themselves,
 	// so nil was a supported rollback lever (`_sd-impl-phase3-role.md` §11.2).
 	// That premise is retired — `aenv-node` has no wake-up surface of its own —
-	// and `services/shared/config`'s `Config.Validate` now refuses to load a
-	// gateway config with `resume_addr` empty, so `cmd/main.go` can no longer
-	// construct a `*Server` with this nil. It stays nil-able here purely
+	// and `cmd/main.go` builds this over the scheduler connection
+	// unconditionally, so it can no longer construct a `*Server` with this
+	// nil. It stays nil-able here purely
 	// because this package's own tests use an unconfigured `*Server` as their
 	// baseline fixture for exercising the data-plane routing paths — the
 	// projection, this wake-up client, and the cold-path LookupNode call

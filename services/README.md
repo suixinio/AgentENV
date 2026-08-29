@@ -222,28 +222,33 @@ loudly rather than being ignored.
 To go back to the single-process shape, deploy the **pre-split image tag** on
 `agentenv-daemonset.yaml` (the last tag built before the crate split; that
 binary still accepts `--role all`) and point the gateway's
-`GATEWAY_REST_UPSTREAM_ADDR` and
-`GATEWAY_RESUME_ADDR` back at the nodes in the same apply. Three things to
-know before starting:
+`GATEWAY_REST_UPSTREAM_ADDR` back at the nodes in the same apply. Three things
+to know before starting:
 
 - it is a **serial DaemonSet roll with a drain per machine**, not a value
   change — budget the grace period times the node count;
 - leaving the gateway aimed at `agentenv-api` while the nodes go back to
-  serving REST is a live half-migration nobody chose, and emptying those two
-  keys while the nodes still run `aenv-node` 404s every REST call in the
+  serving REST is a live half-migration nobody chose, and emptying that key
+  while the nodes still run `aenv-node` 404s every REST call in the
   cluster. `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`
   (`shared/config/execution_switches_manifest_test.go`) is what refuses the
   second of those in the tree;
-- 🔴 **a current-generation gateway can no longer be pointed at empty
-  addresses at all.** `services/shared/config`'s `Config.Validate` refuses to
-  load a "gateway" config with `GATEWAY_REST_UPSTREAM_ADDR` or
-  `GATEWAY_RESUME_ADDR` empty, from either the ConfigMap or
-  `config/gateway.json`'s file fallback — the gateway now fails to start
-  rather than serving the outage those two keys used to produce when emptied.
-  So this rollback needs the **gateway's own image tag pinned back too**, to a
-  build from before that refusal existed, in the same apply as the DaemonSet's
-  pre-split tag and the two emptied keys — the DaemonSet image tag alone is
-  not enough any more.
+- 🔴 **a current-generation gateway can no longer be pointed at an empty
+  address at all.** `services/shared/config`'s `Config.Validate` refuses to
+  load a "gateway" config with `GATEWAY_REST_UPSTREAM_ADDR` empty, from either
+  the ConfigMap or `config/gateway.json`'s file fallback — the gateway now
+  fails to start rather than serving the outage that key used to produce when
+  emptied. So this rollback needs the **gateway's own image tag pinned back
+  too**, to a build from before that refusal existed, in the same apply as the
+  DaemonSet's pre-split tag and the emptied key — the DaemonSet image tag
+  alone is not enough any more.
+
+🔴 There used to be a second key in that list, `GATEWAY_RESUME_ADDR`, naming
+the api half's wake-up surface. It is deleted: `SandboxResumeService` and the
+`Scheduler` service share one gRPC listener on `agentenv-api`, so the key could
+only ever hold `gateway.scheduler_addr`'s value, and `cmd/main.go` reuses that
+one `ClientConn` for the wake-up RPC. A manifest that still sets it is silently
+ignored — the loader reads no such key.
 
 From the repository root:
 

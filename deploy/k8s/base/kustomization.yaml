@@ -271,39 +271,41 @@ configMapGenerator:
       # read as a quiet `false` — loud, but only if you spell it right in the
       # first place.
       - AENV_BINDING_STORE_PROJECTION_AUTHORITATIVE=true
-  # 阶段 3a, in two keys: which upstream the gateway sends user-facing REST to,
-  # and who wakes a paused sandbox the routing projection has no answer for.
+  # 阶段 3a, in one key: which upstream the gateway sends user-facing REST to.
   #
-  # 🔴 This ConfigMap *is* 3a's switch, and 3a is **on**, permanently now. Both
-  # keys carry real addresses because the cluster has been running them since
-  # 08-24: the gateway sends user-facing REST to the api half and wakes paused
-  # sandboxes through it, rather than fanning out to whichever node the
-  # scheduler names.
+  # 🔴 This ConfigMap *is* 3a's switch, and 3a is **on**, permanently now. The
+  # key carries a real address because the cluster has been running it since
+  # 08-24: the gateway sends user-facing REST to the api half rather than
+  # fanning out to whichever node the scheduler names.
   #
-  # 🔴 Emptying either key is no longer a rollback, and no longer possible at
+  # 🔴 It used to carry a second key, `GATEWAY_RESUME_ADDR`, naming the api
+  # half's wake-up surface at `agentenv-api:8002`. That is deleted, not
+  # emptied: `SandboxResumeService` and the `Scheduler` service share one gRPC
+  # listener, so the key could only ever hold `gateway.scheduler_addr`'s value,
+  # and the gateway now reuses that connection for the wake-up RPC.
+  #
+  # 🔴 Emptying this key is no longer a rollback, and no longer possible at
   # all. The DaemonSet has since moved to `aenv-node` (3b, see
   # agentenv-daemonset.yaml), so the nodes answer 404 on the sandboxes routes
-  # and have no wake-up surface of their own — the shape of rollback this
-  # ConfigMap used to offer (empty the two keys, roll the gateway, leave the
-  # DaemonSet alone) would point the gateway at a target that cannot serve
-  # either call. `services/shared/config`'s `Config.Validate` now refuses to
-  # load a gateway config with either key empty, from the file or the
-  # environment, so an `apply -k` that emptied one is a CrashLoopBackOff at
-  # the next gateway restart rather than the silent REST/wake-up outage —
+  # — the shape of rollback this ConfigMap used to offer (empty the key, roll
+  # the gateway, leave the DaemonSet alone) would point the gateway at a target
+  # that cannot serve the call. `services/shared/config`'s `Config.Validate`
+  # now refuses to load a gateway config with it empty, from the file or the
+  # environment, so an `apply -k` that emptied it is a CrashLoopBackOff at
+  # the next gateway restart rather than the silent REST outage —
   # discoverable only as 404s — that it used to be. The only rollback left for
   # this half is the image-tag rollback in `services/README.md`'s "Rolling the
   # node half back" section: a pre-阶段3a gateway image tag alongside the
   # pre-split DaemonSet image tag, in the same apply, because a current
-  # gateway image can no longer run with these two empty at all.
+  # gateway image can no longer run with this empty at all.
   #
-  # `config/gateway.json` still mounts both keys empty, and that stays
+  # `config/gateway.json` still mounts the key empty, and that stays
   # deliberate: it is what makes losing this ConfigMap a loud, fail-fast
   # refusal to start rather than a fallback to a value nobody meant.
   # `services/shared/config` has tests that pin both halves of this.
   - name: api-upstream-config
     literals:
       - GATEWAY_REST_UPSTREAM_ADDR=http://agentenv-api:8000
-      - GATEWAY_RESUME_ADDR=agentenv-api:8002
   # The cold LookupNode path a projection miss and an undecided wake-up both
   # fall through to — declared here at the code default (3s) so losing this
   # ConfigMap is safe rather than a quiet change, the same reasoning

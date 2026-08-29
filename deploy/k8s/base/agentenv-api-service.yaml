@@ -6,11 +6,14 @@
 # replica can answer for any sandbox, because the ledger is in Redis — so load
 # balancing across the replicas is the whole point.
 #
-# Both ports carry 阶段 3a's two switches:
-#   · `http` is what `gateway.rest_upstream_addr` points at.
-#   · `grpc` is what `gateway.resume_addr` points at.
-# Neither switch can be flipped before this object exists, which is why it is a
-# separate manifest from the Deployment and applied with it rather than after.
+# The two ports the gateway knows this half by:
+#   · `http` is what `gateway.rest_upstream_addr` points at — 阶段 3a's switch.
+#   · `grpc` is what `gateway.scheduler_addr` points at. One listener answers
+#     both the `Scheduler` service and `SandboxResumeService` on it, so the
+#     gateway's wake-up RPC rides the same connection; `gateway.resume_addr`,
+#     which used to name this port separately, is deleted.
+# Neither can be pointed anywhere before this object exists, which is why it is
+# a separate manifest from the Deployment and applied with it rather than after.
 apiVersion: v1
 kind: Service
 metadata:

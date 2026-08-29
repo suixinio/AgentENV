@@ -297,9 +297,10 @@ spec:
             # `aenv_api::api::grpc::serve_on`. Two gRPC services share that one
             # listener, always, multiplexed by HTTP/2 path: `SandboxResumeService`
             # and `NodeRegistryGrpcService`'s `Scheduler` service. So both of this
-            # port's callers land here — the gateway's cold path, pointed at it
-            # by `GATEWAY_RESUME_ADDR=agentenv-api:8002`, and every node's
-            # heartbeat, pointed at it by
+            # port's callers land here — the gateway, pointed at it by
+            # `GATEWAY_SCHEDULER_ADDR=agentenv-api:8002` for both the Scheduler
+            # RPCs and the wake-up it reuses that connection for, and every
+            # node's heartbeat, pointed at it by
             # `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-api:8002`
             # (both literals in kustomization.yaml).
             #

@@ -7,19 +7,21 @@ import (
 	"time"
 )
 
-// 阶段 3a's two addresses (`GATEWAY_REST_UPSTREAM_ADDR`, `GATEWAY_RESUME_ADDR`)
-// have no code-level default — see defaultConfig and GatewayConfig — because
-// there is no sensible default for a specific api Service address, so
-// `Config.Validate` refuses to load a "gateway" config with either one empty.
-// Most of this package's tests load or build a "gateway" config to exercise
-// something that has nothing to do with that switch, so this sets both to
-// placeholder-but-valid values for the whole test binary; the handful of
-// tests that are specifically about `rest_upstream_addr`/`resume_addr`
-// override them locally with `t.Setenv`, which restores this default once the
-// subtest ends.
+// 阶段 3a's REST upstream (`GATEWAY_REST_UPSTREAM_ADDR`) has no code-level
+// default — see defaultConfig and GatewayConfig — because there is no sensible
+// default for a specific api Service address, so `Config.Validate` refuses to
+// load a "gateway" config with it empty. Most of this package's tests load or
+// build a "gateway" config to exercise something that has nothing to do with
+// that switch, so this sets a placeholder-but-valid value for the whole test
+// binary; the handful of tests that are specifically about
+// `rest_upstream_addr` override it locally with `t.Setenv`, which restores
+// this default once the subtest ends.
+//
+// It used to seed a second variable, GATEWAY_RESUME_ADDR, under the same
+// reasoning. That address is deleted: the wake-up RPC rides
+// `gateway.scheduler_addr`'s connection, so there is nothing left to seed.
 func TestMain(m *testing.M) {
 	os.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "http://agentenv-api.default.svc.cluster.local:8000")
-	os.Setenv("GATEWAY_RESUME_ADDR", "agentenv-api.default.svc.cluster.local:8002")
 	os.Exit(m.Run())
 }
 
@@ -43,36 +45,38 @@ func TestValidateAcceptsSupportedLogFormats(t *testing.T) {
 	for _, format := range formats {
 		cfg := defaultConfig("gateway")
 		cfg.LogFormat = format
-		// defaultConfig deliberately gives these two no value — see
-		// GatewayConfig.RestUpstreamAddr/ResumeAddr — so a Validate() call
-		// made directly against the struct, bypassing Load's env overlay, has
-		// to supply both itself.
+		// defaultConfig deliberately gives this no value — see
+		// GatewayConfig.RestUpstreamAddr — so a Validate() call made directly
+		// against the struct, bypassing Load's env overlay, has to supply it
+		// itself.
 		cfg.Gateway.RestUpstreamAddr = "http://agentenv-api:8000"
-		cfg.Gateway.ResumeAddr = "agentenv-api:8002"
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("expected format %q to validate, got error %v", format, err)
 		}
 	}
 }
 
-// 🔴 Both halves of 阶段 3a's REST upstream switch are mandatory now: nodes run
-// `aenv-node` and answer 404 on every user-facing REST route and have no
-// wake-up surface of their own, so an empty `rest_upstream_addr` or
-// `resume_addr` is not a rollback, it is an outage discovered only once
+// 🔴 阶段 3a's REST upstream switch is mandatory now: nodes run `aenv-node`
+// and answer 404 on every user-facing REST route, so an empty
+// `rest_upstream_addr` is not a rollback, it is an outage discovered only once
 // something calls in. This is the direct unit test of that refusal; the
 // manifest-level guards in manifest_test.go and
 // execution_switches_manifest_test.go check that the deployed cluster never
 // actually supplies an empty one.
-func TestValidateRefusesAnEmptyGatewayUpstreamOrResumeAddr(t *testing.T) {
+//
+// It used to cover a second address, `resume_addr`, under the same reasoning.
+// That one is deleted rather than made optional again — the wake-up RPC rides
+// `gateway.scheduler_addr`'s connection now — so there is no second empty to
+// refuse.
+func TestValidateRefusesAnEmptyGatewayUpstream(t *testing.T) {
 	base := func() Config {
 		cfg := defaultConfig("gateway")
 		cfg.Gateway.RestUpstreamAddr = "http://agentenv-api:8000"
-		cfg.Gateway.ResumeAddr = "agentenv-api:8002"
 		return cfg
 	}
 
 	if err := base().Validate(); err != nil {
-		t.Fatalf("a config with both addresses set was refused: %v", err)
+		t.Fatalf("a config with the address set was refused: %v", err)
 	}
 
 	t.Run("empty rest_upstream_addr", func(t *testing.T) {
@@ -88,22 +92,6 @@ func TestValidateRefusesAnEmptyGatewayUpstreamOrResumeAddr(t *testing.T) {
 		cfg.Gateway.RestUpstreamAddr = "   "
 		if err := cfg.Validate(); err == nil {
 			t.Fatal("a whitespace-only rest_upstream_addr was accepted")
-		}
-	})
-
-	t.Run("empty resume_addr", func(t *testing.T) {
-		cfg := base()
-		cfg.Gateway.ResumeAddr = ""
-		if err := cfg.Validate(); err == nil {
-			t.Fatal("an empty resume_addr was accepted")
-		}
-	})
-
-	t.Run("whitespace resume_addr", func(t *testing.T) {
-		cfg := base()
-		cfg.Gateway.ResumeAddr = "   "
-		if err := cfg.Validate(); err == nil {
-			t.Fatal("a whitespace-only resume_addr was accepted")
 		}
 	})
 }

@@ -1259,6 +1259,26 @@ pub struct ClusterConfig {
     /// the very first `warmed_up` call with zero heartbeats received.
     #[config(default = 15u64, env = "AENV_CLUSTER_NATIVE_WARMUP_TIMEOUT_SECS")]
     pub native_warmup_timeout_secs: u64,
+    /// How many candidate nodes the placement *shadow* scorer samples,
+    /// without replacement, on each selection
+    /// ([`crate::node_registry::placement`]).
+    ///
+    /// 🔴 This does not decide placement. Real placement is round-robin and
+    /// stays that way in this build; the shadow scorer runs after the
+    /// strategy has already answered and produces metrics only. There is
+    /// deliberately no switch that would let this take over — see that
+    /// module's own doc for why best-of-K without cross-replica pending
+    /// accounting would herd a concurrent burst onto one node.
+    ///
+    /// `0` is refused at load ([`AppConfig::validate`]) rather than treated
+    /// as "off": a zero-width sample would keep every one of the four
+    /// metric series alive while making all of them meaningless, which is
+    /// the one failure mode a shadow feature must not have.
+    ///
+    /// Note that `k >= N` (the usual case on a small cluster) makes
+    /// best-of-K the global optimum, not a sample.
+    #[config(default = 3u32, env = "AENV_CLUSTER_PLACEMENT_SHADOW_K")]
+    pub placement_shadow_k: u32,
     /// The shared-roster fix: see [`ClusterNodeRegistryStoreConfig`].
     #[config(nested)]
     pub node_registry_store: ClusterNodeRegistryStoreConfig,
@@ -2022,6 +2042,12 @@ impl AppConfig {
             bail!(
                 "snapshot.catalog.build_heartbeat_interval_secs must be > 0; a build that never \
                  says it is alive is ended by the catalog's reaper while it is still running"
+            );
+        }
+        if self.cluster.placement_shadow_k == 0 {
+            bail!(
+                "cluster.placement_shadow_k must be > 0; a zero-width sample keeps every \
+                 placement shadow metric series alive while making all of them meaningless"
             );
         }
         Ok(())
@@ -4391,6 +4417,7 @@ endpoint = "http://second:9000"
             kubernetes_discovery: Default::default(),
             static_discovery_nodes: Vec::new(),
             native_warmup_timeout_secs: 15,
+            placement_shadow_k: crate::node_registry::placement::DEFAULT_PLACEMENT_SHADOW_K,
             node_registry_store: Default::default(),
         };
         config.normalize();
@@ -4406,6 +4433,7 @@ endpoint = "http://second:9000"
             kubernetes_discovery: Default::default(),
             static_discovery_nodes: Vec::new(),
             native_warmup_timeout_secs: 15,
+            placement_shadow_k: crate::node_registry::placement::DEFAULT_PLACEMENT_SHADOW_K,
             node_registry_store: Default::default(),
         };
         config.normalize();
@@ -4481,6 +4509,62 @@ endpoint = "http://second:9000"
             err.to_string().contains("fill_concurrency"),
             "unexpected error: {err}"
         );
+    }
+
+    /// The shadow scorer's one config knob, pinned on all three axes the
+    /// spec fixes: the TOML path, the environment variable, and the
+    /// default.
+    ///
+    /// 🔴 The env name comes off confique's own `META`, not off a source
+    /// scan. A scan can only say the string appears in this file; `META` is
+    /// what confique actually reads the environment with, so a typo in the
+    /// attribute fails here rather than becoming a knob that silently does
+    /// nothing in production.
+    #[test]
+    fn placement_shadow_k_defaults_to_three_and_binds_its_documented_env_var() {
+        use confique::meta::{Expr, FieldKind, Integer, LeafKind};
+
+        let field = ClusterConfig::META
+            .fields
+            .iter()
+            .find(|field| field.name == "placement_shadow_k")
+            .expect("[cluster].placement_shadow_k exists");
+        let FieldKind::Leaf { env, kind } = field.kind else {
+            panic!("placement_shadow_k is a leaf, not a nested section");
+        };
+        assert_eq!(env, Some("AENV_CLUSTER_PLACEMENT_SHADOW_K"));
+        assert_eq!(
+            kind,
+            LeafKind::Required {
+                default: Some(Expr::Integer(Integer::U32(3))),
+            },
+        );
+
+        assert_eq!(AppConfig::default().cluster.placement_shadow_k, 3);
+    }
+
+    /// `0` is refused rather than quietly meaning "shadow scoring off".
+    ///
+    /// 🔴 A zero-width sample would leave all four shadow series registered
+    /// and reporting — agreement would be filed as `false` forever, the
+    /// classification counters would keep ticking — while the number those
+    /// series exist to produce became meaningless. Silence is a readable
+    /// failure; a metric that is wrong is not.
+    #[test]
+    fn validate_rejects_a_zero_placement_shadow_k() {
+        let mut config = AppConfig::default();
+        config.cluster.placement_shadow_k = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cluster.placement_shadow_k must be > 0"),
+            "unexpected error: {err}"
+        );
+
+        // And the default passes, so the refusal is not simply always on.
+        AppConfig::default()
+            .validate()
+            .expect("the shipped default must load");
     }
 
     #[test]

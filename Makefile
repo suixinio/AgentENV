@@ -62,7 +62,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	mutants coverage \
 	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
-	bench bench-snapshot bench-ublk bench-orchestrator-store \
+	bench bench-snapshot bench-ublk bench-orchestrator-store bench-placement-shadow \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
 	services gateway \
@@ -304,6 +304,11 @@ bench-ublk:
 
 bench-orchestrator-store:
 	$(CARGO) bench -p agentenv-benchmarks --bench orchestrator_store
+
+# What the placement shadow scorer costs per selection, at N = 2 / 100 / 1000.
+# Needs no ublk and no root, unlike `make bench`.
+bench-placement-shadow:
+	$(CARGO) bench -p agentenv-benchmarks --bench placement_shadow
 
 OCI_IMAGE ?=
 bench-oci-conversion:

@@ -62,6 +62,25 @@ message NewColdSandboxHint {
 message NewSandboxHint {
   // Sandbox metadata key/value pairs parsed from the request body.
   map<string, string> metadata = 1;
+  // The sandbox's declared size, so placement can weigh the request against
+  // what each node has already allocated.
+  //
+  // Both use proto3 explicit presence, and that is load-bearing rather than
+  // stylistic: "the caller did not say" and "the caller said zero" have to
+  // be distinguishable. A request for 0 vCPU is a real (if unusual) answer
+  // that participates in the arithmetic; an absent field means placement is
+  // scoring blind and is counted as such
+  // (agentenv_api_placement_missing_request_resources_total). Without
+  // presence, a legacy caller and a zero-sized request would be the same
+  // bytes on the wire.
+  //
+  // Additive: older peers ignore both tags, and this build reads an older
+  // peer's hint as "not stated". Field 1 is metadata, so these take 2 and 3.
+  optional uint32 cpu_count = 2;
+  // MiB, matching SandboxResources::memory_mib, which is where the value
+  // comes from. Named for its unit precisely because the cold-start hint
+  // above spells the same quantity `memory_mb`.
+  optional uint64 memory_mib = 3;
 }
 
 message ScheduleRequest {

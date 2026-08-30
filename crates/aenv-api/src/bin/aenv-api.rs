@@ -810,7 +810,11 @@ async fn start_native_node_registry(
         Duration::from_secs(config.native_warmup_timeout_secs),
         std::time::SystemTime::now(),
     ));
-    let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup));
+    let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup))
+        // The placement shadow scorer's sampling width. `0` was already
+        // refused by `AppConfig::validate`, so nothing here has to decide
+        // what a zero-width sample would mean.
+        .with_placement_shadow_k(config.placement_shadow_k);
 
     // Mirrors `services/scheduler/cmd/main.go`'s own
     // `switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode))`:

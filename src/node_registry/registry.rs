@@ -125,6 +125,7 @@ use crate::proto::scheduler::{
 };
 
 use super::cpu_template::intersect_cpu_configs;
+use super::placement::score::SnapshotFreshness;
 use super::redis::{
     PublishOp, StoredDiskMetric, StoredMachineInfo, StoredNodeSnapshot, StoredObservedRecord,
     StoredP2pEndpoint, StoredRosterEntry,
@@ -227,6 +228,29 @@ pub trait NodeRegistry: Send + Sync {
     /// for scheduling decisions. `None` if the node has never sent a
     /// heartbeat.
     fn peek_observed(&self, node_id: &str) -> Option<NodeSnapshot>;
+    /// [`NodeRegistry::peek_observed`], plus how stale that snapshot is —
+    /// one read, one verdict, for the placement scorer
+    /// (`super::placement`).
+    ///
+    /// 🔴 Deliberately a second accessor rather than a second call. The
+    /// candidate list is built one node at a time under this registry's
+    /// `RwLock`; asking again during scoring would double the read count on
+    /// every placement, and the two reads could straddle a heartbeat and
+    /// disagree about which snapshot the freshness verdict belongs to.
+    ///
+    /// 🔴 `snapshot` here is byte-for-byte what `peek_observed` returns for
+    /// the same node — the real candidate list must not change shape
+    /// because a scorer was added. The freshness half is judged against the
+    /// record's own `report_ttl` (never a hardcoded default) and against
+    /// the API-receive-side `last_seen` (never the node's self-reported
+    /// `reported_at_unix_ms`), and answers
+    /// [`SnapshotFreshness::ClockSkew`] rather than unwrapping when
+    /// `last_seen` is in the future.
+    fn peek_observed_with_freshness(
+        &self,
+        node_id: &str,
+        now: SystemTime,
+    ) -> Option<(NodeSnapshot, SnapshotFreshness)>;
     /// The sandbox roster a node reported in its last heartbeat, and when it
     /// reported it.
     fn roster_of(&self, node_id: &str) -> Option<(Vec<RosterEntry>, SystemTime)>;
@@ -268,6 +292,31 @@ struct ObservedNodeRecord {
     /// The roster from this node's last heartbeat, normalized.
     entries: Vec<RosterEntry>,
     last_seen: SystemTime,
+}
+
+impl ObservedNodeRecord {
+    /// The TTL *this record* is judged against.
+    ///
+    /// 🔴 One helper, two callers, on purpose. `derive_observed_node_view`
+    /// (the status the observed/admin APIs report) and
+    /// `NodeRegistry::peek_observed_with_freshness` (the placement scorer's
+    /// freshness) have to agree: a deployment running a non-default
+    /// `observed_ttl` would otherwise have the registry calling a node
+    /// `UNHEALTHY` while the scorer, hardcoding
+    /// [`DEFAULT_OBSERVED_REPORT_TTL`], still counted it as healthy — and
+    /// the disagreement would be invisible on the default TTL, which is
+    /// what every test and every current deployment runs.
+    ///
+    /// A zero `report_ttl` falls back to the default rather than meaning
+    /// "never expires": that is the pre-existing convention, and a record
+    /// read back from the shared Redis store can carry one.
+    fn effective_report_ttl(&self) -> Duration {
+        if self.report_ttl > Duration::ZERO {
+            self.report_ttl
+        } else {
+            DEFAULT_OBSERVED_REPORT_TTL
+        }
+    }
 }
 
 /// The wire-format conversions for `super::redis`'s shared observed store.
@@ -669,11 +718,7 @@ impl Inner {
             }
         }
 
-        let ttl = if record.report_ttl > Duration::ZERO {
-            record.report_ttl
-        } else {
-            DEFAULT_OBSERVED_REPORT_TTL
-        };
+        let ttl = record.effective_report_ttl();
 
         let snapshot = out.snapshot.as_mut().expect("snapshot defaulted above");
         if last_seen_unix_ms > 0 && (now_ms - last_seen_unix_ms) > ttl.as_millis() as i64 {
@@ -1242,6 +1287,27 @@ impl NodeRegistry for AtomicNodeRegistry {
     fn peek_observed(&self, node_id: &str) -> Option<NodeSnapshot> {
         let inner = self.inner.read().expect("node registry lock poisoned");
         inner.observed.get(node_id)?.node.snapshot.clone()
+    }
+
+    fn peek_observed_with_freshness(
+        &self,
+        node_id: &str,
+        now: SystemTime,
+    ) -> Option<(NodeSnapshot, SnapshotFreshness)> {
+        let inner = self.inner.read().expect("node registry lock poisoned");
+        let record = inner.observed.get(node_id)?;
+        let snapshot = record.node.snapshot.clone()?;
+        let freshness = match now.duration_since(record.last_seen) {
+            // K-5: `last_seen` after `now`. Across API replicas the record
+            // travels through Redis carrying the writing replica's clock,
+            // so this is a state to report, not one to unwrap through.
+            Err(_) => SnapshotFreshness::ClockSkew,
+            // `>`, matching `derive_observed_node_view`'s own comparison:
+            // a record exactly at its TTL is still fresh on both paths.
+            Ok(age) if age > record.effective_report_ttl() => SnapshotFreshness::Stale,
+            Ok(_) => SnapshotFreshness::Fresh,
+        };
+        Some((snapshot, freshness))
     }
 
     fn roster_of(&self, node_id: &str) -> Option<(Vec<RosterEntry>, SystemTime)> {
@@ -3151,6 +3217,147 @@ mod tests {
             PublishOp::Remove { node_id } => assert_eq!(node_id, "node-a"),
             PublishOp::Upsert { .. } => panic!("expected a remove, got an upsert"),
         }
+    }
+
+    /// F-7 / M-5 / K-4 / K-5 — freshness, in one place.
+    ///
+    /// # 🔴 Why the report TTL comes off the record
+    ///
+    /// A registry running a non-default `observed_ttl` stamps that TTL onto
+    /// every record it ingests. A scorer that hardcoded
+    /// [`DEFAULT_OBSERVED_REPORT_TTL`] instead would call a node fresh that
+    /// the registry itself already derives `UNHEALTHY` for — and, because
+    /// every test and every current deployment runs the default TTL, the
+    /// disagreement would never show up. So the non-default case is
+    /// asserted first here, and the default second, against the same
+    /// helper `derive_observed_node_view` uses.
+    ///
+    /// # 🔴 Why `last_seen` and not `reported_at_unix_ms`
+    ///
+    /// `reported_at_unix_ms` is the *node's* clock, which the API half does
+    /// not own. The two cases below hold `now` fixed and move the two
+    /// timestamps in opposite directions, so an implementation that read
+    /// the node's own timestamp gets the answer backwards in both.
+    #[test]
+    fn peek_observed_with_freshness_judges_against_the_records_own_ttl() {
+        let now = unix(1_000);
+        let five_seconds = Duration::from_secs(5);
+        let registry = AtomicNodeRegistry::new(vec![node("node-a", "http://node-a")], five_seconds);
+
+        // (1) Received 6s ago under a 5s TTL: stale. The node's own
+        // `reported_at` says "right now", so a mutant reading it answers
+        // Fresh.
+        let mut beat = ready_heartbeat("node-a", "cluster-1");
+        beat.snapshot
+            .as_mut()
+            .expect("snapshot")
+            .reported_at_unix_ms = unix_millis(now);
+        registry
+            .heartbeat(&beat, now - Duration::from_secs(6))
+            .expect("heartbeat");
+        let (_snapshot, freshness) = registry
+            .peek_observed_with_freshness("node-a", now)
+            .expect("the node has reported");
+        assert_eq!(freshness, SnapshotFreshness::Stale);
+        // The registry's own derivation agrees, which is the point of
+        // sharing `effective_report_ttl`.
+        let derived = registry
+            .get_observed("node-a", "cluster-1", now)
+            .expect("observed view");
+        assert_eq!(
+            derived.snapshot.expect("snapshot").status(),
+            NodeStatus::Unhealthy
+        );
+
+        // (2) The reverse control: received 1s ago, but the node claims it
+        // measured itself 6s ago. Fresh — a mutant reading the node's
+        // timestamp answers Stale.
+        let mut beat = ready_heartbeat("node-a", "cluster-1");
+        beat.snapshot
+            .as_mut()
+            .expect("snapshot")
+            .reported_at_unix_ms = unix_millis(now - Duration::from_secs(6));
+        registry
+            .heartbeat(&beat, now - Duration::from_secs(1))
+            .expect("heartbeat");
+        let (_snapshot, freshness) = registry
+            .peek_observed_with_freshness("node-a", now)
+            .expect("the node has reported");
+        assert_eq!(freshness, SnapshotFreshness::Fresh);
+
+        // (3) The same 6s-old record under the *default* 30s TTL is fresh —
+        // so case (1)'s verdict really did come from the record's own TTL
+        // and not from a constant that happens to be smaller.
+        let default_ttl = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+        );
+        default_ttl
+            .heartbeat(
+                &ready_heartbeat("node-a", "cluster-1"),
+                now - Duration::from_secs(6),
+            )
+            .expect("heartbeat");
+        let (_snapshot, freshness) = default_ttl
+            .peek_observed_with_freshness("node-a", now)
+            .expect("the node has reported");
+        assert_eq!(freshness, SnapshotFreshness::Fresh);
+    }
+
+    /// K-5 — `last_seen` after `now` is a state, not an `unwrap`. Reachable
+    /// across API replicas, where a record travels through Redis carrying
+    /// the writing replica's clock.
+    #[test]
+    fn peek_observed_with_freshness_reports_clock_skew_instead_of_panicking() {
+        let now = unix(1_000);
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+        );
+        registry
+            .heartbeat(
+                &ready_heartbeat("node-a", "cluster-1"),
+                now + Duration::from_secs(1),
+            )
+            .expect("heartbeat");
+
+        let (_snapshot, freshness) = registry
+            .peek_observed_with_freshness("node-a", now)
+            .expect("the node has reported");
+        assert_eq!(freshness, SnapshotFreshness::ClockSkew);
+    }
+
+    /// The snapshot half is byte-for-byte `peek_observed`'s, including for a
+    /// node discovery knows about that has never reported. Adding the
+    /// scorer must not change the candidate list.
+    #[test]
+    fn peek_observed_with_freshness_returns_the_same_snapshot_peek_observed_does() {
+        let now = unix(1_000);
+        let registry = AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://node-a"),
+                node("node-silent", "http://node-silent"),
+            ],
+            DEFAULT_OBSERVED_REPORT_TTL,
+        );
+        registry
+            .heartbeat(&ready_heartbeat("node-a", "cluster-1"), now)
+            .expect("heartbeat");
+
+        assert_eq!(
+            registry
+                .peek_observed_with_freshness("node-a", now)
+                .map(|(snapshot, _)| snapshot),
+            registry.peek_observed("node-a"),
+        );
+        // 🔴 The invariant `freshness.is_none()` iff `snapshot.is_none()`:
+        // a discovered node with no heartbeat answers `None` on both
+        // accessors, and the scorer classifies it `no_snapshot` rather than
+        // having it disappear from the candidate list.
+        assert_eq!(registry.peek_observed("node-silent"), None);
+        assert!(registry
+            .peek_observed_with_freshness("node-silent", now)
+            .is_none());
     }
 
     #[test]

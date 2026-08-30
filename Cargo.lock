@@ -255,6 +255,7 @@ dependencies = [
 name = "agentenv-benchmarks"
 version = "0.1.0"
 dependencies = [
+ "aenv-core",
  "aenv-node",
  "anyhow",
  "criterion",

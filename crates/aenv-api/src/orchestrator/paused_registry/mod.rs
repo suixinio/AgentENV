@@ -97,6 +97,16 @@ mod pg {
         fn peek_observed(&self, _node_id: &str) -> Option<crate::proto::scheduler::NodeSnapshot> {
             None
         }
+        fn peek_observed_with_freshness(
+            &self,
+            _node_id: &str,
+            _now: SystemTime,
+        ) -> Option<(
+            crate::proto::scheduler::NodeSnapshot,
+            crate::node_registry::placement::score::SnapshotFreshness,
+        )> {
+            None
+        }
         fn roster_of(
             &self,
             _node_id: &str,

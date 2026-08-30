@@ -587,6 +587,7 @@ mod tests {
             kubernetes_discovery: Default::default(),
             static_discovery_nodes: Vec::new(),
             native_warmup_timeout_secs: 15,
+            placement_shadow_k: crate::node_registry::placement::DEFAULT_PLACEMENT_SHADOW_K,
             node_registry_store: Default::default(),
         }
     }

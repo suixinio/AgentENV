@@ -551,3 +551,168 @@ mod serialized_value_golden {
         );
     }
 }
+
+#[cfg(test)]
+mod scheduler_wire_tests {
+    use prost::Message as _;
+
+    use super::scheduler as pb;
+
+    /// The `NewSandboxHint` shape as it was **before** `cpu_count` and
+    /// `memory_mib` existed: metadata on field 1, and nothing else.
+    ///
+    /// 🔴 Declaring it here, by hand, is the whole point. Encoding with the
+    /// new type and decoding with the new type proves only that prost is
+    /// self-consistent — it cannot fail. What a rolling upgrade actually
+    /// does is hand new bytes to a peer built from the old `.proto`, and
+    /// the only way to test that in one process is to keep the old shape
+    /// alive as a separate type.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyNewSandboxHint {
+        #[prost(map = "string, string", tag = "1")]
+        metadata: std::collections::HashMap<String, String>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyScheduleRequestHint {
+        #[prost(oneof = "LegacyKind", tags = "1, 2")]
+        kind: Option<LegacyKind>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Oneof)]
+    enum LegacyKind {
+        #[prost(message, tag = "1")]
+        NewColdSandbox(LegacyNewColdSandboxHint),
+        #[prost(message, tag = "2")]
+        NewSandbox(LegacyNewSandboxHint),
+    }
+
+    /// Only what the oneof needs to be well-formed; the cold hint is not
+    /// what this test is about.
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyNewColdSandboxHint {
+        #[prost(uint32, tag = "1")]
+        cpu_count: u32,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    struct LegacyScheduleRequest {
+        #[prost(message, optional, tag = "2")]
+        hint: Option<LegacyScheduleRequestHint>,
+    }
+
+    fn new_sandbox_request(cpu_count: Option<u32>, memory_mib: Option<u64>) -> pb::ScheduleRequest {
+        pb::ScheduleRequest {
+            hint: Some(pb::ScheduleRequestHint {
+                kind: Some(pb::schedule_request_hint::Kind::NewSandbox(
+                    pb::NewSandboxHint {
+                        metadata: Default::default(),
+                        cpu_count,
+                        memory_mib,
+                    },
+                )),
+            }),
+        }
+    }
+
+    /// `NewSandboxHint`'s two resource fields, byte by byte, in both
+    /// directions.
+    ///
+    /// # 🔴 Why bytes and not a round trip
+    ///
+    /// This control plane deploys as a rolling upgrade of two halves built
+    /// from one `.proto`, so a field-number or wire-type mistake compiles,
+    /// type-checks, and passes every same-build test — it only misbehaves
+    /// against the peer that has not restarted yet. The three sequences
+    /// below are what a peer sees.
+    ///
+    /// - `12 02 12 00` — neither field set. The hint is still present and
+    ///   still `new_sandbox`; the two optional fields write nothing.
+    /// - `12 07 12 05 10 02 18 80 04` — `cpu_count = 2` (tag 2, varint) and
+    ///   `memory_mib = 512` (tag 3, varint `80 04`).
+    /// - `12 06 12 04 10 00 18 00` — both set to an explicit zero. 🔴 This
+    ///   is the sequence that proves the fields carry presence: without
+    ///   `optional`, proto3 elides zero-valued scalars and these bytes
+    ///   would be identical to the first case.
+    #[test]
+    fn new_sandbox_hint_resource_fields_keep_their_wire_shape() {
+        const ABSENT: &[u8] = &[0x12, 0x02, 0x12, 0x00];
+        const STATED: &[u8] = &[0x12, 0x07, 0x12, 0x05, 0x10, 0x02, 0x18, 0x80, 0x04];
+        const EXPLICIT_ZEROES: &[u8] = &[0x12, 0x06, 0x12, 0x04, 0x10, 0x00, 0x18, 0x00];
+
+        assert_eq!(new_sandbox_request(None, None).encode_to_vec(), ABSENT);
+        assert_eq!(
+            new_sandbox_request(Some(2), Some(512)).encode_to_vec(),
+            STATED
+        );
+        assert_eq!(
+            new_sandbox_request(Some(0), Some(0)).encode_to_vec(),
+            EXPLICIT_ZEROES
+        );
+
+        // And back: absence and explicit zero must not collapse into each
+        // other on the way in either.
+        let decoded = pb::ScheduleRequest::decode(ABSENT).expect("decodes");
+        let pb::schedule_request_hint::Kind::NewSandbox(hint) = decoded
+            .hint
+            .expect("the hint survives")
+            .kind
+            .expect("the oneof survives")
+        else {
+            panic!("the absent case must still decode as new_sandbox");
+        };
+        assert_eq!(hint.cpu_count, None);
+        assert_eq!(hint.memory_mib, None);
+
+        let decoded = pb::ScheduleRequest::decode(EXPLICIT_ZEROES).expect("decodes");
+        let pb::schedule_request_hint::Kind::NewSandbox(hint) = decoded
+            .hint
+            .expect("the hint survives")
+            .kind
+            .expect("the oneof survives")
+        else {
+            panic!("the explicit-zero case must still decode as new_sandbox");
+        };
+        assert_eq!(hint.cpu_count, Some(0));
+        assert_eq!(hint.memory_mib, Some(0));
+    }
+
+    /// The rolling-upgrade direction that matters: a peer built before
+    /// these fields existed reads a message that carries them.
+    ///
+    /// It must still recognise `new_sandbox` — that is, tags 2 and 3 must
+    /// be skipped as unknown fields inside the hint, not mistaken for a
+    /// different `oneof` arm and not fatal to the decode.
+    #[test]
+    fn a_pre_resource_peer_still_reads_a_hint_that_carries_them() {
+        const STATED: &[u8] = &[0x12, 0x07, 0x12, 0x05, 0x10, 0x02, 0x18, 0x80, 0x04];
+
+        let legacy = LegacyScheduleRequest::decode(STATED)
+            .expect("an older build must not fail on the new fields");
+        let Some(LegacyKind::NewSandbox(hint)) = legacy.hint.expect("the hint survives").kind
+        else {
+            panic!("the older build must still see a new_sandbox hint");
+        };
+        assert!(
+            hint.metadata.is_empty(),
+            "and must not have mistaken a resource field for metadata"
+        );
+    }
+
+    /// `Some(hint { kind: None })` is reachable, and `request_from_hint`'s
+    /// table has a row for it because of this: a peer that assigns a third
+    /// `oneof` tag sends a hint this build cannot name.
+    ///
+    /// `12 02 1a 00` is `ScheduleRequest.hint` wrapping a single unknown
+    /// length-delimited field 3.
+    #[test]
+    fn an_unknown_oneof_tag_decodes_to_a_present_hint_with_no_kind() {
+        let decoded = pb::ScheduleRequest::decode(&[0x12u8, 0x02, 0x1a, 0x00][..])
+            .expect("an unknown oneof tag must not fail the decode");
+        let hint = decoded.hint.expect("the outer hint is present");
+        assert!(
+            hint.kind.is_none(),
+            "and its kind is empty, which is a shape the mapping has to answer for"
+        );
+    }
+}

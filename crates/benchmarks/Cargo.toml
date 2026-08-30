@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
+aenv-core = { path = "../.." }
 aenv-node = { path = "../aenv-node" }
 anyhow = "1.0.100"
 criterion = { version = "0.8", features = ["async_tokio"] }
@@ -38,4 +39,9 @@ harness = false
 [[bench]]
 name = "oci_conversion_pipeline"
 path = "benches/oci_conversion_pipeline_benchmark.rs"
+harness = false
+
+[[bench]]
+name = "placement_shadow"
+path = "benches/placement_shadow_benchmark.rs"
 harness = false

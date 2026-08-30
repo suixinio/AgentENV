@@ -1572,6 +1572,16 @@ mod pg {
         fn peek_observed(&self, _node_id: &str) -> Option<crate::proto::scheduler::NodeSnapshot> {
             unreachable!("not exercised by renew_once")
         }
+        fn peek_observed_with_freshness(
+            &self,
+            _node_id: &str,
+            _now: SystemTime,
+        ) -> Option<(
+            crate::proto::scheduler::NodeSnapshot,
+            crate::node_registry::placement::score::SnapshotFreshness,
+        )> {
+            unreachable!("not exercised by renew_once")
+        }
         fn roster_of(
             &self,
             _node_id: &str,

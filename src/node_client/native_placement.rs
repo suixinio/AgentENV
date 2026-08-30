@@ -266,7 +266,7 @@ impl NodePlacement for NativeNodePlacement {
     async fn place_new(
         &self,
         _sandbox_id: SandboxId,
-        _resources: SandboxResources,
+        resources: SandboxResources,
     ) -> Result<NodeEndpoint> {
         let response = self
             .local
@@ -275,6 +275,15 @@ impl NodePlacement for NativeNodePlacement {
                     kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
                         scheduler::NewSandboxHint {
                             metadata: Default::default(),
+                            // 🔴 Stated, not dropped. This argument used to
+                            // be `_resources`: the caller already knew how
+                            // big the sandbox was, and placement threw it
+                            // away at the door, so every scoring question
+                            // downstream was answered blind. Both are
+                            // `Some(..)` even at zero — an explicit zero is
+                            // an answer, and this producer always has one.
+                            cpu_count: Some(resources.cpu_count),
+                            memory_mib: Some(u64::from(resources.memory_mib)),
                         },
                     )),
                 }),

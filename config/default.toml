@@ -203,6 +203,21 @@ api_grpc_addr = "0.0.0.0:8002"
 # given a second endpoint list to keep in step with the first.
 node_service_port = 8001
 
+# How many candidate nodes the *shadow* placement scorer samples, without
+# replacement, on each selection.
+#
+# 🔴 This does not decide placement. Real placement is round-robin; the
+# shadow scorer runs after the strategy has already answered and emits
+# metrics only (agentenv_api_placement_shadow_*). There is deliberately no
+# switch that lets it take over — see src/node_registry/placement/mod.rs for
+# why best-of-K without cross-replica pending accounting would herd a
+# concurrent burst onto whichever node last reported itself emptiest.
+#
+# 0 is refused at load rather than meaning "off". On a cluster with no more
+# nodes than this, best-of-K is the global optimum rather than a sample.
+# Commented out so the default below is the one the code declares.
+# placement_shadow_k = 3
+
 [cluster.node_registry_store]
 # The shared-roster fix's own Redis tuning (backend/redis_url/redis_key_prefix
 # are set via AENV_CLUSTER_NODE_REGISTRY_STORE_* environment variables in

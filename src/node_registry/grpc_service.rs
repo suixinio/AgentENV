@@ -124,6 +124,7 @@ use crate::proto::scheduler::{
     UnregisterNodeResponse,
 };
 
+use super::placement::{ShadowPlacement, ShadowSource};
 use super::registry::{
     AtomicNodeRegistry, NodeNotInRegistry, NodeRegistry, ServiceInstanceMismatch,
 };
@@ -183,6 +184,20 @@ pub struct NodeRegistryGrpcService {
     /// while every round-robin test kept passing. `Clone` on this service
     /// clones the `Arc`, so a second handle shares the same cursor too.
     strategy: Arc<RoundRobinStrategy>,
+    /// The placement *shadow* scorer — `crate::node_registry::placement`.
+    ///
+    /// 🔴 Built here, at construction, because that is where its 20 metric
+    /// handles are resolved. `metrics::counter!` is not a free macro: the
+    /// Prometheus recorder's `register_counter` goes through
+    /// `get_or_create_counter`, which takes an `RwLock`. Resolving handles
+    /// per call — worse, per candidate — would put an O(N) lock sequence on
+    /// every placement in exchange for an observation that is not allowed
+    /// to affect anything.
+    ///
+    /// 🔴 An `Arc`, like `strategy`, so `Clone`ing this service (the
+    /// observed-nodes metrics loop holds a second handle) shares one set of
+    /// handles rather than registering a second.
+    shadow: Arc<ShadowPlacement>,
 }
 
 impl NodeRegistryGrpcService {
@@ -196,7 +211,29 @@ impl NodeRegistryGrpcService {
             artifact_store: None,
             paused_registry: None,
             strategy: Arc::new(RoundRobinStrategy::new()),
+            shadow: Arc::new(ShadowPlacement::default()),
         }
+    }
+
+    /// Replaces the shadow scorer with one sampling `k` candidates —
+    /// `[cluster].placement_shadow_k`, which `AppConfig::validate` has
+    /// already refused if it is `0`.
+    ///
+    /// Still construction time: this rebuilds the handles rather than
+    /// mutating a live scorer, so the "resolve once, never on the hot path"
+    /// discipline holds however many builder methods a caller chains.
+    #[must_use]
+    pub fn with_placement_shadow_k(mut self, k: u32) -> Self {
+        self.shadow = Arc::new(ShadowPlacement::new(k));
+        self
+    }
+
+    /// Swaps in a scorer a test has scripted the sample draws on.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_placement_shadow(mut self, shadow: ShadowPlacement) -> Self {
+        self.shadow = Arc::new(shadow);
+        self
     }
 
     /// `lookup_node`'s stage 3. Independent of `with_binding_store` -- a
@@ -767,8 +804,15 @@ impl Scheduler for NodeRegistryGrpcService {
         let deps = ScheduleDeps {
             node_registry: self.registry.as_ref(),
             strategy: self.strategy.as_ref(),
+            shadow: self.shadow.as_ref(),
         };
-        let result = lookup_logic::select_node(&deps, req.hint.as_ref(), "");
+        let result = lookup_logic::select_node(
+            &deps,
+            req.hint.as_ref(),
+            "",
+            ShadowSource::Schedule,
+            SystemTime::now(),
+        );
         let strategy_name = self.strategy.name();
         let status_label = crate::observability::prometheus::result_status(result.is_ok());
         metrics::histogram!(
@@ -817,6 +861,7 @@ impl Scheduler for NodeRegistryGrpcService {
             place: ScheduleDeps {
                 node_registry: self.registry.as_ref(),
                 strategy: self.strategy.as_ref(),
+                shadow: self.shadow.as_ref(),
             },
             binding_store: binding_store.as_ref(),
             paused_registry: self.paused_registry.as_deref(),
@@ -4098,5 +4143,627 @@ mod tests {
             second.next_page_token, "",
             "the last page must report no further token"
         );
+    }
+
+    // ---- Placement shadow scoring: the wiring, not the arithmetic ----
+    //
+    // The pressure formula, the sampler and the classification boundaries
+    // are pinned in `super::super::placement`'s own fixture suite. What is
+    // pinned *here* is everything between a real RPC and that arithmetic:
+    // that the producer's declared resources survive the trip, that each
+    // call path files its samples under its own `source`, that a preferred
+    // node produces no sample at all, and — most of all — that none of it
+    // moves the node the RPC actually returns.
+
+    use crate::node_registry::placement::ShadowPlacement;
+    use metrics_util::debugging::{DebugValue, Snapshotter};
+
+    /// Every counter the recorder holds, drained **once**, keyed
+    /// `"<name>|<sorted labels>"`.
+    ///
+    /// 🔴 One drain, not one per assertion. `Snapshotter::snapshot()`
+    /// *consumes* what it reports: a second call answers empty, so a test
+    /// that snapshotted per metric would see its first assertion's data and
+    /// then a series of empty maps — every "this must not have been
+    /// incremented" assertion after the first would pass no matter what the
+    /// code did.
+    ///
+    /// 🔴 Zero-valued series are dropped. All 20 shadow handles are
+    /// resolved when the service is constructed — that is the point of
+    /// resolving them there — so the recorder reports every one of them,
+    /// incremented or not, and "absent" here means "never incremented".
+    struct DrainedCounters(StdHashMap<String, u64>);
+
+    fn drain_counters(snapshotter: &Snapshotter) -> DrainedCounters {
+        let mut out: StdHashMap<String, u64> = StdHashMap::new();
+        for (composite, _unit, _description, value) in snapshotter.snapshot().into_vec() {
+            let DebugValue::Counter(count) = value else {
+                continue;
+            };
+            if count == 0 {
+                continue;
+            }
+            let key = composite.key();
+            let mut labels: Vec<String> = key
+                .labels()
+                .map(|label| format!("{}={}", label.key(), label.value()))
+                .collect();
+            labels.sort();
+            *out.entry(format!("{}|{}", key.name(), labels.join(",")))
+                .or_insert(0) += count;
+        }
+        DrainedCounters(out)
+    }
+
+    impl DrainedCounters {
+        fn get(&self, name: &str, labels: &str) -> u64 {
+            self.0
+                .get(&format!("{name}|{labels}"))
+                .copied()
+                .unwrap_or(0)
+        }
+
+        /// Every incremented series of one metric, labels-only keys.
+        fn series(&self, name: &str) -> StdHashMap<String, u64> {
+            let prefix = format!("{name}|");
+            self.0
+                .iter()
+                .filter_map(|(key, count)| {
+                    key.strip_prefix(&prefix)
+                        .map(|labels| (labels.to_string(), *count))
+                })
+                .collect()
+        }
+    }
+
+    fn sized_snapshot(
+        allocated_cpu: u32,
+        cpu_count: u32,
+        allocated_memory_bytes: u64,
+        memory_total_bytes: u64,
+    ) -> scheduler::NodeSnapshot {
+        scheduler::NodeSnapshot {
+            status: scheduler::NodeStatus::Ready as i32,
+            allocated_cpu,
+            allocated_memory_bytes,
+            cpu_count,
+            memory_total_bytes,
+            ..Default::default()
+        }
+    }
+
+    fn sized_heartbeat(node_id: &str, snapshot: scheduler::NodeSnapshot) -> HeartbeatRequest {
+        let mut req = heartbeat_req(node_id, Vec::new());
+        req.snapshot = Some(snapshot);
+        req
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// M-9 and M-10, in one test.
+    ///
+    /// 🔴 The assertion that matters most is the *first* one: `Schedule`
+    /// returns `node-a`, which is what the round-robin cursor says, while
+    /// the shadow scorer — looking at the same two nodes with the same
+    /// request — would have picked `node-z`. A shadow that leaked into the
+    /// return value fails the first assertion; a shadow that was deleted
+    /// from the production path fails the second.
+    ///
+    /// The fixture: both nodes hold 8 GiB of a 64 GiB machine, so
+    /// `after_mem` is `8193/65536 == 0.1250152587890625` for both on a
+    /// 1 MiB request. `node-a` is at 7 of 8 vCPU, so its `after_cpu` is
+    /// `1.0` and CPU is its bottleneck; `node-z` is idle, so memory is
+    /// its bottleneck and its pressure is the shared 0.1250152587890625.
+    /// `node-z` therefore wins the shadow by a wide margin — and loses the
+    /// real placement, because round-robin starts at cursor 0 and
+    /// `AtomicNodeRegistry::snapshot` sorts by id.
+    #[tokio::test]
+    async fn the_shadow_disagrees_without_moving_the_placement() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-z", "http://10.0.0.2:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        registry
+            .heartbeat(
+                &sized_heartbeat("node-a", sized_snapshot(7, 8, 8 * GIB, 64 * GIB)),
+                SystemTime::now(),
+            )
+            .expect("node-a heartbeats");
+        registry
+            .heartbeat(
+                &sized_heartbeat("node-z", sized_snapshot(0, 8, 8 * GIB, 64 * GIB)),
+                SystemTime::now(),
+            )
+            .expect("node-z heartbeats");
+
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            // K = 2 over 2 candidates, drawn [node-a, node-z].
+            .with_placement_shadow(ShadowPlacement::new(2).with_scripted_rng([0, 0]));
+
+        let placed = service
+            .schedule(Request::new(ScheduleRequest {
+                hint: Some(scheduler::ScheduleRequestHint {
+                    kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
+                        scheduler::NewSandboxHint {
+                            metadata: Default::default(),
+                            cpu_count: Some(1),
+                            memory_mib: Some(1),
+                        },
+                    )),
+                }),
+            }))
+            .await
+            .expect("two discovered nodes")
+            .into_inner();
+
+        drop(guard);
+
+        assert_eq!(
+            placed.node.expect("a node was chosen").node_id,
+            "node-a",
+            "the round-robin cursor decides placement; the shadow must not"
+        );
+        let counters = drain_counters(&snapshotter);
+        let agreement = counters.series("agentenv_api_placement_shadow_agreement_total");
+        assert_eq!(
+            counters.get(
+                "agentenv_api_placement_shadow_agreement_total",
+                "agrees=false,source=schedule"
+            ),
+            1,
+            "the shadow must have run and disagreed: {agreement:?}"
+        );
+        assert_eq!(
+            counters.get(
+                "agentenv_api_placement_shadow_agreement_total",
+                "agrees=true,source=schedule"
+            ),
+            0,
+            "the shadow picked node-z, so nothing may be filed as agreement: {agreement:?}"
+        );
+        // Both candidates were scoreable, under `schedule`'s own source.
+        assert_eq!(
+            counters.get(
+                "agentenv_api_placement_shadow_classification_total",
+                "class=scored,source=schedule"
+            ),
+            2,
+            "{:?}",
+            counters.series("agentenv_api_placement_shadow_classification_total")
+        );
+        // The hint stated both fields, so nothing is missing.
+        assert!(
+            counters
+                .series("agentenv_api_placement_missing_request_resources_total")
+                .is_empty(),
+            "a fully stated hint must not count as missing"
+        );
+    }
+
+    /// M-12 — the producer end, entered where production enters it.
+    ///
+    /// 🔴 Not "hand a hint to `schedule` and check it arrives". That test
+    /// passes with `place_new` still throwing its `resources` argument
+    /// away, which is exactly the bug: the caller knew the sandbox's size
+    /// and placement never saw it. This one starts at
+    /// `NativeNodePlacement::place_new` and lets the value travel.
+    ///
+    /// The fixture is built so the *answer* depends on the request size:
+    ///
+    /// - `node-a`: 8 vCPU idle, 1 GiB with 512 MiB taken.
+    ///   Blind (0, 0) -> `max(0, 0.5) = 0.5`.
+    ///   With (2, 512) -> `max(0.25, 1.0) = 1.0`.
+    /// - `node-z`: 5 of 8 vCPU taken, 8 GiB of 64 GiB taken.
+    ///   Blind (0, 0) -> `max(0.625, 0.125) = 0.625`.
+    ///   With (2, 512) -> `max(0.875, 0.1328125) = 0.875`.
+    ///
+    /// So a placement that sees the request prefers `node-z`; one that is
+    /// blind prefers `node-a`. Round-robin returns `node-a` either way, so
+    /// the shadow agrees exactly when the resources were dropped.
+    #[tokio::test]
+    async fn place_new_hands_placement_the_resources_it_was_given() {
+        use crate::node_client::{NativeNodePlacement, NodePlacement};
+        use crate::types::SandboxResources;
+
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-z", "http://10.0.0.2:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        registry
+            .heartbeat(
+                &sized_heartbeat("node-a", sized_snapshot(0, 8, 512 * 1024 * 1024, GIB)),
+                SystemTime::now(),
+            )
+            .expect("node-a heartbeats");
+        registry
+            .heartbeat(
+                &sized_heartbeat("node-z", sized_snapshot(5, 8, 8 * GIB, 64 * GIB)),
+                SystemTime::now(),
+            )
+            .expect("node-z heartbeats");
+
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
+            .with_placement_shadow(ShadowPlacement::new(2).with_scripted_rng([0, 0]));
+        let placement =
+            NativeNodePlacement::new(Arc::clone(&registry), 8001, warm_gate(&registry), service);
+
+        let chosen = placement
+            .place_new(
+                SandboxId::new(),
+                SandboxResources {
+                    cpu_count: 2,
+                    memory_mib: 512,
+                    disk_size_mib: 1024,
+                },
+            )
+            .await
+            .expect("two discovered nodes");
+
+        drop(guard);
+
+        assert_eq!(chosen.node_id, "node-a", "round-robin still decides");
+        let counters = drain_counters(&snapshotter);
+        let agreement = counters.series("agentenv_api_placement_shadow_agreement_total");
+        assert_eq!(
+            counters.get(
+                "agentenv_api_placement_shadow_agreement_total",
+                "agrees=false,source=schedule"
+            ),
+            1,
+            "the shadow saw a 2 vCPU / 512 MiB request and preferred node-z; \
+             a producer that dropped its resources would have made it agree: {agreement:?}"
+        );
+        assert!(
+            counters
+                .series("agentenv_api_placement_missing_request_resources_total")
+                .is_empty(),
+            "the production producer always states both fields"
+        );
+    }
+
+    /// §3.4's table, entered through a real `Schedule` call rather than
+    /// through the mapping function — so a wiring that forgot to consult
+    /// the hint at all is caught here as well.
+    ///
+    /// 🔴 The `Some(hint { kind: None })` row is built from raw bytes, not
+    /// from a struct literal: the shape it stands for is a peer that sent a
+    /// `oneof` tag this build does not know, and there is no way to
+    /// construct that from the generated Rust type. `12 02 1a 00` is
+    /// `ScheduleRequest.hint` (field 2, length 2) wrapping an unknown field
+    /// 3 of length 0 — so the outer hint decodes to `Some` and its `kind`
+    /// to `None`.
+    #[tokio::test]
+    async fn every_hint_shape_maps_onto_the_missing_request_resources_counter() {
+        use prost::Message as _;
+
+        let raw_unknown_kind =
+            ScheduleRequest::decode(&[0x12u8, 0x02, 0x1a, 0x00][..]).expect("a decodable request");
+        assert!(
+            raw_unknown_kind.hint.is_some(),
+            "the outer hint must survive"
+        );
+        assert!(
+            raw_unknown_kind
+                .hint
+                .as_ref()
+                .expect("outer hint")
+                .kind
+                .is_none(),
+            "an unknown oneof tag must leave `kind` empty rather than fail the decode"
+        );
+
+        let new_sandbox = |cpu_count, memory_mib| ScheduleRequest {
+            hint: Some(scheduler::ScheduleRequestHint {
+                kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
+                    scheduler::NewSandboxHint {
+                        metadata: Default::default(),
+                        cpu_count,
+                        memory_mib,
+                    },
+                )),
+            }),
+        };
+
+        // (label, request, counts as missing)
+        let cases: Vec<(&str, ScheduleRequest, bool)> = vec![
+            ("hint = None", ScheduleRequest { hint: None }, true),
+            ("Some(hint { kind: None })", raw_unknown_kind, true),
+            ("NewSandbox { None, None }", new_sandbox(None, None), true),
+            ("CPU-only", new_sandbox(Some(4), None), true),
+            ("memory-only", new_sandbox(None, Some(2048)), true),
+            ("both stated", new_sandbox(Some(2), Some(512)), false),
+            ("explicit zeroes", new_sandbox(Some(0), Some(0)), false),
+            (
+                "NewColdSandbox",
+                ScheduleRequest {
+                    hint: Some(scheduler::ScheduleRequestHint {
+                        kind: Some(scheduler::schedule_request_hint::Kind::NewColdSandbox(
+                            scheduler::NewColdSandboxHint {
+                                cpu_count: 3,
+                                memory_mb: 4096,
+                                images: Vec::new(),
+                                metadata: Default::default(),
+                            },
+                        )),
+                    }),
+                },
+                false,
+            ),
+        ];
+
+        for (label, request, expect_missing) in cases {
+            let recorder = metrics_util::debugging::DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            let guard = metrics::set_default_local_recorder(&recorder);
+
+            let registry = Arc::new(AtomicNodeRegistry::new(
+                vec![node("node-a", "http://10.0.0.1:8000")],
+                Duration::from_secs(30),
+            ));
+            registry
+                .heartbeat(
+                    &sized_heartbeat("node-a", sized_snapshot(0, 8, 0, 8 * GIB)),
+                    SystemTime::now(),
+                )
+                .expect("node-a heartbeats");
+            let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
+            service
+                .schedule(Request::new(request))
+                .await
+                .unwrap_or_else(|err| panic!("{label} must still place: {err}"));
+
+            drop(guard);
+            let counters = drain_counters(&snapshotter);
+            assert_eq!(
+                counters.get(
+                    "agentenv_api_placement_missing_request_resources_total",
+                    "source=schedule"
+                ),
+                u64::from(expect_missing),
+                "{label}: missing-resources accounting is wrong: {:?}",
+                counters.series("agentenv_api_placement_missing_request_resources_total")
+            );
+        }
+    }
+
+    /// K-2 and K-3 together: each caller's samples land under its own
+    /// `source`, and the `prefer_node_id` hit produces no sample at all.
+    ///
+    /// 🔴 The last part is not tidiness. `lookup_node`'s `Paused` branch
+    /// prefers the origin node, which by design is often *not* what a
+    /// resource scorer would pick. Scoring that path would file a
+    /// deliberate origin affinity as a shadow disagreement, and the
+    /// disagreement rate is the single number this whole feature exists to
+    /// produce.
+    #[tokio::test]
+    async fn each_call_path_reports_under_its_own_source_and_a_preference_reports_nothing() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-b", "http://10.0.0.2:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        for node_id in ["node-a", "node-b"] {
+            registry
+                .heartbeat(
+                    &sized_heartbeat(node_id, sized_snapshot(0, 8, 0, 8 * GIB)),
+                    SystemTime::now(),
+                )
+                .expect("heartbeat");
+        }
+
+        // (1) The paused branch with no origin preference: it reaches the
+        // strategy, so it scores — under `paused_lookup`.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let unpreferred = SandboxId::new();
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
+            .with_paused_registry(Arc::new(FakePausedRegistry::with_entry(
+                paused_entry(unpreferred, PausedRegistryState::Paused, "", None),
+                true,
+            )));
+        service
+            .schedule(Request::new(ScheduleRequest { hint: None }))
+            .await
+            .expect("two discovered nodes");
+        service
+            .lookup_node(Request::new(LookupNodeRequest {
+                sandbox_id: unpreferred.to_string(),
+            }))
+            .await
+            .expect("a paused row with no origin preference");
+
+        drop(guard);
+        let agreement =
+            drain_counters(&snapshotter).series("agentenv_api_placement_shadow_agreement_total");
+        let total_under = |source: &str| -> u64 {
+            agreement
+                .iter()
+                .filter(|(labels, _)| labels.ends_with(&format!("source={source}")))
+                .map(|(_, count)| *count)
+                .sum()
+        };
+        assert_eq!(total_under("schedule"), 1, "{agreement:?}");
+        assert_eq!(total_under("paused_lookup"), 1, "{agreement:?}");
+
+        // (2) The same branch, with an origin the candidate list contains.
+        // It returns before the strategy is ever asked, so there is nothing
+        // to shadow.
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let preferred = SandboxId::new();
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
+            .with_paused_registry(Arc::new(FakePausedRegistry::with_entry(
+                paused_entry(preferred, PausedRegistryState::Paused, "node-b", None),
+                true,
+            )));
+        let answer = service
+            .lookup_node(Request::new(LookupNodeRequest {
+                sandbox_id: preferred.to_string(),
+            }))
+            .await
+            .expect("a paused row preferring node-b")
+            .into_inner();
+
+        drop(guard);
+        assert_eq!(answer.node.expect("a node").node_id, "node-b");
+        let counters = drain_counters(&snapshotter);
+        assert!(
+            counters
+                .series("agentenv_api_placement_shadow_agreement_total")
+                .is_empty(),
+            "a preferred node short-circuits the strategy, so it must not be scored"
+        );
+        assert!(
+            counters
+                .series("agentenv_api_placement_shadow_classification_total")
+                .is_empty(),
+            "and it must not classify the candidates either"
+        );
+    }
+
+    /// A discovered node that has never sent a heartbeat stays in the real
+    /// candidate list — `filter_unschedulable` keeps it on purpose, so a
+    /// freshly started cluster has somewhere to put its first sandbox — and
+    /// the shadow classifies it `no_snapshot` rather than dropping it or
+    /// treating a missing snapshot as an empty one.
+    ///
+    /// 🔴 The wrong fix for "the scorer cannot score this node" is to
+    /// derive `UNHEALTHY` for it and hand that to `filter_unschedulable`.
+    /// That changes the real candidate set, which is exactly what a shadow
+    /// may not do — and on a cold cluster it would leave nothing to place
+    /// onto at all.
+    #[tokio::test]
+    async fn a_never_reported_node_stays_a_candidate_and_classifies_as_no_snapshot() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let guard = metrics::set_default_local_recorder(&recorder);
+
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-silent", "http://10.0.0.2:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        registry
+            .heartbeat(
+                &sized_heartbeat("node-a", sized_snapshot(0, 8, 0, 8 * GIB)),
+                SystemTime::now(),
+            )
+            .expect("node-a heartbeats");
+
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_placement_shadow(ShadowPlacement::new(2).with_scripted_rng([0, 0]));
+        // Two calls, so the cursor visits both slots of the candidate list
+        // and the silent node is demonstrably still in it.
+        let mut placed = Vec::new();
+        for _ in 0..2 {
+            placed.push(
+                service
+                    .schedule(Request::new(ScheduleRequest { hint: None }))
+                    .await
+                    .expect("two discovered nodes")
+                    .into_inner()
+                    .node
+                    .expect("a node")
+                    .node_id,
+            );
+        }
+
+        drop(guard);
+        assert_eq!(placed, vec!["node-a", "node-silent"]);
+        let counters = drain_counters(&snapshotter);
+        let classification = counters.series("agentenv_api_placement_shadow_classification_total");
+        assert_eq!(
+            counters.get(
+                "agentenv_api_placement_shadow_classification_total",
+                "class=no_snapshot,source=schedule"
+            ),
+            2,
+            "one silent candidate per call: {classification:?}"
+        );
+        assert_eq!(
+            counters.get(
+                "agentenv_api_placement_shadow_classification_total",
+                "class=scored,source=schedule"
+            ),
+            2,
+            "and one scoreable candidate per call: {classification:?}"
+        );
+    }
+
+    /// A burst of concurrent `Schedule` calls inside one heartbeat window
+    /// must distribute exactly as round-robin always did: the shadow adds
+    /// no second cursor, no lock ordering, and no path that could reorder
+    /// the atomic `fetch_add` the distribution comes from.
+    #[tokio::test]
+    async fn a_concurrent_burst_distributes_exactly_as_round_robin() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-b", "http://10.0.0.2:8000"),
+                node("node-c", "http://10.0.0.3:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        for node_id in ["node-a", "node-b", "node-c"] {
+            registry
+                .heartbeat(
+                    &sized_heartbeat(node_id, sized_snapshot(0, 8, 0, 8 * GIB)),
+                    SystemTime::now(),
+                )
+                .expect("heartbeat");
+        }
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
+
+        let mut handles = Vec::new();
+        for _ in 0..90 {
+            let service = service.clone();
+            handles.push(tokio::spawn(async move {
+                service
+                    .schedule(Request::new(ScheduleRequest { hint: None }))
+                    .await
+                    .expect("three discovered nodes")
+                    .into_inner()
+                    .node
+                    .expect("a node")
+                    .node_id
+            }));
+        }
+
+        let mut counts: StdHashMap<String, usize> = StdHashMap::new();
+        for handle in handles {
+            *counts
+                .entry(handle.await.expect("the task joined"))
+                .or_insert(0) += 1;
+        }
+        // 90 calls over one shared cursor and three candidates: exactly 30
+        // each, regardless of completion order.
+        assert_eq!(counts.get("node-a").copied(), Some(30), "{counts:?}");
+        assert_eq!(counts.get("node-b").copied(), Some(30), "{counts:?}");
+        assert_eq!(counts.get("node-c").copied(), Some(30), "{counts:?}");
     }
 }

@@ -522,7 +522,26 @@ func (x *NewColdSandboxHint) GetMetadata() map[string]string {
 type NewSandboxHint struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sandbox metadata key/value pairs parsed from the request body.
-	Metadata      map[string]string `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// The sandbox's declared size, so placement can weigh the request against
+	// what each node has already allocated.
+	//
+	// Both use proto3 explicit presence, and that is load-bearing rather than
+	// stylistic: "the caller did not say" and "the caller said zero" have to
+	// be distinguishable. A request for 0 vCPU is a real (if unusual) answer
+	// that participates in the arithmetic; an absent field means placement is
+	// scoring blind and is counted as such
+	// (agentenv_api_placement_missing_request_resources_total). Without
+	// presence, a legacy caller and a zero-sized request would be the same
+	// bytes on the wire.
+	//
+	// Additive: older peers ignore both tags, and this build reads an older
+	// peer's hint as "not stated". Field 1 is metadata, so these take 2 and 3.
+	CpuCount *uint32 `protobuf:"varint,2,opt,name=cpu_count,json=cpuCount,proto3,oneof" json:"cpu_count,omitempty"`
+	// MiB, matching SandboxResources::memory_mib, which is where the value
+	// comes from. Named for its unit precisely because the cold-start hint
+	// above spells the same quantity `memory_mb`.
+	MemoryMib     *uint64 `protobuf:"varint,3,opt,name=memory_mib,json=memoryMib,proto3,oneof" json:"memory_mib,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -562,6 +581,20 @@ func (x *NewSandboxHint) GetMetadata() map[string]string {
 		return x.Metadata
 	}
 	return nil
+}
+
+func (x *NewSandboxHint) GetCpuCount() uint32 {
+	if x != nil && x.CpuCount != nil {
+		return *x.CpuCount
+	}
+	return 0
+}
+
+func (x *NewSandboxHint) GetMemoryMib() uint64 {
+	if x != nil && x.MemoryMib != nil {
+		return *x.MemoryMib
+	}
+	return 0
 }
 
 type ScheduleRequest struct {
@@ -2995,12 +3028,18 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x95\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf8\x01\n" +
 	"\x0eNewSandboxHint\x12F\n" +
-	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x12 \n" +
+	"\tcpu_count\x18\x02 \x01(\rH\x00R\bcpuCount\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"memory_mib\x18\x03 \x01(\x04H\x01R\tmemoryMib\x88\x01\x01\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"N\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\f\n" +
+	"\n" +
+	"_cpu_countB\r\n" +
+	"\v_memory_mib\"N\n" +
 	"\x0fScheduleRequest\x125\n" +
 	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hintJ\x04\b\x01\x10\x02\":\n" +
 	"\x10ScheduleResponse\x12&\n" +
@@ -3365,6 +3404,7 @@ func file_api_proto_scheduler_proto_init() {
 		(*ScheduleRequestHint_NewColdSandbox)(nil),
 		(*ScheduleRequestHint_NewSandbox)(nil),
 	}
+	file_api_proto_scheduler_proto_msgTypes[3].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{

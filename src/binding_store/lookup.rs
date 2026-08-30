@@ -41,10 +41,15 @@
 //! existed with `execution_id`/`execution_authority` populated, so there is
 //! nothing here to gate.
 
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::binding_store::BindingStore;
 use crate::node_registry::filter::filter_unschedulable;
+use crate::node_registry::placement::score::SnapshotFreshness;
+use crate::node_registry::placement::{
+    request_from_hint, ShadowCandidate, ShadowPlacement, ShadowRequest, ShadowSource,
+};
 use crate::node_registry::registry::NodeRegistry;
 use crate::node_registry::strategy::{NoNodesAvailable, RoundRobinStrategy};
 use crate::node_registry::types::{Node, RichNode};
@@ -73,6 +78,15 @@ pub use crate::node_registry::registry::DEFAULT_OBSERVED_REPORT_TTL as ROSTER_FR
 pub struct ScheduleDeps<'a> {
     pub node_registry: &'a dyn NodeRegistry,
     pub strategy: &'a RoundRobinStrategy,
+    /// The shadow scorer, holding the sampling width and the metric handles
+    /// its construction resolved once.
+    ///
+    /// 🔴 Deliberately *not* where the [`ShadowSource`] lives. Both call
+    /// paths share one of these — that sharing is the point for `strategy`
+    /// — so a source stored here would be whatever the last caller set it
+    /// to. It is a `select_node` argument instead, supplied by each of the
+    /// two real call sites.
+    pub shadow: &'a ShadowPlacement,
 }
 
 /// One selection, with the candidate counts it was taken over -- mirrors
@@ -92,17 +106,52 @@ pub struct Placement {
 /// that could bring back a node the filters removed would let an isolated
 /// or overloaded node be selected by the one path that never asked the
 /// strategy.
+///
+/// # The shadow scorer sits at the end, and only at the end
+///
+/// [`crate::node_registry::placement`] runs *after* `strategy.select` has
+/// already produced the answer this function returns, over the same
+/// candidate slice, and its result is dropped. Three consequences that are
+/// correctness properties rather than style:
+///
+/// - The `prefer_node_id` hit above returns before the strategy is ever
+///   asked, so it does not score either. Scoring it would file a
+///   deliberate origin affinity as a shadow disagreement and poison the
+///   very evidence the shadow exists to collect.
+/// - The strategy is asked exactly once. A second `select` — including one
+///   "just for the shadow" — would advance the shared round-robin cursor a
+///   second time and change real placement.
+/// - `now` is captured by the caller and used for both the freshness
+///   verdicts and the classification, so one selection cannot straddle two
+///   clocks.
 pub fn select_node(
     deps: &ScheduleDeps<'_>,
     hint: Option<&ScheduleRequestHint>,
     prefer_node_id: &str,
+    source: ShadowSource,
+    now: SystemTime,
 ) -> Result<Placement, NoNodesAvailable> {
     let discovered = deps.node_registry.snapshot(/* allow_lingering */ false);
     let candidates = discovered.len();
+    // One registry read per node, answering both questions. `snapshot` is
+    // byte-for-byte what `peek_observed` returned before the scorer existed,
+    // so the candidate list the filter and the strategy see is unchanged;
+    // the freshness half rides alongside in `freshness_by_id` and is never
+    // written back into a `RichNode` (deriving `UNHEALTHY` here and feeding
+    // it to `filter_unschedulable` would change the real candidate set).
+    let mut freshness_by_id: HashMap<String, Option<SnapshotFreshness>> =
+        HashMap::with_capacity(candidates);
     let rich: Vec<RichNode> = discovered
         .into_iter()
         .map(|node| {
-            let snapshot = deps.node_registry.peek_observed(&node.id);
+            let (snapshot, freshness) = match deps
+                .node_registry
+                .peek_observed_with_freshness(&node.id, now)
+            {
+                Some((snapshot, freshness)) => (Some(snapshot), Some(freshness)),
+                None => (None, None),
+            };
+            freshness_by_id.insert(node.id.clone(), freshness);
             RichNode { node, snapshot }
         })
         .collect();
@@ -126,6 +175,33 @@ pub fn select_node(
     }
 
     let node = deps.strategy.select(&eligible_nodes, hint)?;
+
+    let shadow_candidates: Vec<ShadowCandidate<'_>> = eligible_nodes
+        .iter()
+        .map(|rich| ShadowCandidate {
+            // The invariant `freshness.is_none()` iff `snapshot.is_none()`
+            // holds because both halves came out of the single
+            // `peek_observed_with_freshness` call above. A node that
+            // somehow is not in the map at all reads as "no snapshot",
+            // which is the same conclusion its absent snapshot would give.
+            freshness: freshness_by_id
+                .get(&rich.node.id)
+                .copied()
+                .flatten()
+                .filter(|_| rich.snapshot.is_some()),
+            rich,
+        })
+        .collect();
+    let request = match source {
+        ShadowSource::Schedule => request_from_hint(hint),
+        // K-3: the paused-restore path is told what it is, never inferred
+        // from its `hint = None`. It has no request size to read and that
+        // is not a caller omission, so it does not count as missing.
+        ShadowSource::PausedLookup => ShadowRequest::PAUSED_LOOKUP,
+    };
+    deps.shadow
+        .evaluate(&shadow_candidates, request, source, &node.node.id);
+
     Ok(Placement {
         node: node.node,
         candidates,
@@ -425,7 +501,13 @@ pub async fn lookup_node(
             // The snapshot is published, so any node can rebuild it. Origin
             // is only a preference, applied through the exact same pipeline
             // `Schedule` runs.
-            match select_node(&deps.place, None, &entry.origin_node_id) {
+            match select_node(
+                &deps.place,
+                None,
+                &entry.origin_node_id,
+                ShadowSource::PausedLookup,
+                now,
+            ) {
                 Err(NoNodesAvailable) => LookupOutcome::Unavailable(
                     LookupResultLabel::UnavailableNoNodes,
                     "no nodes available",
@@ -510,5 +592,241 @@ pub async fn lookup_node(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::node_registry::registry::{
+        AtomicNodeRegistry, NodeNotInRegistry, ServiceInstanceMismatch, DEFAULT_OBSERVED_REPORT_TTL,
+    };
+    use crate::node_registry::types::{Roster, RosterEntry};
+    use crate::proto::scheduler::{
+        HeartbeatRequest, NodeSnapshot, NodeStatus, ObservedNode, P2pPeer,
+    };
+
+    /// An [`AtomicNodeRegistry`] with a tally on the two snapshot accessors.
+    ///
+    /// 🔴 It delegates rather than fakes: the point of the assertion below
+    /// is the *number of reads a real placement performs*, and a hand-rolled
+    /// fake would let the count be whatever the fake happened to make easy.
+    struct CountingRegistry {
+        inner: AtomicNodeRegistry,
+        peeks: AtomicUsize,
+        peeks_with_freshness: AtomicUsize,
+    }
+
+    impl CountingRegistry {
+        fn new(nodes: Vec<Node>) -> Self {
+            Self {
+                inner: AtomicNodeRegistry::new(nodes, DEFAULT_OBSERVED_REPORT_TTL),
+                peeks: AtomicUsize::new(0),
+                peeks_with_freshness: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl NodeRegistry for CountingRegistry {
+        fn snapshot(&self, allow_lingering: bool) -> Vec<Node> {
+            self.inner.snapshot(allow_lingering)
+        }
+        fn contains(&self, node: &Node) -> bool {
+            self.inner.contains(node)
+        }
+        fn resolve(&self, node_id: &str) -> Option<Node> {
+            self.inner.resolve(node_id)
+        }
+        fn heartbeat(
+            &self,
+            req: &HeartbeatRequest,
+            now: SystemTime,
+        ) -> Result<(Node, String), NodeNotInRegistry> {
+            self.inner.heartbeat(req, now)
+        }
+        fn list_observed(&self, cluster_id: &str, now: SystemTime) -> Vec<ObservedNode> {
+            self.inner.list_observed(cluster_id, now)
+        }
+        fn list_p2p_peers(
+            &self,
+            cluster_id: &str,
+            backend: &str,
+            exclude_node_id: &str,
+            now: SystemTime,
+        ) -> Vec<P2pPeer> {
+            self.inner
+                .list_p2p_peers(cluster_id, backend, exclude_node_id, now)
+        }
+        fn filter_p2p_peers(
+            &self,
+            cluster_id: &str,
+            backend: &str,
+            node_ids: &[String],
+            exclude_node_id: &str,
+            now: SystemTime,
+        ) -> Vec<P2pPeer> {
+            self.inner
+                .filter_p2p_peers(cluster_id, backend, node_ids, exclude_node_id, now)
+        }
+        fn get_observed(
+            &self,
+            node_id: &str,
+            cluster_id: &str,
+            now: SystemTime,
+        ) -> Option<ObservedNode> {
+            self.inner.get_observed(node_id, cluster_id, now)
+        }
+        fn peek_observed(&self, node_id: &str) -> Option<NodeSnapshot> {
+            self.peeks.fetch_add(1, Ordering::Relaxed);
+            self.inner.peek_observed(node_id)
+        }
+        fn peek_observed_with_freshness(
+            &self,
+            node_id: &str,
+            now: SystemTime,
+        ) -> Option<(NodeSnapshot, SnapshotFreshness)> {
+            self.peeks_with_freshness.fetch_add(1, Ordering::Relaxed);
+            self.inner.peek_observed_with_freshness(node_id, now)
+        }
+        fn roster_of(&self, node_id: &str) -> Option<(Vec<RosterEntry>, SystemTime)> {
+            self.inner.roster_of(node_id)
+        }
+        fn nodes_holding(&self, sandbox_id: &str) -> Vec<String> {
+            self.inner.nodes_holding(sandbox_id)
+        }
+        fn rosters_in_cluster(&self, cluster_id: &str) -> Vec<Roster> {
+            self.inner.rosters_in_cluster(cluster_id)
+        }
+        fn unregister_observed(
+            &self,
+            node_id: &str,
+            service_instance_id: &str,
+        ) -> Result<(), ServiceInstanceMismatch> {
+            self.inner.unregister_observed(node_id, service_instance_id)
+        }
+        fn applied_cpu_intersection(&self, cluster_id: &str) -> Option<String> {
+            self.inner.applied_cpu_intersection(cluster_id)
+        }
+    }
+
+    fn node(id: &str) -> Node {
+        Node {
+            id: id.to_string(),
+            endpoint: format!("http://{id}:8000"),
+            pod_name: String::new(),
+        }
+    }
+
+    fn heartbeat(node_id: &str) -> HeartbeatRequest {
+        HeartbeatRequest {
+            node_id: node_id.to_string(),
+            cluster_id: "cluster-a".to_string(),
+            service_instance_id: format!("{node_id}-instance"),
+            snapshot: Some(NodeSnapshot {
+                status: NodeStatus::Ready as i32,
+                allocated_cpu: 1,
+                allocated_memory_bytes: 1024 * 1024 * 1024,
+                cpu_count: 8,
+                memory_total_bytes: 8 * 1024 * 1024 * 1024,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// 🔴 One registry read per candidate, for the whole selection —
+    /// candidate construction *and* scoring.
+    ///
+    /// The obvious way to add a scorer is to let it ask the registry for
+    /// each candidate's freshness while it scores. That doubles the number
+    /// of `RwLock` acquisitions on a path that runs on every sandbox
+    /// create, and worse, the second read can land on the other side of a
+    /// heartbeat — so a candidate could be scored against a freshness
+    /// verdict belonging to a snapshot it was not built from. Both are
+    /// prevented by reading once, and this is what fails if that stops
+    /// being true.
+    ///
+    /// The count is also *exactly* one per node, not "at most": a scorer
+    /// that skipped the accessor entirely and hardcoded `Fresh` would pass
+    /// an upper bound.
+    #[test]
+    fn a_selection_reads_each_candidate_from_the_registry_exactly_once() {
+        let registry = CountingRegistry::new(vec![node("node-a"), node("node-b"), node("node-c")]);
+        let now = SystemTime::now();
+        for node_id in ["node-a", "node-b", "node-c"] {
+            registry
+                .heartbeat(&heartbeat(node_id), now)
+                .expect("heartbeat");
+        }
+        registry.peeks.store(0, Ordering::Relaxed);
+        registry.peeks_with_freshness.store(0, Ordering::Relaxed);
+
+        let strategy = RoundRobinStrategy::new();
+        let shadow = ShadowPlacement::default();
+        let deps = ScheduleDeps {
+            node_registry: &registry,
+            strategy: &strategy,
+            shadow: &shadow,
+        };
+
+        let placement = select_node(&deps, None, "", ShadowSource::Schedule, now)
+            .expect("three discovered nodes");
+        assert_eq!(placement.candidates, 3);
+        assert_eq!(placement.eligible, 3);
+
+        assert_eq!(
+            registry.peeks_with_freshness.load(Ordering::Relaxed),
+            3,
+            "exactly one combined read per candidate"
+        );
+        assert_eq!(
+            registry.peeks.load(Ordering::Relaxed),
+            0,
+            "the split accessor is not called a second time on this path"
+        );
+    }
+
+    /// The `prefer_node_id` hit returns before the strategy is asked, so it
+    /// must not advance the round-robin cursor either — the cursor is the
+    /// one piece of placement state a shadow-adjacent change could move
+    /// invisibly.
+    #[test]
+    fn a_preferred_node_neither_asks_the_strategy_nor_moves_its_cursor() {
+        let registry = CountingRegistry::new(vec![node("node-a"), node("node-b")]);
+        let now = SystemTime::now();
+        for node_id in ["node-a", "node-b"] {
+            registry
+                .heartbeat(&heartbeat(node_id), now)
+                .expect("heartbeat");
+        }
+
+        let strategy = RoundRobinStrategy::new();
+        let shadow = ShadowPlacement::default();
+        let deps = ScheduleDeps {
+            node_registry: &registry,
+            strategy: &strategy,
+            shadow: &shadow,
+        };
+
+        // Two preferred selections in a row, then a bare one. If either
+        // preferred call had advanced the cursor, the bare call would
+        // answer `node-a` only by coincidence — so the bare call is made
+        // three times and the full rotation is asserted.
+        for _ in 0..2 {
+            let placement = select_node(&deps, None, "node-b", ShadowSource::PausedLookup, now)
+                .expect("node-b is a candidate");
+            assert_eq!(placement.node.id, "node-b");
+        }
+        let rotation: Vec<String> = (0..3)
+            .map(|_| {
+                select_node(&deps, None, "", ShadowSource::Schedule, now)
+                    .expect("two discovered nodes")
+                    .node
+                    .id
+            })
+            .collect();
+        assert_eq!(rotation, vec!["node-a", "node-b", "node-a"]);
     }
 }

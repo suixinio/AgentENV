@@ -867,8 +867,9 @@ mod tests {
     #[test]
     fn resume_placement_is_wired_after_every_builder() {
         let source = include_str!("aenv-api.rs");
+        let raw_body = body_of(source, "async fn assemble_api(config: &AppConfig)");
         // Strip comments so prose cannot satisfy the ordering checks.
-        let assemble: String = body_of(source, "async fn assemble_api(config: &AppConfig)")
+        let assemble: String = raw_body
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
@@ -879,8 +880,17 @@ mod tests {
                 .find(needle)
                 .unwrap_or_else(|| panic!("assemble_api no longer contains {needle}"))
         };
+        // Control for the strip filter: a phrase that occurs only in one of
+        // assemble_api's own comment lines, so it is present before the strip
+        // and absent after it.
+        const COMMENT_ANCHOR: &str = "stale-release is identity-scoped";
         assert!(
-            !assemble.contains("🔴"),
+            raw_body.contains(COMMENT_ANCHOR),
+            "the comment this check anchors on is gone; re-anchor on another \
+             comment line inside assemble_api"
+        );
+        assert!(
+            !assemble.contains(COMMENT_ANCHOR),
             "no comment line survived the strip, so this is scanning the raw body again"
         );
         let resume = at("ResumeWiring::cluster_in_process(node_registry_grpc_service.clone())");

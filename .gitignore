@@ -63,6 +63,9 @@ Temporary Items
 env/
 .env
 
+### Local task working directories
+.tasks/
+
 # OpenAPI Generator
 .openapi-generator/
 

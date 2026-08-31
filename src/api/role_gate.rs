@@ -89,7 +89,7 @@ async fn refuse_outside_role(request: Request, next: Next) -> Response<Body> {
         return next.run(request).await;
     }
 
-    // Expected migration traffic is counted without warning per request.
+    // Expected traffic is counted without warning per request.
     debug!(
         role = GATE_ROLE_LABEL,
         method = %request.method(),

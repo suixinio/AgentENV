@@ -1,7 +1,8 @@
-//! Gateway credential gate for the node's user-facing REST API.
+//! Gateway credential gate for user-facing REST, mounted by both halves.
 //!
 //! The layer attaches to the generated router before the data-plane proxy is
-//! merged, so proxy traffic remains outside this gate.
+//! merged, so proxy traffic remains outside this gate. On `aenv-api` it is the
+//! only transport-level gate on user-facing REST.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};

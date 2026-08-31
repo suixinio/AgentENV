@@ -293,14 +293,15 @@ redis_connect_timeout_ms = 3000
 # redis_connect_timeout_ms = 3000
 
 [api]
-# Credentials that prove a control-plane call arrived through the gateway.
-# Empty (together with control_plane_token_file) leaves the node's user-facing
-# REST open to anything that can reach it, which is the behaviour that predates
-# this setting.
+# Credentials that prove a control-plane call arrived through the gateway; both
+# halves read them.
+# Empty (together with control_plane_token_file) leaves this process's
+# user-facing REST open to anything that can reach it, which is the behaviour
+# that predates this setting.
 #
 # 🔴 This one is read once at startup. The file below is re-read while the
-# process runs, and is the only way to turn the gate on or off without
-# restarting the node — a restart pauses every sandbox on the machine.
+# process runs, and is the only way to turn the gate on or off without a
+# restart — and restarting aenv-node pauses every sandbox on the machine.
 control_plane_tokens = []
 # Path to a file holding the same credentials, one per line. Point it at a
 # mounted Secret; a secretKeyRef environment variable is not refreshed by

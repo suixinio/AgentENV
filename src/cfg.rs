@@ -889,7 +889,7 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
-    /// Optional startup reclaim override; unset lets the deployment role decide.
+    /// Optional startup reclaim override; unset means enabled.
     #[config(env = "AENV_STARTUP_RECLAIM_ENABLED")]
     pub startup_reclaim_enabled: Option<bool>,
     /// Delay after node isolation before shutdown begins pausing sandboxes.

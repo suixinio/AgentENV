@@ -79,7 +79,7 @@ var (
 	// two-sided reconciliation. This is the other half restored on this side.
 	// In a window where nothing has changed:
 	//
-	//	Δ{redis_miss} + Δ{redis_error} ≈ Δ agentenv_scheduler_lookup_total
+	//	Δ{redis_miss} + Δ{redis_error} ≈ Δ agentenv_api_lookup_node_total
 	//
 	// A persistent disagreement means one of the two sides is counting
 	// something it is not doing.
@@ -123,14 +123,6 @@ var (
 	// to answer "did the cold-path cap fire", which the RPC-status series
 	// cannot answer on its own since a caller-side deadline firing looks
 	// identical to it there.
-	//
-	// 🔴 Used to be a CounterVec named agentenv_gateway_scheduler_fallback_total
-	// with an "outcome" label taking "disabled" or "timeout" — "disabled" was
-	// the now-deleted query-only-scheduler fallback's decommissioning lever,
-	// which made zero RPCs and so needed its own outcome to distinguish from a
-	// timeout. With that switch gone, "timeout" is the only outcome this
-	// series could ever record, so the label was dropped along with it rather
-	// than kept as a single-value vocabulary.
 	gatewayColdLookupTimeout = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "agentenv_gateway_cold_lookup_timeout_total",

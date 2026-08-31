@@ -50,11 +50,6 @@ func TestMetricsListenersAreDeclaredAndExposed(t *testing.T) {
 			svc:        "gateway-service.yaml",
 			metricsOf:  func(c Config) string { return c.Gateway.MetricsListenAddr },
 		},
-		// 🔴 阶段四/Stage E: the "scheduler" case that used to run here
-		// (config/scheduler.json against scheduler-deployment.yaml /
-		// scheduler-service.yaml) was deleted along with those files —
-		// services/scheduler has been decommissioned. See
-		// services/README.md for the current architecture.
 	} {
 		t.Run(tc.service, func(t *testing.T) {
 			cfg, err := Load(filepath.Join(manifestDir, tc.configFile))

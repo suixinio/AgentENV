@@ -7,7 +7,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// This file is the gateway's half of 阶段 3a: where user-facing REST goes.
+// This file decides where user-facing REST goes.
 //
 // # There is one position, not two
 //
@@ -19,39 +19,14 @@ import (
 // only to discard the answer would consume a placement and move the
 // strategy's cursor for a request that never went there.
 //
-// 🔴 An empty `rest_upstream_addr` used to be a second, supported position:
-// the scheduler placed the call and forwarded it to whichever node it named,
-// because every node was still the pre-split single process and answered
-// those routes itself. That premise is retired — nodes run `aenv-node` now
-// and never serve user-facing REST under any configuration — so an empty
-// value would only ever produce a 404 from every node in the fleet, never a
-// working rollback. `services/shared/config`'s `Config.Validate` refuses to
-// load a gateway config with `rest_upstream_addr` empty for exactly that
-// reason: see
-// `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`. By the time a
-// `*Server` exists in this process, `s.restUpstream` is always a real
-// address; the package-level `ServerOptions` type still *accepts* an empty
-// one, purely so the test suite in this package can keep using an
-// unconfigured server as a fixture for the data-plane routing paths —
-// unrelated to this switch — that a bare `*Server` also exercises. There is
-// no longer a second, node-routing position of `handleProxy` for that
-// fixture to reach for a REST call: the fallback was deleted outright once
-// nothing reachable from a validated deployment could take it, so a REST
-// call against an unconfigured `*Server` now answers 502 rather than
-// exercising anything.
+// `services/shared/config`'s `Config.Validate` refuses a gateway config with
+// `rest_upstream_addr` empty: nodes run `aenv-node` and never serve
+// user-facing REST, so an empty value could only draw 404s from every node in
+// the fleet. See `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`.
 //
-// # 🔴 Why this was a value and not a manifest, while it was still a switch
-//
-// 3a's whole value, while it had two positions, was the shape of its
-// rollback. The nodes stayed pre-split for the whole of it, so they never
-// stopped being able to serve REST, so putting the traffic back was emptying
-// this one value and rolling the gateway — seconds, and nothing touched the
-// DaemonSet. 3b, where the DaemonSet moved to `aenv-node`, was the step whose
-// rollback is a serial roll with an hour of grace per machine
-// (`_sd-impl-phase3-role.md` §11.1, §11.2). Now that 3b has shipped and the
-// nodes no longer serve REST in any configuration, that rollback shape no
-// longer exists either way — see `services/README.md` for the rollback this
-// value now has instead.
+// `ServerOptions` still accepts an empty value so this package's own tests can
+// use an unconfigured server as a fixture for the data-plane routing paths a
+// bare `*Server` exercises; a REST call against that fixture answers 502.
 //
 // # 🔴 What this switch never carries
 //
@@ -69,17 +44,12 @@ import (
 //     holds neither, so this switch does not move them and no position of it
 //     ever will.
 //
-//     🔴 `GET /sandboxes` and `GET /v2/sandboxes` are *not* in that list, and
-//     used not to be in this one either. They are aggregations over the nodes
-//     rather than over the scheduler, and the api half owns the cluster ledger
-//     they aggregate. While this switch still had two positions they moved
-//     with it: unset, a fan-out that lived in cluster_list.go asked every node
-//     for its own rows and merged them; set, the two routes were forwarded
-//     here like any other REST call. That fan-out — and the position of the
-//     switch it existed for — is gone: `isUserFacingRestRequest` claims both
-//     routes unconditionally now, so they are always forwarded here, and there
-//     is no longer a second code path in this package that builds a
-//     cluster-wide listing out of the nodes at all.
+//     `GET /sandboxes` and `GET /v2/sandboxes` are *not* in that list. They
+//     are aggregations over the nodes rather than over the scheduler, and the
+//     api half owns the cluster ledger they aggregate:
+//     `isUserFacingRestRequest` claims both routes unconditionally, so they
+//     are always forwarded here, and no other code path in this package
+//     builds a cluster-wide listing out of the nodes.
 
 // restUpstreamTarget labels which upstream served a REST call.
 //

@@ -131,16 +131,9 @@ type ServerOptions struct {
 	// RequestTimeout would mean nobody could tighten one without retuning the
 	// other.
 	//
-	// 🔴 This used to be SchedulerFallbackTimeout, with a sibling
-	// (SchedulerFallbackDisabled) that could skip the call entirely and a
-	// client-selection field (QueryOnlySchedulerClient) that could point it at
-	// a different scheduler than every other RPC in this package. Both are
-	// deleted along with the Go scheduler they existed to decommission — the
-	// call now always goes to the client NewServer was given, unconditionally
-	// — but this timeout is not decommissioning-only scaffolding: it is the
-	// ordinary protection every outbound RPC with a budget shorter than its
-	// caller's needs, and removing it would silently widen this call's
-	// failure window from a few seconds to RequestTimeout's 30-90s.
+	// Removing it would silently widen this call's failure window from a few
+	// seconds to RequestTimeout's 30-90s: it is the ordinary protection any
+	// outbound RPC with a budget shorter than its caller's needs.
 	ColdLookupTimeout time.Duration
 }
 
@@ -348,15 +341,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 
-	// 阶段 3a, and since 阶段 4/R9 the only position left: every user-facing
-	// REST exchange — including `GET /sandboxes` and `GET /v2/sandboxes`,
-	// which used to fan out to every node when no api half was configured, see
-	// cluster_list.go's history — goes to the api half. There is no longer a
-	// node-routing fallback to fall through to: `services/shared/config`'s
-	// `Config.Validate` has refused to load a gateway config with
-	// `rest_upstream_addr` empty since 阶段 3b, so the branch that used to run
-	// when it was empty was dead in every validated deployment and has been
-	// deleted outright rather than kept as an unreachable option.
+	// Every user-facing REST exchange goes to the api half; no node-routing
+	// fallback exists. `shared/config`'s `Config.Validate` refuses a gateway
+	// config with `rest_upstream_addr` empty
+	// (TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest).
 	if isUserFacingRestRequest(r, hostRoute, routeSource) {
 		recordRestUpstream(restUpstreamAPI)
 		s.forwardToRestUpstream(w, r, routingCtx, sandboxID, longLived)
@@ -478,16 +466,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 	}
-	// 🔴 No else. Every request that resolves no sandbox — a create, a cold
+	// No else. Every request that resolves no sandbox — a create, a cold
 	// create, a template build — is a user-facing REST call, and the
 	// isUserFacingRestRequest branch above has already forwarded it (and
-	// returned) before this point is reached. The gateway used to build a
-	// scheduling hint and call Schedule itself here, then proxy straight to
-	// whichever node it named; placement is the api half's decision now
-	// (`NodePlacement::record_placement`, called from the stub that has just
-	// had a create or a resume acknowledged), and calling Schedule only to
-	// discard the answer would consume a placement and move the strategy's
-	// cursor for a request that never went there.
+	// returned) before this point is reached. Placement is the api half's
+	// decision (`NodePlacement::record_placement`, called from the stub that
+	// has just had a create or a resume acknowledged), and calling Schedule
+	// only to discard the answer would consume a placement and move the
+	// strategy's cursor for a request that never went there.
 	//
 	// What is left of this branch at runtime is a defensive no-op: `node`
 	// stays nil for the one shape of request that can still reach here
@@ -559,14 +545,6 @@ func locationNeedsAssignment(location schedulerv1.SandboxLocation) bool {
 // wake-up both fall through to: the last resort that asks the scheduler
 // client directly instead of answering from a projection or from the api
 // half's own wake-up decision.
-//
-// 🔴 This used to also carry a disable switch (schedulerFallbackDisabled) and
-// a separate client (queryOnlyScheduler) that could point this one call at a
-// different address than every other Scheduler RPC in this package. Both are
-// deleted along with the Go scheduler they existed to let this call stop
-// depending on independently of `gateway.scheduler_addr` itself — the call is
-// unconditional again and always goes to s.scheduler, exactly as every other
-// RPC in this file does.
 //
 // What is left, and stays, is the timeout: an unreachable-but-not-yet-failed
 // target must not be allowed to hold this call open for whatever of the

@@ -396,7 +396,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
 
     /// Build a sandbox backend from backend-specific paused state captured by `pause`.
     ///
-    /// 🔴 `decode_paused_state` above deliberately takes no incarnation: it
+    /// `decode_paused_state` above deliberately takes no incarnation: it
     /// reads the state a previous run left on disk, which says nothing about
     /// which run is about to happen. This one does, because it builds the run.
     fn build_from_paused_state(

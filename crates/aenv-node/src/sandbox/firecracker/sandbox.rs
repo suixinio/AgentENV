@@ -296,17 +296,8 @@ impl SandboxBackend for FirecrackerSandbox {
     }
 
     /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
-    ///
-    /// 🔴 `_committer_waiting` is ignored, deliberately. This backend's
-    /// publishable capture is `FirecrackerCapturedSnapshot::in_caller_owned_dir`
-    /// over the artifacts the persister has already written into
-    /// `artifact_root` — it copies nothing and writes nothing, so there is no
-    /// storage to save by withholding it. What withholding it *would* change is
-    /// what the caller is told: an absent capture means "this pause produced
-    /// nothing publishable", and on a node with no cluster registry that would
-    /// replace the true reason (nobody was going to commit it) with a false one.
-    /// The flag exists for backends whose capture costs a durable write, which
-    /// is every backend driving a sandbox on another machine.
+    /// `_committer_waiting` is deliberately ignored: this capture reuses artifacts
+    /// already written by the persister without copying or writing them.
     async fn pause(
         &mut self,
         artifact_root: Option<&Path>,

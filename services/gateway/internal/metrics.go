@@ -129,19 +129,13 @@ var (
 			Help: "Cold-path LookupNode calls (a projection miss or an undecided wake-up) that hit their own timeout before the RPC returned.",
 		},
 	)
-	// Which upstream served a user-facing REST call.
-	//
-	// 🔴 The label set is `{"upstream"}`, but only `restUpstreamAPI` is ever
-	// recorded: handleProxy's node-routing fallback for user-facing REST is
-	// gone outright, not merely unreachable behind a switch, so
-	// `{upstream="node"}` will never be exported by any build of this package.
-	// See rest_upstream.go.
-	gatewayRestUpstream = promauto.NewCounterVec(
+	// User-facing REST exchanges. The api half is the only upstream that can
+	// serve them, so this counter carries no label naming one.
+	gatewayRestUpstream = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "agentenv_gateway_rest_upstream_total",
-			Help: "User-facing REST exchanges by which upstream served them: the api half, or a node the scheduler named.",
+			Help: "User-facing REST exchanges served by the api half.",
 		},
-		[]string{"upstream"},
 	)
 )
 
@@ -360,12 +354,10 @@ func recordRouteResolution(source string) {
 	gatewayRouteResolution.WithLabelValues(source).Inc()
 }
 
-// recordRestUpstream counts one user-facing REST exchange against the upstream
-// about to serve it. Its one call site, handleProxy's isUserFacingRestRequest
-// branch, only ever passes restUpstreamAPI — see gatewayRestUpstream's own
-// doc comment.
-func recordRestUpstream(upstream string) {
-	gatewayRestUpstream.WithLabelValues(upstream).Inc()
+// recordRestUpstream counts one user-facing REST exchange about to be handed
+// to the api half.
+func recordRestUpstream() {
+	gatewayRestUpstream.Inc()
 }
 
 // gatewaySandboxLocationLabel keeps the label set closed. An enum value this

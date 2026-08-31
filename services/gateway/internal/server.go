@@ -346,7 +346,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// config with `rest_upstream_addr` empty
 	// (TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest).
 	if isUserFacingRestRequest(r, hostRoute, routeSource) {
-		recordRestUpstream(restUpstreamAPI)
+		recordRestUpstream()
 		s.forwardToRestUpstream(w, r, routingCtx, sandboxID, longLived)
 		return
 	}

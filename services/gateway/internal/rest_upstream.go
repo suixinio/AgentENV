@@ -51,20 +51,6 @@ import (
 //     are always forwarded here, and no other code path in this package
 //     builds a cluster-wide listing out of the nodes.
 
-// restUpstreamTarget labels which upstream served a REST call.
-//
-// 🔴 `restUpstreamNode` (the label value "node") used to be declared here too,
-// for dashboard and alert label-set compatibility with 阶段 3a, when both arms
-// moved and a scrape's own control was `{upstream="node"}` flat at zero while
-// `{upstream="api"}` climbed. handleProxy's node-routing fallback for
-// user-facing REST is deleted, not merely unreachable behind a switch, so
-// `{upstream="node"}` will not be exported by any build of this package —
-// its absence is not itself evidence of anything any more, the way its
-// presence would have been. The constant is gone; the value it named still
-// appears as a literal in rest_upstream_test.go's regression sentinel, which
-// asserts nothing may ever record against it again.
-const restUpstreamAPI = "api"
-
 // isUserFacingRestRequest reports whether this exchange is one of the routes the
 // api half exists to answer: the `sandboxes`, `snapshots` and `templates`
 // groups, which are exactly the routes `aenv-node` answers 404 on.

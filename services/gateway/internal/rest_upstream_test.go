@@ -256,20 +256,10 @@ func TestTheGatewaysSchedulerAggregationsAreNotSentToTheApiHalf(t *testing.T) {
 	}
 }
 
-// 🔴 Only one arm moves now. 阶段 3a's acceptance criterion was "no node
-// serves user REST any more", and this test used to prove it two ways at
-// once: an "off" server (restUpstream=="") against the same scheduler stub,
-// asserting the node arm moved instead. Off no longer forwards anything to a
-// node — see rest_upstream.go — so there is no second server left to compare
-// against, and gatewayRestUpstream.WithLabelValues("node") is asserted never
-// to move by any test in this package any more. "node" is a literal, not the
-// constant restUpstreamNode: that constant is deleted along with the
-// node-routing fallback it named, but the label value it stood for is still
-// a real value the label set `{"upstream"}` could take, so this sentinel
-// keeps asserting against it directly.
-func TestBothArmsOfTheRestUpstreamCounterMove(t *testing.T) {
-	apiBefore := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamAPI))
-	nodeBefore := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues("node"))
+// 🔴 The counter has no upstream label: user-facing REST has exactly one
+// upstream, and no code path in this package can serve it from a node.
+func TestTheRestUpstreamCounterCountsApiExchanges(t *testing.T) {
+	before := testutil.ToFloat64(gatewayRestUpstream)
 
 	api := newRecordingUpstream(t)
 	scheduler := refusingScheduler(t, "the api half places its own sandboxes")
@@ -278,15 +268,8 @@ func TestBothArmsOfTheRestUpstreamCounterMove(t *testing.T) {
 	resp := serve(t, on, httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{}`)))
 	_ = resp.Body.Close()
 
-	if got := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues(restUpstreamAPI)) - apiBefore; got != 1 {
-		t.Fatalf("api arm moved by %v, want 1", got)
-	}
-	// 🔴 The regression guard this test still owns even without a second
-	// server to contrast against: nothing in this package may ever record
-	// against `{upstream="node"}` again. If a future change reintroduces a
-	// node-routing fallback for user-facing REST, this is what catches it.
-	if got := testutil.ToFloat64(gatewayRestUpstream.WithLabelValues("node")) - nodeBefore; got != 0 {
-		t.Fatalf("node arm moved by %v, want 0: there is no node-routing fallback left to record against", got)
+	if got := testutil.ToFloat64(gatewayRestUpstream) - before; got != 1 {
+		t.Fatalf("the counter moved by %v, want 1", got)
 	}
 }
 

@@ -525,28 +525,27 @@ mod build_tests {
     }
 
     #[tokio::test]
-    async fn every_backend_reports_which_one_it_is() {
-        for backend in [PausedRegistryBackendKind::Local] {
-            let recorder = Recorder::default();
-            let guard = recorder.install();
-            build_paused_registry(&config(backend), &identity(), None, None)
-                .await
-                .expect("the local backend dials nothing here");
-            drop(guard);
+    async fn the_local_backend_reports_which_one_it_is() {
+        let backend = PausedRegistryBackendKind::Local;
+        let recorder = Recorder::default();
+        let guard = recorder.install();
+        build_paused_registry(&config(backend), &identity(), None, None)
+            .await
+            .expect("the local backend dials nothing here");
+        drop(guard);
 
-            // These fields distinguish backend selection and registry scope.
-            for field in [
-                &format!("backend={}", backend.as_str()),
-                "cluster_id=00000000-0000-0000-0000-000000000000",
-                "lease_ttl_secs=90",
-                "paused sandbox registry ready",
-            ] {
-                assert!(
-                    recorder.saw(tracing::Level::INFO, field),
-                    "{backend:?} did not report {field:?}: {:?}",
-                    recorder.events()
-                );
-            }
+        // These fields distinguish backend selection and registry scope.
+        for field in [
+            &format!("backend={}", backend.as_str()),
+            "cluster_id=00000000-0000-0000-0000-000000000000",
+            "lease_ttl_secs=90",
+            "paused sandbox registry ready",
+        ] {
+            assert!(
+                recorder.saw(tracing::Level::INFO, field),
+                "{backend:?} did not report {field:?}: {:?}",
+                recorder.events()
+            );
         }
     }
 }

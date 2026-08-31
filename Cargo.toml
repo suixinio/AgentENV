@@ -76,7 +76,6 @@ hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-rocksdb = "0.24.0"
 tower = "0.5.2"
 anyhow = "1.0.100"
 tempfile = "3.22.0"
@@ -155,18 +154,3 @@ opt-level = 3
 [profile.dev.package.crypto-common]
 opt-level = 3
 
-[profile.dev.package.rocksdb]
-opt-level = 3
-debug = 0
-
-[profile.dev.package.librocksdb-sys]
-opt-level = 3
-debug = 0
-
-[profile.test.package.rocksdb]
-opt-level = 3
-debug = 0
-
-[profile.test.package.librocksdb-sys]
-opt-level = 3
-debug = 0

@@ -1006,7 +1006,7 @@ mod tests {
 
     /// Fixture rooted in a caller-owned record store.
     ///
-    /// Seed it before opening because RocksDB permits one handle.
+    /// Seed it before this call: the orchestrator loads records as it starts.
     async fn api_rooted(
         root: &std::path::Path,
         registry: Arc<dyn PausedSandboxRegistry>,

@@ -5,7 +5,6 @@ pub mod digest;
 pub mod identity;
 pub mod image;
 pub mod leader_task;
-pub mod local_store;
 pub mod logging;
 pub mod node_client;
 pub mod node_registry;

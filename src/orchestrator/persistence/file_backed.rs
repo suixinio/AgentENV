@@ -10,9 +10,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{ClusterRegistration, PersistenceResult, SandboxPersistenceError, SandboxPersister};
-use crate::local_store::LocalStoreDurability;
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
-use crate::record_dir::{discard_unreadable_store, JsonRecordDir};
+use crate::record_dir::{discard_unreadable_store, JsonRecordDir, RecordDurability};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
@@ -105,7 +104,7 @@ fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
 pub struct FileBackedSandboxPersister {
     root: PathBuf,
     virtualization_mode: VirtualizationMode,
-    durability: LocalStoreDurability,
+    durability: RecordDurability,
     records: OnceCell<JsonRecordDir>,
 }
 
@@ -114,7 +113,7 @@ impl FileBackedSandboxPersister {
         Self {
             root,
             virtualization_mode,
-            durability: LocalStoreDurability::Sync,
+            durability: RecordDurability::Full,
             records: OnceCell::new(),
         }
     }
@@ -124,7 +123,7 @@ impl FileBackedSandboxPersister {
         Self::new(root, VirtualizationMode::Kvm)
     }
 
-    pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
+    pub fn with_durability(mut self, durability: RecordDurability) -> Self {
         self.durability = durability;
         self
     }
@@ -576,7 +575,7 @@ mod tests {
 
     fn test_persister(root: &Path) -> FileBackedSandboxPersister {
         FileBackedSandboxPersister::new_for_test(root.to_path_buf())
-            .with_durability(LocalStoreDurability::Memory)
+            .with_durability(RecordDurability::Memory)
     }
 
     async fn persist_test_record(
@@ -647,7 +646,7 @@ mod tests {
         drop(kvm_persister);
         let pvm_persister =
             FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
-                .with_durability(LocalStoreDurability::Memory);
+                .with_durability(RecordDurability::Memory);
 
         let loaded = pvm_persister.load_all(&MockBackendFactory::new()).await?;
 
@@ -671,7 +670,7 @@ mod tests {
 
         let pvm_persister =
             FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
-                .with_durability(LocalStoreDurability::Memory);
+                .with_durability(RecordDurability::Memory);
         let pvm_root = temp.path().join("pvm-artifacts");
         let (pvm_id, _pvm_state) = persist_test_record(&pvm_persister, &pvm_root).await?;
 

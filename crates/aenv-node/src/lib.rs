@@ -2,8 +2,8 @@
 //! resolution, snapshots, and templates.
 
 pub use aenv_core::{
-    api, binding_store, cfg, digest, identity, leader_task, local_store, logging, node_client,
-    node_registry, observability, orchestrator, p2p, privileges, proto, runtime_snapshot,
+    api, binding_store, cfg, digest, identity, leader_task, logging, node_client, node_registry,
+    observability, orchestrator, p2p, privileges, proto, record_dir, runtime_snapshot,
     scheduler_endpoint, server_main, types, virtualization,
 };
 

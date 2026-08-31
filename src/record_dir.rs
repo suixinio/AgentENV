@@ -4,7 +4,26 @@ use anyhow::Context;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
-use crate::local_store::LocalStoreDurability;
+/// How far a [`JsonRecordDir`] write is pushed to disk before it returns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordDurability {
+    /// No fsync. For tests and for records that are rebuilt after a crash.
+    Memory,
+    /// Fsync the record, but not the directory entry naming it.
+    File,
+    /// Fsync the record and the directory entry naming it.
+    Full,
+}
+
+impl RecordDurability {
+    fn syncs_file(self) -> bool {
+        matches!(self, Self::File | Self::Full)
+    }
+
+    fn syncs_dir(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
 
 const RECORD_SUFFIX: &str = ".json";
 const TEMP_SUFFIX: &str = ".json.tmp";
@@ -19,14 +38,14 @@ const MAX_FILE_NAME: usize = 255;
 #[derive(Clone, Debug)]
 pub struct JsonRecordDir {
     dir: PathBuf,
-    durability: LocalStoreDurability,
+    durability: RecordDurability,
 }
 
 impl JsonRecordDir {
     /// Open the directory at `dir`, creating it and its parents when absent.
     pub async fn open(
         dir: impl Into<PathBuf>,
-        durability: LocalStoreDurability,
+        durability: RecordDurability,
     ) -> anyhow::Result<Self> {
         let dir = dir.into();
         fs::create_dir_all(&dir)
@@ -62,7 +81,7 @@ impl JsonRecordDir {
         let write = async {
             file.write_all(value.as_ref()).await?;
             file.flush().await?;
-            if syncs_file(self.durability) {
+            if self.durability.syncs_file() {
                 file.sync_all().await?;
             }
             Ok::<_, std::io::Error>(())
@@ -82,7 +101,7 @@ impl JsonRecordDir {
                 temp.display()
             )
         })?;
-        if syncs_dir(self.durability) {
+        if self.durability.syncs_dir() {
             sync_dir(&self.dir).await?;
         }
         Ok(())
@@ -98,7 +117,7 @@ impl JsonRecordDir {
                 return Err(err).with_context(|| format!("remove record {}", path.display()))
             }
         }
-        if syncs_dir(self.durability) {
+        if self.durability.syncs_dir() {
             sync_dir(&self.dir).await?;
         }
         Ok(())
@@ -215,17 +234,6 @@ pub async fn discard_unreadable_store(path: &Path) -> bool {
     }
 }
 
-fn syncs_file(durability: LocalStoreDurability) -> bool {
-    matches!(
-        durability,
-        LocalStoreDurability::Wal | LocalStoreDurability::Sync
-    )
-}
-
-fn syncs_dir(durability: LocalStoreDurability) -> bool {
-    matches!(durability, LocalStoreDurability::Sync)
-}
-
 async fn sync_dir(dir: &Path) -> anyhow::Result<()> {
     let handle = fs::File::open(dir)
         .await
@@ -279,7 +287,7 @@ mod tests {
     use tempfile::TempDir;
 
     async fn record_dir(temp: &TempDir) -> anyhow::Result<JsonRecordDir> {
-        JsonRecordDir::open(temp.path().join("records"), LocalStoreDurability::Memory).await
+        JsonRecordDir::open(temp.path().join("records"), RecordDurability::Memory).await
     }
 
     #[tokio::test]
@@ -438,7 +446,7 @@ mod tests {
     async fn synced_writes_are_readable() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let records =
-            JsonRecordDir::open(temp.path().join("synced"), LocalStoreDurability::Sync).await?;
+            JsonRecordDir::open(temp.path().join("synced"), RecordDurability::Full).await?;
 
         records.put("alpha", b"durable").await?;
         assert_eq!(

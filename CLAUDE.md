@@ -71,7 +71,7 @@ Registry access goes through `regctl` (manifests, config blobs, layers, tools dr
 
 P2P artifact transport (`src/p2p/`, `docs/src/internals/p2p-design.md`): consumers depend on `P2pTransport`; `DisabledP2pTransport` is the default, `IrohBlobsP2pTransport` embeds `iroh` + `iroh-blobs`. Overlaybd layer artifact identity is owned by `crates/aenv-node/src/overlaybd/p2p/artifact.rs`; snapshot publishing reuses it rather than inventing snapshot-specific keys. The node registry keeps only key-to-node hints (`RecordP2pArtifact`/`ForgetP2pArtifact`/`LookupP2pArtifact`), never locators or bytes.
 
-Local RocksDB helper (`src/local_store.rs`): use `LocalKvStore` with an explicit `LocalStoreDurability` for new node-local record/catalog persistence; keep values compact; choose durability in code, not config.
+Node-local metadata carries no embedded database (`make check-crate-boundaries` fails a workspace that links one). Rebuild it from the on-disk layout where the layout is the truth, or store it with `JsonRecordDir` (`src/record_dir.rs`) — one atomic JSON file per record, under an explicit `RecordDurability` chosen in code, not config.
 
 ### Distributed Control Plane
 

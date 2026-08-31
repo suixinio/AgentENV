@@ -134,7 +134,13 @@ check-crate-boundaries:
 	  echo "aenv-node links a PostgreSQL driver; a node must never hold database credentials."; \
 	  fail=1; \
 	fi; \
-	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, aenv-node has no database"; fi; \
+	workspace_tree=$$($(CARGO) tree --workspace -e normal,build,dev --prefix none) || { echo "cargo tree --workspace failed"; exit 1; }; \
+	if printf '%s\n' "$$workspace_tree" | sort -u | grep -E '^(rocksdb|librocksdb-sys) v[0-9]'; then \
+	  echo "the workspace links an embedded database; node-local metadata is derived from the"; \
+	  echo "cache layout or written as JSON records, and nothing here needs one."; \
+	  fail=1; \
+	fi; \
+	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, aenv-node has no database, the workspace has no embedded database"; fi; \
 	exit $$fail
 
 mutants:
@@ -156,8 +162,8 @@ test: test-agent test-envd test-ublk
 # What that hid, then and now: `the_shutdown_bounds_are_still_wired` and
 # `async_main_actually_refuses_a_configured_pg_dsn`
 # (`crates/aenv-node/src/bin/aenv-node.rs`) scan that file's own source for
-# calls nothing else in the suite exercises — a stuck RocksDB `spawn_blocking`
-# hanging the process past `terminationGracePeriodSeconds`, and a `[pg].dsn`
+# calls nothing else in the suite exercises — blocking work still outstanding
+# at exit hanging the process past `terminationGracePeriodSeconds`, and a `[pg].dsn`
 # reaching a machine that runs user code. Both live in a `src/bin/` file
 # because what they read is that file; moving them into a library would only
 # make them read a sibling. The target selection was the thing that was wrong,

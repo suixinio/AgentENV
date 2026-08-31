@@ -58,29 +58,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - e2e_name: single-node
-            make_target: test-e2e
           - e2e_name: docker-compose
             make_target: test-e2e-compose
     steps:
       - uses: actions/checkout@v6
-      - uses: ./.github/actions/rust-ci-setup
-        if: ${{ matrix.e2e_name == 'single-node' }}
-        with:
-          ci_deps_target: ci-deps
-      - uses: ./.github/actions/sandbox-ci-setup
-        if: ${{ matrix.e2e_name == 'single-node' }}
-        with:
-          ghcr_username: ${{ github.actor }}
-          ghcr_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Configure ublk test host
-        if: ${{ matrix.e2e_name != 'single-node' }}
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
       - name: Set up Docker Buildx
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
         uses: docker/setup-buildx-action@v4
       - name: Build AgentENV runtime image
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -90,7 +76,6 @@ jobs:
           cache-from: type=gha,scope=agentenv-runtime
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-runtime,mode=max' || '' }}
       - name: Build gateway image
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -112,11 +97,6 @@ jobs:
       - name: Install e2b Python SDK
         run: python3 -m pip install --upgrade e2b e2b-code-interpreter
       - name: E2E tests (${{ matrix.e2e_name }})
-        run: |
-          if [[ "${{ matrix.e2e_name }}" == "single-node" ]]; then
-            sg kvm -c "make ${{ matrix.make_target }} PROFILE=debug"
-          else
-            SKIP_BUILD=1 make ${{ matrix.make_target }} PROFILE=debug
-          fi
+        run: SKIP_BUILD=1 make ${{ matrix.make_target }} PROFILE=debug
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()

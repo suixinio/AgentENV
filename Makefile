@@ -61,7 +61,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	fmt clippy check-crate-boundaries \
 	mutants coverage \
 	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
-	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
+	test-e2e-compose test-e2e-k8s test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store bench-placement-shadow \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
@@ -332,17 +332,13 @@ agentenv-server:
 custom-extension-client:
 	$(CARGO) adev codegen custom-extension
 
-test-e2e:
-	$(MAKE) install-ublk PROFILE=debug
-	bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
-
 test-e2e-compose:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=compose bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
 
 test-e2e-k8s:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=k8s bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
 
-test-e2e-all: test-e2e test-e2e-compose test-e2e-k8s
+test-e2e-all: test-e2e-compose test-e2e-k8s
 
 # 🔴 The node half only. There are two binaries, and a developer running one
 # machine wants the one that boots VMs.

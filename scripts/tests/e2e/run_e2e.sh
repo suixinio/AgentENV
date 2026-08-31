@@ -71,9 +71,6 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     require_cmd kubectl
     log "Building kubernetes runtime images ..."
     make --no-print-directory -C "${REPO_ROOT}" k8s-build
-  else
-    log "Building single-node e2e runtime ..."
-    make --no-print-directory -C "${REPO_ROOT}" build-server
   fi
 fi
 

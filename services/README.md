@@ -246,6 +246,14 @@ listener on `agentenv-api`, so the key could only ever hold
 `ClientConn` for the wake-up RPC. A manifest that still sets it is silently
 ignored — the loader reads no such key.
 
+### Rolling the *API* half back
+
+Same mechanism as the node half and no flags: set an earlier `agentenv-api`
+digest on `agentenv-api-deployment.yaml` and apply. Pin the digest, not a
+moving tag, and move `agentenv-runtime` to the same build in the same apply —
+`SERIALIZED_VALUE_SCHEMA_VERSION` fails every cross-half RPC on a skew (see the
+note on the `images:` block in `deploy/k8s/base/kustomization.yaml`).
+
 From the repository root:
 
 ```bash

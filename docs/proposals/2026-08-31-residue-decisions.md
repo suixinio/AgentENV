@@ -137,5 +137,7 @@ api 半边上，`api-gate-token` 这道闸是面向用户 REST 唯一的传输�
 ## D8 — api 半边回滚指针
 
 CLAUDE.md 里"Rolling this half back is an image-tag change; see `services/README.md`"
-此前指向一个不存在的小节。`services/README.md` 补一个两行小节：api 半边回滚是
-Deployment 镜像改动（tag/digest），没有开关，与 node 半边同机制，并指向 digest 钉法。
+此前指向一个不存在的小节。`services/README.md` 新增 "Rolling the *API* half back"：api
+半边回滚是 Deployment 镜像 digest 改动，没有开关，与 node 半边同机制；顺带记下
+`kustomization.yaml` 的 `images:` 约束——两半必须同一次 apply 一起动，否则
+`SERIALIZED_VALUE_SCHEMA_VERSION` 会让每个跨半 RPC 失败。

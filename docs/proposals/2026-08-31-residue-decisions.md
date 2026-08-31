@@ -85,11 +85,24 @@ attribute（`create_instance.go:410`，`metric.WithAttributes(attributes...)`）
 
 ---
 
-## D4 — shadow 打分保留
+## D4 — shadow 打分：保留，并给一个 owner 和一个复查条件
 
 保留 `src/node_registry/placement/` 的 shadow 打分，它是 e2b 对齐工作
 （`docs/proposals/2026-08-30-e2b-alignment-placement-scoring.md`）的交付物，而不是过渡
-残留。owner 与复查条件见下（本节在 E4 一并落定）。
+残留。但 shadow 状态不再无限期开放：
+
+- **Owner**：suixinio。
+- **复查条件**（满足任一即复查是否翻默认）：集群规模超过 2 个节点；或者集群级
+  pending-assignment 记账被排期。后者是 `src/node_registry/placement/mod.rs` 模块文档
+  已经写下的前置条件——单靠心跳快照落后于并发 create，会把突发流量赶到同一个陈旧的
+  最小值上。
+- **2026-08-31 pve-mf 实测**：21 次 create 之后
+  `agentenv_api_placement_shadow_pressure_spread` 直方图**一条都没记**。该直方图只在样本内
+  `Scored` 候选 ≥2 时记录（对齐规格 §4，`scored_in_sample >= 2`），而两节点集群极少满足。
+  在当前集群形状下这条指标对"打分分歧有多大"不给任何信号。
+- **e2b 参照实现**：`packages/api/internal/orchestrator/placement/placement_best_of_K.go`——
+  `Score` 在 `:33`，pending 资源在 `:37-43` 被加进已分配量，无放回采样在 `:145`。上面那条
+  复查条件正对应 `:37-43`：e2b 的打分从一开始就读 pending 量，我们要翻默认就得先有它。
 
 ---
 

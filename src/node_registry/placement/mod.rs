@@ -6,6 +6,7 @@
 //!
 //! This remains shadow-only until placement has cluster-wide pending-assignment accounting;
 //! heartbeat snapshots alone lag concurrent creates and would herd bursts onto stale minima.
+//! Owner and review condition: `docs/proposals/2026-08-31-residue-decisions.md` §D4.
 
 pub mod sample;
 pub mod score;

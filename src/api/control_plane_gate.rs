@@ -319,6 +319,66 @@ mod tests {
     }
 
     #[test]
+    fn the_api_half_projects_its_own_key_of_the_credential_secret() {
+        const API: &str = include_str!("../../deploy/k8s/base/agentenv-api-deployment.yaml");
+        const SECRET: &str = "agentenv-control-plane-token";
+        const API_KEY: &str = "api-gate-token";
+        const GATEWAY_KEY: &str = "token";
+        const TOKEN_FILE: &str = "/etc/agentenv/control-plane/token";
+
+        // The volume, not the volumeMount that shares its name.
+        let after_marker = API
+            .rsplit_once("        - name: control-plane-token\n")
+            .expect("the api deployment mounts the control-plane credential")
+            .1;
+        // Bound checks to this volume so sibling projections cannot satisfy them.
+        let volume = after_marker
+            .split_once("\n        - name: ")
+            .map_or(after_marker, |(this_volume, _next_sibling)| this_volume);
+
+        assert!(
+            volume.contains(&format!("secretName: {SECRET}\n")),
+            "the api half's credential volume must name the shared Secret"
+        );
+        assert!(
+            volume.contains(&format!("- key: {API_KEY}\n")),
+            "the volume must project `{API_KEY}` by name; on this half that key is the \
+             only transport-level check on user-facing REST"
+        );
+        assert!(
+            volume.contains("optional: true"),
+            "the projection must stay optional, or a Secret without `{API_KEY}` fails \
+             the mount instead of leaving the gate off"
+        );
+        assert!(
+            !volume.contains(&format!("- key: {GATEWAY_KEY}\n")),
+            "the api half must not project the gateway's stamping key"
+        );
+        assert_ne!(
+            API_KEY, GATEWAY_KEY,
+            "the api gate and the gateway's stamp must be different keys of the Secret"
+        );
+
+        // The projected file, the mount point and the env var naming it agree.
+        let (token_dir, token_basename) = TOKEN_FILE
+            .rsplit_once('/')
+            .expect("the credential path names a directory and a file");
+        assert!(
+            volume.contains(&format!("path: {token_basename}\n")),
+            "the projected path must be the basename the env var below names"
+        );
+        assert!(
+            API.contains("- name: AENV_API_CONTROL_PLANE_TOKEN_FILE")
+                && API.contains(&format!("value: {TOKEN_FILE}\n")),
+            "the process must be told to read the credential from the mounted file"
+        );
+        assert!(
+            API.contains(&format!("mountPath: {token_dir}\n")),
+            "the volume must be mounted at the directory the env var's path lives in"
+        );
+    }
+
+    #[test]
     fn the_gateway_and_the_node_read_different_keys_of_the_credential_secret() {
         const DAEMONSET: &str = include_str!("../../deploy/k8s/base/agentenv-daemonset.yaml");
         const GATEWAY: &str = include_str!("../../deploy/k8s/base/gateway-deployment.yaml");

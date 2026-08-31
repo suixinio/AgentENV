@@ -9,18 +9,12 @@ use tokio::io::AsyncWriteExt;
 pub enum RecordDurability {
     /// No fsync. For tests and for records that are rebuilt after a crash.
     Memory,
-    /// Fsync the record, but not the directory entry naming it.
-    File,
     /// Fsync the record and the directory entry naming it.
     Full,
 }
 
 impl RecordDurability {
-    fn syncs_file(self) -> bool {
-        matches!(self, Self::File | Self::Full)
-    }
-
-    fn syncs_dir(self) -> bool {
+    fn fsyncs(self) -> bool {
         matches!(self, Self::Full)
     }
 }
@@ -30,6 +24,14 @@ const TEMP_SUFFIX: &str = ".json.tmp";
 
 /// Longest `NAME_MAX` a record file may occupy once the suffixes are appended.
 const MAX_FILE_NAME: usize = 255;
+
+/// Widest `.{pid}-{sequence}` a staging name can carry, from the decimal forms
+/// of [`u32::MAX`] and [`u64::MAX`].
+const MAX_STAGING_TAG: usize = 1 + 10 + 1 + 20;
+
+/// Budget every key must leave for the longest name [`JsonRecordDir::put`] can
+/// build, which is always the staging one.
+const MAX_NAME_OVERHEAD: usize = MAX_STAGING_TAG + TEMP_SUFFIX.len();
 
 /// A directory of records, one atomically replaced `<key>.json` file each.
 ///
@@ -70,9 +72,12 @@ impl JsonRecordDir {
     }
 
     /// Write one record, replacing any previous value for `key` atomically.
+    ///
+    /// Concurrent writers of one key each stage into their own file, so the
+    /// published record is always exactly one of the values written.
     pub async fn put(&self, key: &str, value: impl AsRef<[u8]>) -> anyhow::Result<()> {
         let encoded = self.encode_name(key)?;
-        let temp = self.dir.join(format!("{encoded}{TEMP_SUFFIX}"));
+        let temp = self.dir.join(staging_name(&encoded));
         let target = self.dir.join(format!("{encoded}{RECORD_SUFFIX}"));
 
         let mut file = fs::File::create(&temp)
@@ -81,7 +86,7 @@ impl JsonRecordDir {
         let write = async {
             file.write_all(value.as_ref()).await?;
             file.flush().await?;
-            if self.durability.syncs_file() {
+            if self.durability.fsyncs() {
                 file.sync_all().await?;
             }
             Ok::<_, std::io::Error>(())
@@ -101,7 +106,7 @@ impl JsonRecordDir {
                 temp.display()
             )
         })?;
-        if self.durability.syncs_dir() {
+        if self.durability.fsyncs() {
             sync_dir(&self.dir).await?;
         }
         Ok(())
@@ -117,7 +122,7 @@ impl JsonRecordDir {
                 return Err(err).with_context(|| format!("remove record {}", path.display()))
             }
         }
-        if self.durability.syncs_dir() {
+        if self.durability.fsyncs() {
             sync_dir(&self.dir).await?;
         }
         Ok(())
@@ -193,12 +198,22 @@ impl JsonRecordDir {
     fn encode_name(&self, key: &str) -> anyhow::Result<String> {
         let encoded = encode_name(key);
         anyhow::ensure!(
-            encoded.len() + TEMP_SUFFIX.len() <= MAX_FILE_NAME,
+            encoded.len() + MAX_NAME_OVERHEAD <= MAX_FILE_NAME,
             "record key {key:?} does not fit in a file name under {}",
             self.dir.display()
         );
         Ok(encoded)
     }
+}
+
+/// Names a staging file no other in-flight `put` can be holding open, and that
+/// a scan still recognizes by [`TEMP_SUFFIX`].
+fn staging_name(encoded: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!("{encoded}.{}-{sequence}{TEMP_SUFFIX}", std::process::id())
 }
 
 /// Removes a node-local store directory this build cannot read, reporting
@@ -288,6 +303,65 @@ mod tests {
 
     async fn record_dir(temp: &TempDir) -> anyhow::Result<JsonRecordDir> {
         JsonRecordDir::open(temp.path().join("records"), RecordDurability::Memory).await
+    }
+
+    /// Big enough to span several write syscalls, so two writers that shared a
+    /// staging file would interleave rather than race only at the rename.
+    const TORN_WRITE_VALUE_LEN: usize = 6 * 1024 * 1024;
+
+    fn concurrent_value(marker: u8) -> Vec<u8> {
+        let mut value = Vec::with_capacity(TORN_WRITE_VALUE_LEN);
+        value.extend_from_slice(b"[\"");
+        value.resize(TORN_WRITE_VALUE_LEN - 2, marker);
+        value.extend_from_slice(b"\"]");
+        value
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_of_one_key_never_publish_a_mixed_record() -> anyhow::Result<()> {
+        const WRITERS: u8 = 6;
+        let temp = TempDir::new()?;
+        let records = record_dir(&temp).await?;
+        let candidates: Vec<Vec<u8>> = (0..WRITERS).map(|n| concurrent_value(b'a' + n)).collect();
+
+        let mut writers = tokio::task::JoinSet::new();
+        for value in candidates.clone() {
+            let records = records.clone();
+            writers.spawn(async move { records.put("contended", value).await });
+        }
+        while let Some(joined) = writers.join_next().await {
+            joined??;
+        }
+
+        let published = records
+            .get("contended")
+            .await?
+            .expect("a writer published a record");
+        let matched = candidates
+            .iter()
+            .position(|candidate| candidate == &published);
+        assert!(
+            matched.is_some(),
+            "the published record is not any single writer's value: {} bytes, \
+             first mismatch against every candidate",
+            published.len()
+        );
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&published).is_ok(),
+            "the published record is not valid JSON"
+        );
+
+        let residue: Vec<String> = std::fs::read_dir(records.path())?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|name| name.ends_with(TEMP_SUFFIX))
+            .collect();
+        assert!(
+            residue.is_empty(),
+            "staging files were left behind: {residue:?}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -391,6 +465,35 @@ mod tests {
             .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
             .collect::<std::io::Result<_>>()?;
         assert_eq!(entries, vec!["..%2Fescape%2Fattempt.json".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn the_staging_tag_budget_covers_the_widest_pid_and_sequence() {
+        let widest = format!(".{}-{}", u32::MAX, u64::MAX);
+        assert_eq!(widest.len(), MAX_STAGING_TAG);
+    }
+
+    #[tokio::test]
+    async fn a_record_is_never_mistaken_for_a_staging_file_and_the_reverse() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let records = record_dir(&temp).await?;
+        // A key that renders every part of the staging name inside the record's
+        // own name, which is as close as an encoded key can get.
+        let key = "looks.999-999.json.tmp";
+        records.put(key, b"{\"kept\":true}").await?;
+        let staged = records.path().join(staging_name(&encode_name(key)));
+        tokio::fs::write(&staged, b"half-written").await?;
+
+        assert!(staged.to_string_lossy().ends_with(TEMP_SUFFIX));
+        let loaded = records.load_all().await?;
+
+        assert_eq!(
+            loaded,
+            vec![(key.to_string(), b"{\"kept\":true}".to_vec())],
+            "the record must survive the scan that reclaims staging files"
+        );
+        assert!(!staged.exists(), "the staging file must be reclaimed");
         Ok(())
     }
 

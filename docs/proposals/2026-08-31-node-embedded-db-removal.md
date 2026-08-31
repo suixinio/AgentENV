@@ -58,9 +58,11 @@ JSON 文件，要么上推控制面；不为它配备嵌入式 DB。**
 
 - `load_all()` / `get(name)` / `put(name, value)` / `remove(name)`；无批写、无前缀
   （命名空间用子目录）。
-- `put` = 写 `<name>.json.tmp` → 按 durability fsync → `rename` → 目录 fsync。
-  durability 由 `RecordDurability` 三档表达：`Full` = fsync 文件+目录；
-  `File` = fsync 文件；`Memory` = 不 fsync（测试）。
+- `put` = 写 `<name>.{pid}-{seq}.json.tmp` → 按 durability fsync → `rename` →
+  目录 fsync。暂存名带进程内唯一后缀，同 key 并发 put 各写各的暂存文件，
+  发布出的记录永远是某一个写入者的完整值。durability 由 `RecordDurability`
+  两档表达：`Full` = fsync 文件+目录；`Memory` = 不 fsync（测试）。
+  （原设计的 `File` = 只 fsync 文件那一档没有任何调用方，已删。）
 - 启动扫描忽略并清理 `.tmp` 残留（崩溃窗口 = 半个临时文件，从不损坏已有记录）。
 - 文件名用可逆的 percent 转义（非 `[A-Za-z0-9._-]` 的字节写成 `%XX`，`%` 自身
   也转义），因此 `load_all` 总能从目录列表还原 key，文件内容就是记录 JSON

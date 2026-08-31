@@ -16,12 +16,7 @@ use tracing::info;
 use url::Url;
 
 use crate::observability::prometheus::MetricGuard;
-// 🔴 Every `record_object_store_request` below passes
-// `ObjectStoreSurface::Artifact` literally, and that is not an oversight: this
-// backend's only key builders are `layout::managed_layer_key` and
-// `layout::artifact_key`, so every request it issues is byte traffic. The
-// classifier that used to derive the label from the key is gone with the
-// `catalog/` keys it looked for. See `metrics::ObjectStoreSurface`.
+// Every request here is artifact-byte traffic.
 use crate::snapshot::repository::metrics::{
     record_object_store_request, ObjectStoreOp, ObjectStoreOutcome, ObjectStoreSurface,
 };
@@ -176,9 +171,7 @@ impl OssClient {
             .await
             .with_context(|| format!("oss exists '{key}'"));
         metric.finish(&result);
-        // A HEAD that answers "absent" is a completed request, not a failure:
-        // `upload_managed_layer_if_missing` and `snapshot_exists` both ask this
-        // question expecting "no" to be a routine answer.
+        // Object absence is a successful HEAD result, not a backend failure.
         record_object_store_request(
             ObjectStoreOp::Head,
             ObjectStoreSurface::Artifact,
@@ -204,8 +197,7 @@ impl OssClient {
             })
             .await
             .with_context(|| format!("oss list '{prefix}'"));
-        // A LIST always answers; an empty listing is a legitimate answer, not
-        // a miss.
+        // An empty listing is a successful result.
         record_object_store_request(
             ObjectStoreOp::List,
             ObjectStoreSurface::Artifact,
@@ -318,9 +310,7 @@ impl OssClient {
 
     /// Delete a single object. Idempotent – missing objects are not errors.
     pub async fn delete(&self, key: &str) -> Result<()> {
-        // `Deleted::Absent` records the idempotent case the public signature
-        // erases: the store answered "no such object" and the caller was told
-        // the delete succeeded.
+        // Preserve whether an idempotent delete found the object for metrics.
         let result = self
             .run_with_key(key, |operator, key| async move {
                 match operator.delete(&key).await {
@@ -445,10 +435,7 @@ enum Deleted {
     Absent,
 }
 
-/// Classifies a read: a `NotFound` from the store is an answer, not a failure.
-/// A caller asking whether an artifact is already uploaded turns that same
-/// error into `Ok(None)` or `Ok(false)`, so counting it as `outcome="error"`
-/// makes routine lookups indistinguishable from real ones.
+/// Classifies `NotFound` as a successful absence rather than an error.
 fn read_outcome<T>(result: &Result<T>) -> ObjectStoreOutcome {
     match result {
         Ok(_) => ObjectStoreOutcome::Ok,

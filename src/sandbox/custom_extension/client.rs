@@ -43,21 +43,6 @@ use tracing::{debug, warn};
 use crate::cfg::ConfigManager;
 use crate::types::{CustomExtensionParams, ExecutionId, SandboxId};
 
-// 🔴 The `sandboxInstanceId` field on the wire carries an
-// [`ExecutionId`][crate::types::ExecutionId] — the sandbox's incarnation, as
-// the rest of this build calls it. The wire name is kept as it is because
-// renaming it would mean editing `src/custom_extension_api/openapi.yml`,
-// regenerating that client, and hand-deleting the model files the generator
-// leaves behind, all to rename a field nothing in any deployed environment has
-// ever seen. The two names mean the same thing, and the OpenAPI description
-// says so on its side.
-//
-// It used to be a locally minted `SandboxInstanceId`, generated inside the
-// start hooks. That was almost right — it did change on every start — but it
-// was minted from the hook kind, and a create-from-snapshot delivers the
-// *resume* hook, so the value was a per-hook identifier rather than a
-// per-incarnation one. It is now handed in from the launch plan, where the
-// create/resume decision is actually taken.
 
 /// Process-wide custom extension client, or `None` when
 /// `[custom_extension].url` is unset.
@@ -235,11 +220,7 @@ impl CustomExtensionClient {
 pub struct CustomExtensionHookGuard {
     client: Arc<CustomExtensionClient>,
     sandbox_id: SandboxId,
-    /// The incarnation this guard belongs to. Handed in at construction and
-    /// never regenerated: it is the run, not the hook, that it identifies.
     execution_id: ExecutionId,
-    /// Whether a start hook has been attempted and not yet stopped (set just
-    /// before the start hook is delivered). `false` leaves the guard inert.
     started: bool,
 }
 
@@ -266,9 +247,7 @@ impl CustomExtensionHookGuard {
         host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
     ) -> Result<Option<String>> {
-        // Record that a start was attempted before delivering the hook: if the
-        // request fails after the extension already processed it (e.g.
-        // client-side timeout), teardown still delivers the matching stop.
+        // Mark started before delivery so a lost response still receives a matching stop.
         self.started = true;
         let extra_boot_args = self
             .client
@@ -605,10 +584,6 @@ pub mod tests {
         let start_json: serde_json::Value = serde_json::from_str(&start_body).unwrap();
         let stop_json: serde_json::Value = serde_json::from_str(&stop_body).unwrap();
         assert_eq!(stop_json["sandboxId"], sandbox_id.to_string());
-        // 🔴 T-A1-8: the value on both hooks is the one handed in from the
-        // outside, not one the guard made up. A guard that minted its own
-        // would still pass the "start and stop agree" half below, which is
-        // what this first assertion exists to rule out.
         assert_eq!(start_json["sandboxInstanceId"], execution_id.to_string());
         assert_eq!(
             stop_json["sandboxInstanceId"],

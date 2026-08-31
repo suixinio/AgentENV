@@ -32,20 +32,11 @@ fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
 }
 
-/// The routing values a control-plane 2xx hands back to the gateway so it can
-/// write the sandbox's routing projection without asking the scheduler first.
-///
-/// 🔴 All three, not just the id. `x-agentenv-execution-id` used to be written
-/// only by the data-plane proxy's echo, so control-plane responses never
-/// carried one — which meant every projection write the gateway made was
-/// unincarnated, and under `enforce` arbitration an unincarnated write against
-/// an existing record is refused *silently*. On resume that is the whole point
-/// of the write: resume mints a fresh incarnation, so without this header the
-/// record keeps naming the run that ended.
+/// Routing values returned to the gateway for projection updates.
 struct RoutingHeaders {
     sandbox_id: String,
     execution_id: String,
-    /// 🔴 0 means "use your own default TTL". It never means "do not expire".
+    /// `0` asks the receiver to use its default TTL.
     projection_ttl_secs: i64,
 }
 
@@ -153,10 +144,7 @@ impl From<SandboxMetadata> for models::ListedSandbox {
             metadata: m.user_metadata,
             state: m.state.into(),
             envd_version: m.runtime_versions.envd_version.clone(),
-            // 🔴 Easiest of the three to leave out, and the one whose absence is
-            // hardest to see: the gateway's cluster listing is decoded from
-            // this shape, so a missing value there is an empty field and no
-            // error anywhere.
+            // Preserve the incarnation used by gateway projection arbitration.
             execution_id: Some(m.execution_id.to_string()),
         }
     }
@@ -297,14 +285,7 @@ fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
 
-/// What a user-facing create means by the `timeout` it did or did not send.
-///
-/// 🔴 Never [`SandboxExpiry::NotKeptHere`]. A user is a client, not a second
-/// orchestrator: it keeps no record of the sandbox, runs no expiry index and
-/// evicts nothing, so "said nothing" can only mean the configured default. The
-/// third answer belongs to the one caller that does keep all three — the API
-/// half asking a node — and it is sent by `RemoteSandboxBackendFactory`, a
-/// layer below this one.
+/// Maps an omitted user timeout to the configured default.
 fn requested_expiry(timeout: Option<u32>) -> SandboxExpiry {
     match duration_from_secs(timeout) {
         Some(timeout) => SandboxExpiry::After(timeout),
@@ -459,29 +440,7 @@ impl Sandboxes<()> for ApiImpl {
             ));
         }
 
-        // 🔴 This half has no `regctl` of its own, and that is the whole of
-        // why the reference travels unresolved. A cold start's first act used
-        // to be resolving `body.image` on the machine serving this call —
-        // `regctl` fetches the manifest, pulls the blobs and converts them
-        // into a local overlaybd image for a local Firecracker VM. `aenv-api`
-        // has no `regctl`, no `/dev/kvm` and no `ublk`, so that used to fail
-        // this route outright (formerly refused at the door here with a 500
-        // naming `aenv-api`; see `SandboxLaunchSource::UnresolvedImage`'s doc
-        // for the shape of that gap). What it does instead: validate the
-        // request exactly as strictly as a resolving half would
-        // (`unresolved_attached_drives` runs the same checks, minus the
-        // registry calls) and ship the raw reference to a node — the same
-        // node-dispatch a snapshot-source create already uses — which resolves
-        // it as part of the same `Create` call (`NodeSandboxService::create`'s
-        // `Source::Image` arm).
-        //
-        // 🔴 There was a second arm here, taken when
-        // `ApiImpl::runs_sandbox_runtime()`, that resolved the image and its
-        // attached drives in-process. It is deleted rather than disabled: on
-        // `aenv-api` it was never taken, and on `aenv-node` this route never
-        // runs at all — `crate::api::role_gate` answers the user-facing REST
-        // surface with 404 there, and a node's real create path is the gRPC
-        // `NodeSandboxService::create`, which does not go through `ApiImpl`.
+        // Keep image references unresolved for the target node that owns registry access.
         let attached_drives =
             match unresolved_attached_drives(body.attached_drives.as_deref().unwrap_or_default()) {
                 Ok(drives) => drives,
@@ -522,12 +481,9 @@ impl Sandboxes<()> for ApiImpl {
             network_policy,
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
-            // 🔴 Never set from the user-facing REST surface: what marks a
-            // sandbox as the control plane's is the node gRPC create, and
-            // nothing else.
+            // User REST creates are not control-plane-owned.
             control_plane_config: None,
-            // A user asking for a sandbox is not an orchestrator quoting an
-            // incarnation it already recorded, so this one is minted.
+            // User REST creates mint their incarnation in the orchestrator.
             execution_id: None,
         };
 
@@ -607,27 +563,7 @@ impl Sandboxes<()> for ApiImpl {
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
         let timer = SandboxStageTimer::new("create_warm");
-        // 🔴 A catalog read, and deliberately only that. A warm create's
-        // first act used to be `load_runnable`, which is not a lookup: it
-        // downloads `vm_state.bin` onto this machine's disk, materializes the
-        // memory and rootfs overlaybd `image.json` files, and takes a lease
-        // pinning all of it in this process's local artifact cache. That is
-        // right for a process about to boot a Firecracker VM from those bytes.
-        //
-        // `aenv-api` is not that process. It hands the create to a node, and
-        // `RemoteSandboxBackendFactory` reads exactly one thing back out of the
-        // `RunnableSnapshot` it is given: the catalog row. The manifest, the
-        // lease and every downloaded byte are dropped unread, and the node
-        // resolves the row itself against the cache its VM actually mmaps. So
-        // this half asks the catalog for the row and stops there — the node
-        // receives byte-for-byte the request it always did, because the row was
-        // already the whole of what `SnapshotSource` carried.
-        //
-        // 🔴 The `load_runnable` arm that used to sit opposite this one, taken
-        // when `ApiImpl::runs_sandbox_runtime()`, is deleted: `aenv-node`
-        // answers this route with 404 (`crate::api::role_gate`) and creates
-        // over gRPC instead, where `NodeSandboxService::create` does its own
-        // resolution.
+        // Fetch only the catalog row; the target node resolves runtime artifacts.
         let loaded: anyhow::Result<Option<SandboxLaunchSource>> = timer
             .time(
                 "load_snapshot",
@@ -689,12 +625,9 @@ impl Sandboxes<()> for ApiImpl {
             network_policy,
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
-            // 🔴 Never set from the user-facing REST surface: what marks a
-            // sandbox as the control plane's is the node gRPC create, and
-            // nothing else.
+            // User REST creates are not control-plane-owned.
             control_plane_config: None,
-            // A user asking for a sandbox is not an orchestrator quoting an
-            // incarnation it already recorded, so this one is minted.
+            // User REST creates mint their incarnation in the orchestrator.
             execution_id: None,
         };
 
@@ -781,9 +714,7 @@ impl Sandboxes<()> for ApiImpl {
                         );
                     }
                 }
-                // The sandbox did not move, but the gateway still records a
-                // routing projection for this request, and a write without an
-                // incarnation is the one arbitration refuses without saying so.
+                // Include the incarnation required for the gateway's projection write.
                 let routing = RoutingHeaders::of(&metadata);
 
                 return Ok(
@@ -803,11 +734,7 @@ impl Sandboxes<()> for ApiImpl {
             SandboxState::Pausing | SandboxState::Paused => {}
         }
 
-        // Ask the cluster who may resume this sandbox before resuming it. This
-        // route used to go straight to the orchestrator, which made it a second
-        // way to bring a sandbox up beside one that is already live elsewhere;
-        // there is now one decision point and every resume path goes through
-        // it.
+        // Arbitrate every resume path before touching the local sandbox.
         let (claimed, connect_held) = match self.arbitrate_resume(sandbox_id).await {
             ResumeArbitration::Proceed(claimed) => (claimed, None),
             ResumeArbitration::Held(entry, claimed) => (claimed, Some(entry.generation)),
@@ -826,8 +753,7 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 ));
             }
-            // 🔴 Not a 404, for the reason spelled out on the resume route: a
-            // 404 here reads downstream as "the sandbox is gone, rebuild it".
+            // Unavailability is not absence; 404 would permit a destructive rebuild.
             ResumeArbitration::Unavailable { reason } => {
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(Self::error(
@@ -849,13 +775,9 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(resumed_metadata) => {
-                // Same as the resume route: the orchestrator repoints the row
-                // for a resume it performed, but not for one that found the
-                // sandbox already running, and a claim nobody confirms sits in
-                // `resuming` until its lease lapses.
+                // Confirm a held claim after the resume chooses its actual node.
                 if connect_held.is_some() {
-                    // The machine the resume actually landed on, not this
-                    // process's own identity.
+                    // Record the node where the resume actually landed.
                     let holding_node_id = self
                         .orchestrator()
                         .sandbox_holding_node_id(&sandbox_id)
@@ -925,21 +847,16 @@ impl Sandboxes<()> for ApiImpl {
                 sandbox_not_found(path_id),
             ));
         };
-        // A leftover paused record here is not the sandbox — it may well be
-        // running on another node. Drop it first so the delete below acts on
-        // something this node actually owns.
+        // Discard a stale local record before deleting cluster-owned state.
         self.discard_if_superseded(sandbox_id).await;
 
         match self.orchestrator().delete_sandbox(sandbox_id).await {
-            // The orchestrator drops the cluster record and its snapshot as
-            // part of the delete.
+            // The orchestrator removes its cluster row and snapshot.
             Ok(_) => {
                 Ok(SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully)
             }
             Err(OrchestratorError::SandboxNotFound(id)) => {
-                // The local node does not have it, but the cluster may still
-                // hold a paused record — deleting a sandbox that lives only as
-                // a published snapshot must still remove it.
+                // A published paused record may exist even without a local sandbox.
                 self.forget_paused_sandbox(sandbox_id).await;
 
                 Ok(SandboxesSandboxIdDeleteResponse::Status404_NotFound(
@@ -980,11 +897,7 @@ impl Sandboxes<()> for ApiImpl {
             .time(
                 "fork",
                 self.orchestrator()
-                    // 🔴 `Fresh`: a fork over the user-facing REST surface
-                    // produces sandboxes the control plane did not ask for and
-                    // does not own, so no child carries a marker. Inheriting
-                    // the source's is what would put a child into the control
-                    // plane's listing under its parent's identity.
+                    // User-created fork children are not control-plane-owned.
                     .fork_sandbox(sandbox_id, ForkChildren::Fresh(count), new_timeout),
             )
             .await
@@ -994,9 +907,7 @@ impl Sandboxes<()> for ApiImpl {
                     .into_iter()
                     .map(|outcome| match outcome {
                         Ok(metadata) => {
-                            // 🔴 On the body, not on a header: one response,
-                            // N children, N incarnations. The child's own
-                            // incarnation is already inside `sandbox`.
+                            // Per-child routing data belongs in each response body entry.
                             let projection_ttl_secs =
                                 i64::from(metadata.projection_ttl_secs(SystemTime::now()));
 
@@ -1226,8 +1137,7 @@ impl Sandboxes<()> for ApiImpl {
             .time("pause", self.orchestrator().pause_sandbox(sandbox_id))
             .await
         {
-            // The orchestrator publishes and registers the pause itself, so
-            // every pause path gets it — this one, expiry, and shutdown alike.
+            // The orchestrator publishes every pause path.
             Ok(_) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
             ),
@@ -1308,11 +1218,7 @@ impl Sandboxes<()> for ApiImpl {
         let published = match timer
             .time(
                 "publish",
-                // 🔴 The id inside this value is a proposal, not a decision.
-                // When the sandbox runs on another node the capture arrives
-                // already staged — under the id *that* node wrote the bytes
-                // into — and only the alias here survives. Which is why the
-                // response below is built from `published`, never from this.
+                // Use the staged result's id; a remote node may have chosen it.
                 self.snapshot_manager.publish_captured(
                     crate::orchestrator::capture_publish_metadata(&capture.metadata, alias.clone()),
                     capture.captured_snapshot,
@@ -1371,10 +1277,7 @@ impl Sandboxes<()> for ApiImpl {
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdRefreshesPostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
-            // 🔴 Matched explicitly. The catch-all below hands the error to
-            // `From<OrchestratorError>`, which builds a body whose `code` says
-            // 400 and then ships it inside an HTTP 500 — a mismatch a client
-            // cannot act on.
+            // Preserve the 400 status for lifetime-limit refusals.
             Err(err @ OrchestratorError::SandboxLifetimeExceeded { .. }) => Ok(
                 SandboxesSandboxIdRefreshesPostResponse::Status400_BadRequest(Self::error(
                     400,
@@ -1404,16 +1307,10 @@ impl Sandboxes<()> for ApiImpl {
         };
         let timeout = duration_from_secs(body.timeout).unwrap_or(default_sandbox_timeout());
 
-        // If the cluster has moved past this sandbox — another node resumed it
-        // while this one was away — drop the leftover local record first, so the
-        // resume below cannot start a second copy alongside the live one.
+        // Drop a superseded local record before attempting resume.
         self.discard_if_superseded(sandbox_id).await;
 
-        // Then ask the cluster who may resume it. Discarding above closes the
-        // case where this node is behind by a whole reconciliation; this closes
-        // the one where it is behind by a moment, which is the case that
-        // actually produces two live copies of one sandbox. Both resume paths
-        // below run under this single decision.
+        // Arbitrate again to close the race with a concurrent resume.
         let arbitration = self.arbitrate_resume(sandbox_id).await;
         let held = match &arbitration {
             ResumeArbitration::Blocked { origin_node_id } => {
@@ -1431,22 +1328,8 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 ));
             }
-            // 🔴 Not a 404. The downstream contract for a 404 on this route is
-            // "the sandbox is gone, rebuild it", which resets the user's
-            // workspace to its template — and what actually happened is that
-            // nobody could be asked. This says "ask again", which is the only
-            // honest answer and the only retryable one.
-            //
-            // 🔴 And 500 rather than the 503 this obviously is, on purpose.
-            // `src/api/openapi.yml` has no 503 anywhere, so introducing one
-            // means regenerating the whole server crate for a code that buys
-            // nothing: the only consumer of this route maps both onto the same
-            // "the sandbox's state is unknown" branch, so 500 and 503 are
-            // literally indistinguishable to it. The wording below is what
-            // carries the meaning, and it is deliberately unique to this
-            // branch so an operator grepping for it lands here and nowhere
-            // else. Revisit if a 503 ever exists in the spec for its own
-            // reasons — not for this.
+            // Unavailability is not absence; 404 would permit a destructive rebuild.
+            // OpenAPI has no 503 response, so this remains the consumer-equivalent 500.
             ResumeArbitration::Unavailable { reason } => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
                     Self::error(
@@ -1459,14 +1342,10 @@ impl Sandboxes<()> for ApiImpl {
             ResumeArbitration::Proceed(_) => None,
         };
 
-        // Split the granting answers into the row (which the rebuild below
-        // still needs) and the claim token (which the resume consumes). The
-        // rebuild path does not need a token: it is a create, and a create mints
-        // its own incarnation.
+        // Separate the optional rebuild row from the claim consumed by resume.
         let (entry, claimed) = match arbitration {
             ResumeArbitration::Held(entry, claimed) => (Some(entry), claimed),
             ResumeArbitration::Proceed(claimed) => (None, claimed),
-            // Every refusing variant returned above.
             _ => unreachable!("refusals return before this point"),
         };
 
@@ -1479,16 +1358,10 @@ impl Sandboxes<()> for ApiImpl {
             )
             .await
         {
-            // Resumed from local artifacts.
             Ok(metadata) => {
-                // The orchestrator repoints the cluster record as part of a
-                // resume it actually performed, but not on the already-running
-                // path, which returns without touching the registry. Saying it
-                // again here is idempotent and keeps a claim from sitting in
-                // `resuming` until its lease lapses.
+                // Confirm a held claim after the resume chooses its actual node.
                 if held.is_some() {
-                    // The machine the resume actually landed on, not this
-                    // process's own identity.
+                    // Record the node where the resume actually landed.
                     let holding_node_id = self
                         .orchestrator()
                         .sandbox_holding_node_id(&sandbox_id)
@@ -1515,14 +1388,10 @@ impl Sandboxes<()> for ApiImpl {
                 );
             }
             Err(OrchestratorError::SandboxNotFound(id)) => {
-                // Nothing local to resume. If the claim above came with a row,
-                // the cluster still has a snapshot to rebuild it from — under
-                // the same ID, on this node.
+                // A claimed catalog row can rebuild a missing local sandbox.
                 let Some(entry) = entry else {
-                    // 既没有本地副本、也没拿到认领权。单发请求下这确实是"沙箱没了"，
-                    // 但并发下不是 —— 输家会走到这里，而赢家正把同一台拉起来。
-                    // 🔴 回 404 之前必须先问清集群：404 的下游契约是"可以重建"，
-                    // 而重建等于把用户工作区退回模板初始态。
+                    // A concurrent resume loser can arrive here while the winner starts the sandbox.
+                    // Confirm cluster absence before returning 404, which permits rebuild.
                     return Ok(match self.resolve_missing_local_resume(sandbox_id).await {
                         MissingLocalResume::Unknown => {
                             SandboxesSandboxIdResumePostResponse::Status404_NotFound(
@@ -1641,7 +1510,6 @@ impl Sandboxes<()> for ApiImpl {
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdTimeoutPostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
-            // Explicit for the same reason as on the refresh route above.
             Err(err @ OrchestratorError::SandboxLifetimeExceeded { .. }) => {
                 Ok(SandboxesSandboxIdTimeoutPostResponse::Status400_BadRequest(
                     Self::error(400, err.to_string()),
@@ -1732,18 +1600,6 @@ impl Sandboxes<()> for ApiImpl {
 mod tests {
     use super::*;
 
-    /// 🔴 A user who sends no `timeout` gets this orchestrator's default, and
-    /// never "keep no deadline".
-    ///
-    /// The same absence means two different things depending on who is asking,
-    /// and this is the half where it means the default. The other half — the
-    /// API process asking a *node* — is `RemoteSandboxBackendFactory`, which
-    /// says `caller_kept` on the wire; the two must not converge, because the
-    /// sandbox would then be one nobody ever expires.
-    ///
-    /// The control face is the same call with a number in it: an implementation
-    /// that returned `AfterConfiguredDefault` for everything would satisfy the
-    /// first assertion on its own.
     #[test]
     fn a_user_that_named_no_timeout_gets_the_configured_default_and_not_none() {
         assert_eq!(
@@ -1861,9 +1717,6 @@ mod routing_header_tests {
     use super::*;
     use std::time::UNIX_EPOCH;
 
-    /// The four operations whose success responses the gateway turns into a
-    /// routing projection write. All four are POSTs; the GET that shares two of
-    /// these paths is not one of them.
     const ROUTING_OPERATIONS: [&str; 4] = [
         "/sandboxes",
         "/sandboxes-cold",
@@ -1883,8 +1736,6 @@ mod routing_header_tests {
         line.len() - line.trim_start().len()
     }
 
-    /// The lines of one block, from the line after `header` up to the next line
-    /// indented no further than `header` was.
     fn block_after(lines: &[&str], header_index: usize) -> Vec<String> {
         let base = indent_of(lines[header_index]);
 
@@ -1912,9 +1763,6 @@ mod routing_header_tests {
         let metadata = SandboxMetadata {
             created_at,
             max_lifetime: Some(Duration::from_secs(86_400)),
-            // Running since 1970, so its budget really is long gone —
-            // `created_at` alone would not say that any more, because paused
-            // time does not count against the ceiling.
             running_since: Some(created_at),
             ..Default::default()
         };
@@ -1923,18 +1771,12 @@ mod routing_header_tests {
 
         assert_eq!(routing.sandbox_id, metadata.id.to_string());
         assert_eq!(routing.execution_id, metadata.execution_id.to_string());
-        // A sandbox that has been running since the epoch is long past its
-        // ceiling. What comes out is still positive: the receiver has to be
-        // able to read every value here as a duration, and 0 is spoken for.
         assert!(
             routing.projection_ttl_secs > 0,
             "a sandbox past its ceiling still asks for a short record, not an immortal one"
         );
     }
 
-    /// 🔴 The control face. Without a ceiling the node has nothing to derive a
-    /// TTL from and says so with 0 — which the receiver reads as "use your own
-    /// default", never as "this record should not expire".
     #[test]
     fn routing_headers_report_zero_when_the_node_has_no_ceiling() {
         let metadata = SandboxMetadata {
@@ -1955,21 +1797,12 @@ mod routing_header_tests {
 
         let ttl = RoutingHeaders::of(&metadata).projection_ttl_secs;
 
-        // At least the hour the sandbox has left. A projection that expires
-        // before the sandbox it points at is the failure this value exists to
-        // prevent, and it is invisible from the outside: the route simply
-        // misses, exactly as a cold cache would.
         assert!(
             ttl >= 3_600,
             "expected at least the remaining hour, got {ttl}"
         );
     }
 
-    /// 🔴 Pinned against the spec rather than against the handlers, so it also
-    /// holds for a route added later. Dropping a header here does not break the
-    /// build anywhere a reader would look: it regenerates a response variant
-    /// with one fewer field, and what fails downstream is a projection write
-    /// that incarnation arbitration refuses without saying so.
     #[test]
     fn every_routing_response_declares_all_three_headers() {
         let lines: Vec<&str> = SPEC.lines().collect();
@@ -1984,8 +1817,6 @@ mod routing_header_tests {
                 path = Some(trimmed.trim_end_matches(':'));
                 continue;
             }
-            // Only the POST on these paths creates or resumes a sandbox; the
-            // listing GET that shares one of them does not.
             if indent_of(line) != 8 || !trimmed.starts_with("\"2") {
                 continue;
             }
@@ -2017,17 +1848,12 @@ mod routing_header_tests {
             "every 2xx the gateway records a routing projection from must name the sandbox, \
              the run, and the budget: {offenders:?}"
         );
-        // Guards the parser itself: an expression that silently matches
-        // nothing would otherwise pass this test forever.
         assert_eq!(
             checked, 5,
             "expected create, cold, resume, and both connect outcomes"
         );
     }
 
-    /// The other half of the carrier. Fork answers with a top-level array, so
-    /// its TTL rides in the body — and on the infrastructure wrapper rather
-    /// than on the user-facing model.
     #[test]
     fn the_fork_result_carries_the_budget_and_the_user_facing_model_does_not() {
         let carries = |name: &str| {
@@ -2052,12 +1878,6 @@ mod routing_header_tests {
 mod execution_exposure_tests {
     use super::*;
 
-    /// T-A6-1. Every shape that names a sandbox names the run it is on.
-    ///
-    /// 🔴 All three, from one record, compared against each other. `ListedSandbox`
-    /// is the one that gets forgotten, and the symptom of forgetting it is not an
-    /// error: the gateway decodes the cluster listing into its own struct, an
-    /// absent field decodes as empty, and the field is simply blank forever.
     #[test]
     fn every_sandbox_response_names_its_execution() {
         let metadata = SandboxMetadata::default();
@@ -2080,13 +1900,6 @@ mod execution_exposure_tests {
         }
     }
 
-    /// T-A6-2. 🔴 Read-only, and that is a line in the contract rather than an
-    /// oversight.
-    ///
-    /// A client that could name the incarnation it wants could name one that has
-    /// already been replaced, and every fencing rule downstream is built on the
-    /// assumption that the value came from the control plane. Pinned against the
-    /// spec, so it holds for shapes nobody has written a handler for yet.
     #[test]
     fn the_execution_is_never_an_input() {
         let spec = include_str!("../openapi.yml");
@@ -2096,7 +1909,6 @@ mod execution_exposure_tests {
         for line in spec.lines() {
             let indent = line.len() - line.trim_start().len();
             let trimmed = line.trim_end();
-            // Schema names sit at six spaces of indent under `schemas:`.
             if indent == 4 && trimmed.ends_with(':') && !trimmed.trim_start().starts_with('-') {
                 schema = Some(trimmed.trim().trim_end_matches(':').to_string());
             }
@@ -2120,32 +1932,6 @@ mod execution_exposure_tests {
     }
 }
 
-/// 🔴 Whether a warm create turns a snapshot into bytes on its own disk.
-///
-/// `POST /sandboxes` used to answer that with an unconditional
-/// `load_runnable`, which is not a catalog lookup: `SnapshotRuntimeResolver`
-/// downloads `vm_state.bin` onto this machine, materializes the memory and
-/// rootfs overlaybd `image.json` files and leases all of it in the local
-/// artifact cache. The api Pod boots no VM from any of it — it hands the
-/// create to a node, and `RemoteSandboxBackendFactory` reads exactly one thing
-/// back out of the `RunnableSnapshot`: the catalog row.
-///
-/// # 🔴 Why the fixture proves it rather than describing it
-///
-/// The resolver here is [`MockSnapshotRuntimeResolver`], which fails every
-/// call. So "did this create resolve" is not a string to match or a counter to
-/// read: a create that resolved *cannot* have succeeded, because the failure
-/// propagates and ends the request. This route answering 201 over a resolver
-/// that refuses is the whole proof, and it stays the proof if every error
-/// message in the tree is reworded.
-///
-/// 🔴 There used to be a second arm here, running the same request through a
-/// `ResumeWiring::node_local` surface and asserting it *did* resolve. It went
-/// with the `load_runnable` branch it covered: `aenv-node` never reaches this
-/// handler — `crate::api::role_gate` answers the user-facing REST surface with
-/// 404 there — and creates over gRPC instead, where
-/// `NodeSandboxService::create` does its own resolution and is covered by
-/// `crates/aenv-node/src/node_server/tests.rs`.
 #[cfg(test)]
 mod warm_start_source_tests {
     use std::sync::Arc;
@@ -2167,21 +1953,6 @@ mod warm_start_source_tests {
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
 
-    /// One API surface whose catalog holds a ready snapshot and whose runtime
-    /// resolver refuses every call.
-    ///
-    /// 🔴 The orchestrator takes the permissive seed policy, for the reason
-    /// `crates/aenv-node/src/tests/api_cold_start.rs`'s own fixture gives: the
-    /// route under test asks `ApiImpl`, and an `Orchestrator` built with
-    /// [`AccessTokenSeedPolicy::MustBeConfigured`] has construction-time
-    /// demands that would make this fail on the fixture rather than on the
-    /// path under test.
-    ///
-    /// 🔴 The factory is `MockBackendFactory` rather than
-    /// `FirecrackerSandboxFactory` because the question is what this half
-    /// *sends*, not whether this machine can run a VM — and
-    /// `MockBackendFactory` is the one factory in the tree that, like the real
-    /// `RemoteSandboxBackendFactory`, accepts both snapshot launch sources.
     async fn surface(row: SnapshotRecord) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().expect("a temp dir");
 
@@ -2210,14 +1981,11 @@ mod warm_start_source_tests {
             crate::api::ResumeWiring::api_half_for_test(),
         ));
 
-        // Held for the process's lifetime: the persister above goes on reading it.
         std::mem::forget(root);
 
         api
     }
 
-    /// A committed, launchable catalog row — the thing a template id resolves
-    /// to, before anything downloads a byte of it.
     fn ready_row() -> SnapshotRecord {
         SnapshotRecord::mock_ready(CommittedSnapshot::mock())
     }

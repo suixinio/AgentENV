@@ -25,14 +25,7 @@ use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use agentenv_http_server::{apis, models};
 pub use paused_coordinator::{PausedSandboxCoordinator, StaleReleaseOutcome};
-// The data-plane auto-resume takes the same decision the REST resume does; both
-// reach it through this one point.
-//
-// 🔴 Still true after the wake-up decision moved to `resume_surface`, and it is
-// what made the move safe: the gRPC surface the gateway calls and the REST
-// resume route both arbitrate here. The local reverse proxy's
-// `try_auto_resume` was the third caller and is deleted; the point survives it
-// — one place a resume can acquire the right to start.
+// REST and data-plane resume share one arbitration path.
 pub(in crate::api) use paused_recovery::ResumeArbitration;
 pub use resume_surface::ResumeWiring;
 pub(in crate::api) use resume_surface::{
@@ -46,11 +39,7 @@ pub(in crate::api) use resume_surface::{
 #[derive(Clone, Debug)]
 pub struct Claims;
 
-/// Everything needed to make a paused sandbox recoverable beyond the node that
-/// paused it, built once at startup and shared by the two sides that need it:
-/// the API, for resumes that arrive on a node which has never run the sandbox,
-/// and the orchestrator, which drives publishing for every pause regardless of
-/// what started it.
+/// Shared pause registry and publication wiring.
 pub struct PausedSandboxWiring {
     pub coordinator: Arc<PausedSandboxCoordinator>,
 }
@@ -78,49 +67,21 @@ impl PausedSandboxWiring {
 
 #[derive(Clone)]
 pub struct ApiImpl {
-    /// 🔴 The orchestration surface, not an `Orchestrator`. Which concrete
-    /// orchestrator is behind it is the calling binary's decision, taken once
-    /// at startup; see `crate::orchestrator::facade` for why it cannot be taken
-    /// one type parameter at a time.
+    /// Process-independent orchestration surface selected at startup.
     orchestrator: Arc<dyn SandboxOrchestration>,
     snapshot_manager: Arc<SnapshotManager>,
-    /// Cluster-wide bookkeeping for paused sandboxes. With the default `local`
-    /// registry backend every call is a no-op and pause/resume stay node-local.
+    /// Cluster pause bookkeeping; the local backend is a no-op.
     paused: Arc<PausedSandboxCoordinator>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
-    /// What the data-plane wake-up path needs beyond the above: where the
-    /// cluster says a sandbox may be woken, and whether this process wakes them
-    /// itself.
+    /// Placement and wake-site policy for data-plane resume.
     resume_wiring: ResumeWiring,
-    /// Where a template build this process cannot run itself should be sent.
-    ///
-    /// 🔴 `Some` only in `aenv-api`: [`Self::runs_sandbox_runtime`] is true in
-    /// `aenv-node`, and a process that can build a template locally has no
-    /// business picking a node to send one to instead. `None` there is not
-    /// "not configured yet" — it is which binary this is showing through,
-    /// matching the `resume_wiring` field's own `WakeSite::Local`/`Remote`
-    /// split just above.
+    /// Placement for template builds this process cannot run locally.
     node_placement: Option<Arc<dyn NodePlacement>>,
 }
 
 impl ApiImpl {
-    // Six, and each one is a distinct subsystem this surface needs rather
-    // than a parameter that could be folded into another.
-    //
-    // 🔴 It was nine while a `role` sat beside `resume_wiring` and a
-    // `TemplateBuildDriver`/`RootfsImageResolver` pair sat beside the snapshot
-    // manager. The `role` said the same thing as `resume_wiring` — see
-    // [`ResumeWiring::runs_sandboxes_here`] — and a pair that must agree is a
-    // pair that can disagree. The build driver and the image resolver were
-    // taken only by the arms this surface reached when it ran the sandboxes it
-    // answered for, and those arms are gone: `aenv-api` dispatches, and
-    // `aenv-node` answers these routes with 404 (`crate::api::role_gate`) and
-    // does its real work over gRPC instead.
-    //
-    // 🔴 Not seven either: `node_placement` is deliberately not a
-    // constructor parameter — see `with_node_placement` below for why.
     pub fn new(
         orchestrator: Arc<dyn SandboxOrchestration>,
         snapshot_manager: Arc<SnapshotManager>,
@@ -141,54 +102,23 @@ impl ApiImpl {
         }
     }
 
-    /// Wires this process to send a template build somewhere else when it
-    /// cannot run one itself.
-    ///
-    /// 🔴 A builder step and not a ninth constructor argument, on purpose:
-    /// every call site of `new` but `assemble_api`'s has no placement to give
-    /// it. A required argument would have meant editing all of them (and they
-    /// have nothing to do with this feature) to pass `None`, for a value that
-    /// only ever varies for one of them.
+    /// Configures remote placement for template builds.
     pub fn with_node_placement(mut self, node_placement: Arc<dyn NodePlacement>) -> Self {
         self.node_placement = Some(node_placement);
         self
     }
 
-    /// Whether the sandboxes this surface answers for run in *this* process.
-    ///
-    /// 🔴 `aenv-node` answers `true`, `aenv-api` answers `false`, and there is
-    /// no third answer: they are two binaries with two dependency graphs, and
-    /// `aenv-api` does not link a sandbox runtime at all
-    /// (`make check-crate-boundaries`). This is a method rather than a
-    /// compile-time constant only because `ApiImpl` lives in the crate *both*
-    /// of them link; a constant here would be a lie for one of them.
-    ///
-    /// Read off [`ResumeWiring::runs_sandboxes_here`] — see there for why this
-    /// surface no longer carries a second copy of the same fact.
+    /// Whether this process runs the sandboxes represented by this API.
     pub fn runs_sandbox_runtime(&self) -> bool {
         self.resume_wiring.runs_sandboxes_here()
     }
 
-    /// Whether this process answers the user-facing REST surface — the
-    /// `sandboxes`, `snapshots` and `templates` route groups — and decides, on
-    /// its own initiative, that a paused sandbox should be woken.
-    ///
-    /// 🔴 The exact complement of [`Self::runs_sandbox_runtime`], and that is
-    /// a property of there being exactly two halves rather than a coincidence
-    /// worth hiding: a node runs VMs, and deciding that a sandbox should exist,
-    /// be woken or be thrown away is the other half's job. A node that kept
-    /// answering those routes while the API half believed it owned the same
-    /// sandboxes would be a second ledger for one set of machines.
-    ///
-    /// These were two separate predicates while a third, `all`, answered `true`
-    /// to both this and `runs_sandbox_runtime`. No process is both any more.
+    /// Whether this process owns user-facing sandbox decisions.
     pub fn owns_sandboxes(&self) -> bool {
         !self.runs_sandbox_runtime()
     }
 
-    /// Where to send a template build this process cannot run itself, or
-    /// `None` when it can (or, on a misconfigured `aenv-api`, when nobody gave
-    /// it one — see the field's own doc).
+    /// Returns remote template-build placement, if configured.
     pub fn node_placement(&self) -> Option<Arc<dyn NodePlacement>> {
         self.node_placement.as_ref().map(Arc::clone)
     }

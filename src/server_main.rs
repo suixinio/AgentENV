@@ -1,18 +1,6 @@
-//! The part of a server process that is the same on both halves.
+//! Shared HTTP serving and ordered shutdown for API and node binaries.
 //!
-//! # 🔴 One serve loop, two binaries
-//!
-//! `aenv-node` and `aenv-api` assemble completely different things — one boots
-//! microVMs, the other owns the cluster's ledger — but what happens *after*
-//! assembly is identical: bind the HTTP listener, serve until a signal, take
-//! the process down in a fixed order. That order is the one real invariant in
-//! this file (see [`RUNTIME_SHUTDOWN_TIMEOUT`] and
-//! [`Assembly::pg_singleton_tasks`] for the two places it has already been got
-//! wrong), so it lives once, here, rather than once per binary.
-//!
-//! What differs is behind [`Assembly`]: the router, the orchestration surface,
-//! the background tasks, and — for the half that brought up a machine —
-//! whatever [`ProcessRuntime`] it has to stand down.
+//! Assembly differs by binary; listener lifecycle and teardown order remain common.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,73 +14,35 @@ use crate::cfg::AppConfig;
 use crate::observability::ObservabilityReporter;
 use crate::orchestrator::SandboxOrchestration;
 
-/// Whatever a process brought up on the machine it runs on, and has to take
-/// back down before exit.
-///
-/// 🔴 A trait and not a concrete type: the half that runs no sandboxes brings
-/// up no Firecracker pool, no ublk daemon and no P2P endpoint, and must not
-/// link the code that would. `None` on that half is the whole statement.
+/// Machine-local process runtime that must be shut down before exit.
 #[async_trait::async_trait]
 pub trait ProcessRuntime: Send {
     async fn shutdown(self: Box<Self>);
 }
 
-/// What an assembled binary hands back to `main`: the router it serves and the
-/// four things the shutdown path has to stand down, in that order.
+/// Router and ordered shutdown resources returned by binary assembly.
 pub struct Assembly {
     pub app: axum::Router,
-    /// The orchestration surface this process drives. Which concrete
-    /// `Orchestrator` is behind it is the assembling binary's decision.
+    /// Orchestration surface selected by the assembling binary.
     pub orchestration: Arc<dyn SandboxOrchestration>,
     /// Background tasks to stop before the shutdown pauses start.
     pub upkeep: Vec<tokio::task::JoinHandle<()>>,
-    /// PostgreSQL-elected singleton background tasks (Stage B: the catalog
-    /// build reaper). Kept apart from `upkeep` deliberately —
-    /// [`LeaderTaskHandle::shutdown`][crate::leader_task::LeaderTaskHandle::shutdown] is `async`, consumes
-    /// `self`, and releases this replica's advisory lock (if it is
-    /// currently leader) before returning; pushing one into `upkeep` and
-    /// letting the shutdown loop `.abort()` it would skip that release
-    /// entirely and strand the lock until the pool itself is torn down.
-    /// Empty in `aenv-node`, which never holds a `[pg]` pool at all.
+    /// PostgreSQL-elected tasks shut down gracefully to release advisory locks.
     pub pg_singleton_tasks: Vec<crate::leader_task::LeaderTaskHandle>,
     /// The heartbeat sender, for a process that reports itself as a machine.
     pub reporter: Option<ObservabilityReporter>,
     /// The machine-local runtime, for a process that brought one up.
     pub runtime: Option<Box<dyn ProcessRuntime>>,
-    /// Whether this process takes itself out of scheduling rotation on
-    /// shutdown and waits for the cluster to notice.
-    ///
-    /// 🔴 `true` in `aenv-node` and `false` in `aenv-api`: only a process that
-    /// can be scheduled *onto* has anything to withdraw. Stated by the
-    /// assembling binary rather than derived from `reporter.is_some()` next to
-    /// it — a node with `observability.enabled = false` has no reporter and
-    /// must still drain, and deriving it would turn that setting into a silent
-    /// "stop draining on shutdown".
+    /// Whether this process withdraws itself from placement during shutdown.
     pub drains_on_shutdown: bool,
-    /// The gRPC surface this process serves alongside the HTTP one, already
-    /// accepting: the task serving it, and the channel that stops it.
-    ///
-    /// 🔴 Already bound by the time this is built. A listener that binds inside
-    /// a spawned task turns "the port is taken" into a task that quietly ended,
-    /// and the process goes on serving HTTP with a gRPC surface nobody can
-    /// reach — which is indistinguishable from a surface nobody is calling.
-    ///
+    /// Already-bound gRPC task and its shutdown sender.
     pub grpc: Option<(tokio::task::JoinHandle<()>, oneshot::Sender<()>)>,
 }
 
-/// Bound for the final `Runtime::shutdown_timeout` call in `main`, below.
-///
-/// 🔴 Deliberately larger than [`NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT`]: by the
-/// time this runs, every shutdown step this file knows to bound has already
-/// run and already had its own timeout, so this bound is what is left over
-/// for whatever *wasn't* individually bounded — a stuck `spawn_blocking`
-/// nothing above reached explicitly. It only needs to be comfortably smaller
-/// than Kubernetes' `terminationGracePeriodSeconds` (observed misconfigured at
-/// 3600s on the cluster this exists for), not tight.
+/// Final Tokio runtime shutdown bound after individually bounded cleanup.
 pub const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Serves `assembly` until a shutdown signal, then takes the process down in
-/// the order the comments below spell out.
+/// Serves until a signal, then tears down assembly in order.
 pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()> {
     let Assembly {
         app,
@@ -105,8 +55,7 @@ pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()>
         grpc,
     } = assembly;
 
-    // Split so the stop signal can travel into the graceful-shutdown closure
-    // while the task stays here to be joined after it.
+    // Separate the gRPC stop signal from the task joined after HTTP shutdown.
     let (grpc_task, grpc_shutdown) = match grpc {
         Some((task, shutdown)) => (Some(task), Some(shutdown)),
         None => (None, None),
@@ -137,15 +86,11 @@ pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()>
                     warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
                 }
             }
-            // Stop reconciling before the shutdown pauses start: those write
-            // paused records these tasks would otherwise be racing to inspect.
+            // Stop reconciliation before shutdown pauses mutate the same records.
             for task in &upkeep {
                 task.abort();
             }
-            // 🔴 Awaited, never `.abort()`-ed — see `Assembly::pg_singleton_tasks`'s
-            // own doc comment: `shutdown()` releases this replica's
-            // PostgreSQL advisory lock if it is currently leader, which an
-            // abort would skip entirely.
+            // Graceful shutdown releases each singleton task's advisory lock.
             for task in pg_singleton_tasks {
                 info!(target: "agentenv", "stopping a pg-elected singleton task before process exit");
                 task.shutdown().await;
@@ -164,17 +109,8 @@ pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()>
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
 
-            // Take the node out of rotation before tearing anything down, and
-            // give the scheduler time to hear about it. Without this pause a
-            // sandbox can be placed here in the moments after the signal and be
-            // paused again before the caller has finished starting it.
-            //
-            // Isolation set through the admin API is left alone: it is already
-            // the state we want, and re-announcing it would reset the timestamp
-            // an operator is watching.
-            //
-            // 🔴 Only a process that can be scheduled onto has anything to
-            // withdraw; an API replica is not a placement target.
+            // Withdraw schedulable nodes before teardown and allow propagation.
+            // Preserve pre-existing operator isolation timestamps.
             if drains_on_shutdown && drain_orchestration.set_scheduling_disabled(true) {
                 info!(
                     target: "agentenv",
@@ -186,9 +122,7 @@ pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()>
                 }
             }
 
-            // Stops accepting on the second listener at the same moment the
-            // HTTP one stops: both carry work that the teardown below is about
-            // to make impossible to finish.
+            // Stop accepting gRPC work before teardown makes it impossible.
             if let Some(shutdown) = grpc_shutdown {
                 let _ = shutdown.send(());
             }
@@ -208,14 +142,7 @@ pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Binds a gRPC listener and spawns the server that answers on it.
-///
-/// 🔴 The bind happens here, in the assembly, and not inside the spawned task.
-/// A `serve(addr, ..)` that binds inside its own future turns "the port is
-/// already in use" into a task that ended: the process goes on serving HTTP,
-/// the surface is unreachable, and from the outside that is the same picture as
-/// a surface nobody is calling. See §15.4 ③ — a reading of zero that means two
-/// different things.
+/// Binds before spawning so listener failures remain startup failures.
 pub async fn spawn_grpc_surface<F, Fut>(
     addr: &str,
     surface: &'static str,
@@ -238,9 +165,7 @@ where
     );
     let task = tokio::spawn(async move {
         if let Err(err) = serving.await {
-            // 🔴 `error`, not `warn`. Reaching here means the surface stopped
-            // answering while the process kept running, which is the state this
-            // whole arrangement exists to make impossible to reach quietly.
+            // A serving task stopping while the process runs is an error.
             tracing::error!(
                 target: "agentenv",
                 surface,
@@ -253,10 +178,7 @@ where
     Ok((task, shutdown_tx))
 }
 
-/// The stop signal a gRPC surface waits on.
-///
-/// Boxed so that [`spawn_grpc_surface`] can hand the same concrete type to
-/// every `serve_on`, each of which takes an opaque `impl Future`.
+/// Boxed stop signal accepted by every gRPC `serve_on` implementation.
 pub type GrpcShutdown = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 pub async fn shutdown_signal() {

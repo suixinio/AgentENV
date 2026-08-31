@@ -1,19 +1,4 @@
 //! The node-local, resolved view of a committed snapshot.
-//!
-//! # 🔴 Why this is not part of `crate::snapshot`
-//!
-//! `crate::snapshot` is the catalog model: rows, layers, aliases, publication
-//! metadata — data every role reads, including the one that runs no sandbox.
-//! The types here are the other half: what a snapshot looks like *after* a node
-//! has downloaded its bytes, materialized overlaybd image configs and taken a
-//! lease over them. They are node-only by construction — since `aenv-api`
-//! stopped resolving snapshots into local bytes, the api half never builds one.
-//!
-//! They lived in `crate::snapshot::types` next to the catalog model, which is
-//! why `crate::sandbox` had to reach into `crate::snapshot` to name the input
-//! its factories take. Splitting them into their own module is what lets the
-//! two halves land in different crates later: a crate boundary can move a
-//! module, not half a file.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -30,11 +15,7 @@ use crate::types::{ExtraDrive, FirecrackerSnapshotManifest, SandboxResources};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 /// Attached-drive state resolved into local runtime inputs for the current node.
 pub enum ResolvedAttachedDrive {
-    /// Node-local OverlayBD drive runtime input.
-    ///
-    /// These absolute paths are valid only on the current node after repository
-    /// resolution. They must not be persisted directly in committed snapshot
-    /// metadata.
+    /// Node-local OverlayBD input whose paths must never enter committed metadata.
     Overlaybd {
         drive_id: String,
         image_config_path: PathBuf,

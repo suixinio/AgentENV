@@ -14,17 +14,6 @@ pub mod orchestrator;
 pub mod p2p;
 pub mod privileges;
 pub mod proto;
-/// 🔴 Test-only, and `cfg(test)` rather than `cfg(any(test, feature =
-/// "test-support"))`.
-///
-/// The three consumers — `orchestrator::store::redis::harness`,
-/// `binding_store::redis::harness`, `node_registry::redis::harness` — are all
-/// `cfg(test)` modules of *this* crate, so `cfg(test)` reaches every one of
-/// them. `test-support` exists for the other case: scaffolding this crate's
-/// *siblings* need (`aenv-node`, `aenv-api`), compiled without this crate's
-/// `cfg(test)`. No sibling spawns a `redis-server`, and putting one behind
-/// that feature would compile a process spawner into their dev builds for no
-/// consumer.
 #[cfg(test)]
 mod redis_test_server;
 pub mod runtime_snapshot;

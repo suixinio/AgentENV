@@ -1,20 +1,7 @@
-//! The gRPC surface the API half serves.
+//! API-half gRPC services.
 //!
-//! Two services share this one listener, always: the data plane's cold path
-//! (see [`resume`] and `services/api/proto/apiproxy/apiproxy.proto` for the
-//! contract) and api's own node-registry heartbeat-receiving plane (task's
-//! own "D5" — see `crate::node_registry::grpc_service`). One TCP listener,
-//! one port to open in a deployment, two independent-audience gRPC services
-//! multiplexed by HTTP/2 path — the same way any two tonic services share a
-//! `Server::builder()`.
-//!
-//! # 🔴 Served by `aenv-api`, and by nothing else
-//!
-//! `assemble_api` binds [`serve_on`] on `[cluster].api_grpc_addr`. `aenv-node`
-//! opens no such listener, and there is no longer a second place the wake-up
-//! decision could be taken: `try_auto_resume`, which took it on the local
-//! reverse proxy's own request path before the split, is deleted. This service
-//! is how the data plane asks for a wake-up, and the only how.
+//! One listener serves data-plane resume requests and node-registry heartbeats;
+//! only `aenv-api` exposes it.
 
 mod resume;
 
@@ -40,21 +27,8 @@ where
     SandboxResumeServiceServer::new(SandboxResumeService::new(api_impl))
 }
 
-/// Serves the wake-up surface and api's node-registry heartbeat plane
-/// together, on a listener somebody else bound, until `shutdown` resolves.
-///
-/// 🔴 A separate listener from the HTTP one, for the same reason the node
-/// service is: the two have different audiences. This one is spoken to only
-/// by the gateway's cold path and by nodes' dual heartbeat, and a deployment
-/// has to be able to expose them differently — the HTTP port carries user
-/// traffic, this one carries a decision.
-///
-/// 🔴 The listener is bound by the caller; see `crate::node_server::serve_on`
-/// for why the bind belongs to the assembly and not to a spawned task. It
-/// matters more here than there: this surface is the *only* way the gateway's
-/// cold path can wake a paused sandbox, and a replica that came up without it
-/// answers every wake-up with a connection refused that the gateway reads as a
-/// control plane that is merely slow.
+/// Serves wake-up and node-registry heartbeat services on a caller-bound
+/// listener until `shutdown` resolves.
 pub async fn serve_on<I>(
     listener: tokio::net::TcpListener,
     api_impl: I,

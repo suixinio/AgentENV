@@ -183,13 +183,7 @@ impl Templates<()> for ApiImpl {
             ));
         }
 
-        // 🔴 Every row. This is the template surface's name lookup — `aenv`
-        // turns every id-or-name argument into a call to it — and a template
-        // is `waiting` from creation until its first build commits. Resolving
-        // it only when it is `ready` means a template cannot be watched,
-        // deleted or built by the name it was created with. Nothing here
-        // launches anything: the id it returns still has to pass the
-        // resolvable read on the launch path.
+        // Template-management lookups include non-ready lifecycle states.
         match self
             .snapshot_manager
             .resolve_alias_scoped(&path_params.alias, CatalogReadScope::AnyStatus)
@@ -212,15 +206,7 @@ impl Templates<()> for ApiImpl {
         }
     }
 
-    /// 🔴 Paginated as of this batch, where it never was.
-    ///
-    /// It is the deprecated listing, and it was also the only one that read the
-    /// whole catalog with nothing bounding it — so on a large catalog it is the
-    /// first endpoint to fall over, while the acceptance criterion everyone
-    /// watches is on `GET /snapshots`. Both parameters are optional and the
-    /// header only appears when there is another page, so a client that ignores
-    /// all three still gets a valid response; what it no longer gets is every
-    /// row.
+    /// Lists a bounded page of templates across all lifecycle states.
     async fn templates_get(
         &self,
         _method: &Method,
@@ -331,11 +317,7 @@ impl Templates<()> for ApiImpl {
             );
         }
 
-        // 🔴 Every row, and this endpoint above all others. Its whole job is
-        // to report `waiting`, `building` and `error` — the three the
-        // resolvable reading hides — so at that scope it answered 404 for
-        // every build that had not finished, which is every build a caller
-        // polls it about.
+        // Build-status reads include every template lifecycle state.
         match self
             .snapshot_manager
             .get_scoped(&path_params.template_id, CatalogReadScope::AnyStatus)
@@ -385,9 +367,7 @@ impl Templates<()> for ApiImpl {
         path_params: &models::TemplatesTemplateIdGetPathParams,
         query_params: &models::TemplatesTemplateIdGetQueryParams,
     ) -> Result<TemplatesTemplateIdGetResponse, ()> {
-        // 🔴 Every row: the response carries the build's status and error
-        // reason, so the states this must show are exactly the ones the
-        // resolvable reading refuses to return.
+        // Template detail includes waiting, building, and error records.
         let record = match self
             .snapshot_manager
             .get_scoped(&path_params.template_id, CatalogReadScope::AnyStatus)
@@ -497,30 +477,7 @@ impl Templates<()> for ApiImpl {
         path_params: &models::V2TemplatesTemplateIdBuildsBuildIdPostPathParams,
         body: &models::TemplateBuildStartV2,
     ) -> Result<V2TemplatesTemplateIdBuildsBuildIdPostResponse, ()> {
-        // 🔴 First, before the request is read at all, because the answer does
-        // not depend on the request. A build drives a real Firecracker VM from
-        // `TemplateBuildRunner`, outside the orchestrator and therefore outside
-        // everything else the split made remote — but unlike a cold create,
-        // this one *can* be forwarded: `TemplateBuildRunner` is ordinary Rust
-        // that runs wherever it is called, and a node has `/dev/kvm`, `regctl`
-        // and a Firecracker binary even when this process does not. So this
-        // half does not refuse here — it dispatches to a node instead
-        // (`run_the_build_on_a_node`, below). What is refused is the one
-        // configuration that can do nothing at all: no node placement to send
-        // the build to, which today only happens if `assemble_api` is ever
-        // changed to construct an `ApiImpl` without one.
-        //
-        // 🔴 This condition used to also spare a process that could run the
-        // build itself (`!self.runs_sandbox_runtime() && ...`). That half of it
-        // is gone with `run_the_build_locally`: there is no local arm left to
-        // spare, and a build with nowhere to dispatch is refused whichever
-        // binary is asked. The refusal itself is deliberately *not* dropped —
-        // see below for what it costs to admit a build nothing will run.
-        //
-        // Refusing here is not a smaller version of running it elsewhere. It is
-        // the whole difference between an answer the caller gets and an answer
-        // only a log has. Nothing has been mutated at this point, so the
-        // template row is left exactly as it was found, in `waiting`.
+        // Refuse before admission only when no node placement can run the build.
         if self.node_placement().is_none() {
             warn!(
                 template_id = %path_params.template_id,
@@ -528,13 +485,7 @@ impl Templates<()> for ApiImpl {
                  the build to"
             );
             return Ok(v2_start_build_error(Self::error(
-                // 🔴 500 because it is the only code this operation declares
-                // that means "this server, not your request"
-                // (`src/api/openapi.yml`: 202/400/401/404/500). 501 and 503 say
-                // it better and neither is in the schema, and inventing one
-                // here would mean a body whose `code` and whose HTTP status
-                // disagree — `v2_start_build_error` maps anything unrecognised
-                // to 500 regardless.
+                // The schema's server-side failure response is 500.
                 500,
                 "template builds are not available on this replica: it runs no sandbox runtime \
                  of its own and has no node placement source configured to forward the build to. \
@@ -558,11 +509,7 @@ impl Templates<()> for ApiImpl {
                 )));
             }
         };
-        // 🔴 Every row, and the name of the binding says why: the record this
-        // reads is *pending*. A template is `waiting` until a build commits,
-        // and this is the call that starts that build — so at the resolvable
-        // scope it 404s on the one state it is guaranteed to find, and the
-        // template can never leave `waiting`.
+        // Admission must read the pending, non-resolvable template row.
         let pending_record = match self
             .snapshot_manager
             .get_scoped(&path_params.template_id, CatalogReadScope::AnyStatus)
@@ -622,9 +569,7 @@ impl Templates<()> for ApiImpl {
         let api = self.clone();
         tokio::spawn(async move {
             info!(build_id = %build_id, "template build started");
-            // 🔴 The build's own id, not the template's. The catalog keys a
-            // build row by it, and they are only equal for a backend that has
-            // no build rows to renew against.
+            // Renew under the admitted build id, which may differ from template id.
             let lease_build_id = started.build_id;
             let lease_api = api.clone();
             let build = run_the_build_on_a_node(api, build_id, base_source, spec);
@@ -635,14 +580,7 @@ impl Templates<()> for ApiImpl {
     }
 }
 
-/// Runs a build while telling the catalog this node is still on it.
-///
-/// 🔴 Two things a build needs that the build itself cannot do. The catalog's
-/// reaper ends a build it has not heard from within the heartbeat TTL, so
-/// without the renewals below every build longer than the TTL is taken away
-/// mid-run and its template handed to whoever asks next. And when the lease
-/// *is* lost, the renewal's answer is the only notice this process gets — so it
-/// has to act on it here, because nothing downstream will.
+/// Runs a build while renewing its catalog lease and stops if ownership is lost.
 async fn hold_the_build_lease(
     api: &ApiImpl,
     build_id: &SnapshotId,
@@ -661,13 +599,7 @@ async fn hold_the_build_lease(
     .await
 }
 
-/// [`hold_the_build_lease`] with the renewal passed in.
-///
-/// 🔴 Split out so the decision can be tested without an `ApiImpl` behind it.
-/// What has to be held still here is which of three answers stops a build, and
-/// that is exactly the part a test built around a whole API implementation
-/// cannot reach: the interesting case is a catalog answering `false`, which no
-/// real catalog does on demand.
+/// Testable lease loop with an injected renewal operation.
 async fn hold_a_lease<Renew, Answer>(
     build_id: &SnapshotId,
     interval: std::time::Duration,
@@ -680,12 +612,10 @@ async fn hold_a_lease<Renew, Answer>(
     tokio::pin!(build);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The first tick is immediate; the catalog stamped a heartbeat when it
-    // admitted the build, so there is nothing to say yet.
+    // Admission already stamped the first heartbeat.
     ticker.tick().await;
 
-    // Whether the catalog has ever confirmed this build is ours. See the arm
-    // below that reads it.
+    // A build is only considered established after one confirmed renewal.
     let mut held_once = false;
 
     loop {
@@ -693,15 +623,7 @@ async fn hold_a_lease<Renew, Answer>(
             () = &mut build => return,
             _ = ticker.tick() => match renew().await {
                 Ok(true) => held_once = true,
-                // 🔴 Only once a renewal has succeeded. Before that, "not the
-                // live build" means the catalog has no row for it — which is
-                // what an admission the catalog was unreachable for looks like
-                // until the compensator replays it, and stopping the build over
-                // that would make a scheduler blip destroy work. It cannot hide
-                // a real reaping: the admitting statement stamps a heartbeat,
-                // so a build can only be reaped a full TTL after it starts, by
-                // which time renewals at a third of the TTL have long since
-                // succeeded.
+                // Before first confirmation, a missing row may still be queued for replay.
                 Ok(false) if !held_once => {
                     warn!(
                         build_id = %build_id,
@@ -710,12 +632,7 @@ async fn hold_a_lease<Renew, Answer>(
                     );
                 }
                 Ok(false) => {
-                    // 🔴 Stop, and write nothing. The template this build was
-                    // holding has already been handed to somebody else — the
-                    // reaper freed it and recorded why, or another build now
-                    // owns it — so marking it failed from here would either
-                    // overwrite that reason or fail a build that is not this
-                    // one. Dropping the future is what stops it.
+                    // Lost ownership stops the build without writing over its successor.
                     warn!(
                         build_id = %build_id,
                         "this build's lease is gone: the catalog has handed its template to \
@@ -725,10 +642,7 @@ async fn hold_a_lease<Renew, Answer>(
                     return;
                 }
                 Err(error) => {
-                    // A scheduler nobody can reach is not a reason to throw
-                    // away a build that is running. If the outage outlasts the
-                    // TTL the reaper takes the template and the next renewal
-                    // says so, which is the branch above.
+                    // Temporary renewal outages do not stop a still-owned build.
                     warn!(
                         build_id = %build_id,
                         error = %format_args!("{error:#}"),
@@ -741,35 +655,9 @@ async fn hold_a_lease<Renew, Answer>(
     }
 }
 
-/// Runs a template build: picks a node through `api.node_placement()`, asks it
-/// to run the build (`crate::node_client::build_template_on_a_node`), and
-/// commits what comes back. Every failure ends the same way —
-/// `mark_v2_build_error` on `build_id`, and the template row stays `waiting`
-/// for the reaper to hand to another build if nothing else claims it first.
+/// Dispatches a template build to a selected node and commits the returned staging.
 ///
-/// 🔴 The only arm. A `run_the_build_locally` sibling used to drive
-/// `TemplateBuildRunner` in this process, chosen by
-/// `ApiImpl::runs_sandbox_runtime`; it is deleted. `aenv-api` never took it,
-/// and `aenv-node` never reaches this route at all — `crate::api::role_gate`
-/// answers the user-facing REST surface with 404 there, and a node runs builds
-/// through the gRPC `NodeSandboxService::build_template`, which does not go
-/// through `ApiImpl`.
-///
-/// # 🔴 Alias ownership
-///
-/// The node never applies an alias when it stages this build — see
-/// `TemplateBuildRequest`'s doc in `node.proto`. This is where the alias this
-/// build actually gets is decided: `adopted_build_metadata` builds a
-/// `SnapshotPublishMetadata` carrying `spec`'s own alias, and
-/// `SnapshotManager::publish_captured` -> `stage_captured` -> `adopt_staged`
-/// writes it into `staged.commit.alias` unconditionally, discarding whatever
-/// (nothing) the node wrote there. This is not a new rule invented for
-/// template builds — it is the same rule a published pause capture already
-/// follows (`capture_publish_metadata(metadata, None)` at the node, the real
-/// alias applied by the committer in `stage_for_caller`'s caller), reused
-/// unchanged because the reason is identical: alias names a row in *this
-/// process's* catalog, and only the process that owns the catalog gets to
-/// decide what a row is called.
+/// Alias ownership remains with this catalog-owning process.
 async fn run_the_build_on_a_node(
     api: ApiImpl,
     build_id: SnapshotId,
@@ -777,11 +665,7 @@ async fn run_the_build_on_a_node(
     spec: crate::template::TemplateBuildSpec,
 ) {
     let Some(placement) = api.node_placement() else {
-        // 🔴 Loud rather than silent: there is no local run to fall back to.
-        // See the door refusal in
-        // `v2_templates_template_id_builds_build_id_post`, which is meant to
-        // catch this before a build is ever admitted. Reaching here means that
-        // refusal's premise changed without this arm changing with it.
+        // This should have been refused before admission; fail loudly if reached.
         warn!(
             build_id = %build_id,
             "template build failed: this replica has no node placement source configured"
@@ -873,15 +757,6 @@ async fn run_the_build_on_a_node(
 
 /// Turns a `TemplateBuildSpec` and its base source into the wire request
 /// `NodeSandboxService::build_template` accepts.
-///
-/// 🔴 `Template(alias)` resolves the base's catalog row here, before
-/// dispatch — the read Q3 moved off the node (see
-/// `docs/proposals/_sd-phase4-open-questions-resolved.md` Q3 and
-/// `TemplateBuildRequest.base_snapshot_resolved`'s own doc in node.proto).
-/// Only the row: `api.snapshot_manager.get`, never `load_runnable` — local
-/// artifact resolution belongs to whichever machine boots the build sandbox,
-/// and that machine is the node this request is about to be sent to, not
-/// this replica.
 async fn build_template_wire_request(
     api: &ApiImpl,
     build_id: &SnapshotId,
@@ -941,14 +816,6 @@ async fn build_template_wire_request(
 
 /// A `SnapshotPublishMetadata` for `adopt_staged` to apply over a node-staged
 /// template build.
-///
-/// 🔴 Only two of its fields ever reach `adopt_staged`: `source`, checked
-/// against the row the node staged (both sides are always
-/// `SnapshotPublishSource::Template`, so this check can never fail here the
-/// way it can for a sandbox capture), and `alias`, applied unconditionally.
-/// Everything else is discarded — `adopt_staged` commits the *node's*
-/// richly-populated row, never this one's — so the placeholders below are
-/// never read by anything.
 fn adopted_build_metadata(
     build_id: &SnapshotId,
     alias: Option<SnapshotAlias>,
@@ -981,12 +848,6 @@ mod tests {
 
     const TICK: Duration = Duration::from_secs(100);
 
-    /// A build that runs until told to stop, and says whether it finished.
-    ///
-    /// 🔴 The distinction the lease tests turn on is "did the build get to
-    /// run to the end", so it has to be a distinction the fixture can express
-    /// in both directions. A build future that always completes immediately
-    /// would make every one of these tests pass whatever the loop did.
     async fn a_build(seconds: u64, finished: Arc<AtomicUsize>) {
         tokio::time::sleep(Duration::from_secs(seconds)).await;
         finished.fetch_add(1, Ordering::SeqCst);
@@ -1022,11 +883,6 @@ mod tests {
         );
     }
 
-    /// 🔴 A lease that is gone stops the build. The template has been handed to
-    /// somebody else, and this is the only notice this process gets.
-    ///
-    /// The first renewal has to succeed for the loss to count — see the test
-    /// below — so this one holds the lease once and then loses it.
     #[tokio::test(start_paused = true)]
     async fn a_lost_lease_stops_the_build() {
         let finished = Arc::new(AtomicUsize::new(0));
@@ -1056,17 +912,6 @@ mod tests {
         );
     }
 
-    /// 🔴 A build whose admission the catalog could not take must not be
-    /// stopped by the catalog not knowing about it.
-    ///
-    /// An unreachable catalog leaves the admission queued rather than lost, so
-    /// until the compensator replays it every renewal answers "not the live
-    /// build" — which is the same answer a reaped build gets. Treating them the
-    /// same would make a scheduler blip during admission destroy the build it
-    /// admitted. They are told apart by whether a renewal has ever succeeded,
-    /// and that is safe because the admitting statement stamps a heartbeat: a
-    /// real reaping cannot happen before a full TTL, by which time renewals at
-    /// a third of the TTL have succeeded.
     #[tokio::test(start_paused = true)]
     async fn a_build_the_catalog_has_not_heard_of_yet_keeps_running() {
         let finished = Arc::new(AtomicUsize::new(0));
@@ -1140,21 +985,6 @@ mod tests {
     }
 }
 
-/// 🔴 The template surface, read through a catalog that hides what PostgreSQL
-/// hides.
-///
-/// Every endpoint here is asking about a row that is deliberately *not*
-/// resolvable: a template is `waiting` from the moment it is created until its
-/// first build commits, and the central catalog answers a resolvable read with
-/// `status_group = 'ready'`. Read at that scope the whole surface goes dark —
-/// 404 from the get, absent from both listings, 404 from the build start that
-/// would have moved the row out of `waiting`, and a delete that reports 204
-/// having deleted nothing. That is what a cluster on `read = postgres` did,
-/// and each test below is one of those endpoints.
-///
-/// The double is what makes them fail rather than pass by accident: a catalog
-/// that answered both scopes the same way — every object-store catalog does —
-/// agrees with a handler that asks at the wrong one.
 #[cfg(test)]
 mod template_read_scope_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1234,11 +1064,6 @@ mod template_read_scope_tests {
             Ok((self.visible_at(scope) && names_it).then(|| self.record.clone()))
         }
 
-        /// 🔴 Not hard-coded empty: routed through the scoped listing below at
-        /// the scope an unscoped read means. A `waiting` template is invisible
-        /// at `Resolvable`, so this comes back empty — but it comes back empty
-        /// for the reason the production catalog would, and it starts returning
-        /// the row the moment `visible_at` says it should.
         async fn list_page(
             &self,
             filter: SnapshotListFilter,
@@ -1314,30 +1139,10 @@ mod template_read_scope_tests {
         build_starts: Arc<AtomicUsize>,
     }
 
-    /// The surface every read-scope fixture here uses: one that can dispatch a
-    /// build, so the build route's door refusal is not what they measure.
     async fn surface() -> Surface {
         surface_as(Some(unreachable_placement())).await
     }
 
-    /// The same surface, differing in one value: where this half sends a
-    /// template build, or `None` for the misconfiguration that has nowhere to
-    /// send one.
-    ///
-    /// 🔴 The `ApiImpl` is always the deciding half
-    /// (`ResumeWiring::api_half_for_test`). It used to be a parameter, because
-    /// four user-facing routes forked on `ApiImpl::runs_sandbox_runtime` and
-    /// these fixtures had to drive both arms; those forks are collapsed and
-    /// `aenv-node` answers this whole route group with 404
-    /// (`crate::api::role_gate`), so the running half never reaches any handler
-    /// under test here.
-    ///
-    /// 🔴 The orchestrator takes [`AccessTokenSeedPolicy::MayGenerate`] in
-    /// every case. It is not what the build route reads — the handler asks
-    /// `ApiImpl` — and an `Orchestrator` built with `MustBeConfigured` refuses
-    /// to construct without a configured envd access-token seed, which would
-    /// make the refusing half of these tests fail on the fixture rather than
-    /// on the thing under test.
     async fn surface_as(node_placement: Option<Arc<dyn NodePlacement>>) -> Surface {
         let id = SnapshotId::generate();
         let alias = SnapshotAlias::parse("pending-template").expect("alias parses");
@@ -1345,8 +1150,6 @@ mod template_read_scope_tests {
         let record = SnapshotRecord {
             id: id.clone(),
             alias: Some(alias.clone()),
-            // 🔴 `waiting`, which is every template between its creation and
-            // its first commit — the state the whole defect is about.
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo::waiting(),
             },
@@ -1398,8 +1201,6 @@ mod template_read_scope_tests {
             Vec::new(),
             crate::api::ResumeWiring::api_half_for_test(),
         );
-        // 🔴 A builder step, matching `assemble_api`'s own use of it — see
-        // `ApiImpl::with_node_placement`.
         let api = Arc::new(match node_placement {
             Some(placement) => api.with_node_placement(placement),
             None => api,
@@ -1441,14 +1242,6 @@ mod template_read_scope_tests {
             .expect("the handler answers")
     }
 
-    /// The message a role refusal carries, or `None` when the handler did not
-    /// refuse on the role.
-    ///
-    /// 🔴 The status code alone cannot tell the two apart, and that is a fact
-    /// about the API rather than about this helper: `/v2/templates/{id}/builds/
-    /// {id}` declares 202/400/401/404/500 and nothing else, so the refusal has
-    /// to reuse 500 — which is also what a failed build admission answers. What
-    /// separates them is the text, so the text is what this reads.
     fn role_refusal(response: &V2TemplatesTemplateIdBuildsBuildIdPostResponse) -> Option<&str> {
         match response {
             V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status500_ServerError(error)
@@ -1655,28 +1448,6 @@ mod template_read_scope_tests {
         )))
     }
 
-    /// 🔴 A process with no node to send the build to is refused at the door —
-    /// and the point of this test is that this is the *only* configuration
-    /// that is, which `assemble_api` never produces in production.
-    ///
-    /// Before `run_the_build_on_a_node` existed, `aenv-api` refused
-    /// unconditionally: the 202 would otherwise have gone out, the build would
-    /// have died in a background task with no machine to run it on, and the
-    /// status endpoint would have reported the same generic reason a user's
-    /// broken `RUN` step reports. This is the regression that refusal existed
-    /// to prevent, restated as "still true when there is truly nowhere to
-    /// send the build" rather than "true for `aenv-api` unconditionally".
-    ///
-    /// 🔴 A second arm used to assert that a `ResumeWiring::node_local`
-    /// surface was admitted without a placement, because it could run the
-    /// build in-process. `run_the_build_locally` is deleted — there is no
-    /// in-process arm to be spared by — and its opposite,
-    /// [`an_api_replica_with_a_node_to_send_the_build_to_is_admitted`], is what
-    /// keeps this from passing on a tree that refuses every build.
-    ///
-    /// The discriminator is the admission counter rather than the status
-    /// code, because a refusal and a failed admission are both 500 — only one
-    /// of them got as far as asking the catalog to start a build.
     #[tokio::test]
     async fn a_build_is_refused_only_when_it_can_run_nowhere_at_all() {
         let s = surface_as(None).await;
@@ -1701,12 +1472,6 @@ mod template_read_scope_tests {
         );
     }
 
-    /// 🔴 The regression guard for the gap this whole feature closes:
-    /// a replica given a node to send the build to is admitted, not refused the
-    /// way `aenv-api` always was before `run_the_build_on_a_node` existed.
-    /// Turning the door's condition back into an unconditional refusal turns
-    /// this assertion red — every build would be refused regardless of whether
-    /// there is somewhere to send one.
     #[tokio::test]
     async fn an_api_replica_with_a_node_to_send_the_build_to_is_admitted() {
         let s = surface_as(Some(unreachable_placement())).await;
@@ -1723,26 +1488,6 @@ mod template_read_scope_tests {
         );
     }
 
-    /// 🔴 The requirement this feature's build lease safety rests on: a node
-    /// this process cannot reach must not leave `run_the_build_on_a_node`'s future
-    /// pending forever. `hold_the_build_lease` only stops renewing once that
-    /// future resolves — see `hold_a_lease`'s tests above, which cover *that*
-    /// half generically against a synthetic build future — so what has to be
-    /// true for a real remote build is that `run_the_build_on_a_node` itself
-    /// resolves when the node cannot be reached. This drives it directly
-    /// against a node nothing is listening on (a dial failure — the fast,
-    /// common shape of "the node is gone"; a node that accepts the
-    /// connection and then dies mid-build is bounded instead by
-    /// `node_client::build`'s HTTP/2 keepalive and call timeout, which is a
-    /// property of those constants rather than something a fast unit test
-    /// can observe without waiting them out) and asserts it returns well
-    /// inside a bound a build lease can survive.
-    ///
-    /// Replacing `CONNECT_TIMEOUT`'s use in `build_template_on_a_node` with
-    /// an unbounded `.connect()` — or deleting the `.map_err` that turns a
-    /// dial failure into an `Err` `run_the_build_on_a_node` can act on —
-    /// turns this test red or makes it hang; either way it stops passing
-    /// quietly.
     #[tokio::test]
     async fn a_node_nobody_answers_does_not_hang_the_remote_build() {
         let s = surface_as(Some(unreachable_placement())).await;

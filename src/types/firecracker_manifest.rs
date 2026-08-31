@@ -1,10 +1,4 @@
 //! On-disk layout of a Firecracker snapshot's artifacts.
-//!
-//! 🔴 A leaf on purpose: the sandbox backend writes this manifest and the
-//! snapshot layer reads it back, so it belongs to neither. Living here is what
-//! lets `crate::snapshot` describe a committed snapshot without depending on
-//! `crate::sandbox`. `crate::sandbox` re-exports the type, so its callers see
-//! no change.
 
 use std::path::{Path, PathBuf};
 
@@ -146,9 +140,6 @@ impl FirecrackerSnapshotManifest {
     }
 }
 
-/// 🔴 `#[doc(hidden)]` rather than `#[cfg(test)]`: `sandbox::mock` is compiled
-/// unconditionally now that `aenv-node`'s and `aenv-api`'s own test suites are
-/// in other crates, and this is what its stageable capture is built from.
 #[doc(hidden)]
 impl FirecrackerSnapshotManifest {
     pub fn for_test(

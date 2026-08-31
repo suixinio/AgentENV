@@ -1,9 +1,4 @@
 //! Undoing a source-registry publication.
-//!
-//! 🔴 Split out of `publisher` so the half that owns catalog rows can remove a
-//! snapshot's external publications without linking the half that creates them.
-//! Creating one reads overlaybd layers off local disk; removing one is a
-//! registry `DELETE` against a digest already written down in the row.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,8 +14,7 @@ pub type AcrClientBuilder =
     dyn Fn(&str) -> Result<AcrClient, AcrClientError> + Send + Sync + 'static;
 
 pub struct AcrPublicationRollback {
-    // This mutex only protects the in-memory client map. It is never held across
-    // an await point; client construction happens outside the lock as well.
+    // Never held across an await or client construction.
     clients: Mutex<HashMap<String, AcrClient>>,
     client_builder: Arc<AcrClientBuilder>,
 }
@@ -94,9 +88,7 @@ impl AcrPublicationRollback {
         let mut clients = self.clients.lock().map_err(|_| AcrClientError::Registry {
             message: "ACR client cache lock poisoned".to_string(),
         })?;
-        // Another task may have populated the cache while this task was loading
-        // Docker credentials in spawn_blocking. Prefer the cached client and
-        // discard the duplicate one.
+        // Prefer a client cached while credentials were loading.
         if let Some(existing) = clients.get(&registry) {
             return Ok(existing.clone());
         }

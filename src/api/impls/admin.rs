@@ -54,12 +54,7 @@ impl From<NodeMetricsSnapshot> for models::NodeMetrics {
     }
 }
 
-/// What a node reports about itself.
-///
-/// Only two of the statuses are the node's to claim: it knows whether it has
-/// been taken out of rotation, and otherwise it is serving. CONNECTING and
-/// UNHEALTHY describe how the *scheduler* is getting on with this node, and a
-/// node claiming either would be describing something it cannot observe.
+/// Maps node-observable state to its public status.
 fn node_status(node: &NodeSnapshot) -> models::NodeStatus {
     if node.draining {
         models::NodeStatus::NodeStatusDraining
@@ -70,7 +65,6 @@ fn node_status(node: &NodeSnapshot) -> models::NodeStatus {
 
 impl From<NodeSnapshot> for models::Node {
     fn from(node: NodeSnapshot) -> Self {
-        // Read the status before the fields below move out of `node`.
         let status = node_status(&node);
         models::Node::new(
             node.version,
@@ -188,12 +182,7 @@ impl Admin<()> for ApiImpl {
         Ok(NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(detail))
     }
 
-    /// Takes this node out of rotation, or puts it back.
-    ///
-    /// Only `ready` and `draining` are settable — see `node_status`. Asking for
-    /// one of the derived statuses is answered with 409 rather than quietly
-    /// ignored, so a caller that believes it parked a node never gets that
-    /// belief for free.
+    /// Sets this node to `ready` or `draining`; scheduler-derived statuses return 409.
     async fn nodes_node_id_post(
         &self,
         _method: &Method,
@@ -211,11 +200,7 @@ impl Admin<()> for ApiImpl {
             )));
         };
 
-        // Same check as the GET above, and it matters more here: this request
-        // reached us through a gateway that resolved the node id to an
-        // endpoint, and a routing mistake must not be allowed to park a node
-        // nobody asked about. The cluster may be named in either place; both
-        // have to agree with us.
+        // Both route and optional cluster identities must address this node.
         let cluster_mismatch = query_params
             .cluster_id
             .or(body.cluster_id)
@@ -244,30 +229,9 @@ impl Admin<()> for ApiImpl {
         Ok(NodesNodeIdPostResponse::Status204_TheNodeStatusWasChangedSuccessfully)
     }
 
-    /// Removes one snapshot: its row in every catalog, its alias, its bytes.
+    /// Deletes a snapshot's catalog records, alias, and artifacts.
     ///
-    /// 🔴 An operator lever, and it is here rather than under `snapshots`
-    /// because of what it is for. Every other delete in the tree is a
-    /// consequence — a sandbox being deleted, a pause superseding the snapshot
-    /// it replaces — and nothing reaches a snapshot whose sandbox is already
-    /// gone. Those accumulate, and until now the only way to remove one was a
-    /// `psql` prompt: a row deleted straight out of PostgreSQL leaves the
-    /// artifacts sitting in object storage with nothing naming them, and no
-    /// route left to find them. This goes through the catalog and then removes
-    /// the alias and the bytes.
-    ///
-    /// 🔴 Not wired into anything automatic, and it must not be. The one
-    /// caller in the tree that deletes on its own judgement is a cross-node
-    /// resume dropping a registry row, and giving that path a way to delete
-    /// snapshots as well would turn a mirror that is briefly behind into a
-    /// mirror that destroys the thing it is behind on.
-    ///
-    /// 404 rather than a courteous 204 for a snapshot no catalog holds: the
-    /// repository's delete is idempotent, but an operator who mistypes an id
-    /// should hear that nothing matched instead of being told a snapshot was
-    /// removed. Asked at every status, because a template that never built is
-    /// `waiting` and a failed one is `error`, and a delete that cannot see
-    /// those rows cannot remove them either.
+    /// Missing snapshots return 404, and all snapshot statuses are addressable.
     async fn snapshots_snapshot_id_delete(
         &self,
         _method: &Method,
@@ -295,9 +259,7 @@ impl Admin<()> for ApiImpl {
             }
         };
 
-        // Named before the delete, and at `info`: this is the one place a
-        // snapshot goes away because a person asked, and the record is the only
-        // description of what went with it.
+        // Capture the record in the operator-visible log before deletion.
         info!(
             snapshot_id = %record.id,
             alias = ?record.alias.as_ref().map(ToString::to_string),
@@ -317,13 +279,6 @@ impl Admin<()> for ApiImpl {
     }
 }
 
-/// The operator lever, and the two ways it can be wrong.
-///
-/// 🔴 What it removes is the whole point of it: a row deleted straight out of
-/// PostgreSQL leaves object storage holding a snapshot the database does not,
-/// which is the population divergence the read-side guard refuses a switch
-/// over. So these tests hold it to going through the catalog — where the double
-/// write reaches both stores — and to taking the bytes with it.
 #[cfg(test)]
 mod operator_snapshot_delete_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -357,11 +312,9 @@ mod operator_snapshot_delete_tests {
         TemplateBuildErrorReason, TemplateBuildInfo,
     };
 
-    /// One row, and a note of what was asked to be deleted.
+    /// Catalog fixture holding one row and recording complete records passed to delete.
     struct OneRowCatalog {
         record: SnapshotRecord,
-        /// The records `delete_record` was handed, whole — the alias travels on
-        /// the record, and unbinding it is what frees the name.
         deleted: Arc<Mutex<Vec<SnapshotRecord>>>,
     }
 
@@ -379,8 +332,7 @@ mod operator_snapshot_delete_tests {
         }
 
         async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-            // Resolvable: a `waiting` template is not one of these, which is
-            // exactly what the scope below has to see past.
+            // Resolvable reads exclude unfinished template records.
             Ok(self
                 .names_it(id_or_alias)
                 .then(|| self.record.clone())
@@ -398,10 +350,7 @@ mod operator_snapshot_delete_tests {
             self.get(id_or_alias).await
         }
 
-        /// 🔴 Empty on purpose, and not because the catalog is: this double
-        /// holds one row and answers `get`/`get_scoped` with it. The admin
-        /// surfaces under test read snapshots by id and never list, so a
-        /// listing that started returning the row would be asserting nothing.
+        /// Listing is unused by this fixture and intentionally empty.
         async fn list_page(
             &self,
             _filter: SnapshotListFilter,
@@ -444,7 +393,6 @@ mod operator_snapshot_delete_tests {
         }
     }
 
-    /// Counts the one call that removes bytes.
     #[derive(Default)]
     struct CountingArtifacts {
         deletes: Arc<AtomicUsize>,
@@ -477,8 +425,7 @@ mod operator_snapshot_delete_tests {
         artifact_deletes: Arc<AtomicUsize>,
     }
 
-    /// A surface holding one snapshot. `committed` picks whether it is a
-    /// finished sandbox snapshot or a template that has never been built.
+    /// Builds a surface holding one committed or waiting snapshot.
     async fn surface(committed: bool) -> Surface {
         let id = SnapshotId::generate();
         let alias = SnapshotAlias::parse("an-orphan").expect("alias parses");
@@ -544,9 +491,6 @@ mod operator_snapshot_delete_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 `node_local`, i.e. the `aenv-node` half: these fixtures
-            // predate the split and assert the behaviour of a process that
-            // runs the sandboxes it answers for.
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ));
 
@@ -570,10 +514,6 @@ mod operator_snapshot_delete_tests {
         .expect("the handler answers")
     }
 
-    /// 🔴 The gap this closes. `DELETE /snapshots/{id}` answered 405, and the
-    /// only remaining way to remove an orphaned snapshot was a `psql` prompt —
-    /// which removes it from one catalog and manufactures the divergence the
-    /// read-side guard exists to detect.
     #[tokio::test]
     async fn an_orphaned_snapshot_can_be_deleted_through_the_api() {
         let s = surface(true).await;
@@ -608,7 +548,6 @@ mod operator_snapshot_delete_tests {
         );
     }
 
-    /// A snapshot no catalog holds is not something that was just deleted.
     #[tokio::test]
     async fn deleting_a_snapshot_nothing_holds_is_a_404() {
         let s = surface(true).await;
@@ -634,10 +573,6 @@ mod operator_snapshot_delete_tests {
         );
     }
 
-    /// 🔴 Every status, not the resolvable ones. A template that has never
-    /// built is `waiting` and a failed one is `error`; read at the resolvable
-    /// scope both are absent, and the lever would answer 404 over rows that are
-    /// sitting right there — which is the same defect `/templates/{id}` had.
     #[tokio::test]
     async fn a_template_that_has_never_been_built_can_still_be_deleted() {
         let s = surface(false).await;

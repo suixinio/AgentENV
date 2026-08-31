@@ -16,18 +16,7 @@ use super::{
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::types::FirecrackerSnapshotManifest;
 
-/// Test double for catalog interactions that should stay unreachable.
-///
-/// `get_calls` — see [`Self::get_calls`] — is what
-/// `node_server::tests`'s fallback/skip pairs assert on rather than matching
-/// on this catalog's and [`MockSnapshotRuntimeResolver`]'s differently-worded
-/// refusals: a string match cannot tell "the catalog was consulted and
-/// refused" from "the catalog was never asked" once the wording changes (for
-/// instance, when `aenv-node` stops holding a catalog at all and the
-/// refusal becomes something like "no catalog access on `aenv-node`" —
-/// still containing the substring "catalog"), while a call count goes to
-/// zero the moment nothing calls [`Self::get`] any more, whatever the
-/// message says.
+/// Refusing catalog test double that records whether reads were attempted.
 #[derive(Debug, Default)]
 pub struct MockSnapshotCatalog {
     get_calls: std::sync::atomic::AtomicUsize,
@@ -132,20 +121,11 @@ impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
     }
 }
 
-/// A catalog and artifact store that accept what they are given, and remember
-/// it.
-///
-/// 🔴 Separate from the refusing doubles above rather than a mode on them. The
-/// refusing pair exists so a test that reaches the repository fails loudly; a
-/// pair that could be switched into accepting would make "the repository was
-/// never called" and "the repository was called and said yes" the same default.
+/// Recording repository test double that accepts stages and commits.
 #[derive(Debug, Default)]
 pub struct RecordingSnapshotRepository {
-    /// Snapshot ids `stage` was asked to write bytes for, in order.
     staged: std::sync::Mutex<Vec<SnapshotId>>,
-    /// Commits announced, in order: id and the alias each was bound under.
     committed: std::sync::Mutex<Vec<(SnapshotId, Option<String>)>>,
-    /// When set, staging refuses. Committing is unaffected.
     staging_fails: std::sync::atomic::AtomicBool,
 }
 
@@ -239,9 +219,6 @@ impl SnapshotCatalog for RecordingSnapshotRepository {
         Ok(None)
     }
 
-    /// Holds no rows at all — it records commits and answers reads with
-    /// nothing — so every page of its listing is empty and there is never a
-    /// next one.
     async fn list_page(&self, _filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
         Ok(SnapshotListPage::single(Vec::new()))
     }
@@ -287,11 +264,7 @@ pub fn mock_snapshot_manager() -> SnapshotManager {
     mock_snapshot_manager_with_catalog().0
 }
 
-/// [`mock_snapshot_manager`], but also hands back the concrete
-/// [`MockSnapshotCatalog`] instance it wired in — for tests that need to
-/// read [`MockSnapshotCatalog::get_calls`] after driving a request, rather
-/// than inferring whether the catalog was consulted from the wording of
-/// whatever it refused with.
+/// Builds a refusing snapshot manager and returns its concrete catalog.
 pub fn mock_snapshot_manager_with_catalog() -> (SnapshotManager, Arc<MockSnapshotCatalog>) {
     let catalog = Arc::new(MockSnapshotCatalog::default());
     let manager = SnapshotManager::from_parts(
@@ -305,16 +278,7 @@ pub fn mock_snapshot_manager_with_catalog() -> (SnapshotManager, Arc<MockSnapsho
     (manager, catalog)
 }
 
-/// A catalog that answers every read with one committed row, and refuses
-/// every write.
-///
-/// 🔴 Exists to be paired with [`MockSnapshotRuntimeResolver`] by
-/// [`unresolvable_snapshot_manager`], and the pairing is the whole point: the
-/// catalog says yes, the resolver says no. Over that manager, a flow that
-/// completes is a flow that never resolved anything — not because a string in
-/// an error message says so, but because resolving would have returned `Err`
-/// and the flow would have failed. See
-/// `MockSnapshotRuntimeResolver::resolve`.
+/// Read-only one-row catalog paired with a refusing runtime resolver.
 pub struct OneRowSnapshotCatalog {
     row: SnapshotRecord,
 }
@@ -333,8 +297,6 @@ impl SnapshotCatalog for OneRowSnapshotCatalog {
         Ok(Some(self.row.clone()))
     }
 
-    /// The one row, paged like any other listing: an explicit `limit: 0` must
-    /// still answer with nothing rather than with the row.
     async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
         Ok(paginate_records(
             vec![self.row.clone()],
@@ -364,19 +326,7 @@ impl SnapshotCatalog for OneRowSnapshotCatalog {
     }
 }
 
-/// A snapshot manager whose catalog holds `row` and whose runtime resolver
-/// refuses every call.
-///
-/// This is the shape of `aenv-api`'s world once it stops resolving: it can
-/// read the catalog, and it has no business turning a row into local bytes.
-///
-/// 🔴 A resolver that refuses, deliberately, rather than the `None` a real
-/// `aenv-api` is now assembled with (see `build_storage_for_role`). This
-/// fixture is handed to `aenv-node` in the same tests, and
-/// for those two the refusal is the *positive* control: they must fail exactly
-/// here, which is what proves they resolved rather than shipped the row. A
-/// `None` would make both roles fail with the same message and the fork would
-/// stop being observable.
+/// Builds a manager whose catalog has `row` and whose runtime resolver refuses.
 pub fn unresolvable_snapshot_manager(row: SnapshotRecord) -> SnapshotManager {
     SnapshotManager::from_parts(
         Arc::new(SnapshotRepository::new(
@@ -438,51 +388,21 @@ pub fn write_mock_built_artifacts(
     Ok((rootfs_lower, memory_lower, manifest))
 }
 
-/// A whole snapshot catalog, in memory.
+/// In-memory snapshot catalog for byte-store and manager tests.
 ///
-/// # 🔴 Why this exists
-///
-/// PostgreSQL is the only snapshot catalog there is, and it lives in
-/// `aenv-api`. A test that wants to exercise the *byte* half — the POSIX and
-/// OSS artifact stores, the runtime resolver, `SnapshotManager`'s
-/// stage/commit/delete flow — still needs a catalog behind it to publish
-/// through, and it cannot use the real one: `aenv-node` links no `sqlx`, and
-/// half of these tests live in that crate.
-///
-/// Until the object-storage catalog was deleted those tests used
-/// `PosixFsCatalogStore` as their catalog, incidentally, because it happened to
-/// sit in the same backend. This is the deliberate replacement, and its
-/// semantics are that store's: the alias rules, the `AliasConflict` a rebind
-/// over a live row produces, the build-status transitions, and
-/// `retains_artifacts_on_publish_failure` returning true for an id that is
-/// already committed — which is what stops a failed re-publish from deleting a
-/// live snapshot's bytes.
-///
-/// Not a production type and not a substitute for one: no durability, no
-/// locking beyond one `Mutex`, no cluster.
+/// It mirrors production alias, paging, build-state, and artifact-retention semantics.
 #[derive(Debug, Default)]
 pub struct InMemorySnapshotCatalog {
     rows: std::sync::Mutex<std::collections::HashMap<String, SnapshotRecord>>,
     aliases: std::sync::Mutex<std::collections::HashMap<String, SnapshotId>>,
 }
 
-/// Sorts an already-materialised listing and cuts one page out of it.
-///
-/// 🔴 The in-memory half of [`SnapshotCatalog::list_page`]'s contract, and the
-/// only one left: this used to be `repository::interfaces::paginate_records`,
-/// the body of a trait default that every object-store catalog inherited. Those
-/// catalogs are gone — PostgreSQL pushes the same keyset into SQL — so the
-/// slice survives only for the test doubles here, and it has to keep answering
-/// exactly what the SQL answers or a paging test proves nothing about
-/// production.
+/// Sorts an in-memory listing and returns one production-compatible page.
 fn paginate_records(
     mut records: Vec<SnapshotRecord>,
     limit: u32,
     cursor: Option<&SnapshotCursor>,
 ) -> SnapshotListPage {
-    // 🔴 An explicit request for no rows is answered with no rows and no
-    // cursor. Clamping it up to one would invent a row the caller did not ask
-    // for, and the arithmetic below would underflow on a zero page size.
     if limit == 0 {
         return SnapshotListPage {
             items: Vec::new(),
@@ -510,13 +430,7 @@ fn paginate_records(
 }
 
 impl InMemorySnapshotCatalog {
-    /// Inserts a row exactly as given, bypassing the write rules.
-    ///
-    /// 🔴 For paging tests only. `create`/`publish_commit` stamp
-    /// `created_at_unix_ms` themselves, and the listing order — and therefore
-    /// every page boundary and every cursor — is a function of that column, so
-    /// a test that cannot choose it cannot construct the tie a cursor has to
-    /// break.
+    /// Seeds an exact row, including its paging timestamp, bypassing write rules.
     pub fn seed(&self, record: SnapshotRecord) {
         self.rows
             .lock()
@@ -540,8 +454,6 @@ impl InMemorySnapshotCatalog {
             .unwrap_or(0)
     }
 
-    /// The alias rule both writes share: rebinding a name a *live* row holds is
-    /// a conflict; rebinding one whose row is gone is a stale entry to clear.
     fn claim_alias(
         &self,
         alias: &super::SnapshotAlias,
@@ -732,14 +644,6 @@ impl SnapshotCatalog for InMemorySnapshotCatalog {
             .cloned())
     }
 
-    /// Matches, then sorts, then slices — the in-memory half of the paging
-    /// contract, opposite PostgreSQL's keyset pushdown.
-    ///
-    /// 🔴 This is the only implementation of that contract a unit test can
-    /// reach without a database, so `interfaces`'s paging tests drive it. The
-    /// sort is [`SnapshotCursor::order`] rather than a hand-written comparison
-    /// because a tie inside one millisecond has to break the same way here as
-    /// it does in SQL.
     async fn list_page(&self, filter: SnapshotListFilter) -> RepositoryResult<SnapshotListPage> {
         let records: Vec<SnapshotRecord> = self
             .rows
@@ -844,9 +748,6 @@ impl SnapshotCatalog for InMemorySnapshotCatalog {
         Ok(())
     }
 
-    /// 🔴 True for an id that is already committed, matching the POSIX catalog
-    /// this replaced: a failed re-publish over a live snapshot must not take
-    /// that snapshot's bytes with it.
     async fn retains_artifacts_on_publish_failure(
         &self,
         id: &SnapshotId,

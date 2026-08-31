@@ -1,9 +1,4 @@
 //! What the rest of the system asks of the image layer.
-//!
-//! 🔴 The resolving half — `regctl`, the layer cache and overlaybd — is
-//! `aenv-node`'s `image` module. What is here is the contract every caller
-//! spells, and the error type they classify by. See [`contract`]'s own module
-//! doc for the argument.
 
 mod contract;
 #[cfg(any(test, feature = "test-support"))]

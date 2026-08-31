@@ -1,16 +1,6 @@
-//! What an OSS snapshot store does *without* overlaybd.
+//! Delete-only OSS artifact access for processes without local OverlayBD layers.
 //!
-//! # 🔴 Half a store, on purpose
-//!
-//! Importing a snapshot's bytes means reading overlaybd layer files off local
-//! disk, dense-exporting the sparse ones and uploading them. Only the machine
-//! that captured the snapshot has those files. Deleting them is a prefix delete
-//! against object storage plus a `DELETE` per external registry publication,
-//! both of which need nothing but what the catalog row already says.
-//!
-//! So the store is split where the dependency is. This half is what a process
-//! that never ran a microVM builds; the other half lives in [`super::import`]
-//! and wraps this one.
+//! Importing remains on the node that captured the snapshot.
 
 use std::sync::Arc;
 
@@ -46,7 +36,6 @@ impl OssSnapshotArtifactStore {
 
 #[async_trait]
 impl SnapshotArtifactStore for OssSnapshotArtifactStore {
-    /// 🔴 Refuses, and the refusal is the point. See this module's own doc.
     async fn import_built_artifacts(
         &self,
         _metadata: &SnapshotPublishMetadata,

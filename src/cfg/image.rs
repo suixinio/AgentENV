@@ -77,10 +77,6 @@ pub struct ImageCacheConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct ImageRemoteBlocksCacheConfig {
-    /// 🔴 Settable from the environment for the reason
-    /// [`ImageCacheConfig::capacity_gb`] is: it is one of the three local-disk
-    /// budgets, it is per-machine, and the file it would otherwise be set in is
-    /// overwritten by every `make k8s-apply`.
     #[config(default = 10u32, env = "AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB")]
     pub max_size_gb: u32,
 }

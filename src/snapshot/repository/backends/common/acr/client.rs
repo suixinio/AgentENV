@@ -36,8 +36,7 @@ pub struct AcrClientOptions {
     pub retry_count: usize,
     pub upload_chunk_size: usize,
     pub retry_initial_backoff: Duration,
-    /// 🔴 Test-only, and gated on the feature rather than `cfg(test)` because
-    /// the fake registry that needs it is driven from `aenv-node`'s suite too.
+    /// Available under `test-support` for cross-crate fake-registry tests.
     #[cfg(any(test, feature = "test-support"))]
     pub allow_insecure_http: bool,
 }
@@ -1123,9 +1122,7 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn loads_credentials_from_docker_credential_helper_binary() {
-        // 用仓内 fixture，不在测试里现写一个可执行文件：写文件的线程持有写 fd
-        // 期间，同进程任何线程的 fork 都会把这个 fd 复制进子进程，紧随其后的
-        // execve 就被内核以 ETXTBSY 拒绝。fixture 谁也不写，窗口不存在。
+        // Use the repository fixture to avoid writable descriptors causing `ETXTBSY` after fork.
         let helper = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/docker-credential-helper.sh");
 

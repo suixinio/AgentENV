@@ -1,63 +1,8 @@
-//! One hot-reloadable gRPC channel to the cluster scheduler, shared by every
-//! process-internal consumer that dials it.
+//! Hot-reloadable scheduler channel shared by node-side consumers.
 //!
-//! # Why this exists
-//!
-//! `4456481` gave `ObservabilityReporter` (heartbeats + lifecycle events) the
-//! ability to move its scheduler target by rewriting a file, no pod restart
-//! required — because a DaemonSet roll to change one config value costs an
-//! hour-long, serial `terminationGracePeriodSeconds` wait
-//! (`docs/proposals/2026-08-20-service-decomposition.md`'s phase four
-//! section), and rolling back a phase-4 stage means switching `aenv-api`'s
-//! implementation back to talking to the Go scheduler — an action that must
-//! not itself require a fleet-wide roll.
-//!
-//! That capability lived entirely inside `src/observability/reporter.rs` as a
-//! private `SchedulerChannelSource`, reachable only by the heartbeat loop.
-//! Two other places in this process dial the scheduler the same way — resume
-//! placement and P2P peer discovery — and neither could hot-reload; changing
-//! their target still meant a restart. This module is that type, promoted
-//! and generalized so all three consumers share one implementation and one
-//! behavior.
-//!
-//! 🔴 A fourth consumer, scheduler-backed node placement
-//! (`SchedulerNodePlacement::connect_hot_reloadable`), used to share this
-//! too. It dialled a Go scheduler process that is deleted from the tree (see
-//! "Distributed Control Plane" in the repo's top-level `CLAUDE.md`), and
-//! `SchedulerNodePlacement` went with it — placement is answered entirely
-//! in-process now (`crate::node_client::NativeNodePlacement`) and no longer
-//! dials anything this module would hot-reload.
-//!
-//! # Two lifecycles kept apart
-//!
-//! - **Construction** ([`SchedulerEndpointSource::spawn`]) can fail: an
-//!   invalid *static* endpoint is refused immediately, exactly as every
-//!   consumer's own direct `Endpoint::from_shared` call did before this type
-//!   existed. What a construction failure *means* — hard-fail the process,
-//!   degrade to node-local, degrade to a no-op discovery backend — is each
-//!   consumer's own policy, argued for at its own call site (see
-//!   `src/p2p/discovery/scheduler.rs`'s `from_config`, which degrades to a
-//!   no-op discovery backend where the heartbeat reporter hard-fails). This
-//!   type does not flatten those differences into one answer.
-//! - **Runtime reload** (the background watcher, once running) never fails
-//!   outward. A missing, empty, or unparseable file is logged, metered under
-//!   `component` (see [`SCHEDULER_ENDPOINT_RELOAD_METRIC`]), and the
-//!   previous working channel keeps being handed out. A config-reload
-//!   regression here is dangerous enough on its own — see
-//!   `src/observability/reporter.rs`'s `against_a_scheduler` test module for
-//!   what one looked like on this repository's dev cluster — that this is
-//!   covered by dedicated tests below, not just argued in a comment.
-//!
-//! # No per-call file I/O
-//!
-//! The file, when configured, is re-read by a background task on a fixed
-//! interval — never inside [`current`](SchedulerEndpointSource::current) or
-//! [`channel`](SchedulerEndpointSource::channel), which are cheap
-//! `tokio::sync::watch` reads safe to call on every request. This matters
-//! for the two consumers on a request path (create placement, resume
-//! placement): the heartbeat reporter could afford a `fs::metadata` call per
-//! five-second tick, but that cost turns into a per-request stall for
-//! anything driven by traffic rather than a timer.
+//! Static endpoint errors fail construction. Runtime reload errors keep the
+//! previous channel. A background watcher performs file I/O; request-path reads
+//! use a cheap watch receiver.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
@@ -69,77 +14,25 @@ use tracing::{error, info, warn};
 
 use crate::cfg::{ClusterConfig, ObservabilitySchedulerReportConfig};
 
-/// Metric name for a watcher's file re-read outcome.
-///
-/// Carries two labels: `component` (which of this process's scheduler
-/// dialers this increment belongs to — `"heartbeat"` and `"p2p_discovery"`,
-/// both `aenv-node`'s) and `result` (`switched` / `unchanged` /
-/// `same_value` / `empty_kept_previous` / `invalid_kept_previous` /
-/// `error_kept_previous`). Consumers sharing one counter with no
-/// `component` label would erase which of them reloaded; the extra
-/// cardinality is a couple of values, which is cheap.
-///
-/// 🔴 The label set used to also list `"paused_registry"`,
-/// `"snapshot_catalog"`, `"create_placement"` and `"resume_placement"`.
-/// Each of those dialers has since been deleted — the paused registry and
-/// the snapshot catalog moved onto `[pg]`, create placement onto
-/// `NativeNodePlacement`'s in-process calls, and resume placement onto
-/// `NativePlacementSource`'s (`src/api/impls/resume_surface.rs`) — which is
-/// why nothing in `aenv-api` builds one of these any more.
+/// Scheduler-endpoint reload metric labeled by component and outcome.
 pub const SCHEDULER_ENDPOINT_RELOAD_METRIC: &str = "agentenv_scheduler_endpoint_reload_total";
 
-/// A live `(Channel, endpoint)` pair, optionally kept fresh by a background
-/// file watcher, shared cheaply — `Clone` is an `Arc`-refcount bump via the
-/// underlying `tokio::sync::watch::Receiver` — by every holder.
-///
-/// See the module docs for the split between construction and runtime
-/// reload failure handling.
+/// Shared live channel and its qualified endpoint string.
 #[derive(Clone)]
 pub struct SchedulerEndpointSource {
     rx: watch::Receiver<(Channel, String)>,
 }
 
 impl SchedulerEndpointSource {
-    /// Builds the source from a static endpoint — fails immediately if it
-    /// does not parse, unchanged from every consumer's previous direct
-    /// `Endpoint::from_shared` call — and, if `file_watch` is `Some((path,
-    /// interval))`, spawns a background task that re-reads `path` every
-    /// `interval` and republishes a new channel through
-    /// [`current`](Self::current) — see the struct's docs for why that
-    /// republish can never itself fail outward.
+    /// Builds a static channel and optionally spawns a permanent file watcher.
     ///
-    /// The task runs for the rest of the process's lifetime; nothing here
-    /// stops it, the same as this process's other permanent background
-    /// loops (the heartbeat reporter's own send loop, an unshut-down
-    /// [`crate::pg::spawn_singleton_task`]). When `file_watch` is `None` —
-    /// every deployment that has not opted in — no task is spawned at all,
-    /// and this behaves exactly like a plain `Endpoint::connect_lazy` call:
-    /// no stat, no re-read, ever.
-    ///
-    /// `component` labels every metric this source's watcher emits — see
-    /// [`SCHEDULER_ENDPOINT_RELOAD_METRIC`].
-    ///
-    /// Requires a Tokio runtime context when `file_watch` is `Some` (for the
-    /// spawned task) — the same requirement `Endpoint::connect_lazy` already
-    /// has for every caller of this function today, so this adds no new
-    /// constraint.
+    /// Runtime reload failures retain the last working channel.
     pub fn spawn(
         static_endpoint: String,
         file_watch: Option<(PathBuf, Duration)>,
         component: &'static str,
     ) -> Result<Self> {
-        // 🔴 `build_channel` is the only place this qualifies its input (see
-        // [`qualified`] and `build_channel`'s own doc comment): some of this
-        // type's consumers (for example the P2P discovery backend) pass
-        // their configured endpoint straight through with no scheme handling
-        // of their own, and `http::Uri` happily parses a bare `host:port` as
-        // an *authority-form* URI (`Endpoint::from_shared` returns `Ok`,
-        // `scheme() == None`) — so without that, those consumers would build
-        // a channel that fails every RPC with "invalid URL, scheme is
-        // missing" instead of refusing to start. The qualified string comes
-        // back out of `build_channel` rather than being recomputed here, so
-        // what gets published through `current()` is provably the same
-        // string the channel was built from.
+        // Build and publish the same qualified endpoint string.
         let (channel, static_endpoint) = build_channel(&static_endpoint)?;
         let (tx, rx) = watch::channel((channel, static_endpoint));
 
@@ -150,11 +43,7 @@ impl SchedulerEndpointSource {
         Ok(Self { rx })
     }
 
-    /// [`spawn`](Self::spawn), resolving `file_watch` from
-    /// [`resolve_endpoint_file`], and the watch interval from
-    /// [`ObservabilitySchedulerReportConfig::interval_secs`] — the heartbeat
-    /// cadence, reused rather than given every consumer its own timing knob
-    /// to configure and reason about.
+    /// Spawns using the configured endpoint file and heartbeat cadence.
     pub fn spawn_from_config(
         static_endpoint: String,
         cluster: &ClusterConfig,
@@ -170,26 +59,17 @@ impl SchedulerEndpointSource {
         )
     }
 
-    /// The channel and endpoint to send the next RPC on. Cheap: an
-    /// `Arc`-refcounted channel clone and a `String` clone out of a
-    /// `tokio::sync::watch`, safe to call on every request — no file I/O, no
-    /// lock held across blocking work.
+    /// Returns the current channel and endpoint without file I/O.
     pub fn current(&self) -> (Channel, String) {
         self.rx.borrow().clone()
     }
 
-    /// [`current`](Self::current) without the endpoint string, for the
-    /// consumers that only ever build a typed client over the channel and
-    /// never log or report the endpoint itself.
+    /// Returns the current channel without its endpoint string.
     pub fn channel(&self) -> Channel {
         self.rx.borrow().0.clone()
     }
 
-    /// A source with no file-driven reload — every call to
-    /// [`current`](Self::current) / [`channel`](Self::channel) returns
-    /// `channel` forever. For tests that need a hand-built [`Channel`] (an
-    /// in-process test server, a broken dial target) without going through
-    /// [`spawn`](Self::spawn)'s endpoint-string parsing.
+    /// Test source that permanently returns a prebuilt channel.
     #[cfg(test)]
     pub fn fixed(channel: Channel, endpoint: impl Into<String>) -> Self {
         let (_tx, rx) = watch::channel((channel, endpoint.into()));
@@ -197,23 +77,7 @@ impl SchedulerEndpointSource {
     }
 }
 
-/// Prefixes `http://` onto `endpoint` unless it already names a scheme.
-///
-/// # 🔴 Why this exists
-///
-/// `http::Uri` — what `tonic::transport::Endpoint::from_shared` parses
-/// through — accepts a schemeless `host:port` as a valid *authority-form*
-/// URI. `Endpoint::from_shared("scheduler:9090")` therefore returns `Ok`
-/// with `scheme() == None`: construction succeeds, `connect_lazy()`
-/// succeeds, and the failure only shows up later, on the first RPC, as
-/// `transport error: invalid URL, scheme is missing`. A bare `host:port` is
-/// exactly what a static discovery list, this source's own hot-reload file,
-/// and the scheduler's own `ListNodes`/`Heartbeat` answers commonly carry,
-/// so every path that can end up inside [`build_channel`] has to be
-/// qualified before it gets there — that function is this type's one choke
-/// point, so qualifying inside it (both in [`SchedulerEndpointSource::spawn`]
-/// for the static endpoint and in [`check_and_publish`] for a hot-reloaded
-/// one) is what makes every consumer, and every reload, behave the same way.
+/// Adds `http://` when an endpoint has no URI scheme.
 pub fn qualified(endpoint: &str) -> String {
     if endpoint.contains("://") {
         endpoint.to_string()
@@ -222,17 +86,7 @@ pub fn qualified(endpoint: &str) -> String {
     }
 }
 
-/// Builds a channel from `endpoint`, qualifying it first if it names no
-/// scheme (see [`qualified`]) — the one place, of every caller in this
-/// module, that actually invokes [`Endpoint::from_shared`]. Both
-/// [`SchedulerEndpointSource::spawn`] (the static endpoint) and
-/// [`check_and_publish`] (a hot-reloaded one) route through here rather than
-/// qualifying their own input, so a static endpoint and a file-driven reload
-/// can never disagree about whether a bare `host:port` dials.
-///
-/// Returns the qualified endpoint alongside the channel — callers publish
-/// and log that string rather than re-deriving it, so what `current()` hands
-/// back is provably the same string the channel was actually built from.
+/// Builds a lazy channel from the qualified endpoint and returns both.
 fn build_channel(endpoint: &str) -> Result<(Channel, String)> {
     let raw_endpoint = qualified(endpoint);
     let built = Endpoint::from_shared(raw_endpoint.clone())
@@ -240,19 +94,7 @@ fn build_channel(endpoint: &str) -> Result<(Channel, String)> {
     Ok((built.connect_lazy(), raw_endpoint))
 }
 
-/// Resolves the hot-reload file location from [`ClusterConfig`]'s own
-/// `scheduler_endpoint_file`.
-///
-/// Blank is the same as absent, matching every other optional-endpoint field
-/// in this configuration (`scheduler_endpoint` itself,
-/// `control_plane_token_file`, ...).
-///
-/// 🔴 This used to also fall back to a deprecated
-/// `[observability.scheduler_report].scheduler_endpoint_file` field
-/// (`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE`), removed once every
-/// deployment moved onto this one. The old name is ignored now — the startup
-/// refusal that carried un-migrated manifests through that move has itself
-/// been removed.
+/// Resolves a nonblank scheduler endpoint file from cluster configuration.
 pub fn resolve_endpoint_file(cluster: &ClusterConfig) -> Option<PathBuf> {
     non_blank(&cluster.scheduler_endpoint_file).map(PathBuf::from)
 }
@@ -275,13 +117,9 @@ fn record_reload_metric(component: &'static str, result: &'static str) {
     .increment(1);
 }
 
-/// Local state the background watcher carries between ticks — the file
-/// fingerprint that lets an unchanged file skip a re-read, and the endpoint
-/// currently published, so a rewrite with identical content can be told
-/// apart from an actual change.
+/// File fingerprint and currently published endpoint held by the watcher.
 struct WatcherState {
-    /// Modification time and length of the file content backing `endpoint`.
-    /// `None` until the file has been read successfully at least once.
+    /// File fingerprint after the first successful read.
     fingerprint: Option<(SystemTime, u64)>,
     endpoint: String,
 }
@@ -297,29 +135,21 @@ async fn watch_file(
         endpoint: tx.borrow().1.clone(),
     };
 
-    // Checks immediately, then every `interval` — not interval-first. A
-    // freshly started process should not run on a stale static endpoint for
-    // a whole interval when the file already names the right target.
+    // Check immediately before sleeping for the first interval.
     loop {
         check_and_publish(&path, component, &tx, &mut state);
         tokio::time::sleep(interval).await;
     }
 }
 
-/// One watcher tick: re-reads `path` if its fingerprint has changed, and
-/// publishes a new channel through `tx` on an actual endpoint change.
-/// Mirrors `SchedulerChannelSource::current`'s original per-call logic
-/// exactly, just restructured to publish instead of return.
+/// Publishes a changed, valid endpoint while retaining the last good channel on failure.
 fn check_and_publish(
     path: &std::path::Path,
     component: &'static str,
     tx: &watch::Sender<(Channel, String)>,
     state: &mut WatcherState,
 ) {
-    // Skip the read when the file is byte-for-byte the one already held. A
-    // watcher tick is rare enough that a stat per tick costs nothing, and
-    // this keeps the common case — nobody has touched the file — to exactly
-    // that.
+    // Skip rereading an unchanged file.
     let fingerprint = std::fs::metadata(path)
         .and_then(|meta| Ok((meta.modified()?, meta.len())))
         .ok();
@@ -346,26 +176,11 @@ fn check_and_publish(
                 return;
             }
 
-            // `candidate` is whatever the file said, not yet qualified —
-            // that happens once, inside `build_channel`, which is why this
-            // is built before the same-value comparison below rather than
-            // compared to `state.endpoint` directly: `state.endpoint` always
-            // holds a *qualified* value (see `build_channel`'s doc comment),
-            // and comparing it against a raw `contents.trim()` would make
-            // the fast path below never fire for a deployment whose file
-            // carries a bare `host:port` — every tick would look like a
-            // change and rebuild a channel, even when the file's content
-            // never moved.
+            // Build first so comparison uses the same qualified form as published state.
             match build_channel(candidate) {
                 Ok((channel, qualified_candidate)) => {
                     if qualified_candidate == state.endpoint {
-                        // Same target, different bytes on disk (e.g. a
-                        // rewrite with identical content, or added trailing
-                        // whitespace, or a scheme added/removed that
-                        // `qualified` normalises away). Remember the new
-                        // fingerprint so the next tick takes the fast path
-                        // above, and drop the channel `build_channel` just
-                        // built — nothing downstream needs a second one.
+                        // Remember equivalent rewrites without publishing a duplicate channel.
                         state.fingerprint = fingerprint;
                         record_reload_metric(component, "same_value");
                         return;
@@ -379,24 +194,12 @@ fn check_and_publish(
                     );
                     state.fingerprint = fingerprint;
                     state.endpoint = qualified_candidate.clone();
-                    // 🔴 Ignored on purpose: an `Err` here means every
-                    // receiver — every clone this source ever handed out —
-                    // has been dropped, which only happens once whatever
-                    // owned this source is gone too. The watcher keeps
-                    // running rather than trying to detect that and stop;
-                    // see the module docs on why nothing here has a
-                    // shutdown handle.
+                    // No receivers means the owner is gone; the permanent watcher may continue.
                     let _ = tx.send((channel, qualified_candidate));
                     record_reload_metric(component, "switched");
                 }
                 Err(err) => {
-                    // 🔴 Never fail open, and never fail *closed* either — a
-                    // malformed edit to the ConfigMap must not stop this
-                    // consumer from working. Keep dialling the last endpoint
-                    // that parsed, and do not update the fingerprint: an
-                    // operator fixing the typo produces a new mtime/len,
-                    // which is picked up on the very next tick without
-                    // needing this branch to remember anything.
+                    // Invalid edits retain the last working endpoint and fingerprint.
                     error!(
                         path = %path.display(),
                         component,
@@ -410,11 +213,7 @@ fn check_and_publish(
             }
         }
         Err(err) => {
-            // 🔴 Same "never fail open" rule as `ControlPlaneGate::file_tokens`
-            // and the original `SchedulerChannelSource`: a read error is not
-            // evidence the endpoint changed, it is evidence of nothing at
-            // all, and treating it as "fall back to the static value" would
-            // let a single disk hiccup silently redirect every future call.
+            // Read errors retain the last successfully published endpoint.
             warn!(
                 path = %path.display(),
                 component,
@@ -447,12 +246,6 @@ mod tests {
         }
     }
 
-    /// A bare `host:port` is what `[cluster].scheduler_endpoint` and this
-    /// source's own hot-reload file usually hold, and `http::Uri` parses it
-    /// without complaint as an authority-form URI with no scheme —
-    /// `Endpoint::from_shared` never rejects it, so nothing downstream of
-    /// `qualified` catches the omission either. See [`qualified`]'s doc
-    /// comment for what that costs when it is skipped.
     #[test]
     fn a_scheme_is_added_only_when_one_is_missing() {
         assert_eq!(qualified("scheduler:9090"), "http://scheduler:9090");
@@ -482,10 +275,6 @@ mod tests {
         );
     }
 
-    /// The behaviour this whole slice exists to add: a source with no file
-    /// configured is exactly what every consumer's direct `connect_lazy` call
-    /// did before this type existed, forever — no stat, no re-read, no drift
-    /// from the static endpoint.
     #[tokio::test]
     async fn no_file_watch_never_changes_the_endpoint() {
         let source =
@@ -545,19 +334,6 @@ mod tests {
         wait_for(|| source.current().1 == "http://scheduler-b:9090").await;
     }
 
-    /// 🔴 The regression this guards: `http::Uri` parses a schemeless
-    /// `host:port` as a valid *authority-form* URI, so a hot-reload file
-    /// naming one used to build fine (`Endpoint::from_shared` returns `Ok`)
-    /// and switch the published channel — logging and metering exactly like
-    /// a healthy reload — while every RPC on that channel then failed with
-    /// "invalid URL, scheme is missing". A file carrying a bare `host:port`
-    /// is not a hypothetical: it is what an operator copying the endpoint
-    /// out of the *static* `[cluster].scheduler_endpoint` config (which
-    /// worked, because its callers used to qualify it themselves before
-    /// this type existed) would naturally paste in. This asserts on the
-    /// published endpoint *string*, not just that a channel was returned —
-    /// a scheme-less channel and a qualified one both come back as `Ok`, so
-    /// only the string tells them apart from a test.
     #[tokio::test]
     async fn a_hot_reloaded_bare_host_port_is_qualified_before_it_is_published() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -650,18 +426,11 @@ mod tests {
         .expect("a valid static endpoint builds a source");
         wait_for(|| source.current().1 == "http://scheduler-b:9090").await;
 
-        // A different length as well as different bytes: the fingerprint
-        // this relies on is (mtime, len), and two writes issued back to back
-        // on a filesystem with coarse mtime resolution could otherwise
-        // collide on both — this makes the length alone enough to tell them
-        // apart even if that ever happens.
+        // Change length too so coarse filesystem mtimes cannot hide the edit.
         std::fs::write(&path, "http://scheduler-charlie:9090").expect("second write");
         wait_for(|| source.current().1 == "http://scheduler-charlie:9090").await;
     }
 
-    /// [`SchedulerEndpointSource::fixed`] exists for tests that need to hand
-    /// in an already-built [`Channel`] — an in-process test server, a broken
-    /// dial target — bypassing `spawn`'s endpoint-string parsing entirely.
     #[tokio::test]
     async fn fixed_never_changes() {
         let channel = Endpoint::from_shared("http://fixed:9090".to_string())
@@ -669,8 +438,7 @@ mod tests {
             .connect_lazy();
         let source = SchedulerEndpointSource::fixed(channel, "http://fixed:9090");
         assert_eq!(source.current().1, "http://fixed:9090");
-        // `channel()` is `current()` without the endpoint string; both must
-        // be callable without panicking or ever needing a background task.
+        // Both accessors remain usable without a watcher.
         let _channel = source.channel();
         assert_eq!(source.current().1, "http://fixed:9090");
     }

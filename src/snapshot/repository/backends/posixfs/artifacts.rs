@@ -1,17 +1,6 @@
-//! What a POSIX-filesystem snapshot store does *without* overlaybd.
+//! Delete-only POSIX artifact access for processes without local OverlayBD layers.
 //!
-//! # 🔴 Half a store, on purpose
-//!
-//! Importing a snapshot's bytes means reading overlaybd layer files, dense-
-//! exporting sparse ones and hard-linking managed layers into the shared store.
-//! Only the machine that captured the snapshot can do any of it, and it needs
-//! the overlaybd layer format to do it. Deleting them is `remove_dir_all` on a
-//! directory named by an id.
-//!
-//! So the store is split where the dependency is. This half — rows already
-//! written, bytes already durable, and a snapshot going away — is what a
-//! process that never ran a microVM builds. The other half lives in
-//! [`super::import`] and wraps this one.
+//! Importing remains on the node that captured the snapshot.
 
 use std::fs;
 use std::path::PathBuf;
@@ -45,8 +34,6 @@ impl PosixFsArtifactStore {
         PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
     }
 
-    /// Removes one snapshot's artifact directory. Idempotent; the commit
-    /// marker inside it goes with it.
     fn remove_snapshot_dir(&self, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
         let snapshot_dir = self.committed_layout(snapshot_id).snapshot_dir();
         match fs::remove_dir_all(&snapshot_dir) {
@@ -62,9 +49,6 @@ impl PosixFsArtifactStore {
 
 #[async_trait]
 impl SnapshotArtifactStore for PosixFsArtifactStore {
-    /// 🔴 Refuses, and the refusal is the point. See this module's own doc: a
-    /// process holding only this half has no overlaybd layers to import and no
-    /// code that could read them.
     async fn import_built_artifacts(
         &self,
         _metadata: &SnapshotPublishMetadata,

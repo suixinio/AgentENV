@@ -11,14 +11,7 @@ use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotL
 use crate::snapshot::{SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord};
 use crate::types::FirecrackerSnapshotManifest;
 
-/// The sandbox a publication says it came from, or `None` for a template
-/// build.
-///
-/// 🔴 A borrow of the id and not the whole enum, because the comparison is
-/// between two values built by two different processes from two different
-/// records, and `SnapshotPublishSource` has no `PartialEq` for exactly that
-/// kind of reason — adding one would invite comparisons of variants whose
-/// equality means nothing here.
+/// Returns the source sandbox id, or `None` for template publication.
 fn source_sandbox_id(source: &SnapshotPublishSource) -> Option<&str> {
     match source {
         SnapshotPublishSource::Template => None,
@@ -33,27 +26,14 @@ fn describe_source(source_sandbox_id: Option<&str>) -> String {
     }
 }
 
-/// What a `stage` on this node produced: the value that travels, and the part
-/// that cannot.
-///
-/// 🔴 The split is the whole point. [`StagedSnapshot`] is pure and goes
-/// anywhere; [`LocalSnapshotStaging`] is files on this disk and goes nowhere.
-/// Keeping them in one struct with two accessors — rather than one struct with
-/// a `#[serde(skip)]` field — means a caller that only has the travelling half
-/// cannot accidentally be handed an empty local half that looks valid.
+/// Pure staged value paired with node-local residue that never crosses processes.
 pub struct StagedSnapshotHandle {
     staged: StagedSnapshot,
     local: LocalSnapshotStaging,
 }
 
 impl StagedSnapshotHandle {
-    /// A staging that ran on another machine.
-    ///
-    /// 🔴 The local half is deliberately empty rather than reconstructed. The
-    /// bytes are on the node that staged them and this process has never seen
-    /// them, so there is no manifest to hold and no temporary directory to keep
-    /// alive — and anything that later reaches for one has to find nothing,
-    /// not a plausible-looking value pointing at paths that do not exist here.
+    /// Adopts staging performed on another machine with no local artifact residue.
     fn adopted(staged: StagedSnapshot) -> Self {
         Self {
             staged,
@@ -73,12 +53,7 @@ impl StagedSnapshotHandle {
         (self.staged, self.local)
     }
 
-    /// Whether the bytes behind this staging are on this machine.
-    ///
-    /// 🔴 Asked of the handle rather than inferred from what the advertisement
-    /// did. "Nothing was advertised" is the same observation whether the
-    /// advertisement had nothing to offer or had something and failed to read
-    /// it, and only the first is a property of the staging.
+    /// Whether this process holds the staged bytes.
     pub fn holds_local_bytes(&self) -> bool {
         self.local.manifest.is_some()
     }
@@ -92,22 +67,11 @@ impl StagedSnapshotHandle {
     }
 }
 
-/// The residue a `stage` leaves on the node it ran on.
-///
-/// Only one thing consumes it: the post-commit P2P advertisement, which reads
-/// the manifest's local paths. It is not serialisable and must not become so —
-/// the manifest's paths are all `#[serde(skip)]`, so a serialised copy would
-/// arrive somewhere else looking complete and pointing at nothing.
+/// Node-local residue retained only for post-commit artifact advertisement.
 pub struct LocalSnapshotStaging {
-    /// `None` when the staging ran on another machine.
-    ///
-    /// 🔴 Not "no artifacts": every staged snapshot has a manifest, and the one
-    /// for a remote staging is on the node that wrote it. `None` means *this
-    /// process cannot read the files the manifest names*, which is the only
-    /// thing the one consumer — the P2P advertisement — actually needs to know.
+    /// Manifest readable by this process, absent for remote staging.
     manifest: Option<FirecrackerSnapshotManifest>,
-    /// Holds the capture's temporary artifact directory open. Never read;
-    /// dropping this is what reclaims it.
+    /// Keeps a temporary artifact directory alive until dropped.
     _capture: Option<CapturedSandboxSnapshot>,
 }
 
@@ -121,26 +85,13 @@ pub struct LocalSnapshotStaging {
 /// local image ref pins.
 pub struct SnapshotManager {
     repository: Arc<SnapshotRepository>,
-    /// 🔴 `None` on a role that runs no sandbox runtime — see
-    /// [`AssembledSnapshotBackend::runtime_resolver`][crate::snapshot::repository::backends::AssembledSnapshotBackend].
-    /// [`Self::resolve_runnable`] is the only reader, and it refuses rather
-    /// than unwrapping.
+    /// Optional resolver; absent on processes that run no sandbox runtime.
     runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
     advertiser: Option<Arc<dyn SnapshotArtifactAdvertiser>>,
 }
 
 impl SnapshotManager {
-    /// Builds a manager over an already-assembled backend.
-    ///
-    /// # 🔴 Assembly happens in the process, not here
-    ///
-    /// This used to be `SnapshotManager::new`, which called
-    /// [`build_snapshot_backend`] itself and so needed everything that
-    /// function needs — including an `Option<sqlx::PgPool>` threaded through
-    /// a type that has no business holding one. Each binary now assembles the
-    /// backend its own half is allowed to build and hands the result here:
-    /// `aenv-node` supplies the byte half and no catalog at all, `aenv-api`
-    /// supplies the byte half plus the PostgreSQL catalog it alone can build.
+    /// Builds from a backend assembled by the owning binary.
     pub fn from_assembled(
         assembled: AssembledSnapshotBackend,
         advertiser: Option<Arc<dyn SnapshotArtifactAdvertiser>>,
@@ -198,38 +149,10 @@ impl SnapshotManager {
         self.commit_and_advertise(handle).await
     }
 
-    /// Writes one capture's bytes into durable storage without announcing them.
+    /// Stages a local capture or adopts a value already staged on another node.
     ///
-    /// 🔴 Consumes the capture. The handle it returns owns it from here, which
-    /// is what keeps the temporary artifact directory alive for exactly as long
-    /// as this node still has something to do with it — and no longer.
-    ///
-    /// # 🔴 Two shapes of capture arrive here, and only one of them still needs
-    /// staging
-    ///
-    /// A capture produced by a sandbox running in *this* process is artifacts in
-    /// a temporary directory: nothing about it is durable yet, and `metadata`
-    /// decides where the bytes go — `metadata.id` most of all, because it names
-    /// the directory they are written into.
-    ///
-    /// A capture that arrived from the node holding the sandbox has already been
-    /// staged **there**. Its bytes are durable, under an id that node chose,
-    /// because the id *is* the directory they are already sitting in. There is
-    /// nothing left for `metadata.id` to decide and re-staging is not available
-    /// to this process anyway: it has no files to read.
-    ///
-    /// What the two have in common is the *name*. Staging never reads
-    /// `metadata.alias` — `SnapshotArtifactStore::import_built_artifacts` takes
-    /// the whole of `metadata` and touches only `id` — so the alias is settled
-    /// by the commit either way, and this half imposing it on an adopted row is
-    /// not overriding a decision the staging node made. It is supplying one the
-    /// staging node was never asked for.
-    ///
-    /// # 🔴 Which id won is never hidden
-    ///
-    /// For an adopted staging, `metadata.id` is *not* the id of the snapshot
-    /// this returns. Callers report `record.id` from the commit rather than the
-    /// id they proposed, which is the only reading that is true on both arms.
+    /// The returned handle owns any temporary local capture until later commit
+    /// and advertisement complete.
     #[tracing::instrument(skip(self, metadata, captured_snapshot), fields(snapshot_id = %metadata.id))]
     pub async fn stage_captured(
         &self,
@@ -259,17 +182,7 @@ impl SnapshotManager {
         })
     }
 
-    /// Takes over a staging performed by the node that holds the bytes.
-    ///
-    /// 🔴 One field is checked and the rest are not, and the asymmetry is the
-    /// point. Everything in `metadata` except `source` describes the machine
-    /// that ran the VM — its kernel, its Firecracker, the image configs it
-    /// resolved — and this half has no second opinion about any of it worth
-    /// preferring; the staging node's own record is the one that saw the
-    /// capture happen. `source` is different: it is the sandbox this half asked
-    /// about *by name*, and a staged row naming a different one is an answer to
-    /// a question nobody asked. Committing it would file one sandbox's snapshot
-    /// under another's provenance, which no later read can tell from the truth.
+    /// Adopts remote staging after verifying it answers for the requested source sandbox.
     fn adopt_staged(
         &self,
         metadata: SnapshotPublishMetadata,
@@ -292,8 +205,7 @@ impl SnapshotManager {
         Ok(StagedSnapshotHandle::adopted(staged))
     }
 
-    /// [`Self::stage_captured`] for artifacts that were built rather than
-    /// captured, and so are not held alive by a capture guard.
+    /// Stages built artifacts that need no capture guard.
     #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]
     pub async fn stage(
         &self,
@@ -311,13 +223,7 @@ impl SnapshotManager {
         })
     }
 
-    /// Announces a staged snapshot. The flip, and nothing else.
-    ///
-    /// 🔴 Takes the pure value, not the handle. A caller that has one of these
-    /// and nothing else — which is every caller once `aenv-api` exists — can
-    /// still commit, and that is the property the seam is for. Serialising a
-    /// [`StagedSnapshot`], sending it, and committing it on the far side has to
-    /// work, so nothing here may consult the local half.
+    /// Commits a pure staged value without consulting node-local residue.
     #[tracing::instrument(skip(self, staged), fields(snapshot_id = %staged.commit.id))]
     pub async fn commit_staged(
         &self,
@@ -326,32 +232,10 @@ impl SnapshotManager {
         self.repository.commit_staged(staged).await
     }
 
-    /// Offers a committed snapshot's local bytes to the P2P transport.
-    ///
-    /// 🔴 After the commit, never before: publishing artifacts for a snapshot
-    /// whose row was never written would advertise something no reader can
-    /// resolve, and the convention that P2P only carries committed snapshots is
-    /// what lets a peer treat a hit as authoritative.
-    ///
-    /// 🔴 Node-local, and that is the piece the next phase has to move. It
-    /// reads files, so it can only run where the bytes are — while the commit
-    /// that must precede it will be running somewhere else. A commit performed
-    /// by `aenv-api` therefore needs a way to tell this node it happened;
-    /// until that exists, the two are in the same process and this ordering is
-    /// simply a statement order.
-    /// 🔴 Takes the residue by value, and the capture inside it goes out of
-    /// scope when this returns. A borrow would also have to be `Sync` to be
-    /// held across the awaits below, and the capture is deliberately not — it
-    /// is a `Box<dyn Any + Send>` owned by exactly one place at a time.
+    /// Advertises committed bytes only when this process holds their local manifest.
     pub async fn advertise_committed(&self, record: &SnapshotRecord, local: LocalSnapshotStaging) {
         let Some(manifest) = local.manifest.as_ref() else {
-            // 🔴 Staged on another machine, so there is nothing here to offer.
-            // Advertising it anyway would announce this node as a source for
-            // bytes it has never held, and a peer that took the hint would get
-            // a miss it had been told was a hit. The node that *does* hold them
-            // advertises its own overlaybd layers through the facade in
-            // `src/overlaybd/p2p/`, which is where a remote staging's bytes are
-            // reachable from.
+            // Remote staging has no local files this process can advertise.
             return;
         };
         let Some(advertiser) = self.advertiser.as_ref() else {
@@ -360,7 +244,7 @@ impl SnapshotManager {
         advertiser.advertise(record, manifest).await;
     }
 
-    /// stage -> commit -> advertise, in the one process that can do all three.
+    /// Stages, commits, then advertises in the process holding local bytes.
     pub async fn commit_and_advertise(
         &self,
         handle: StagedSnapshotHandle,
@@ -401,14 +285,7 @@ impl SnapshotManager {
             })
     }
 
-    /// Whether a snapshot's absence is the last word on it.
-    ///
-    /// 🔴 Not [`Self::get_scoped`] answering `None`. That is one store's answer
-    /// at one scope; this is whether anything the node can consult still holds
-    /// the snapshot or still owes a write that would produce it. Ask it only
-    /// where absence is about to destroy something —
-    /// [`SnapshotCatalog::absence_of`](crate::snapshot::repository::SnapshotCatalog::absence_of)
-    /// says why the two questions are not the same one.
+    /// Determines whether absence is settled enough for destructive action.
     pub async fn absence_of(&self, id: &SnapshotId) -> anyhow::Result<SnapshotAbsence> {
         self.repository
             .absence_of(id)
@@ -416,11 +293,7 @@ impl SnapshotManager {
             .with_context(|| format!("settle whether snapshot '{id}' is really gone"))
     }
 
-    /// Lists one page of snapshot records, newest first.
-    ///
-    /// What every listing endpoint calls: the page bounds ride on the filter so
-    /// that a catalog able to push them into its storage does, and one that
-    /// cannot still answers the same page.
+    /// Lists one bounded page of resolvable snapshots, newest first.
     pub async fn list_page(&self, filter: SnapshotListFilter) -> anyhow::Result<SnapshotListPage> {
         self.list_page_scoped(filter, CatalogReadScope::Resolvable)
             .await
@@ -528,10 +401,7 @@ impl SnapshotManager {
         self.repository.try_start_build(id).await
     }
 
-    /// Says this node is still running `build_id`.
-    ///
-    /// 🔴 `false` means the template has been handed to somebody else and this
-    /// build must stop. See [`SnapshotCatalog::renew_build_lease`].
+    /// Renews build ownership; `false` means the builder must stop.
     pub async fn renew_build_lease(
         &self,
         build_id: &SnapshotId,

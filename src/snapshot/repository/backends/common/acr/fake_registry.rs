@@ -1,14 +1,4 @@
-//! A fake OCI registry, and the client that talks to it.
-//!
-//! # 🔴 Not `#[cfg(test)]`, and not shipped either
-//!
-//! `aenv-node`'s `acr::publisher` tests drive this exact fake server: they
-//! publish a snapshot's disk image and then assert what the registry received.
-//! Those tests live in another crate now, where this crate's `cfg(test)` is
-//! off, so the scaffolding cannot be `#[cfg(test)]` — and it must not be
-//! unconditional either, or an axum router full of registry handlers ends up
-//! in the shipped binary. It is behind `feature = "test-support"`, which only
-//! the sibling crates' `[dev-dependencies]` turn on.
+//! Fake OCI registry support for cross-crate tests under `test-support`.
 
 use std::sync::{Arc, Mutex};
 

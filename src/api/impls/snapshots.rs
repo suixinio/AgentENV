@@ -51,12 +51,7 @@ impl Snapshots<()> for ApiImpl {
         _claims: &Self::Claims,
         query_params: &models::SnapshotsGetQueryParams,
     ) -> Result<SnapshotsGetResponse, ()> {
-        // 🔴 No cursor means "start at the newest row", and it is expressed by
-        // its absence rather than by a sentinel at `now`. The sentinel had a
-        // failure only a fast cluster shows: its instant carries nanoseconds
-        // while a row's carries milliseconds, so a snapshot created during the
-        // current millisecond ties with it and loses the id comparison against
-        // the maximum UUID — and falls off the first page it should have led.
+        // Absence starts at the newest row without a timestamp sentinel.
         let cursor = match query_params.next_token.as_deref() {
             Some(token) => match snapshot_cursor_from_token(token) {
                 Ok(cursor) => Some(cursor),
@@ -70,11 +65,7 @@ impl Snapshots<()> for ApiImpl {
             None => None,
         };
 
-        // 🔴 The page bounds travel *with* the filter, and that is the whole
-        // change: a catalog that can push them into its storage does, and one
-        // that cannot answers the same page from a scan. Before this the
-        // listing was read whole and sliced up here, so `?limit=5` cost exactly
-        // what `?limit=100` did.
+        // Catalogs receive page bounds so capable backends can push them down.
         let filter = SnapshotListFilter::sandbox_snapshots(
             query_params.sandbox_id.clone(),
             query_params.name.clone(),

@@ -1,12 +1,5 @@
 //! Attached-drive descriptions shared by the sandbox runtime that materializes
 //! them and the snapshot layer that records them.
-//!
-//! 🔴 This is deliberately a leaf: it names drives and validates the names, and
-//! nothing here touches a block device. The half that does — device creation,
-//! symlinking, rollback — stays in `crate::sandbox::extra_drive`, which is the
-//! only side that needs `overlaybd` and `uvm-ublk-daemon`. Keeping the
-//! vocabulary here is what lets `crate::snapshot` describe a committed drive
-//! without depending on the sandbox runtime.
 
 use std::path::{Path, PathBuf};
 
@@ -25,13 +18,9 @@ pub enum ExtraDrive {
         read_only: bool,
         #[serde(default)]
         mount_path: PathBuf,
-        /// Phase-specific OverlayBD virtual size in bytes.
+        /// OverlayBD virtual size in bytes.
         ///
-        /// During a fresh launch this carries the optional target size requested
-        /// by the API (`attachedDrives[].diskSizeMB`). During snapshot/resume it
-        /// carries the known actual block-device size recorded in snapshot
-        /// metadata. When this is `None`, the ublk daemon resolves the source
-        /// image size while materializing the runtime device.
+        /// `None` lets the node use the source image size.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         virtual_size: Option<u64>,
         /// Optional sub-path inside the drive root to bind-mount onto

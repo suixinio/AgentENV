@@ -1,29 +1,7 @@
-//! The one RPC the data plane asks the control plane for.
+//! Data-plane resume RPC.
 //!
-//! The gateway resolves a sandbox to a node out of its own routing projection.
-//! When that misses, the sandbox is paused, gone, or somewhere the projection
-//! has not caught up with — and only the half that owns sandboxes can tell
-//! which. This service is that question, and the answer is either a node to
-//! forward to or a refusal precise enough to back off on.
-//!
-//! # 🔴 What this is not
-//!
-//! It is not a remote form of the REST resume route. That route serves a user
-//! who asked for a resume and can be told "409, try again"; this one serves a
-//! request that is already in flight towards a sandbox. The difference shows up
-//! in two places, both inherited from the local reverse proxy's deleted
-//! `try_auto_resume` rather than from the REST route:
-//!
-//! - the lifetime the woken sandbox gets is the auto-resume floor, not a
-//!   caller-supplied one;
-//! - the wake-up is bounded by `proxy::auto_resume_deadline()`, and the claim
-//!   is handed back when that bound is hit — a request already in flight cannot
-//!   wait indefinitely, and a claim left behind blocks the next attempt from
-//!   anywhere.
-//!
-//! Everything else is the same path. Both go through
-//! `ApiImpl::arbitrate_resume`, which is the single point a resume can acquire
-//! the right to start.
+//! It returns a node to forward to or a structured refusal. Wake-ups use the
+//! auto-resume lifetime floor and deadline, and share arbitration with REST resume.
 
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -35,18 +13,12 @@ use crate::proto::apiproxy::{
 };
 use crate::types::SandboxId;
 
-/// Reason values that are not pin refusals but still travel in the refusal
-/// trailer, so the gateway has one key to read rather than two.
+/// Trailer reason for an in-progress transition.
 const REASON_TRANSITION_IN_PROGRESS: &str = "transition_in_progress";
 
-/// The sandbox was created with `autoResume` off.
+/// Trailer reason for a sandbox created with `autoResume` disabled.
 ///
-/// 🔴 Travels as a reason on a `FailedPrecondition` rather than as a status
-/// code of its own, because the gateway already reads this trailer to separate
-/// refusals that share a code, and because there is no gRPC code that means
-/// "gone" — the 410 this becomes is decided on the gateway side, from this
-/// string. Keep it in step with `resumeReasonAutoResumeDisabled` in
-/// `services/gateway/internal/metrics.go`, which is a closed set.
+/// Keep synchronized with `resumeReasonAutoResumeDisabled` in the gateway.
 const REASON_AUTO_RESUME_DISABLED: &str = "auto_resume_disabled";
 
 /// Serves [`pb::sandbox_resume_service_server::SandboxResumeService`] out of one
@@ -77,9 +49,7 @@ where
         let envd_access_token = string_metadata(&request, pb::ACCESS_TOKEN_METADATA);
         let sandbox_id = request.into_inner().sandbox_id;
         let Ok(sandbox_id) = SandboxId::parse_str(&sandbox_id) else {
-            // 🔴 InvalidArgument and not NotFound. A malformed id is a caller
-            // bug, and answering "no such sandbox" would tell the gateway to
-            // report a sandbox gone that it never named.
+            // A malformed id is a caller error, not evidence that a sandbox is gone.
             record("invalid_argument");
             return Err(Status::invalid_argument(format!(
                 "'{sandbox_id}' is not a sandbox id"
@@ -123,19 +93,13 @@ where
                     "invalid or missing envd access token",
                 ))
             }
-            // 🔴 The only answer that means "this sandbox is gone". Everything
-            // else on this surface is retryable, because the gateway turns this
-            // one into the 404 the platform reads as "rebuild it from its
-            // template" — which resets a user's workspace.
+            // This is the only outcome that tells the platform the sandbox is gone.
             DataPlaneResume::NotFound => {
                 record("not_found");
                 Err(Status::not_found(format!("sandbox {sandbox_id} not found")))
             }
             DataPlaneResume::AutoResumeDisabled => {
-                // `debug`, not `warn`. A sandbox that declines to wake on
-                // traffic is doing what it was asked to do, and every request
-                // that reaches it while it is paused lands here — so this is
-                // as high-volume as the traffic itself.
+                // Expected, high-volume traffic for sandboxes with auto-resume disabled.
                 debug!(
                     %sandbox_id,
                     "refusing to wake a sandbox created with auto-resume off"
@@ -161,10 +125,7 @@ where
                 origin_node_id,
                 detail,
             } => {
-                // 🔴 Warn, not debug, and this is the line `_sd-recon-env.md`
-                // §8's outstanding item asked for: the scheduler side of the
-                // same refusal has a counter and no log, so an operator
-                // watching a sandbox that will not wake has nothing to grep.
+                // Pin refusals need an operator-visible log as well as a counter.
                 warn!(
                     target: "agentenv",
                     %sandbox_id,
@@ -180,9 +141,7 @@ where
                 record("resource_exhausted");
                 Err(Status::resource_exhausted(reason))
             }
-            // 🔴 Unavailable and never NotFound. "Nobody could be asked" is not
-            // an answer about whether the sandbox exists, and the two have
-            // different consequences all the way down to the user's files.
+            // Failure to decide is not evidence that the sandbox is gone.
             DataPlaneResume::Undecided(reason) => {
                 warn!(
                     target: "agentenv",
@@ -197,12 +156,7 @@ where
                 record("internal");
                 Err(Status::internal(reason))
             }
-            // 🔴 The same status as `Failed` and a different label. §6.3's table
-            // sends everything unclassified to `Internal`, and the local reverse
-            // proxy answered a timed-out auto-resume with the same 502 it gave a
-            // failed one — so answering differently here would make the pre-split single process
-            // and the cold path disagree, which is the one thing the rollback
-            // story cannot afford. The counter is where the two separate.
+            // Timed-out and failed wake-ups share a status but retain distinct metrics.
             DataPlaneResume::TimedOut => {
                 record("timed_out");
                 Err(Status::internal("the wake-up did not finish in time"))
@@ -211,10 +165,7 @@ where
     }
 }
 
-/// A `FailedPrecondition` carrying its reason where the gateway can read it.
-///
-/// See `crate::proto::apiproxy` for why the reason is a trailer and not a
-/// status detail.
+/// Builds a `FailedPrecondition` with refusal metadata consumed by the gateway.
 fn refusal(message: impl Into<String>, reason: &str, origin_node_id: &str) -> Status {
     let mut metadata = tonic::metadata::MetadataMap::new();
     if let Ok(value) = reason.parse() {
@@ -226,8 +177,7 @@ fn refusal(message: impl Into<String>, reason: &str, origin_node_id: &str) -> St
     Status::with_metadata(tonic::Code::FailedPrecondition, message, metadata)
 }
 
-/// The metric label for a pin refusal. Identical to the wire reason on purpose:
-/// one grep joins the gateway's log, this half's log, and the scrape.
+/// Returns the wire reason as the metric label for pin refusals.
 fn pin_result_label(reason: PinRefusalReason) -> &'static str {
     reason.as_str()
 }
@@ -236,12 +186,7 @@ fn record(result: &'static str) {
     metrics::counter!("agentenv_api_resume_grpc_total", "result" => result).increment(1);
 }
 
-/// Publishes every outcome of this service at zero.
-///
-/// 🔴 Called when the service is built, not when it is first used. The
-/// acceptance probe for this whole move compares the gateway's attempt counter
-/// against this one "逐条相等" — and two counters cannot be compared when one
-/// of them does not exist until something goes right.
+/// Initializes every service outcome metric at zero.
 pub fn describe_metrics() {
     for result in [
         "ok",
@@ -263,13 +208,7 @@ pub fn describe_metrics() {
     }
 }
 
-/// The port the data-plane request that triggered this was addressed to.
-///
-/// 🔴 Absent and unparseable are the same answer here, and that answer is
-/// `None`, which [`ApiImpl::resume_for_data_plane`] treats as "possibly envd" —
-/// the strict direction. A caller that could skip the credential check by
-/// sending a port of `banana` would be a hole shaped exactly like the one the
-/// check exists to close.
+/// Parses the request's target port; absent or invalid metadata yields `None`.
 fn target_port_of<T>(request: &Request<T>) -> Option<u16> {
     request
         .metadata()

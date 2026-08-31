@@ -159,16 +159,7 @@ pub fn system_time_from_unix_ms(unix_ms: i64) -> SystemTime {
     }
 }
 
-/// An instant as whole milliseconds, rounded **up**.
-///
-/// 🔴 The direction is the point. Catalog rows carry whole milliseconds and
-/// every token this service mints is rendered from one, so for any token that
-/// came from here this is exact. A token carrying a finer instant did not come
-/// from here, and the two ways of handling it are not symmetric: rounding down
-/// moves the cursor back past rows in the same millisecond that the page before
-/// it already returned, and — because the tie inside a millisecond is broken by
-/// id — those rows are then *excluded* rather than repeated. Rounding up can at
-/// worst repeat a row, which a reader can see. Silently skipping one it cannot.
+/// Converts an instant to whole milliseconds, rounding toward positive infinity.
 fn unix_ms_ceil(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
         Ok(elapsed) => {
@@ -179,22 +170,16 @@ fn unix_ms_ceil(time: SystemTime) -> i64 {
                 ms.saturating_add(1)
             }
         }
-        // Before the epoch, truncating the magnitude toward zero already is the
-        // ceiling of the negative instant.
+        // Truncating a pre-epoch magnitude toward zero is already a ceiling.
         Err(before) => i64::try_from(before.duration().as_millis())
             .unwrap_or(i64::MAX)
             .saturating_neg(),
     }
 }
 
-/// The listing position a client's `nextToken` names.
+/// Decodes the public snapshot-listing token into its catalog cursor.
 ///
-/// 🔴 The token's shape — base64url of an RFC3339 instant, `__`, the id — is
-/// public API, and this is the only place it is read. The catalog never sees
-/// it: it gets the two values, and a remote catalog gets them on the wire as
-/// two fields. That is what keeps a token minted before a read-side switch
-/// readable after one, and it is why the rendering did not move when the
-/// paging did.
+/// The token format must remain stable across catalog backends.
 pub fn snapshot_cursor_from_token(token: &str) -> Result<SnapshotCursor, PaginationError> {
     let parsed = PaginationCursor::<SnapshotId>::parse(token)?;
     Ok(SnapshotCursor::new(
@@ -391,23 +376,10 @@ mod tests {
         assert_eq!(out.next_token, None);
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // The public token, which did not move when the paging did
-    // ─────────────────────────────────────────────────────────────────────
-
     fn snapshot_id(text: &str) -> SnapshotId {
         SnapshotId::parse(text).expect("a fixed snapshot id")
     }
 
-    /// 🔴 The wire format, pinned to the byte.
-    ///
-    /// `x-next-token` is a response header on an OpenAPI endpoint. Changing its
-    /// shape breaks clients holding one, and — worse for this batch — makes the
-    /// read-side rollback lossy, because a token minted while reads came from
-    /// PostgreSQL has to be readable after they come from object storage again.
-    /// The rendering is base64url of `{RFC3339 with nanoseconds}__{id}`, and
-    /// this test exists so that changing it is a decision rather than an
-    /// accident.
     #[test]
     fn the_public_token_is_base64url_of_an_rfc3339_instant_and_the_id() {
         let id = snapshot_id("0198f0a1-0000-7000-8000-0000000c0ffe");
@@ -420,9 +392,6 @@ mod tests {
         );
     }
 
-    /// A token this service minted decodes to exactly the position it named.
-    /// 🔴 Exactly: the instant is carried as whole milliseconds on the wire to
-    /// the catalog, so any rounding at all here would move a page boundary.
     #[test]
     fn a_token_this_service_minted_round_trips_to_the_same_position() {
         let cursor = SnapshotCursor::new(
@@ -436,10 +405,6 @@ mod tests {
         assert_eq!(round_tripped, cursor);
     }
 
-    /// 🔴 A token minted by the build *before* the paging moved into the
-    /// catalog. Written out by hand rather than produced by this code, because
-    /// a round trip through one implementation cannot tell whether the format
-    /// changed underneath it.
     #[test]
     fn a_token_minted_before_the_paging_moved_still_decodes() {
         let token =
@@ -470,14 +435,6 @@ mod tests {
         ));
     }
 
-    /// 🔴 A finer-than-millisecond instant rounds **up**, and the direction is
-    /// load-bearing.
-    ///
-    /// Rounding down moves the cursor back into the millisecond the previous
-    /// page already returned; because the tie inside a millisecond is broken by
-    /// ascending id, the rows there then compare as *already returned* and are
-    /// dropped — a silent skip. Rounding up can at worst repeat a row, which a
-    /// reader can see.
     #[test]
     fn a_sub_millisecond_instant_rounds_up_so_no_row_is_skipped() {
         let exact = UNIX_EPOCH + Duration::from_millis(1_000);
@@ -494,9 +451,6 @@ mod tests {
         );
     }
 
-    /// The control for the rounding above, stated as the behaviour rather than
-    /// the arithmetic: a cursor at a finer instant must still return the rows
-    /// sharing its millisecond that it has not already passed.
     #[test]
     fn a_sub_millisecond_token_does_not_drop_the_rows_it_ties_with() {
         let token =

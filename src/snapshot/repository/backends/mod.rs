@@ -14,79 +14,34 @@ use crate::snapshot::repository::SnapshotRepository;
 pub use catalog_write::{CatalogRefusal, CatalogWrite};
 use posixfs::posixfs_artifacts_only_repository;
 
-/// Whether this process holds a snapshot catalog at all.
-///
-/// 🔴 A parameter and not a compile-time constant because
-/// [`build_snapshot_backend`] is in the crate both binaries link. Each of them
-/// passes one literal: `aenv-api` [`AsConfigured`](CentralCatalogUse::AsConfigured),
-/// `aenv-node` [`Never`](CentralCatalogUse::Never).
+/// Whether this process assembles the shared PostgreSQL catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CentralCatalogUse {
-    /// `aenv-api`: the `PostgresSnapshotCatalog` over the shared `[pg]` pool.
-    ///
-    /// 🔴 Required, not optional. PostgreSQL is the only snapshot catalog there
-    /// is — object storage held one until Stage B's cutover and holds byte
-    /// artifacts alone now — so an api replica assembled without `[pg]` has no
-    /// catalog and can answer no snapshot request. [`build_snapshot_backend`]
-    /// refuses to assemble under this arm rather than starting a process whose
-    /// first snapshot call is the one that discovers it.
+    /// API process with required PostgreSQL catalog.
     AsConfigured,
-    /// `aenv-node`: none, ever.
-    ///
-    /// 🔴 A node queries no catalog at all. Both of its request-time reads
-    /// (`create`'s `Source::Snapshot` arm, `build_template`'s
-    /// `Base::BaseSnapshotRef` arm) are pre-resolved by api and sent down with
-    /// the request, and the row for a snapshot a node captures is written by
-    /// api's `commit_staged` — a node only ever `stage`s the bytes.
-    ///
-    /// The repository this half assembles therefore carries
-    /// [`NoSnapshotCatalog`][crate::snapshot::repository::no_catalog::NoSnapshotCatalog],
-    /// which refuses. It cannot hold the real one: `[pg]` is the deciding
-    /// half's alone, and `aenv-node` does not link `sqlx`
-    /// (`make check-crate-boundaries`).
+    /// Node process with no catalog; catalog operations refuse.
     Never,
 }
 
-/// Everything the snapshot layer needs from storage, assembled.
+/// Assembled repository and optional runtime resolver.
 pub struct AssembledSnapshotBackend {
     pub repository: Arc<SnapshotRepository>,
-    /// 🔴 `None` in the half that runs no sandbox runtime — `aenv-api`.
-    /// Resolving a snapshot is not a lookup: it downloads
-    /// `vm_state.bin` onto this machine's disk, materializes the memory and
-    /// rootfs overlaybd `image.json` files, and leases all of it in this
-    /// process's local artifact cache. An api replica boots nothing, so it
-    /// builds none of that; see [`build_catalog_only_storage`].
+    /// Absent on a process that runs no sandbox runtime.
     pub runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
 }
 
-/// Puts the configured catalog in front of the byte half the caller built.
-///
-/// 🔴 The composition is here rather than inside a backend because it is not a
-/// property of any backend: the rows live in PostgreSQL and the bytes live in
-/// object storage or on a POSIX filesystem, and neither half knows about the
-/// other. That is what the catalog/artifact trait split bought.
+/// Combines caller-built byte storage with the selected catalog policy.
 pub fn build_snapshot_backend(
-    // 🔴 Built by the caller — see [`RoleStorage`]. Which byte half exists at
-    // all is the calling binary's decision, and now its crate's.
+    // Byte storage is assembled by the owning binary.
     storage: RoleStorage,
-    // 🔴 `None` in `aenv-node` always — that binary holds no `[pg]` pool (see
-    // `crates/aenv-node/src/bin/aenv-node.rs::refuse_configured_pg_dsn`, and
-    // the dependency graph it is a belt over). In `aenv-api` this is `None`
-    // only when `[pg].dsn` is unset, which is a misconfiguration this refuses
-    // to start under.
-    //
-    // 🔴 An already-built catalog rather than the `sqlx::PgPool` it comes from:
-    // constructing it is the deciding half's business, and this function is
-    // shared. Build one with
-    // [`pg_snapshot_catalog`][postgres::pg_snapshot_catalog].
+    // PostgreSQL catalog is supplied only by the API process.
     pg: Option<Arc<dyn SnapshotCatalog>>,
     central: CentralCatalogUse,
 ) -> Result<AssembledSnapshotBackend> {
     let (repository, runtime_resolver) = storage;
 
     if central == CentralCatalogUse::Never {
-        // The repository already carries `NoSnapshotCatalog` — see
-        // [`CentralCatalogUse::Never`].
+        // Node storage already carries the refusing no-catalog implementation.
         return Ok(AssembledSnapshotBackend {
             repository,
             runtime_resolver,
@@ -120,43 +75,17 @@ pub fn build_snapshot_backend(
     })
 }
 
-/// The two storage halves an assembly hands [`build_snapshot_backend`]: the
-/// durable repository, and a runtime resolver only for a process that has
-/// somewhere to run a sandbox.
+/// Repository plus optional runtime resolver assembled by the owning binary.
 ///
-/// 🔴 Built by the caller, not here. `aenv-node` builds both halves
-/// ([`build_node_storage`][storage::build_node_storage]); `aenv-api` builds
-/// the first and passes `None` for the second
-/// ([`build_catalog_only_storage`]), because resolving a snapshot is not a
-/// lookup — it downloads `vm_state.bin` onto local disk, materializes the
-/// memory and rootfs overlaybd `image.json` files and leases all of it in a
-/// node-local artifact cache. That machinery, and the overlaybd layer store
-/// it drags in, is not linked into the api binary at all.
-///
-/// 🔴 The `SnapshotRepository` in here carries no usable catalog in either
-/// half — both are assembled over
-/// [`NoSnapshotCatalog`][crate::snapshot::repository::no_catalog::NoSnapshotCatalog].
-/// [`build_snapshot_backend`] is what puts PostgreSQL in front of the api
-/// half's byte store; the node half keeps the refusal.
+/// Both arrive with a refusing catalog until API assembly adds PostgreSQL.
 pub type RoleStorage = (
     Arc<SnapshotRepository>,
     Option<Arc<dyn SnapshotRuntimeResolver>>,
 );
 
-/// The durable byte half — byte *lifecycle*, with nothing that turns bytes into
-/// something a VM can mmap, and no catalog.
+/// Durable artifact lifecycle without runtime materialization or a catalog.
 ///
-/// Both backends already had the seam: POSIX's is
-/// [`posixfs_artifacts_only_repository`], and the OSS one is
-/// [`oss_durable_parts`][oss::oss_durable_parts]. What each of them *doesn't*
-/// build is the resolver, which is the only consumer of the overlaybd layer
-/// store, the shared artifact cache, and the runtime cache root.
-///
-/// 🔴 Delete stays on this side on purpose, and that is why this arm still
-/// gets a real artifact store rather than a stub. A snapshot's origin node can
-/// be gone — hard death, or simply rolled — and a delete that had to be
-/// dispatched there would leave the row removed, the bytes orphaned, and
-/// nobody holding a record of either.
+/// Delete remains available because the origin node may be gone.
 pub fn build_catalog_only_storage(config: &AppConfig) -> Result<RoleStorage> {
     Ok((build_artifacts_only_repository(config)?, None))
 }
@@ -213,11 +142,6 @@ mod tests {
         )
     }
 
-    /// 🔴 The startup error the removal of the object-storage catalog made
-    /// necessary. Before it, an api replica with no `[pg]` assembled happily
-    /// over an object-storage catalog; there is no such catalog any more, so
-    /// the same configuration now has *nothing* behind it, and the failure has
-    /// to be at assembly rather than at the first snapshot request.
     #[test]
     fn the_deciding_half_refuses_to_assemble_without_postgresql() {
         let Err(error) = build_snapshot_backend(storage(), None, CentralCatalogUse::AsConfigured)
@@ -231,21 +155,6 @@ mod tests {
         );
     }
 
-    /// 🔴 And it must not name an environment variable that does not exist.
-    ///
-    /// This message said "Configure [pg] (or AENV_PG_DSN)" for as long as the
-    /// refusal has existed, and nothing reads that name: `AppConfig::pg` is an
-    /// `Option<PgConfig>`, and confique reaches a field from the environment
-    /// only through `#[config(nested)]`, which may not be optional — so no
-    /// field under `[pg]` can carry an `env =` binding at all (see
-    /// `src/cfg.rs`'s own note). An operator who followed it would export the
-    /// variable, restart, and get the identical error back.
-    ///
-    /// The positive half is what makes the negative one actionable, and it is
-    /// deliberately the same three facts `build_pg_pool`'s message carries
-    /// (`crates/aenv-api/src/bin/aenv-api.rs`): the setting is `[pg].dsn`, it
-    /// is TOML-file-only, and it arrives through `AENV_CONFIG_PATH` or an
-    /// `AENV_CONFIG_OVERLAY_PATH` overlay.
     #[test]
     fn the_refusal_names_no_environment_variable_that_does_not_exist() {
         let Err(error) = build_snapshot_backend(storage(), None, CentralCatalogUse::AsConfigured)
@@ -263,14 +172,6 @@ mod tests {
         assert!(rendered.contains("pg-dsn.toml"), "{rendered}");
     }
 
-    /// The other direction: a catalog is handed over, and it is the one the
-    /// repository then reads through.
-    ///
-    /// 🔴 Asserted on `MockSnapshotCatalog::get_calls`, not on the answer: what
-    /// this test is for is *which* catalog the assembly wired in, and a
-    /// returned value would be the same whether the read reached the handed-over
-    /// catalog or the `NoSnapshotCatalog` the byte half arrives carrying. The
-    /// counter can only move if the former happened.
     #[tokio::test]
     async fn the_deciding_half_reads_the_catalog_it_was_handed() {
         let catalog = Arc::new(MockSnapshotCatalog::default());
@@ -295,11 +196,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The node half assembles with no catalog and is not refused for it —
-    /// and what it holds refuses rather than reporting absence. Absence is what
-    /// callers act on by deleting artifacts and refusing resumes; that is the
-    /// failure the object-storage catalog left behind on this half after the
-    /// cutover, and the reason it is an error now.
     #[tokio::test]
     async fn the_running_half_assembles_with_a_catalog_that_refuses() {
         let assembled = build_snapshot_backend(storage(), None, CentralCatalogUse::Never)
@@ -318,8 +214,7 @@ mod tests {
             "a node's catalog read must refuse, never report absence: {error}"
         );
 
-        // The byte half is real on this arm: delete still has to work where
-        // the bytes are.
+        // Node byte storage remains real even though catalog operations refuse.
         let _: Arc<dyn SnapshotArtifactStore> = assembled.repository.artifacts();
     }
 }

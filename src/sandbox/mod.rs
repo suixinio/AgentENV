@@ -39,17 +39,7 @@ pub struct FreshSandboxBuildSpec {
     pub extra_boot_args: Option<String>,
 }
 
-/// One attached drive named by an OCI image reference nobody has resolved
-/// yet.
-///
-/// # 🔴 The unresolved counterpart to [`ExtraDrive::Overlaybd`]
-///
-/// `ExtraDrive` carries an `image_config_path` — a path on the local disk an
-/// `ImageResolver` already wrote. This carries the reference that path would
-/// have come from, because the machine building the request
-/// (`aenv-api`, which has no `regctl`) is not the machine that gets to
-/// resolve it. See [`UnresolvedImageBuildSpec`] and
-/// `SandboxLaunchSource::UnresolvedImage`.
+/// An attached drive whose OCI reference must be resolved on the target node.
 #[derive(Clone, Debug)]
 pub struct UnresolvedAttachedDrive {
     pub image_ref: String,
@@ -57,26 +47,13 @@ pub struct UnresolvedAttachedDrive {
     pub mount_path: PathBuf,
     pub sub_path: Option<PathBuf>,
     pub read_only: bool,
-    /// Already converted to bytes from the REST API's `diskSizeMB`, exactly
-    /// as [`ExtraDrive::Overlaybd::virtual_size`] carries it. `None` when the
-    /// caller named no size, in which case the node that resolves this drive
-    /// falls back to the source image's own size, same as a local cold create
-    /// does today.
+    /// Requested virtual size in bytes.
+    ///
+    /// `None` lets the target node use the source image size.
     pub virtual_size: Option<u64>,
 }
 
-/// A sandbox to build from an OCI image reference nobody has resolved yet.
-///
-/// # 🔴 The unresolved counterpart to [`FreshSandboxBuildSpec`]
-///
-/// `FreshSandboxBuildSpec` is handed to a factory that resolves images
-/// locally and can turn a reference into a local overlaybd path itself. A
-/// factory whose sandboxes run on another machine (`RemoteSandboxBackendFactory`)
-/// cannot do that — resolving an image needs `regctl`, and `aenv-api` has
-/// none — so it needs the reference, not a path, to hand to the machine that
-/// will. `resources` is unaffected: computing the sandbox's CPU/memory/disk
-/// request needs no image, so it is resolved locally either way and travels
-/// here already concrete, exactly like `FreshSandboxBuildSpec::resources`.
+/// A sandbox whose OCI image references must be resolved on the target node.
 #[derive(Clone, Debug)]
 pub struct UnresolvedImageBuildSpec {
     pub image_ref: String,
@@ -109,22 +86,9 @@ pub struct SandboxLaunchConfig {
     /// Runtime-only credential used by envd. The token is never serialized and
     /// its Debug representation is redacted.
     pub envd_access_token: Option<EnvdAccessToken>,
-    /// The control plane's ownership marker for this sandbox, when the
-    /// orchestrator above is one that stamps them.
+    /// Opaque control-plane ownership marker.
     ///
-    /// 🔴 Opaque here, and opaque on the machine it lands on. This layer moves
-    /// the bytes and never reads them — the same contract the node service
-    /// keeps (`crate::orchestrator::ControlPlaneConfig`), which is why the
-    /// field is bytes rather than that type: the sandbox layer has no business
-    /// knowing what a control plane's record looks like, and does not depend
-    /// on the orchestrator for anything else.
-    ///
-    /// 🔴 `None` and `Some(vec![])` are not the same thing anywhere else in
-    /// this system — an empty marker means *not owned*, which is the direction
-    /// that leaves a sandbox alone — so nothing may put an empty vector here.
-    /// The only producer is `ControlPlaneConfig::as_bytes`, which cannot be
-    /// empty by construction, and `Orchestrator::stamp_control_plane_ownership`
-    /// is the only writer.
+    /// `None` means unowned; producers must never emit an empty value.
     pub control_plane_config: Option<Vec<u8>>,
 }
 

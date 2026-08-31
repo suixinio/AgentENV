@@ -15,19 +15,7 @@ struct PendingAttachedDrive {
     image: String,
 }
 
-/// Validates and deduplicates attached drive declarations, without resolving
-/// any of their source images.
-///
-/// # 🔴 Validation without registry access, on purpose
-///
-/// Everything here is pure input validation — drive id shape, mount path
-/// shape, sub-path shape, uniqueness, `diskSizeMB`'s bounds — and needs no
-/// registry access. `sandboxes_cold_post` cannot resolve an image (no
-/// `regctl` on the deciding half), but it can and must still run these checks
-/// before it ever asks a node to: a caller sending a malformed drive should
-/// get a 400 from the machine it talked to, not a registry round trip on
-/// another machine followed by a refusal that says nothing about the request.
-/// See [`unresolved_attached_drives`], this function's caller.
+/// Validates attached-drive input without registry access.
 fn validate_attached_drives(
     drives: &[models::AttachedDrive],
 ) -> Result<Vec<PendingAttachedDrive>, models::Error> {
@@ -99,14 +87,6 @@ fn validate_attached_drives(
 
 /// Validates every attached drive declaration and leaves its image reference
 /// unresolved, for the node that will build the sandbox to resolve instead.
-///
-/// 🔴 The only shape left. A `resolve_attached_drives` sibling used to sit
-/// here, resolving each drive's image through a `RootfsImageResolver` for the
-/// half that ran the sandbox in-process; `sandboxes_cold_post` chose between
-/// the two on `ApiImpl::runs_sandbox_runtime`. That arm is deleted — the
-/// deciding half never took it, and the running half answers this route with
-/// 404 (`crate::api::role_gate`) and creates over gRPC, where
-/// `NodeSandboxService::create` does its own resolution.
 pub fn unresolved_attached_drives(
     drives: &[models::AttachedDrive],
 ) -> Result<Vec<crate::sandbox::UnresolvedAttachedDrive>, models::Error> {
@@ -148,15 +128,6 @@ pub fn virtual_size_from_disk_size_mb(
         })
 }
 
-/// The validation every attached-drive declaration goes through.
-///
-/// 🔴 These moved here from `crates/aenv-node/src/tests/`, where they lived
-/// because they drove a real `ImageResolver` over a fake `regctl` through
-/// `resolve_attached_drives`. That function is deleted with the cold-create
-/// arm that called it; what it and [`unresolved_attached_drives`] shared —
-/// [`validate_attached_drives`], the whole of what these tests ever asserted —
-/// is reached through the surviving one, and needs nothing from the running
-/// half.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,7 +207,7 @@ mod tests {
             .message
             .contains("duplicate attached drive mountPath"));
 
-        // mount_path validation fires before source validation.
+        // Mount-path validation precedes source resolution.
         let invalid_mount = unresolved_attached_drives(&[drive(
             "data",
             source_image("img"),
@@ -249,7 +220,6 @@ mod tests {
 
     #[test]
     fn sub_path_validation() {
-        // Valid values pass through unchanged.
         assert_eq!(
             validate_sub_path("workspace/data").expect("valid sub_path"),
             PathBuf::from("workspace/data"),
@@ -258,16 +228,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_sub_paths() {
-        // Strict mode: empty / whitespace-padded values are *not* normalised
-        // into "absent"; they are rejected with 400 unchanged.
         let cases: &[(Option<&str>, &str)] = &[
             (Some(""), "subPath must not be empty"),
             (Some("   "), "whitespace"),
             (Some(" workspace/data "), "whitespace"),
             (Some("/workspace/data"), "relative"),
             (Some("workspace/../etc"), "'..'"),
-            // ':' must be rejected: it is the cmdline separator in
-            // `agentenv_drives=vd<letter>:<mountPath>[:<subPath>]`.
+            // `:` separates fields in the kernel command-line encoding.
             (Some("workspace:data"), "colons"),
         ];
 
@@ -308,8 +275,6 @@ mod tests {
         }
     }
 
-    /// 🔴 `diskSizeMB` is checked in the same first pass as every other field,
-    /// before anything downstream is asked to resolve the drive's image.
     #[test]
     fn rejects_invalid_disk_size_mb_with_the_rest_of_validation() {
         for disk_size_mb in [0, 512, 1536] {

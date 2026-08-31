@@ -239,13 +239,6 @@ impl TemplateBuildSpec {
     }
 
     /// Replaces the step list wholesale.
-    ///
-    /// 🔴 For `NodeSandboxService::build_template`, which receives an already
-    /// fully-formed `Vec<TemplateBuildStep>` off the wire (decoded from the
-    /// same type this crate serialises) rather than the individual
-    /// `RUN`/`ENV`/... calls that build one up locally. Re-deriving those
-    /// calls from the decoded kinds would just reconstruct the vector this
-    /// method sets directly, one match arm at a time, for no benefit.
     pub fn with_steps(mut self, steps: Vec<TemplateBuildStep>) -> Self {
         self.steps = steps;
         self

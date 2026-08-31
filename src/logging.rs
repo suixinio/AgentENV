@@ -6,31 +6,12 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-/// The filter used when `RUST_LOG` is unset.
+/// Default target-prefix filter used when `RUST_LOG` is unset.
 ///
-/// 🔴 Every entry here is a **target prefix**, and a target that no entry is a
-/// prefix of is dropped before it reaches any layer. `tracing`'s macros default
-/// a target to `module_path!()`, which begins with the crate name with hyphens
-/// turned into underscores — so this list has to name crates, and it goes stale
-/// the moment one is renamed. It did: splitting `agentenv` into `aenv-core` /
-/// `aenv-node` / `aenv-api` left `agentenv=info` matching nothing but the 51
-/// call sites that pass `target: "agentenv"` explicitly, and silently dropped
-/// the other ~1100. `default_filter_covers_this_crate` in each of the three
-/// crates is the guard; it reads its own `module_path!()` so the next rename
-/// turns it red instead of turning the logs off.
-///
-/// What each entry is for:
-/// - `aenv_core`, `aenv_node`, `aenv_api`: the three workspace crates that log.
-/// - `agentenv`: the explicit `target: "agentenv"` call sites, and — because
-///   the match is a plain `starts_with` — the generated `agentenv_http_server`.
-/// - `envd`, `uvm_ublk`: unchanged by the split; `uvm_ublk` also covers
-///   `uvm_ublk_daemon` through the same prefix rule.
+/// Keep it aligned with each logging crate's `module_path!()` guard.
 pub const DEFAULT_FILTER: &str =
     "aenv_core=info,aenv_node=info,aenv_api=info,agentenv=info,envd=info,uvm_ublk=info";
 
-/// The filter this crate shipped before the `agentenv` -> `aenv-*` split.
-///
-/// Kept only so the guards can assert it no longer covers anything.
 #[cfg(any(test, feature = "test-support"))]
 pub const PRE_RENAME_FILTER: &str = "agentenv=info,envd=info,uvm_ublk=info";
 const LOG_FORMAT_ENV: &str = "AENV_LOG_FORMAT";
@@ -156,16 +137,7 @@ pub fn init_for_tests() {
             LogFormat::Json => base.json().boxed(),
         };
 
-        // 🔴 The filter moves onto the printing layer rather than sitting over
-        // the whole stack, so that [`capture`] below sits underneath nothing.
-        //
-        // A callsite's interest is decided once, globally, the first time it is
-        // reached, and a callsite that no subscriber wanted is cached as
-        // uninteresting for the rest of the process. With the filter over the
-        // registry, a `debug!` reached by a test that installed no recorder was
-        // cached away, and the next test that did install one never saw its own
-        // event. That is a test failing at random depending on the order the
-        // harness happened to run in — which is what it did.
+        // Filter only the printing layer so test capture can observe every callsite.
         let registry = tracing_subscriber::registry();
         #[cfg(any(test, feature = "test-support"))]
         let registry = registry.with(capture::layer());
@@ -174,14 +146,7 @@ pub fn init_for_tests() {
     });
 }
 
-/// Collects log events so a test can assert one was emitted.
-///
-/// Some of what this codebase logs is not decoration: an operator finding the
-/// line is the whole mechanism. A claim that cost somebody their last
-/// unpublished pause, and a registry that could not say whether a local copy is
-/// still valid, are both cases where the code does the right thing silently and
-/// the only way to know it happened is the log. Those lines can be deleted by a
-/// refactor without any test noticing, which is what this is for.
+/// Collects log events for behavioral assertions in tests.
 #[cfg(any(test, feature = "test-support"))]
 pub mod capture {
     use std::cell::RefCell;
@@ -193,13 +158,7 @@ pub mod capture {
     use tracing_subscriber::Layer;
 
     thread_local! {
-        /// The recorder collecting this thread's events, if any.
-        ///
-        /// Per thread rather than per process so tests running in parallel do
-        /// not record each other's events. `#[tokio::test]` runs its future on
-        /// a current-thread runtime driven by the test's own thread, so awaits
-        /// stay inside the scope — a `flavor = "multi_thread"` test would not,
-        /// and would record nothing.
+        /// Per-thread recorder; multi-thread Tokio tests are not captured.
         static ACTIVE: RefCell<Option<Recorder>> = const { RefCell::new(None) };
     }
 
@@ -227,13 +186,7 @@ pub mod capture {
 
         /// Collects this thread's events until the returned guard is dropped.
         ///
-        /// 🔴 The subscriber itself is process-wide and installed once, by
-        /// [`super::init_for_tests`]; only the routing is per thread. Installing
-        /// a scoped subscriber here instead is the obvious shape and does not
-        /// work: whether a callsite is reachable at all is decided once for the
-        /// whole process, the first time it is reached, so a test that got
-        /// there first without a subscriber would silence the callsite for
-        /// everyone afterwards.
+        /// Routing is thread-local, but the subscriber remains process-wide.
         pub fn install(&self) -> Guard {
             super::init_for_tests();
             ACTIVE.with(|active| *active.borrow_mut() = Some(self.clone()));
@@ -255,22 +208,9 @@ pub mod capture {
         RecordingLayer
     }
 
-    /// Runs `emit` under a throwaway subscriber gated by `filter`, and returns
-    /// the target of every event that survived it.
+    /// Returns targets emitted by `emit` that pass `filter`.
     ///
-    /// 🔴 This is the end-to-end shape on purpose. Asserting that a *string*
-    /// contains a crate name proves nothing: the question is whether a real
-    /// `info!` written in a real module comes out the other side of a real
-    /// [`EnvFilter`], and the two halves that have to agree — the filter and
-    /// `module_path!()` — are edited in different files by different people.
-    /// So the caller passes a closure that logs from its own crate and never
-    /// names a target, and this decides it the way the process does.
-    ///
-    /// The subscriber is scoped to this call rather than installed globally, so
-    /// the same callsite can be run against two different filters. Call it
-    /// twice with one shared `emit` function and the callsite is held fixed
-    /// across both, which is what rules out "recorded nothing because the
-    /// callsite was never interesting" as an explanation for an empty result.
+    /// The caller should emit from its own crate without specifying `target:`.
     pub fn targets_passing_filter(filter: &str, emit: impl FnOnce()) -> Vec<String> {
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -314,8 +254,6 @@ pub mod capture {
         }
     }
 
-    /// Flattens every field into one string, so an assertion can look for the
-    /// message or for any value that travelled with it.
     struct MessageVisitor(String);
 
     impl Visit for MessageVisitor {
@@ -357,21 +295,11 @@ mod tests {
     }
 }
 
-/// Proves the default filter still lets this crate's own logs out.
-///
-/// See [`DEFAULT_FILTER`] for what went wrong; `aenv-node` and `aenv-api` each
-/// carry the same guard, because the target of a log line is decided by the
-/// crate it was written in and neither of them can be checked from here.
 #[cfg(test)]
 mod default_filter_guard {
     use super::capture::targets_passing_filter;
     use super::{DEFAULT_FILTER, PRE_RENAME_FILTER};
 
-    /// One callsite, reused by both directions below.
-    ///
-    /// No `target:` — that is the whole point. `tracing` fills it in as
-    /// `module_path!()`, so this line's target tracks the crate name and goes
-    /// stale in exactly the way the real ~1100 call sites do.
     fn emit_untargeted() {
         tracing::info!("default-filter probe");
     }
@@ -388,8 +316,6 @@ mod default_filter_guard {
 
     #[test]
     fn the_pre_rename_filter_no_longer_covers_this_crate() {
-        // The same callsite as the passing case above, so an empty result here
-        // cannot be blamed on the callsite: it is the filter rejecting it.
         assert_eq!(
             targets_passing_filter(PRE_RENAME_FILTER, emit_untargeted),
             Vec::<String>::new(),
@@ -401,10 +327,6 @@ mod default_filter_guard {
 
     #[test]
     fn default_filter_still_covers_the_explicit_agentenv_target() {
-        // 51 call sites across the three crates pass this literal. They are the
-        // only reason the node and api Pods logged anything at all while the
-        // filter was stale, and dropping `agentenv=` from it would take them
-        // out. Hardcoded here because it is hardcoded there too.
         fn emit_legacy() {
             tracing::info!(target: "agentenv", "legacy explicit target");
         }
@@ -416,11 +338,6 @@ mod default_filter_guard {
 
     #[test]
     fn default_filter_still_covers_the_generated_server() {
-        // `agentenv_http_server` is codegen output (`make agentenv-server`), so
-        // there is no `module_path!()` of it to borrow from here. What this
-        // pins is the prefix rule that keeps it lit: EnvFilter matches a target
-        // with a plain `starts_with`, so `agentenv=` covers `agentenv_*` too.
-        // Its 179 `error!` sites were never dark, and must not go dark now.
         fn emit_generated() {
             tracing::error!(target: "agentenv_http_server::server", "probe");
         }
@@ -432,9 +349,6 @@ mod default_filter_guard {
 
     #[test]
     fn the_prefix_rule_also_keeps_the_ublk_daemon_lit() {
-        // Same rule, the other crate that depends on it: `uvm_ublk=` is what
-        // covers `uvm_ublk_daemon`'s 63 call sites. Neither crate was renamed,
-        // but the coverage is incidental, so say so out loud.
         fn emit_daemon() {
             tracing::info!(target: "uvm_ublk_daemon::device", "probe");
         }

@@ -1,58 +1,24 @@
-//! Object-storage request accounting shared by the snapshot repository
-//! backends.
+//! Object-storage request accounting shared by snapshot repositories.
 //!
-//! The `surface` label existed to separate two bodies of data that shared one
-//! bucket: rows under `catalog/`, and the snapshot bytes everything else. Only
-//! the `surface="catalog"` series answered "how many object-storage requests
-//! does listing snapshots cost", which is what the catalog migration was
-//! measured against. That migration is finished — PostgreSQL is the catalog,
-//! object storage holds no rows at all — so every request a backend issues
-//! today is byte traffic and the label is emitted as the constant
-//! `surface="artifact"`.
-//!
-//! 🔴 The label stays. `agentenv_snapshot_object_store_requests_total` is a
-//! published series with three labels, and dropping one because it currently
-//! has a single value silently rewrites every query and dashboard built on it
-//! — a PromQL selector naming `surface` matches nothing at all against a series
-//! that no longer carries it. See the test that pins the name and the three
-//! keys.
+//! The published `surface` label remains even while every request is artifact traffic.
 
-/// One increment per request a repository backend issues against its durable
-/// store.
+/// Counts backend operations against durable storage.
 ///
-/// Counts *backend operations*, not literal HTTP round-trips: opendal's retry
-/// layer and multipart uploads can turn one increment into several requests on
-/// the wire.
+/// Retries and multipart uploads may produce multiple HTTP requests per increment.
 pub const OBJECT_STORE_REQUESTS_TOTAL: &str = "agentenv_snapshot_object_store_requests_total";
 
-/// Publish rollbacks that deliberately left a snapshot's artifacts in place.
+/// Counts publish rollbacks that deliberately retained artifacts.
 ///
-/// 🔴 A counter over a leak, and the leak is on purpose. A failed publish asks
-/// both catalogs whether anything still points at the bytes and keeps them if
-/// *either* says yes, because the alternative — deleting on a single "no" — is
-/// what once destroyed the bytes of a sandbox a user had just paused. The trade
-/// is right and it is not being revisited here; what was missing is that
-/// nothing said when it fired. Measured on the cluster: one orphan prefix, two
-/// objects, 22,194 bytes, and no way to tell from outside that it existed.
-///
-/// Nothing collects these. Every increment is bytes that will sit in the store
-/// until somebody looks, so a rising number is the signal to go and look.
+/// Retained bytes have no collector, so a rising value requires operator cleanup.
 pub const ARTIFACTS_RETAINED_TOTAL: &str = "agentenv_snapshot_artifacts_retained_total";
 
 pub fn record_artifacts_retained() {
     metrics::counter!(ARTIFACTS_RETAINED_TOTAL).increment(1);
 }
 
-/// Which body of data a request touched.
+/// Published label for the body of data touched by a request.
 ///
-/// 🔴 One variant, on purpose. A `Catalog` variant sat beside it, chosen by a
-/// `for_key` classifier that tested the key against a `catalog/` prefix; the
-/// only key builders left are `oss::layout`'s `managed-layers/{digest}` and
-/// `artifacts/{id}/…`, so every one of the eight call sites resolved to
-/// `Artifact` and the classifier was a branch that could not be taken. Kept as
-/// an enum rather than folded into the emission site because the label is part
-/// of the published series either way, and a second body of data arriving is
-/// then a variant and eight compiler errors instead of a silent mislabelling.
+/// Only artifact bytes currently use object storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectStoreSurface {
     /// Snapshot artifacts and managed layers — the bytes.
@@ -75,10 +41,7 @@ pub enum ObjectStoreOp {
     Head,
     List,
     Delete,
-    /// Composite: one LIST followed by one DELETE per listed key. Kept distinct
-    /// from [`ObjectStoreOp::Delete`] because those constituent requests are
-    /// each counted in their own right, so the leaf verbs still sum to the true
-    /// request count and a reader can exclude this series.
+    /// Composite LIST plus per-key DELETEs, distinct from the counted leaf operations.
     DeletePrefix,
 }
 
@@ -95,17 +58,7 @@ impl ObjectStoreOp {
     }
 }
 
-/// What the store answered.
-///
-/// 🔴 `NotFound` exists because the absence of an object is a *successful*
-/// answer from the store, and repository code asks that question constantly:
-/// "is this alias already bound", "does this record exist yet", "has this
-/// content-addressed layer already been uploaded". Folding those into
-/// `outcome="error"` made a plain snapshot creation emit two catalog errors
-/// (`load_alias_target` before the bind, plus the pre-bind or pre-commit
-/// record read), so anyone alerting on the error series fired on entirely
-/// healthy traffic. `Error` now means only what it says: the request did not
-/// produce a usable answer.
+/// Classifies successful answers, including object absence, separately from failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectStoreOutcome {
     /// The store returned the object, the listing, or the write acknowledgement.
@@ -163,13 +116,7 @@ pub fn record_object_store_request(
     .increment(1);
 }
 
-/// Test-only counter readouts, shared by the backend test modules so they all
-/// assert against the same series naming.
-///
-/// 🔴 `object_store_requests` — the per-`{op,surface,outcome}` readout of
-/// [`OBJECT_STORE_REQUESTS_TOTAL`] — lived here too, and its only callers were
-/// the POSIX and OSS *catalog* test modules. Both stores are byte repositories
-/// now and neither has a catalog test module, so the helper went with them.
+/// Test-only counter readouts shared by backend tests.
 #[cfg(test)]
 pub mod test_support {
     use metrics_util::debugging::{DebugValue, Snapshotter};
@@ -194,8 +141,6 @@ mod tests {
     use super::*;
     use metrics_util::debugging::DebuggingRecorder;
 
-    /// The name and the full label set of the one sample
-    /// [`record_object_store_request`] emits.
     fn emitted_series(
         op: ObjectStoreOp,
         surface: ObjectStoreSurface,
@@ -218,14 +163,6 @@ mod tests {
         (key.name().to_owned(), labels)
     }
 
-    /// 🔴 The published contract of
-    /// `agentenv_snapshot_object_store_requests_total`, pinned by value.
-    ///
-    /// The metric name and all three label keys are consumed from outside this
-    /// repository, so renaming the series or dropping a label is a breaking
-    /// change that compiles, passes every other test, and shows up as an empty
-    /// graph. `surface` in particular now has one possible value — which is
-    /// exactly the state in which somebody deletes it as redundant.
     #[test]
     fn the_object_store_counter_keeps_its_name_and_all_three_labels() {
         let (name, labels) = emitted_series(
@@ -247,8 +184,6 @@ mod tests {
         );
     }
 
-    /// The other label values a reader can select on, so a renamed variant
-    /// string is caught here rather than in a dashboard.
     #[test]
     fn every_op_and_outcome_keeps_its_label_value() {
         for (op, expected) in [

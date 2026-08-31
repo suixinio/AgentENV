@@ -1,8 +1,4 @@
 //! A [`RuntimeImageRefs`] that records instead of pinning.
-//!
-//! 🔴 In `aenv-core`, not beside the layer cache it stands in for: the
-//! orchestrator's own test suite is here, and this is the double it drives.
-//! Behind `feature = "test-support"` so nothing ships it.
 
 use anyhow::Result;
 use async_trait::async_trait;

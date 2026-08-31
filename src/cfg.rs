@@ -17,29 +17,7 @@ use crate::virtualization::VirtualizationMode;
 
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
 
-/// Extra TOML files layered on top of [`ENV_CONFIG_PATH`], separated by `:`.
-///
-/// 🔴 This exists because of one file that cannot be in this repository and
-/// cannot be reached from the environment either.
-///
-/// `deploy/k8s/run.sh` copies `config/default.toml` over the cluster's
-/// `agentenv-k8s-config` ConfigMap on every apply (run.sh:30), so anything a
-/// cluster says only in that ConfigMap is lost on the next `make k8s-apply`.
-/// For scalars the answer is an `env =` attribute, which an apply cannot
-/// reach — `AENV_SNAPSHOT_REPOSITORY_BACKEND` and the two image-cache budgets
-/// went that way. `[backend.oss]` cannot: confique descends into a struct only
-/// through `#[config(nested)]`, `nested` may not be `Option<_>`, and
-/// `backend.oss` is `Option<OssBackendConfig>` — so the endpoint, the bucket
-/// and the credentials are deserialized from a file and from nothing else.
-/// `no_new_env_binding_is_declared_where_confique_cannot_read_it` pins that.
-///
-/// A second file is the only way in, and it wants to be a *mounted* one: the
-/// credentials belong in a Secret, and kubelet refreshes volumes.
-///
-/// Unset — or set to nothing but separators — is the whole of the old
-/// behaviour: [`ConfigManager::load_config_file`] then runs confique's
-/// `.env().file(path)` untouched, and
-/// `no_overlay_is_byte_for_byte_the_old_load` compares a full dump of both.
+/// Additional TOML overlays, applied in order after [`ENV_CONFIG_PATH`].
 const ENV_CONFIG_OVERLAY_PATH: &str = "AENV_CONFIG_OVERLAY_PATH";
 
 /// Separates the entries of [`ENV_CONFIG_OVERLAY_PATH`], `PATH`-style.
@@ -104,30 +82,9 @@ pub fn regctl_path(deps_path: &Path) -> PathBuf {
 
 #[derive(Debug, Clone, Config)]
 pub struct AppConfig {
-    /// Shared PostgreSQL connection settings for the control plane
-    /// (`aenv-api`). See `src/pg/mod.rs`.
+    /// Optional PostgreSQL settings loaded only from files.
     ///
-    /// `Option<PgConfig>`, not `#[config(nested)]`, on purpose and for the
-    /// same reason as `[backend.oss]`: confique only descends into a struct
-    /// through `#[config(nested)]`, which may not be `Option<_>`, so this is
-    /// deserialized from a file and from nothing else — no `env =` binding on
-    /// it or anything inside it can ever be read. The DSN belongs in a file
-    /// named by `AENV_CONFIG_OVERLAY_PATH`, mounted from a Secret, never in
-    /// `config/default.toml`.
-    ///
-    /// 🔴 Kept first in this struct, deliberately: the source scan behind
-    /// `no_new_env_binding_is_declared_where_confique_cannot_read_it` walks
-    /// backward from an `Option<_>` field over any preceding sibling field
-    /// that ends in a comma, including ones with unrelated `#[config(nested)]`
-    /// attributes, and only stops at whatever comes before the field it is
-    /// checking — so a bare `Option<_>` field placed *after* one of this
-    /// struct's many `#[config(nested)]` fields would read as falsely
-    /// reachable and the scan would stop watching it for a dead `env =`
-    /// binding. `[backend.oss]`/`[backend.posix_fs]` avoid the same trap by
-    /// living inside `BackendConfig`, a struct with no `nested` fields in it
-    /// at all; `[pg]` has no natural wrapper of its own to borrow that from,
-    /// so first-with-nothing-before-it is what keeps the scan honest here
-    /// instead.
+    /// Keep this first so the source guard correctly detects unreachable env bindings.
     pub pg: Option<PgConfig>,
     #[config(
         env = "AENV_HOME_PATH",
@@ -192,12 +149,7 @@ pub struct AppConfig {
     pub custom_extension: CustomExtensionConfig,
     #[config(nested)]
     pub api: ApiConfig,
-    /// Task's own "D3": the routing/binding store
-    /// (`src/binding_store/`) — a top-level section, not nested under
-    /// `[orchestrator]`, because it is deliberately a different subsystem
-    /// with a different lifetime than `[orchestrator.store]` (that struct's
-    /// own doc comment on `redis_key_prefix` explains why the two Redis
-    /// key spaces must stay disjoint).
+    /// Routing/binding store configuration with an independent key space.
     #[config(nested)]
     pub binding_store: BindingStoreConfig,
 }
@@ -205,36 +157,18 @@ pub struct AppConfig {
 /// The node's own HTTP API.
 #[derive(Debug, Config, Clone)]
 pub struct ApiConfig {
-    /// Credentials that prove a control-plane call came through the gateway.
+    /// Static gateway credentials accepted together during rotation.
     ///
-    /// A list rather than a single value so a rotation can accept the old and
-    /// the new one at once. Empty — together with an empty
-    /// [`control_plane_token_file`](Self::control_plane_token_file) — means the
-    /// gate is off and the node behaves exactly as it did before it existed,
-    /// which is what makes turning it off a configuration change rather than a
-    /// code change.
-    ///
-    /// 🔴 Read once, at startup. Changing it means restarting the process, and
-    /// this process pauses every sandbox on the node on its way out. Use the
-    /// file below to turn the gate on and off.
+    /// Empty together with the token file disables the gate.
     #[config(
         default = [],
         env = "AENV_API_CONTROL_PLANE_TOKEN",
         parse_env = confique::env::parse::list_by_comma
     )]
     pub control_plane_tokens: Vec<String>,
-    /// A file holding the same thing, one credential per line, re-read while
-    /// the process runs.
+    /// Reloadable gateway credentials, one per line.
     ///
-    /// 🔴 This is what makes enabling and disabling the gate free. The node is
-    /// a DaemonSet whose graceful shutdown pauses every sandbox it holds, so a
-    /// restart is never cheap and a rollback that needs one is a rollback
-    /// nobody will reach for. Point this at a mounted Secret — mounted, not
-    /// `secretKeyRef`, because kubelet refreshes volumes and does not refresh
-    /// environment variables.
-    ///
-    /// The effective set is the union of both. Empty or unset contributes
-    /// nothing.
+    /// The effective credential set is the union with static tokens.
     #[config(
         default = "",
         env = "AENV_API_CONTROL_PLANE_TOKEN_FILE",
@@ -251,32 +185,9 @@ pub struct BackendConfig {
 
 #[derive(Debug, Deserialize, Clone, Config)]
 pub struct PosixFsBackendConfig {
-    /// Root directory of the posix_fs snapshot repository.
+    /// Root directory of the `posix_fs` snapshot repository.
     ///
-    /// 🔴 There is no environment binding here, and one must not be added
-    /// back. This field carried an `env` attribute naming AENV_SNAPSHOT_STORE
-    /// from the day it was written; `docs/src/configuration/env-vars.md`
-    /// promised that variable to operators for just as long, and confique
-    /// never once read it. `[backend.posix_fs]`
-    /// is reached as `Option<PosixFsBackendConfig>`, confique descends into a
-    /// struct only through `#[config(nested)]`, and `nested` may not be
-    /// `Option<_>` (`confique-macro/src/parse.rs:127`) — so this struct is
-    /// deserialized by serde from a file and by nothing else. An environment
-    /// binding on it is not an override, it is a promise the loader will not
-    /// keep, and a
-    /// promise is worse than an absence: somebody sets the variable, nothing
-    /// happens, and nothing says so.
-    ///
-    /// Making it real would mean giving `[backend]` two non-`Option` nested
-    /// fields, which changes what a config with `repository_backend = "oss"`
-    /// resolves to — `backend.posix_fs` would stop being `None` there, and
-    /// `sandbox/firecracker/overlaybd_snapshot.rs` reads exactly that. Not a
-    /// change to make on the way past.
-    ///
-    /// The supported way to set this from outside the file is
-    /// [`ENV_CONFIG_OVERLAY_PATH`], which is also the only way to reach
-    /// `[backend.oss]`. `no_new_env_binding_is_declared_where_confique_cannot_read_it`
-    /// fails if any environment binding reappears on this side of the seam.
+    /// This optional nested config is file-only; use [`ENV_CONFIG_OVERLAY_PATH`].
     #[config(default = "$AENV_HOME/snapshot-store")]
     pub snapshot_store: PathBuf,
 }
@@ -305,27 +216,9 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), Firecracker logging is enabled and written to a
     /// `firecracker.log` file in the same directory as the Firecracker stdout log.
     pub log_level: Option<String>,
-    /// Whether the cluster-wide CPUID intersection the scheduler computes is
-    /// applied to a cold-booting microVM via `PUT /cpu-config`.
+    /// Applies the cluster CPUID intersection to cold boots.
     ///
-    /// 🔴 Default on, because turning it off is a real loss: the template is
-    /// what makes two machines with different CPUs present the same CPUID to a
-    /// sandbox, and a snapshot that cold-boots on one host and is expected to
-    /// behave the same on another depends on it.
-    ///
-    /// It is a setting at all because a host can refuse the template outright.
-    /// On Intel Granite Rapids (Xeon 6975P-C) the helper dumps CPUID leaf 0x1f
-    /// subleaf 1, which KVM will not let a VMM write, and Firecracker answers
-    /// the pre-boot call with
-    ///   `Template changes a CPUID entry not supported by KVM: Leaf: 1f, Subleaf: 1`
-    /// — every cold boot fails, which means every template build and every new
-    /// sandbox fails, with nothing in the message pointing at a setting.
-    ///
-    /// Turning it off is safe exactly when every node in the cluster has the
-    /// same CPU, which is the only shape the intersection was protecting.
-    /// Resume is unaffected either way: a snapshot carries the full CPU state
-    /// in `vm_state.bin` and Firecracker rejects re-applying a template on top
-    /// of it, so this path is cold boot only.
+    /// Disable only on homogeneous hosts that reject the generated template.
     #[config(default = true, env = "AENV_FIRECRACKER_APPLY_CLUSTER_CPU_TEMPLATE")]
     pub apply_cluster_cpu_template: bool,
 }
@@ -481,28 +374,9 @@ pub struct SnapshotConfig {
         default = "$AENV_HOME/snapshot-local-cache"
     )]
     pub local_cache_path: PathBuf,
-    /// 🔴 Settable from the environment for the reason `paused_registry.backend`
-    /// is: `deploy/k8s/run.sh` copies
-    /// `config/default.toml` over the cluster's `agentenv-k8s-config` ConfigMap
-    /// on every apply (run.sh:30), so a cluster that said `oss` only in that
-    /// ConfigMap loses it on the next `make k8s-apply`.
+    /// Snapshot repository backend selected independently of file overlays.
     ///
-    /// And it loses it in the quiet direction. `posix_fs` is a backend that
-    /// starts: the node comes up serving an empty local filesystem while the
-    /// snapshots and templates it used to answer for sit untouched in a bucket
-    /// it no longer looks at. Nothing fails, nothing is logged at `error`, and
-    /// the catalog rows still point at artifacts the process can no longer
-    /// fetch. That is the failure this override exists to remove.
-    ///
-    /// 🔴 Setting this to `oss` is only half of it. `[backend.oss]` — the
-    /// endpoint, bucket and credentials — is *not* reachable from the
-    /// environment (see `no_env_binding_is_declared_where_confique_cannot_read_it`),
-    /// so a cluster that sets this variable and lets the apply take its
-    /// `[backend.oss]` section away does not start at all: both
-    /// `write_generated_overlaybd_global_config` and the repository builder
-    /// stop with "backend.oss config is required when repository_backend =
-    /// oss". Loud, and therefore survivable — but it is not a working cluster,
-    /// and the section still has to reach the node some other way.
+    /// Selecting `oss` still requires file-based `[backend.oss]` settings.
     #[config(default = "posix_fs", env = "AENV_SNAPSHOT_REPOSITORY_BACKEND")]
     pub repository_backend: SnapshotRepositoryBackendKind,
     /// When true, snapshot artifacts are published to and fetched from the P2P
@@ -515,65 +389,14 @@ pub struct SnapshotConfig {
     pub catalog: SnapshotCatalogConfig,
 }
 
-/// The snapshot catalog's tuning knobs.
-///
-/// 🔴 *Which* store holds the catalog is no longer one of them. PostgreSQL is
-/// the catalog; object storage held one until the Stage B cutover and holds
-/// byte artifacts alone now. The two switches that expressed the move —
-/// `write` and `read`, `AENV_SNAPSHOT_CATALOG_WRITE` /
-/// `AENV_SNAPSHOT_CATALOG_READ` — are gone, along with the startup refusal
-/// that carried un-migrated manifests through the transition. Those names are
-/// now simply ignored: confique reads no field that declares them. The
-/// manifest-side hygiene guard in
-/// `services/shared/config/snapshot_catalog_manifest_test.go` is what keeps
-/// them out of this repository's own deployments.
+/// Snapshot catalog tuning.
 #[derive(Debug, Config, Clone)]
 pub struct SnapshotCatalogConfig {
-    /// The cluster-wide ceiling on builds that are `pending`/`in_progress` at
-    /// once, enforced by [`crate::snapshot::repository::backends::postgres::PostgresSnapshotCatalog`]
-    /// — mirrors `scheduler.catalog.max_concurrent_builds`
-    /// (`services/shared/config/config.go`), including its default (20) and
-    /// its two special values:
-    ///
-    /// 🔴 `0` takes the default rather than meaning "no ceiling" — matching a
-    /// config that was left unset, exactly like Go's own
-    /// `NewStoreWithPool`/`store_postgres.go:134-137` re-applying that
-    /// fallback even though the top-level default (this field's own `20`) is
-    /// already supposed to have supplied it: an explicit `0` (from
-    /// `AENV_SNAPSHOT_CATALOG_MAX_CONCURRENT_BUILDS=0`, say) must land on the
-    /// same value as leaving the field out entirely.
-    ///
-    /// 🔴 A *negative* value removes the ceiling entirely — and with it the
-    /// advisory lock and the cluster-wide `count(*)` that exist only to
-    /// enforce one (`postgres::writes::start_build`'s own `> 0` gate,
-    /// matching `store_postgres.go:809`'s `if s.maxConcurrentBuilds > 0`). This
-    /// is a thing to do knowingly, never by leaving the field at its
-    /// zero-value, hence negative rather than zero disables it — matching
-    /// `SchedulerCatalogConfig.MaxConcurrentBuilds`'s own doc.
-    ///
-    /// Settable from the environment because `deploy/k8s/run.sh` copies
-    /// `config/default.toml` over the cluster's ConfigMap on every apply: this
-    /// is one of the knobs `SCHEDULER_CATALOG_MAX_CONCURRENT_BUILDS` lets a Go
-    /// operator reach for during an incident, and a value edited directly into
-    /// `config/default.toml` is rolled back by the next apply.
+    /// Cluster-wide concurrent-build ceiling: zero uses the default, negative
+    /// disables the ceiling.
     #[config(default = 20i32, env = "AENV_SNAPSHOT_CATALOG_MAX_CONCURRENT_BUILDS")]
     pub max_concurrent_builds: i32,
-    /// How often a running build tells the catalog it is still alive.
-    ///
-    /// 🔴 This is the *only* declaration of the cadence now, and the reaper's
-    /// TTL is derived from it rather than configured beside it:
-    /// `aenv-api.rs::reaper_cadence` computes `ttl = 3 ×` this value. The
-    /// reaper ends a build that has gone unheard from for the TTL and hands
-    /// its template to whoever asks next, so the factor of three is the margin
-    /// — two renewals may be lost, to a rollout or a slow network, before a
-    /// build that is running perfectly well is taken away from it.
-    ///
-    /// It used to have to be kept in lockstep with a second declaration on the
-    /// Go scheduler (`scheduler.catalog.build_heartbeat_ttl` /
-    /// `node_build_heartbeat_interval`), because nothing on the wire carried
-    /// this number and the process enforcing the TTL could not see it. That
-    /// process is deleted; the reaper now runs in the same binary that reads
-    /// this field, so there is no second copy left to drift.
+    /// Build heartbeat cadence; the reaper TTL is three times this interval.
     #[config(default = 100u64)]
     pub build_heartbeat_interval_secs: u64,
 }
@@ -584,27 +407,12 @@ pub struct SnapshotImagePublishConfig {
     pub enabled: bool,
 }
 
-/// `[pg]`: shared PostgreSQL connection settings, consumed by
-/// `src/pg::PgPoolSettings::from_config`.
+/// File-only shared PostgreSQL settings.
 ///
-/// Reached only as `Option<PgConfig>` (see the field doc on
-/// [`AppConfig::pg`]), so — like [`OssBackendConfig`] — every field here is
-/// deserialized by serde from a file and none may ever carry an `env =`
-/// attribute; `no_new_env_binding_is_declared_where_confique_cannot_read_it`
-/// enforces that by scanning this file's source text.
+/// Fields here must not declare unreachable environment bindings.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct PgConfig {
-    /// A libpq-style connection URL
-    /// (`postgres://user:password@host:port/dbname`). Absent or blank means
-    /// PostgreSQL is not configured for this process.
-    ///
-    /// 🔴 Never a real value in `config/default.toml` or any other tracked
-    /// file — `the_bundled_default_config_never_carries_a_pg_dsn` fails the
-    /// build if it ever is. `deploy/k8s` must supply it the same way it
-    /// supplies `[backend.oss]`'s credentials: a tracked, credential-free
-    /// overlay file for everything else in this struct, and a second overlay
-    /// projected from a mounted Secret, listed after it in
-    /// `AENV_CONFIG_OVERLAY_PATH`, carrying this field alone.
+    /// Libpq connection URL; absent or blank disables PostgreSQL.
     pub dsn: Option<String>,
     /// Per-replica pool cap. Defaults to 8 when unset — see
     /// `src/pg::pool::DEFAULT_MAX_CONNECTIONS` for why that number, and for
@@ -619,11 +427,7 @@ pub struct PgConfig {
 }
 
 impl PgConfig {
-    /// [`Self::dsn`] with surrounding whitespace trimmed and blank treated as
-    /// absent — the same "blank is the same as absent" rule
-    /// `PausedRegistryConfig`'s `scheduler_endpoint` uses, for the same
-    /// reason: a ConfigMap that carries the key with an empty value is not
-    /// naming a database.
+    /// Returns the trimmed DSN, treating blank as absent.
     pub fn dsn(&self) -> Option<&str> {
         self.dsn
             .as_deref()
@@ -667,39 +471,14 @@ pub enum PausedRegistryBackendKind {
     /// Node-local only. A paused sandbox is resumable on the node that paused
     /// it and invisible to the rest of the cluster.
     Local,
-    /// The registry's PG schema, reached by connecting directly rather than
-    /// through the scheduler's gRPC surface.
+    /// Direct PostgreSQL paused registry owned by `aenv-api`.
     ///
-    /// Stage C (`docs/proposals/_sd-phase4-stageC-paused-registry.md`)'s own
-    /// backend: `aenv-api` hold the `paused_sandboxes` table's
-    /// connection pool, schema and credentials themselves instead of the
-    /// scheduler owning them. Requires `[pg].dsn` and, for the background
-    /// reconcile/reclaim loops' D2 Fix A safety net, a heartbeat roster —
-    /// `aenv-api`'s node registry, which it always builds now — or startup
-    /// refuses; see `orchestrator::paused_registry::build_paused_registry`'s
-    /// own doc.
-    ///
-    /// 🔴 This name was briefly retired between D11 (which removed
-    /// `aenv-node`'s own direct connection to this database — an unsafe
-    /// shape for a process that also runs user code) and Stage C (which
-    /// reintroduces the same word for the *`aenv-api`*
-    /// connection, a safe shape because neither role runs user code). A
-    /// build from that window refuses this value at startup rather than
-    /// silently reinterpreting it either as `local` (losing cluster-wide
-    /// recovery with no error) or as `central` (pointing at a scheduler
-    /// endpoint nobody configured) — see that build's own history for the
-    /// refusal message. Today the value is live again and means what it
-    /// says.
+    /// Requires `[pg].dsn` and a heartbeat roster for safe reclaim.
     Postgres,
 }
 
 impl PausedRegistryBackendKind {
-    /// The name a deployment writes into `AENV_PAUSED_REGISTRY_BACKEND`.
-    ///
-    /// Used by the registry's assembly log, so what an operator reads back is
-    /// the same word they set — a log that named the backends differently
-    /// would be one more thing to translate at the moment somebody is checking
-    /// whether the switch they just made took effect.
+    /// Deployment spelling for this backend.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -710,88 +489,36 @@ impl PausedRegistryBackendKind {
 
 #[derive(Debug, Config, Clone)]
 pub struct PausedRegistryConfig {
-    /// 🔴 Settable from the environment on purpose. `deploy/k8s/run.sh` copies
-    /// `config/default.toml` over the cluster's ConfigMap on every apply, so a
-    /// cluster that expressed its choice of backend by editing that ConfigMap
-    /// would silently lose it — and lose it in the quiet direction, falling
-    /// back to node-local pauses that report no error at all. A deployment
-    /// selects the backend here instead, where the file cannot overwrite it.
+    /// Backend selection that survives replacement of the base ConfigMap.
     #[config(default = "local", env = "AENV_PAUSED_REGISTRY_BACKEND")]
     pub backend: PausedRegistryBackendKind,
-    /// How often to renew this node's registry leases and re-check its local
-    /// paused records against the registry.
+    /// Lease-renewal and local reconciliation cadence.
     ///
-    /// This is how a node finds out that a sandbox it still holds as paused was
-    /// resumed somewhere else — nothing tells it, so the only bound on how long
-    /// it keeps advertising a sandbox it no longer owns is this interval. It is
-    /// also the renewal cadence for `lease_ttl_secs`. Ignored with the `local`
-    /// backend, where there is nothing to reconcile against.
+    /// Ignored by the local backend.
     #[config(default = 30u64)]
     pub reconcile_interval_secs: u64,
-    /// How long a node's hold on a *parked* sandbox stays valid without
-    /// renewal.
+    /// Lease lifetime for parked sandboxes, floored by renewal cadence.
     ///
-    /// A sandbox that was paused but whose snapshot never reached the
-    /// repository can only be brought back by the node holding its local
-    /// artifacts. Once that node stops renewing, the cluster gives up waiting
-    /// and rebuilds the sandbox elsewhere from the previous snapshot instead —
-    /// losing the last pause's work, which is why it waits at all. This is that
-    /// wait.
-    ///
-    /// 🔴 A live sandbox is never handed to another node on this alone. A lapsed
-    /// lease only proves the holder cannot reach the database, and a
-    /// partitioned node goes on running every sandbox it has; rebuilding one of
-    /// those elsewhere would produce two live copies. Live rows are released by
-    /// the next process to start on the holder's own machine — the only party
-    /// that can prove the previous one is gone — or, for a machine that never
-    /// comes back, reclaimed once the sandbox has *also* outlived its own
-    /// deadline.
-    ///
-    /// So this value is a floor on how long the cluster waits before either of
-    /// those, never the thing that decides them. Lowering it does not bring a
-    /// dead node's sandboxes back sooner than their own timeouts allow.
+    /// Lease expiry alone never authorizes moving a live sandbox.
     #[config(default = 90u64)]
     pub lease_ttl_secs: u64,
-    /// How often the `postgres` backend's cluster-wide reclaim pass runs
-    /// (`PostgresPausedSandboxRegistry`'s reclaim leader loop,
-    /// `AdvisoryLockKey::PausedRegistryReclaim`). Ignored by every other
-    /// backend.
-    ///
-    /// A separate knob from `reconcile_interval_secs` on purpose, mirroring
-    /// Go's own split (`services/shared/config/config.go`'s
-    /// `ReconcileInterval`/`ReclaimInterval`, independently configurable
-    /// there too even though both default to the same 30s): the two loops
-    /// answer different questions on different urgency — reconcile keeps
-    /// healthy leases alive, reclaim is a backstop for rows nothing has
-    /// renewed in a lease's worth of time already, per `RunReclaim`'s own
-    /// comment ("nothing about it is urgent").
+    /// PostgreSQL cluster-wide reclaim cadence; ignored by other backends.
     #[config(default = 30u64)]
     pub reclaim_interval_secs: u64,
 }
 
 impl PausedRegistryConfig {
-    /// Reconciliation cadence, floored at one second.
-    ///
-    /// Zero is not merely useless here, it is fatal: a zero-period
-    /// `tokio::time::interval` panics, so an operator could take the node down
-    /// at startup with a config value.
+    /// Reconciliation cadence, floored at one second to avoid a zero-period panic.
     pub fn reconcile_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.reconcile_interval_secs.max(1))
     }
 
-    /// Reclamation cadence, floored at one second -- same reasoning as
-    /// [`Self::reconcile_interval`].
+    /// Reclamation cadence, floored at one second.
     pub fn reclaim_interval(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.reclaim_interval_secs.max(1))
     }
 
     /// Lease length, held to at least three renewal intervals.
-    ///
-    /// A lease shorter than the cadence that renews it expires on a healthy
-    /// node, so a sandbox parked on a node that is doing fine would be rebuilt
-    /// elsewhere from an older snapshot for no reason. Three intervals leaves
-    /// room for two missed renewals before the cluster concludes a node is
-    /// gone.
     pub fn lease_ttl_secs(&self) -> u64 {
         self.lease_ttl_secs
             .max(self.reconcile_interval_secs.max(1).saturating_mul(3))
@@ -811,8 +538,6 @@ mod paused_registry_config_tests {
         }
     }
 
-    /// `tokio::time::interval` panics on a zero period, so an unclamped value
-    /// here is a config field that takes the node down at startup.
     #[test]
     fn a_zero_interval_never_reaches_the_timer() {
         assert_eq!(
@@ -821,24 +546,17 @@ mod paused_registry_config_tests {
         );
     }
 
-    /// A lease shorter than the cadence renewing it expires on a perfectly
-    /// healthy node — which is an invitation to take over a live sandbox, the
-    /// exact thing the lease exists to prevent.
     #[test]
     fn a_lease_can_never_be_shorter_than_the_renewal_cadence() {
         assert_eq!(config(60, 10).lease_ttl_secs(), 180);
         assert_eq!(config(0, 0).lease_ttl_secs(), 3);
     }
 
-    /// A lease longer than the floor is the operator's call: it only trades
-    /// slower recovery for more tolerance of an unresponsive node.
     #[test]
     fn a_generous_lease_is_left_alone() {
         assert_eq!(config(30, 600).lease_ttl_secs(), 600);
     }
 
-    /// The shipped defaults have to satisfy the same rule, or every deployment
-    /// that touches nothing starts out broken.
     #[test]
     fn the_defaults_leave_room_for_two_missed_renewals() {
         let defaults = config(30, 90);
@@ -866,15 +584,7 @@ pub struct UblkTomlConfig {
     pub overlaybd: UblkOverlaybdTomlConfig,
 }
 
-/// Runtime upper format for newly materialized writable OverlayBD images.
-///
-/// 🔴 Mirrors the storage crate's `UpperMode` instead of re-using it. This
-/// module is read by every role, including the one that runs no sandbox and
-/// therefore links no storage engine, so the configuration vocabulary is
-/// defined here and converted at the boundary
-/// (a `From<RuntimeUpperMode>` impl in `crate::sandbox::ublk`). The serde
-/// representation is identical to the storage crate's, so the accepted TOML
-/// spellings are unchanged.
+/// Writable OverlayBD upper format, converted to the storage type at the boundary.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum RuntimeUpperMode {
@@ -979,48 +689,19 @@ pub struct ObservabilitySchedulerReportConfig {
     pub interval_secs: u64,
 }
 
-/// The shared-roster fix: which backend
-/// [`crate::node_registry::registry::AtomicNodeRegistry`]'s
-/// heartbeat-derived ("observed") state — machine info, CPU config,
-/// sandbox roster, `last_seen` — is mirrored into so every `aenv-api`
-/// replica sees the whole cluster's roster, not just the nodes whose
-/// heartbeat happens to be pinned to it (a node's gRPC heartbeat is a
-/// long-lived HTTP/2 stream through the `agentenv-api` Service, so it
-/// sticks to one replica for its whole life). See
-/// [`crate::node_registry::redis`]'s own module doc for the full design.
+/// Backend for sharing heartbeat-derived node observations across API replicas.
 ///
-/// Mirrors [`MetadataStoreBackendKind`]'s two-value shape, deliberately kept
-/// as its own type rather than reused — this codebase's established choice
-/// for one enum per shared-state subsystem. `[binding_store]` used to carry
-/// a third such enum; it was deleted once Redis became its only legal
-/// value.
+/// This remains distinct from other shared-state subsystem backends.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRegistryObservedBackendKind {
-    /// One replica's own heartbeat shard, lost when it exits and invisible
-    /// to every other replica. Correct only for a single-node
-    /// deployment — the pre-split single process never even constructs
-    /// `AtomicNodeRegistry`'s native-placement wiring, so this default
-    /// never matters there; under `aenv-api`, which always builds that
-    /// wiring now, it is the exact split roster this fix exists to close,
-    /// and `wire_shared_node_observed_store`
-    /// (`src/bin/aenv-api.rs`) refuses to start on it unconditionally, for
-    /// the same reason `[binding_store]` no longer has an in-memory backend
-    /// to choose at all: nothing at this layer can distinguish "one replica,
-    /// alone, safe" from "one of several, silently split."
+    /// Replica-local observations; rejected by multi-replica API assembly.
     InMemory,
-    /// A single Redis hash (`{redis_key_prefix}:observed`, one field per
-    /// node id) every replica publishes its own heartbeats to and
-    /// periodically pulls in full — see
-    /// [`crate::node_registry::redis::SharedObservedStore`].
+    /// Shared Redis observations visible to every API replica.
     Redis,
 }
 
-/// The shared-roster fix's own tuning, nested under [`ClusterConfig`]
-/// alongside [`ClusterConfig::kubernetes_discovery`] — both are read
-/// unconditionally: `aenv-api` always builds its own node registry, kube
-/// discovery, and the heartbeat-receiving gRPC service, with nothing left to
-/// gate any of it on.
+/// Shared node-registry store configuration.
 #[derive(Debug, Config, Clone)]
 pub struct ClusterNodeRegistryStoreConfig {
     /// See [`NodeRegistryObservedBackendKind`].
@@ -1036,31 +717,14 @@ pub struct ClusterNodeRegistryStoreConfig {
         parse_env = parse_trimmed_string
     )]
     pub redis_url: String,
-    /// 🔴 Deliberately its own namespace — neither
-    /// `[binding_store].redis_key_prefix`'s fixed
-    /// `agentenv:scheduler:bindings` (gateway's own read path) nor
-    /// `[orchestrator.store].redis_key_prefix`'s `agentenv:api` (the
-    /// sandbox ledger). A third independent piece of shared state gets a
-    /// third independent prefix, the same way the other two each got their
-    /// own rather than being folded together — see
-    /// `src/binding_store/mod.rs`'s own module doc for why this codebase
-    /// keeps Redis-backed subsystems apart rather than sharing plumbing.
+    /// Independent Redis namespace for node observations.
     #[config(
         default = "agentenv:node-registry",
         env = "AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_KEY_PREFIX",
         parse_env = parse_trimmed_string
     )]
     pub redis_key_prefix: String,
-    /// How long a single Redis command (`HGETALL`/`HSET`/`HGET`) may run
-    /// before `redis::aio::ConnectionManager` times it out and reconnects.
-    /// redis-rs's own default is 500ms; raised because a 292ms
-    /// `ZRANGEBYSCORE` has been observed against this same production
-    /// Redis (`[orchestrator.store]`'s expiry index, a neighbor on the
-    /// same instance) and cross-node RTT stacks on top of that on every
-    /// command. See `crate::node_registry::redis::DEFAULT_RESPONSE_TIMEOUT`'s
-    /// own doc for the full trade-off (a dead Redis now takes longer to be
-    /// detected; audited as safe because nothing on this path depends on a
-    /// fast failure).
+    /// Redis command response timeout.
     #[config(
         default = 2000u64,
         env = "AENV_CLUSTER_NODE_REGISTRY_STORE_REDIS_RESPONSE_TIMEOUT_MS"
@@ -1075,28 +739,9 @@ pub struct ClusterNodeRegistryStoreConfig {
     pub redis_connect_timeout_ms: u64,
 }
 
-/// Which discovery strategy seeds `aenv-api`'s node registry — built
-/// unconditionally, with nothing left to make that registry conditional on.
-/// Mirrors
-/// `services/shared/config.SchedulerDiscoveryConfig.Mode`
-/// (`"static"` or `"kubernetes"`, validated in `services/shared/config/config.go`'s
-/// `Config.validate` and dispatched in `services/scheduler/cmd/main.go`'s
-/// `switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode))`).
+/// Node discovery strategy.
 ///
-/// 🔴 The default here (`Kubernetes`) deliberately does not match Go's
-/// (`static`, `applyDefaults`'s `if ... Mode == "" { Mode = "static" }`).
-/// Go's default is safe *because* its default `Nodes` list is a real,
-/// usable single-node fallback (`defaultConfig`'s
-/// `Nodes: []Node{{ID: "local-node", Endpoint: "http://127.0.0.1:8000"}}`).
-/// This process ships no such fallback list — [`ClusterConfig::static_discovery_nodes`]
-/// defaults to empty — so defaulting the *mode* to `Static` here would make
-/// every already-deployed cluster (`deploy/k8s/base`, configured only with
-/// `[cluster.kubernetes_discovery]`, never with a static node list) refuse
-/// to start the moment this switch shipped. Defaulting to `Kubernetes`
-/// keeps that fleet's dependency footprint and behavior byte-for-byte
-/// unchanged; a deployment that wants static discovery (e.g.
-/// `deploy/docker-compose.yml`, which has no Kubernetes API to discover
-/// against) sets `AENV_CLUSTER_NODE_DISCOVERY_MODE=static` explicitly.
+/// Kubernetes is the default because this process has no usable static fallback list.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ClusterNodeDiscoveryMode {
@@ -1105,14 +750,7 @@ pub enum ClusterNodeDiscoveryMode {
     Static,
 }
 
-/// One entry of [`ClusterConfig::static_discovery_nodes`]. Mirrors Go's
-/// `services/shared/config.Node` (`json:"id"`/`json:"endpoint"`) — the wire
-/// shape `services/scheduler/cmd/main.go`'s static branch reads directly
-/// into `scheduler.Node{ID: n.ID, Endpoint: n.Endpoint}`, leaving
-/// `PodName`/[`crate::node_registry::types::Node::pod_name`] at its zero
-/// value on both sides (see `crate::node_registry::static_discovery`'s own
-/// module doc for the full mapping and its golden test against this exact
-/// shape).
+/// Static discovery entry with the same id/endpoint shape as the scheduler.
 #[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
 pub struct ClusterStaticDiscoveryNode {
     pub id: String,
@@ -1122,161 +760,48 @@ pub struct ClusterStaticDiscoveryNode {
 #[derive(Debug, Config, Clone)]
 pub struct ClusterConfig {
     /// Shared gRPC scheduler endpoint for cluster-level services.
-    ///
-    /// 🔴 Read by `aenv-node` only. Its two consumers are the observability
-    /// heartbeat reporter (`src/observability/reporter.rs`) and P2P peer
-    /// discovery (`src/p2p/mod.rs::peer_discovery_from_config`), and both run
-    /// in the node half. `aenv-api` reads this key nowhere: placement answers
-    /// from its own in-process node registry
-    /// (`src/node_client/native_placement.rs`) and resume placement calls
-    /// `NodeRegistryGrpcService::lookup_node` on the value it already holds
-    /// (`src/api/impls/resume_surface.rs`), rather than dialling the endpoint
-    /// — which on every shipped deployment names `aenv-api`'s own listener.
-    /// The field stays because the node half needs it, and because the
-    /// gateway still dials that same listener under its own
-    /// `gateway.scheduler_addr`.
     #[config(
         env = "AENV_OBSERVABILITY_SCHEDULER_ENDPOINT",
         parse_env = parse_trimmed_string
     )]
     pub scheduler_endpoint: Option<String>,
-    /// A file holding a replacement for [`scheduler_endpoint`], re-read on a
-    /// fixed interval (reusing
-    /// [`ObservabilitySchedulerReportConfig::interval_secs`], the heartbeat
-    /// cadence, so this does not need a second timing knob) while the
-    /// process runs — no restart required to move traffic.
+    /// Reloadable scheduler endpoint override.
     ///
-    /// Every consumer that dials the scheduler — P2P peer discovery and the
-    /// heartbeat reporter, both `aenv-node`'s — watches this file through
-    /// [`crate::scheduler_endpoint::SchedulerEndpointSource`] and picks up an
-    /// edit within one interval, with no pod restart. Point it at a file
-    /// mounted from a ConfigMap **without** `subPath` — kubelet only
-    /// refreshes non-`subPath` volumes, so a `subPath` mount would silently
-    /// never update.
-    ///
-    /// 🔴 Not a union with the static value: once this has been read
-    /// successfully at least once, it *overrides* `scheduler_endpoint`
-    /// outright rather than adding to it. Unset — or set but never yet read
-    /// successfully (not mounted yet, briefly unreadable) — falls back to
-    /// the static value, which is today's behavior, byte-for-byte, for every
-    /// deployment that has not opted into this.
-    ///
-    /// 🔴 This field used to have a deprecated twin,
-    /// `[observability.scheduler_report].scheduler_endpoint_file`
-    /// (`AENV_OBSERVABILITY_SCHEDULER_ENDPOINT_FILE`), read as a fallback
-    /// when this one was unset. That field is gone: every deployment moved
-    /// onto this one. The old name is now simply ignored — no field declares
-    /// it, so confique never reads it and nothing refuses it either.
-    ///
-    /// [`scheduler_endpoint`]: ClusterConfig::scheduler_endpoint
+    /// Before its first successful read, consumers fall back to the static endpoint.
     #[config(
         default = "",
         env = "AENV_CLUSTER_SCHEDULER_ENDPOINT_FILE",
         parse_env = parse_trimmed_string
     )]
     pub scheduler_endpoint_file: String,
-    /// Where `aenv-node` serves the node sandbox service — the gRPC surface
-    /// the API half drives a machine through (`crate::node_server`).
-    ///
-    /// 🔴 A second listener rather than a route on the HTTP port, because the
-    /// two have different audiences: this one is spoken to only by the API
-    /// half, and a deployment has to be able to expose them differently.
-    /// `aenv-api` never binds it: it is the caller of this surface, not a
-    /// server of it.
+    /// Address where nodes serve the API-driven sandbox gRPC service.
     #[config(default = "0.0.0.0:8001", env = "AENV_NODE_SERVICE_ADDR")]
     pub node_service_addr: String,
-    /// Where `aenv-api` serves the data plane's wake-up surface
-    /// (`crate::api::grpc`).
-    ///
-    /// Separate from the HTTP port for the same reason as above: the gateway's
-    /// cold path is the only caller.
+    /// Address where the API serves data-plane wake-up gRPC.
     #[config(default = "0.0.0.0:8002", env = "AENV_API_GRPC_ADDR")]
     pub api_grpc_addr: String,
-    /// The port the API half reaches a node's [`node_service_addr`] on.
-    ///
-    /// 🔴 A port and not an address, because the *host* is not this process's
-    /// to choose: it comes from the scheduler, which names a node as
-    /// `http://<addr>:<http-port>` (`kubernetes_discovery.go`, and the static
-    /// discovery list). That is the node's user-facing HTTP address, and the
-    /// node service is on a different port of the same machine — so the API
-    /// half substitutes this port into the answer rather than being configured
-    /// with a second endpoint list that would have to be kept in step with the
-    /// first.
-    ///
-    /// [`node_service_addr`]: ClusterConfig::node_service_addr
+    /// Port substituted into discovered node HTTP addresses for the node gRPC service.
     #[config(default = 8001u16, env = "AENV_NODE_SERVICE_PORT")]
     pub node_service_port: u16,
-    /// Which discovery strategy `aenv-api`'s node registry is seeded from —
-    /// read unconditionally, see [`ClusterNodeDiscoveryMode`].
+    /// Strategy used to seed the API process's node registry.
     #[config(default = "kubernetes", env = "AENV_CLUSTER_NODE_DISCOVERY_MODE")]
     pub node_discovery_mode: ClusterNodeDiscoveryMode,
-    /// Kubernetes EndpointSlice/Pod discovery for `aenv-api`'s node
-    /// registry. Read, and a kube client built, whenever
-    /// [`Self::node_discovery_mode`] is [`ClusterNodeDiscoveryMode::Kubernetes`]
-    /// (the default) — unconditionally.
+    /// Kubernetes discovery settings used in Kubernetes mode.
     #[config(nested)]
     pub kubernetes_discovery: ClusterKubernetesDiscoveryConfig,
-    /// Statically-configured node list, read only when
-    /// [`Self::node_discovery_mode`] is [`ClusterNodeDiscoveryMode::Static`].
-    /// Mirrors Go's `services/shared/config.SchedulerConfig.Nodes`
-    /// (`json:"nodes"`) — seeded into the registry once at startup
-    /// (`start_native_node_registry`, `crates/aenv-api/src/bin/aenv-api.rs`)
-    /// with no ongoing watch, exactly like Go's own static branch
-    /// (`services/scheduler/cmd/main.go`'s `registry.Set(nodes, nil)`,
-    /// called once, never again).
+    /// File-only static node list used in static mode.
     ///
-    /// 🔴 TOML-file only, deliberately with no `env =` binding — not a
-    /// confique nested-`Option` limitation (this field is not `#[config(nested)]`
-    /// at all, so that limitation does not even apply here), but the same
-    /// choice Go itself already made: `services/shared/config`'s
-    /// `overrideWithEnv` never touches `Scheduler.Nodes` either, so a
-    /// structured node list has only ever been a config-file concept on
-    /// either side of this port. Set it via `AENV_CONFIG_OVERLAY_PATH` when
-    /// the file named by `AENV_CONFIG_PATH` is not itself editable (e.g.
-    /// `deploy/docker-compose.yml`, which bind-mounts a single read-only
-    /// `config/default.toml`).
+    /// Structured lists are supplied through TOML overlays, not an env binding.
     #[config(default = [])]
     pub static_discovery_nodes: Vec<ClusterStaticDiscoveryNode>,
-    /// How long [`crate::node_registry::warmup::WarmupGate`] withholds a
-    /// binding-store "not found" answer while waiting for every node
-    /// discovery currently knows about to report at least one heartbeat.
-    /// Mirrors Go's `defaultWarmupTimeout`
-    /// ([`crate::node_registry::warmup::DEFAULT_WARMUP_TIMEOUT`], `15`) as
-    /// the default; `0` also falls back to that default (same convention as
-    /// `WarmupGate::new` already applied to a hardcoded value before this
-    /// existed as a config knob).
+    /// Native registry warm-up timeout, measured from gRPC listener readiness.
     ///
-    /// 🔴 The clock this timeout is measured from starts when
-    /// `start_native_node_registry`'s (`src/bin/aenv-api.rs`) gRPC listener —
-    /// the same listener `Heartbeat` RPCs arrive on — actually binds, not
-    /// when the gate is constructed: constructing it is one of the first
-    /// things `assemble_api` does, well before `RedisMetadataStore::connect`,
-    /// `Orchestrator::new`, `SnapshotManager::new`, `build_paused_registry`,
-    /// and `release_stale_node_holdings` (which makes a network call of its
-    /// own) all run. That assembly sequence has measured over 15s end to
-    /// end; a deadline started that early can expire before the listener a
-    /// heartbeat would arrive on even exists, latching the gate "warm" on
-    /// the very first `warmed_up` call with zero heartbeats received.
+    /// Zero uses the registry's default timeout.
     #[config(default = 15u64, env = "AENV_CLUSTER_NATIVE_WARMUP_TIMEOUT_SECS")]
     pub native_warmup_timeout_secs: u64,
-    /// How many candidate nodes the placement *shadow* scorer samples,
-    /// without replacement, on each selection
-    /// ([`crate::node_registry::placement`]).
+    /// Candidate count for metrics-only placement shadow scoring.
     ///
-    /// 🔴 This does not decide placement. Real placement is round-robin and
-    /// stays that way in this build; the shadow scorer runs after the
-    /// strategy has already answered and produces metrics only. There is
-    /// deliberately no switch that would let this take over — see that
-    /// module's own doc for why best-of-K without cross-replica pending
-    /// accounting would herd a concurrent burst onto one node.
-    ///
-    /// `0` is refused at load ([`AppConfig::validate`]) rather than treated
-    /// as "off": a zero-width sample would keep every one of the four
-    /// metric series alive while making all of them meaningless, which is
-    /// the one failure mode a shadow feature must not have.
-    ///
-    /// Note that `k >= N` (the usual case on a small cluster) makes
-    /// best-of-K the global optimum, not a sample.
+    /// Zero is invalid; this setting never changes real round-robin placement.
     #[config(default = 3u32, env = "AENV_CLUSTER_PLACEMENT_SHADOW_K")]
     pub placement_shadow_k: u32,
     /// The shared-roster fix: see [`ClusterNodeRegistryStoreConfig`].
@@ -1284,22 +809,9 @@ pub struct ClusterConfig {
     pub node_registry_store: ClusterNodeRegistryStoreConfig,
 }
 
-/// Rust-side counterpart of Go's `SchedulerDiscoveryKubernetesConfig`
-/// (`services/shared/config/config.go`), consumed by
-/// [`crate::node_registry::kubernetes_discovery::KubernetesDiscovery`].
+/// Kubernetes EndpointSlice and Pod discovery settings.
 ///
-/// 🔴 Every field here is required in the sense that
-/// `start_native_node_registry` refuses to start without `namespace` and
-/// `service_name` — mirroring Go's own `SchedulerDiscoveryConfig` validation
-/// (`scheduler.discovery.kubernetes.namespace is required`, `...service_name
-/// is required`) — but neither carries a default, unlike Go, because there is
-/// no single namespace/Service name every deployment of this process shares
-/// the way `agentenv-system`/`agentenv-nodes` happens to be what
-/// `deploy/k8s/base/config/scheduler.json` (deleted along with
-/// `services/scheduler`) used to pick for the Go scheduler. This struct is
-/// read whenever [`ClusterConfig::node_discovery_mode`] is `"kubernetes"`
-/// (the default) — unconditionally, not gated on anything else — so every
-/// deployment that has not opted into static discovery has to set both.
+/// Namespace and service name are required when Kubernetes mode is selected.
 #[derive(Debug, Config, Clone)]
 pub struct ClusterKubernetesDiscoveryConfig {
     /// The namespace the watched `EndpointSlice`/`Pod` objects live in.
@@ -1309,12 +821,7 @@ pub struct ClusterKubernetesDiscoveryConfig {
     /// `kubernetes.io/service-name` on each slice.
     #[config(default = "", env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME")]
     pub service_name: String,
-    /// The node's user-facing HTTP port, as named on the watched
-    /// `EndpointSlice` — discovery's `Node.endpoint` is built from the
-    /// slice's address and this port, the same value
-    /// `deploy/k8s/base/config/scheduler.json` (deleted along with
-    /// `services/scheduler`) used to carry as `port` (`8000` in that
-    /// deployment).
+    /// Node HTTP port used to construct discovered endpoints.
     #[config(default = 8000u16, env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_PORT")]
     pub port: u16,
     /// The scheme discovered node endpoints are built with (`"http"` or
@@ -1335,25 +842,13 @@ pub struct ClusterKubernetesDiscoveryConfig {
         env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_NO_SCHEDULE_POD_SELECTOR"
     )]
     pub no_schedule_pod_selector: String,
-    /// [`crate::node_registry::registry::EmptySyncGuard::confirmations`] —
-    /// how many consecutive all-empty discovery syncs in a row confirm that
-    /// the cluster genuinely has no nodes, rather than one sync being a
-    /// transient re-LIST. See
-    /// [`crate::node_registry::registry::AtomicNodeRegistry`]'s own module
-    /// doc comment ("Deliberate divergence from Go") for why this exists.
-    /// `0` and `1` both mean "the first empty sync confirms it immediately"
-    /// — Go's original, unconditional behavior, deliberately still
-    /// reachable rather than special-cased away.
+    /// Consecutive empty syncs required before accepting an empty cluster.
     #[config(
         default = 3u32,
         env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_EMPTY_SYNC_CONFIRMATIONS"
     )]
     pub empty_sync_confirmations: u32,
-    /// [`crate::node_registry::registry::EmptySyncGuard::window`], in
-    /// seconds — how long the first all-empty discovery sync may stand
-    /// unconfirmed before wall-clock time alone confirms it, independent of
-    /// [`Self::empty_sync_confirmations`]. `0` means the first call confirms
-    /// it immediately.
+    /// Maximum window before an empty sync is confirmed by time alone.
     #[config(
         default = 60u64,
         env = "AENV_CLUSTER_KUBERNETES_DISCOVERY_EMPTY_SYNC_WINDOW_SECS"
@@ -1379,20 +874,9 @@ pub struct OrchestratorConfig {
     pub default_sandbox_timeout_secs: u64,
     #[config(default = 300u64)]
     pub auto_resume_min_sandbox_timeout_secs: u64,
-    /// Hard ceiling on how long a sandbox may **run** in total, summed across
-    /// every resume. A request asking for more is clamped, not refused, and a
-    /// later SetTimeout can never push the deadline past it.
+    /// Total running-time ceiling across resumes; zero disables it.
     ///
-    /// 🔴 Running time, not wall-clock time since creation: a sandbox spends
-    /// this budget only while it is not paused. A sandbox paused for a week
-    /// comes back with the budget it went away with, which is what makes a
-    /// resume after the ceiling has elapsed a working sandbox instead of one
-    /// the eviction loop tears down within the second.
-    ///
-    /// 🔴 `0` means "no ceiling", and with it no derivable routing-projection
-    /// TTL: the node then reports `projection_ttl_secs = 0` and the scheduler
-    /// falls back to its own `binding_ttl`, which is exactly the behaviour that
-    /// shipped before this knob existed.
+    /// Paused time does not consume this budget.
     #[config(default = 86400u64, env = "AENV_MAX_SANDBOX_LIFETIME_SECS")]
     pub max_sandbox_lifetime_secs: u64,
     /// Slack added to the routing projection's TTL so the record outlives the
@@ -1405,27 +889,10 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
-    /// Whether this process sweeps the host at startup for what a previous
-    /// process on this machine left behind: leftover Firecracker VMMs and the
-    /// work directories they were running in. See `crate::node_reclaim`.
-    ///
-    /// 🔴 Three states, and the unset one is not "off". Unset means the role
-    /// decides — `aenv-node` sweeps, the pre-split single process does not — because the
-    /// sweep is only sound while "the previous process on this machine is
-    /// gone" holds, and that is a property of the deployment rather than of
-    /// the code. A DaemonSet with `maxSurge: 0` guarantees it; a developer's
-    /// laptop running a second server alongside the first does not, and a
-    /// sweep there would kill the other one's VMs.
+    /// Optional startup reclaim override; unset lets the deployment role decide.
     #[config(env = "AENV_STARTUP_RECLAIM_ENABLED")]
     pub startup_reclaim_enabled: Option<bool>,
-    /// How long shutdown waits, after isolating the node, before it starts
-    /// tearing sandboxes down.
-    ///
-    /// The pause exists so the scheduler learns this node is out of rotation
-    /// while the node can still serve — otherwise a sandbox placed in the last
-    /// moments before shutdown is created only to be paused again. Two
-    /// heartbeat intervals is enough for the report to land and be applied.
-    /// Zero disables the wait, which is what tests and local runs want.
+    /// Delay after node isolation before shutdown begins pausing sandboxes.
     #[config(default = 10u64, env = "AENV_SHUTDOWN_DRAIN_PROPAGATION_SECS")]
     pub shutdown_drain_propagation_secs: u64,
     #[config(nested)]
@@ -1438,13 +905,7 @@ pub struct OrchestratorConfig {
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MetadataStoreBackendKind {
-    /// This process's own ledger, lost when it exits.
-    ///
-    /// 🔴 Correct for a machine-local role and *only* for one. A node's records
-    /// describe the sandboxes on that machine, and a machine that is gone has
-    /// no sandboxes; an API replica's records describe sandboxes on other
-    /// machines, and a replica that used this would hold an opinion about them
-    /// that no other replica shared.
+    /// Process-local ledger, suitable only for machine-local orchestration.
     InMemory,
     /// The cluster's shared store, so every API replica reads and writes one
     /// ledger.
@@ -1452,7 +913,7 @@ pub enum MetadataStoreBackendKind {
 }
 
 impl MetadataStoreBackendKind {
-    /// The name a deployment writes into `AENV_ORCHESTRATOR_STORE_BACKEND`.
+    /// Deployment spelling for this backend.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InMemory => "in_memory",
@@ -1461,122 +922,72 @@ impl MetadataStoreBackendKind {
     }
 }
 
-/// Task's own "D3": tuning for `src/binding_store/`. A top-level TOML
-/// section (`[binding_store]`), not nested under `[orchestrator]` — see
-/// [`AppConfig::binding_store`]'s own doc comment.
+/// Binding-store configuration.
 #[derive(Debug, Config, Clone)]
 pub struct BindingStoreConfig {
-    /// `redis://host:port[/db]`.
-    ///
-    /// 🔴 Not optional, and there is no backend switch above it any more.
-    /// `[binding_store]` had a `backend` field (`AENV_BINDING_STORE_BACKEND`,
-    /// defaulting to `"in_memory"`) whose only other value, `"redis"`, was
-    /// the only one `build_binding_store` would accept — the in-memory arm
-    /// was refused unconditionally, because a binding table one replica
-    /// cannot see is a silent routing failure and nothing here can tell
-    /// whether this process is one replica of many. A switch with one
-    /// legal position is not a switch; both it and the enum behind it are
-    /// deleted, and production always constructs the Redis store.
+    /// Redis endpoint; Redis is the only supported binding-store backend.
     #[config(
         default = "redis://127.0.0.1:6379",
         env = "AENV_BINDING_STORE_REDIS_URL",
         parse_env = parse_trimmed_string
     )]
     pub redis_url: String,
-    /// 🔴 Deliberately the exact Go value
-    /// (`crate::binding_store::record::DEFAULT_KEY_PREFIX`) by default —
-    /// this is gateway's existing read path, not an internal choice this
-    /// deployment is free to rename without also updating gateway's own
-    /// `GATEWAY_REDIS_ADDR`-adjacent configuration.
+    /// Gateway-compatible Redis key prefix.
     #[config(
         default = "agentenv:scheduler:bindings",
         env = "AENV_BINDING_STORE_REDIS_KEY_PREFIX",
         parse_env = parse_trimmed_string
     )]
     pub redis_key_prefix: String,
-    /// How long a node's reverse-index set lives without a refresh. Not
-    /// tied to `binding_ttl_secs` — it is reconciliation bookkeeping, not a
-    /// route (Go's `defaultRedisNodeIndexTTL`, one hour).
+    /// TTL for per-node reverse-index reconciliation data.
     #[config(
         default = 3600u64,
         env = "AENV_BINDING_STORE_REDIS_NODE_INDEX_TTL_SECS"
     )]
     pub redis_node_index_ttl_secs: u64,
-    /// The TTL a binding gets when its writer does not supply its own
-    /// (`RecordAssignmentRequest.projection_ttl_secs <= 0`, or a roster
-    /// entry with no budget of its own).
+    /// Default TTL when a writer supplies no positive projection budget.
     #[config(default = 30u64, env = "AENV_BINDING_STORE_BINDING_TTL_SECS")]
     pub binding_ttl_secs: u64,
-    /// Mirrors Go's `SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE`. Off is
-    /// the safe default (every write always re-arms a fresh deadline); on
-    /// lets a heartbeat refresh of the same incarnation keep the existing
-    /// deadline (`KEEPTTL` on the Redis backend) instead.
+    /// Whether same-incarnation heartbeat refreshes preserve projection TTL.
     #[config(default = false, env = "AENV_BINDING_STORE_PROJECTION_AUTHORITATIVE")]
     pub projection_authoritative: bool,
-    /// The ceiling `RecordAssignment`'s `resolve_projection_ttl` clamps a
-    /// node-supplied budget to. `0` means no ceiling. Go's own default is
-    /// 25 hours (`defaultMaxProjectionTTL`) — one hour past a day, the
-    /// node-grace window past the longest ordinary sandbox lifetime.
+    /// Maximum node-supplied projection TTL; zero removes the ceiling.
     #[config(
         default = 90_000u64,
         env = "AENV_BINDING_STORE_MAX_PROJECTION_TTL_SECS"
     )]
     pub max_projection_ttl_secs: u64,
-    /// Task's own "D4": whether the heartbeat-timeout binding sweep
-    /// (`src/binding_store/sweep.rs`) runs at all. On by default — a
-    /// binding's own TTL is the backstop either way, this only shortens
-    /// the window.
+    /// Enables heartbeat-timeout binding sweeps.
     #[config(default = true, env = "AENV_BINDING_STORE_SWEEP_ENABLED")]
     pub sweep_enabled: bool,
-    /// How often a sweep round runs. Go's own default
-    /// (`defaultBindingSweepInterval`) is 30 seconds.
+    /// Binding sweep cadence.
     #[config(default = 30u64, env = "AENV_BINDING_STORE_SWEEP_INTERVAL_SECS")]
     pub sweep_interval_secs: u64,
-    /// How long a node may go without a heartbeat before its bindings
-    /// become sweep candidates. Go's own default
-    /// (`defaultBindingSweepSilence`) is 5 minutes.
+    /// Node silence threshold before bindings become sweep candidates.
     #[config(default = 300u64, env = "AENV_BINDING_STORE_SWEEP_SILENCE_SECS")]
     pub sweep_silence_secs: u64,
-    /// Task's own "D4": how many artifact keys the P2P artifact-to-node
-    /// hint index (`src/binding_store/artifact_index.rs`) holds before it
-    /// starts evicting the least-recently-touched one. Go's own default is
-    /// 1,000,000.
+    /// Capacity of the P2P artifact-to-node hint index.
     #[config(
         default = 1_000_000u64,
         env = "AENV_BINDING_STORE_ARTIFACT_INDEX_CAPACITY"
     )]
     pub artifact_index_capacity: u64,
-    /// How long a single Redis command (a script `EVAL`, a `GET`) may run
-    /// before `redis::aio::ConnectionManager` times it out and reconnects.
-    /// redis-rs's own default is 500ms, which this store's own
-    /// `operation_timeout` field (now `response_timeout`) had already
-    /// picked a 2s replacement for without it ever actually being wired
-    /// into the connection — see
-    /// `crate::binding_store::redis::RedisBindingStoreConfig::response_timeout`'s
-    /// own doc for the full history and trade-off audit.
+    /// Redis command response timeout.
     #[config(
         default = 2000u64,
         env = "AENV_BINDING_STORE_REDIS_RESPONSE_TIMEOUT_MS"
     )]
     pub redis_response_timeout_ms: u64,
-    /// How long a fresh TCP connection attempt (initial connect, or a
-    /// reconnect after a `redis_response_timeout_ms`) may take.
+    /// Redis connection-attempt timeout.
     #[config(default = 3000u64, env = "AENV_BINDING_STORE_REDIS_CONNECT_TIMEOUT_MS")]
     pub redis_connect_timeout_ms: u64,
 }
 
 #[derive(Debug, Config, Clone)]
 pub struct OrchestratorStoreConfig {
-    /// 🔴 Settable from the environment for the same reason
-    /// [`PausedRegistryConfig::backend`] is: `deploy/k8s/run.sh` overwrites the
-    /// deployed `config/default.toml` on every apply, so a store selected by
-    /// editing that ConfigMap would silently revert — and revert to the
-    /// per-process ledger, which reports nothing and simply forgets other
-    /// replicas' sandboxes.
+    /// Store backend selected independently of file overlays.
     ///
-    /// The default is what `aenv-node` want. `aenv-api`
-    /// refuses to start with it rather than starting a replica whose ledger
-    /// nobody else can see.
+    /// API processes reject the process-local default.
     #[config(default = "in_memory", env = "AENV_ORCHESTRATOR_STORE_BACKEND")]
     pub backend: MetadataStoreBackendKind,
     /// `redis://host:port[/db]`, read only when `backend = "redis"`.
@@ -1586,48 +997,26 @@ pub struct OrchestratorStoreConfig {
         parse_env = parse_trimmed_string
     )]
     pub redis_url: String,
-    /// Prefix for every key the Redis store owns.
-    ///
-    /// 🔴 Must not overlap `agentenv:scheduler:bindings:*`, which is the
-    /// routing projection and belongs to a different subsystem with a
-    /// different lifetime. `RedisStoreConfig::validate` refuses an overlapping
-    /// value at startup rather than letting two owners share a keyspace.
+    /// Redis namespace, which must not overlap the binding projection.
     #[config(
         default = "agentenv:api",
         env = "AENV_ORCHESTRATOR_STORE_KEY_PREFIX",
         parse_env = parse_trimmed_string
     )]
     pub redis_key_prefix: String,
-    /// Whether contended record updates queue behind a distributed lock or
-    /// fail fast.
-    ///
-    /// 🔴 A throughput switch, not a correctness switch: with it off, a
-    /// contended `update_if_state` answers `ConcurrentUpdate` instead of
-    /// waiting, and nothing is corrupted either way. It is exposed because it
-    /// is the one knob whose right value depends on the deployment's replica
-    /// count rather than on the code.
+    /// Whether contended updates wait on a distributed lock or fail fast.
     #[config(
         default = true,
         env = "AENV_ORCHESTRATOR_STORE_DISTRIBUTED_LOCK_ENABLED"
     )]
     pub redis_distributed_lock_enabled: bool,
-    /// How long a single Redis command may run before
-    /// `redis::aio::ConnectionManager` times it out and reconnects.
-    /// redis-rs's own default is 500ms; raised because a `ZRANGEBYSCORE` on
-    /// this exact store's own expiry index was observed taking 292ms in
-    /// production, plus cross-node RTT on every command. The default here
-    /// is kept below `RedisStoreConfig::write_budget`'s own default (2s,
-    /// not independently configurable — see the module doc above this
-    /// section); see `RedisStoreConfig::response_timeout`'s own doc for
-    /// the full trade-off audit and for why that is a default-vs-default
-    /// relationship rather than a `validate`-enforced one.
+    /// Redis command response timeout.
     #[config(
         default = 1500u64,
         env = "AENV_ORCHESTRATOR_STORE_REDIS_RESPONSE_TIMEOUT_MS"
     )]
     pub redis_response_timeout_ms: u64,
-    /// How long a fresh TCP connection attempt (initial connect, or a
-    /// reconnect after a `redis_response_timeout_ms`) may take.
+    /// Redis connection-attempt timeout.
     #[config(
         default = 2500u64,
         env = "AENV_ORCHESTRATOR_STORE_REDIS_CONNECT_TIMEOUT_MS"
@@ -1651,13 +1040,7 @@ pub struct CustomExtensionConfig {
     pub timeout_ms: u64,
 }
 
-/// Which artifact transport `[p2p].transport` selects.
-///
-/// 🔴 A config value, and so it lives here rather than in `crate::p2p`. The
-/// half of the system that reads config is not always the half that links a
-/// transport implementation: a process that never moves artifact bytes still
-/// has to parse a config file that names one. `crate::p2p` re-exports this and
-/// owns the mapping from a name to a linked backend.
+/// Configured P2P transport kind, mapped to an implementation by `crate::p2p`.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum P2pTransportKind {
@@ -1976,23 +1359,7 @@ impl AppConfig {
                 .get_or_insert_with(PosixFsBackendConfig::default);
             posix_fs.snapshot_store =
                 resolve_path(&self.home_path, config_dir, &posix_fs.snapshot_store);
-            // 🔴 `posix_fs` is also `repository_backend`'s own `#[config(default
-            // = "posix_fs", ...)]`, so this branch cannot tell "posix_fs was
-            // chosen" from "nothing chose anything" — confique has already
-            // collapsed that distinction by the time `normalize` runs, and
-            // recovering it would mean this field stops being a plain enum with
-            // a default. What is still true either way, and worth saying either
-            // way, is *where this process is about to look for snapshots*: on a
-            // machine where `$AENV_HOME` is a real, persistent directory this is
-            // a normal, working default; in a container where it is an emptyDir
-            // — every Kubernetes Pod this binary runs in — it is silently a
-            // brand-new, empty store on every restart, and the only visible
-            // effect is downstream reads answering "0 rows" or "no such
-            // snapshot" in a way that reads exactly like a genuine catalog
-            // inconsistency rather than like a missing `oss` config. That
-            // confusion has already cost real debugging time on a real cluster
-            // once. Logged here, once, at the one place both paths (default and
-            // explicit) are guaranteed to pass through.
+            // The default can silently select an empty local store; log the resolved path.
             warn!(
                 path = %posix_fs.snapshot_store.display(),
                 "snapshot repository backend resolved to posix_fs (this is also the default when \
@@ -2245,14 +1612,7 @@ impl ConfigManager {
             return manager;
         }
 
-        // 🔴 `feature = "test-support"` as well as `cfg(test)`. `aenv-node`
-        // and `aenv-api` are separate crates now, so their tests run against
-        // this one built as a *dependency*, where `cfg(test)` is off — and
-        // anything they reach that reads the global config (a mock snapshot,
-        // a paused-registry fixture) would panic here instead of loading the
-        // bundled `config/default.toml`. The feature is enabled only from
-        // those crates' `[dev-dependencies]`, so a real binary still gets the
-        // refusal below.
+        // Sibling-crate tests build this crate as a dependency with `cfg(test)` off.
         #[cfg(any(test, feature = "test-support"))]
         {
             Self::init_global().expect("test ConfigManager initialization failed")
@@ -2322,14 +1682,7 @@ impl ConfigManager {
         Self::global().config()
     }
 
-    /// The global config if one has been loaded, and `None` otherwise.
-    ///
-    /// 🔴 For the handful of callers that must not take a process down by
-    /// asking. [`Self::global`] panics outside the crate's own tests when
-    /// nothing initialised it, which is right for the server's own paths — a
-    /// node running on defaults nobody chose is worse than one that will not
-    /// start — but wrong for a value that has a perfectly good fallback of its
-    /// own, such as this machine's name.
+    /// Returns global configuration only if already initialized.
     pub fn try_global_config() -> Option<&'static AppConfig> {
         GLOBAL_CONFIG_MANAGER.get().map(Self::config)
     }
@@ -2348,18 +1701,7 @@ impl ConfigManager {
         Self::load_config_file_with_overlays(path, &Self::overlay_paths_from_env())
     }
 
-    /// The overlay files named by [`ENV_CONFIG_OVERLAY_PATH`], in the order
-    /// they are applied — left to right, each one layered over what came
-    /// before it.
-    ///
-    /// 🔴 Empty segments are dropped rather than refused, and that is what
-    /// makes the switch flippable from a manifest. A Deployment writes
-    /// `$(A):$(B)` and turns one half off by clearing the ConfigMap key behind
-    /// it; if an empty segment were an error, or were read as the current
-    /// directory, turning half of it off would take a manifest edit instead of
-    /// a `kubectl set env`. A value that is nothing but separators is
-    /// therefore the same as unset, which is the same rule
-    /// [`Self::env_path`] applies to `AENV_CONFIG_PATH` itself.
+    /// Returns non-empty overlay paths in left-to-right application order.
     fn overlay_paths_from_env() -> Vec<PathBuf> {
         std::env::var(ENV_CONFIG_OVERLAY_PATH)
             .ok()
@@ -2374,17 +1716,8 @@ impl ConfigManager {
             .collect()
     }
 
-    /// 🔴 With no overlay this is confique's `.env().file(path)` and nothing
-    /// else — the same two lines it has always been. That branch is the
-    /// promise every existing deployment is owed: a tree that grew this
-    /// mechanism must parse identically on a cluster that never sets the
-    /// variable, and `no_overlay_is_byte_for_byte_the_old_load` compares a
-    /// full `{:#?}` of the loaded config to prove it rather than asserting it.
-    ///
-    /// With overlays the main file stops being a confique source and becomes
-    /// the bottom of a TOML document that is merged in this process first —
-    /// see [`overlaid_config_layer`] for why the merge cannot be left to
-    /// confique's own layering.
+    /// Loads with confique's ordinary path when no overlays are configured;
+    /// otherwise deep-merges TOML before applying the environment layer.
     fn load_config_file_with_overlays(path: &Path, overlays: &[PathBuf]) -> Result<AppConfig> {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let mut config = if overlays.is_empty() {
@@ -2426,48 +1759,16 @@ impl ConfigManager {
     }
 }
 
-/// The main config file and its overlays, merged into one confique layer.
+/// Merges the main TOML file and overlays into one confique layer.
 ///
-/// # Merge semantics
-///
-/// One deep, key-by-key merge of TOML tables: the main file first, then each
-/// overlay in `AENV_CONFIG_OVERLAY_PATH` order. Where both sides hold a table
-/// the two are merged; anywhere else — a scalar, a string, an array — the
-/// later file replaces the earlier value whole. There is no way to *remove* a
-/// key, only to give it another value.
-///
-/// 🔴 The merge is done here rather than by handing confique a second `.file()`
-/// source, and the difference is the entire reason this function exists.
-/// confique merges *layers*, and a layer mirrors the config struct: it descends
-/// into a section only where the field is `#[config(nested)]`. `[backend.oss]`
-/// is `Option<OssBackendConfig>` — one serde value — so under confique's own
-/// layering a second file that mentioned `[backend.oss]` at all would replace
-/// the section entire, and the endpoint and the bucket would have to be in the
-/// same file as the credentials. They must not be: the credentials come from a
-/// Secret and the endpoint and bucket are ordinary deployment facts that belong
-/// in this repository where they can be read and reviewed. Merging the
-/// documents before either becomes a layer is what lets one `[backend.oss]`
-/// section be assembled out of a tracked ConfigMap file and a mounted Secret.
-///
-/// A consequence worth stating: the main file is merged the same way, so
-/// `AENV_CONFIG_PATH` reaches confique through
-/// `toml::Table` -> `Layer` here instead of through confique's own file source.
-/// `overlay_merge_leaves_the_main_file_alone` loads the bundled config both
-/// ways and compares the whole of the result.
-///
-/// # What is *not* merged here
-///
-/// The environment. It stays confique's top layer, above everything this
-/// function produces, exactly as it was above `.file(path)` before. An operator
-/// who reaches for `kubectl set env` in an incident still wins over every file
-/// on the node.
+/// Tables merge recursively and later scalar/array values replace earlier ones.
+/// Merging before conversion preserves partial optional nested sections such as
+/// `[backend.oss]`; environment values remain the top confique layer.
 fn overlaid_config_layer(
     path: &Path,
     overlays: &[PathBuf],
 ) -> Result<<AppConfig as Config>::Layer> {
-    // Missing is empty, matching what confique's optional file source does with
-    // `AENV_CONFIG_PATH`. Adding an overlay must not also change what happens
-    // when the *main* file is absent.
+    // The optional main file remains empty when absent; overlays are required.
     let mut merged = read_config_toml(path, false)?;
     for overlay in overlays {
         merge_toml_tables(&mut merged, read_config_toml(overlay, true)?);
@@ -2486,20 +1787,7 @@ fn overlaid_config_layer(
     })
 }
 
-/// Reads one TOML document as a table.
-///
-/// 🔴 `required` is the difference between the main config file and an
-/// overlay, and a named overlay that is not on disk stops the process.
-///
-/// That is the opposite of what confique's own file source does, and it is
-/// deliberate. confique treats a missing file as an empty layer, which is
-/// right for "the operator may or may not have written a config" and wrong for
-/// every reason [`ENV_CONFIG_OVERLAY_PATH`] is ever set: the file is a mounted
-/// Secret carrying the object-storage endpoint and credentials, and a node
-/// that quietly started without it falls back to `posix_fs` — a backend that
-/// *works*. It starts, serves an empty local snapshot store, logs nothing
-/// above `info`, and the catalog goes on naming artifacts the process can no
-/// longer fetch. Naming a file is a statement that it is there.
+/// Reads a TOML table, allowing a missing main file but requiring named overlays.
 fn read_config_toml(path: &Path, required: bool) -> Result<toml::Table> {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -2651,11 +1939,6 @@ mod tests {
         Ok(())
     }
 
-    /// 🔴 The section has to be in the file, not merely in the code defaults.
-    /// `deploy/k8s/run.sh` copies this file over the cluster ConfigMap on every
-    /// apply, so a cluster whose registry settings live only in that ConfigMap
-    /// loses them on the next `make k8s-apply` — falling back to node-local
-    /// pauses without reporting anything.
     #[test]
     fn the_bundled_default_config_documents_the_paused_registry() {
         let text = std::fs::read_to_string(
@@ -2684,11 +1967,6 @@ mod tests {
             );
         }
 
-        // 🔴 Neither key may come back. The node does not connect to the
-        // registry database at all any more, and a config that still offers a
-        // DSN and a connection budget is a config that reads as though it
-        // could — on the machines that run user code, which is the whole
-        // reason the connection moved.
         for key in ["dsn", "max_connections"] {
             assert!(
                 !section.contains_key(key),
@@ -2698,13 +1976,6 @@ mod tests {
         }
     }
 
-    /// `[pg].dsn` is a credential and `config/default.toml` is copied
-    /// verbatim over the cluster ConfigMap on every apply
-    /// (`deploy/k8s/run.sh`), so a real DSN committed here would ship a
-    /// database password into a checkout and into every apply of it.
-    ///
-    /// An absent `[pg]` table is fine (`dsn` reads back as `None` either
-    /// way); what this refuses is a `dsn` key with a non-blank value.
     #[test]
     fn the_bundled_default_config_never_carries_a_pg_dsn() {
         let text = std::fs::read_to_string(
@@ -2731,24 +2002,11 @@ mod tests {
         );
     }
 
-    /// The backend a deployment actually runs has to be settable from outside
-    /// the file, for the same reason: the file is overwritten on every apply.
-    /// And what is settable has to be exactly what is accepted — a value that
-    /// is neither accepted nor refused is the silent fallback this override
-    /// exists to remove.
-    ///
-    /// Touches a process-global environment variable, which nothing else in
-    /// this crate reads or writes. Both halves live in one test so that stays
-    /// true: two tests setting it would race each other under the default
-    /// parallel runner.
     #[test]
     fn the_paused_registry_backend_is_settable_from_the_environment() {
         let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-        // Every backend has to be reachable this way, or the one that is not
-        // can only be selected by editing a file that the next apply
-        // overwrites — which is the failure this override exists to remove.
         for (value, expected) in [
             ("postgres", PausedRegistryBackendKind::Postgres),
             ("local", PausedRegistryBackendKind::Local),
@@ -2767,10 +2025,6 @@ mod tests {
                 expected
             );
 
-            // The assembly log names the backend with `as_str`, and it is read
-            // by whoever just set this variable and wants to know whether it
-            // took. A name the log prints but the environment will not accept
-            // is a name that cannot be checked against anything.
             assert_eq!(
                 expected.as_str(),
                 value,
@@ -2778,13 +2032,6 @@ mod tests {
             );
         }
 
-        // 🔴 A value nothing recognises stops the node instead of leaving it on
-        // `local`. This override exists because the backend cannot be chosen in
-        // the ConfigMap the next apply overwrites — and that is worth nothing
-        // if a typo in the replacement is answered by node-local pauses and no
-        // error at all. Startup is where the mistake is still cheap; past it,
-        // it surfaces when a node is lost and its sandboxes turn out to have
-        // gone with it.
         for typo in ["postgress", "Postgres", "postgres ", "node-local"] {
             std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", typo);
             let loaded = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
@@ -2824,26 +2071,12 @@ mod tests {
         );
     }
 
-    /// The repository backend a deployment actually runs has to be settable
-    /// from outside the file, for the same reason the paused registry's is: the
-    /// file is overwritten on every apply, and losing this one is silent.
-    ///
-    /// 🔴 The two halves are each other's control and live in one test on
-    /// purpose. "The environment set it to `oss`" proves nothing on its own —
-    /// a loader that ignored the variable and a config that already said `oss`
-    /// are the same observation. What makes it evidence is that the *same*
-    /// file, read in the same test, answers `posix_fs` when the variable is
-    /// unset. Two tests could not say that: the environment variable is
-    /// process-global and nothing else in this crate touches it, so a second
-    /// test setting it would race this one under the default parallel runner.
     #[test]
     fn the_snapshot_repository_backend_is_settable_from_the_environment() {
         let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         let bundled = workspace.join("config/default.toml");
 
-        // The control. This is the value the repository ships and the value
-        // every `make k8s-apply` puts back into the cluster ConfigMap.
         assert_eq!(
             ConfigManager::new_from_path(&bundled)
                 .expect("load without the override")
@@ -2854,8 +2087,6 @@ mod tests {
             "the file's value must stand when the environment says nothing"
         );
 
-        // Every backend has to be reachable this way, or the one that is not
-        // can only be selected by editing the file the next apply overwrites.
         for (value, expected) in [
             ("oss", SnapshotRepositoryBackendKind::Oss),
             ("posix_fs", SnapshotRepositoryBackendKind::PosixFs),
@@ -2875,11 +2106,6 @@ mod tests {
             );
         }
 
-        // 🔴 A value nothing recognises stops the node instead of leaving it on
-        // `posix_fs`. The override exists because the backend cannot be chosen
-        // in the ConfigMap the next apply overwrites, and that is worth nothing
-        // if a typo in the replacement is answered by a node that starts
-        // serving an empty local filesystem and says so nowhere.
         for typo in ["OSS", "oss ", "s3", "object_storage", "posixfs"] {
             std::env::set_var("AENV_SNAPSHOT_REPOSITORY_BACKEND", typo);
             let loaded = ConfigManager::new_from_path(&bundled);
@@ -2892,15 +2118,7 @@ mod tests {
             );
         }
 
-        // 🔴 And it still wins over an overlay file that says the opposite.
-        //
-        // This is the priority order, pinned where the variable already has an
-        // owner: file, then AENV_CONFIG_OVERLAY_PATH, then the environment.
-        // The environment on top is not a preference, it is the rollback: the
-        // overlay is a mounted Secret an operator may not be able to rewrite
-        // in the middle of an incident, and `kubectl set env` has to be able to
-        // overrule it. Both directions are checked in the same loop, so
-        // "the environment won" cannot be an overlay that happened to agree.
+        // Environment values override file overlays.
         let dir = tempdir().expect("tempdir");
         let overlay = dir.path().join("overlay.toml");
         for (env_value, overlay_value, overlay_expected, expected) in [
@@ -2926,8 +2144,6 @@ mod tests {
             )
             .expect("write overlay");
 
-            // The control, in the same iteration: with the environment quiet
-            // the overlay is what decides.
             let from_overlay = ConfigManager::load_config_file_with_overlays(
                 &bundled,
                 std::slice::from_ref(&overlay),
@@ -2957,26 +2173,16 @@ mod tests {
         }
     }
 
-    /// The three local-disk budgets are per-machine numbers, and the file they
-    /// would otherwise be set in is one file for the whole fleet — and is
-    /// overwritten by every apply. Two of the three are reachable from the
-    /// environment; this pins that they are, and that they are *not* already
-    /// the values being set.
     #[test]
     fn the_image_cache_budgets_are_settable_from_the_environment() {
         let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         let bundled = workspace.join("config/default.toml");
 
-        // The control, read from the same file in the same test. The bundled
-        // config's own numbers, which are what an apply restores.
         let shipped = ConfigManager::new_from_path(&bundled).expect("load without the override");
         let shipped_capacity = shipped.config().image.cache.capacity_gb;
         let shipped_remote = shipped.config().image.cache.remote_blocks.max_size_gb;
 
-        // 🔴 The overrides below have to be values the file does not already
-        // carry, or the assertion passes against a loader that ignores the
-        // environment entirely.
         assert_ne!(
             shipped_capacity,
             Some(24),
@@ -3006,8 +2212,6 @@ mod tests {
             "AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB did not reach the config"
         );
 
-        // And back to the file's own numbers once the environment is quiet, in
-        // the same test, so "the override worked" cannot be a leaked value.
         let after = ConfigManager::new_from_path(&bundled).expect("load after the override");
         assert_eq!(after.config().image.cache.capacity_gb, shipped_capacity);
         assert_eq!(
@@ -3016,17 +2220,7 @@ mod tests {
         );
     }
 
-    /// 🔴 Serializes every test in this module that either sets one of the
-    /// `AENV_*` variables the loader reads or compares two loads against each
-    /// other.
-    ///
-    /// The variables are process-global and `cargo test` runs this module's
-    /// tests in parallel threads of one process. Without this, a test that
-    /// sets `AENV_SNAPSHOT_REPOSITORY_BACKEND` for a few microseconds can land
-    /// between the two loads another test is comparing, and the failure it
-    /// produces names neither test. The convention up to now has been one
-    /// owner per variable, which keeps the *setters* from fighting each other
-    /// but does nothing for a reader.
+    /// Serializes tests that read or modify process-global config environment variables.
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         ENV_LOCK
@@ -3034,15 +2228,6 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Deep merge, key by key, with the later document winning.
-    ///
-    /// 🔴 Every assertion here has its opposite in the same call: the merged
-    /// table is checked for what the *earlier* file said as well as for what
-    /// the later one changed. "The overlay won" and "the overlay replaced the
-    /// whole table" are the same observation if only the overridden key is
-    /// looked at, and they are the difference between being able to keep
-    /// `[backend.oss]`'s endpoint in this repository and having to put it in a
-    /// Secret alongside the credentials.
     #[test]
     fn merging_config_documents_is_deep_and_the_later_file_wins() {
         let mut merged: toml::Table = toml::from_str(
@@ -3084,8 +2269,7 @@ endpoint = "http://second:9000"
 
         let oss = merged["backend"]["oss"].as_table().expect("[backend.oss]");
 
-        // The point of the whole mechanism: a key only the base has survives a
-        // file that writes into the same table.
+        // Base-only keys survive partial table overlays.
         assert_eq!(
             oss["bucket"].as_str(),
             Some("base-bucket"),
@@ -3093,14 +2277,11 @@ endpoint = "http://second:9000"
              into it; the endpoint and the bucket would then have to live in the same file as \
              the credentials"
         );
-        // ...and so does a key only an intermediate overlay has.
         assert_eq!(
             oss["access_key_id"].as_str(),
             Some("from-first-overlay"),
             "the second overlay dropped what the first one contributed"
         );
-        // The counter-face: where they collide, the last file wins — twice
-        // over, so "later wins" is not "first wins" read the wrong way round.
         assert_eq!(oss["endpoint"].as_str(), Some("http://second:9000"));
         assert_eq!(merged["scalar"].as_str(), Some("from second"));
         assert_eq!(
@@ -3109,10 +2290,7 @@ endpoint = "http://second:9000"
             "a table no overlay mentioned was disturbed"
         );
 
-        // 🔴 Arrays replace, they do not concatenate. Stated as a test because
-        // the alternative is defensible and somebody will assume it: a list of
-        // proxy domains or of allowed boot-arg prefixes that grew by one entry
-        // per layer would be a surprise nothing reports.
+        // Arrays replace rather than concatenate.
         assert_eq!(
             merged["array"].as_array().map(Vec::len),
             Some(1),
@@ -3120,8 +2298,6 @@ endpoint = "http://second:9000"
         );
         assert_eq!(merged["array"][0].as_integer(), Some(9));
 
-        // And a scalar giving way to a table (or the reverse) is a plain
-        // replacement rather than a panic or a silent keep.
         let mut swapped: toml::Table = toml::from_str("value = 1\n[table]\nx = 1\n").expect("base");
         merge_toml_tables(
             &mut swapped,
@@ -3131,19 +2307,6 @@ endpoint = "http://second:9000"
         assert!(swapped["value"].is_table());
     }
 
-    /// 🔴 The promise every cluster that never sets the new variable is owed.
-    ///
-    /// With no overlay, `load_config_file` must be the two lines it always
-    /// was — confique's `.env().file(path)` — and produce a configuration that
-    /// is identical field for field. This compares a full `{:#?}` of the
-    /// result against the old expression written out by hand, over
-    /// `config/default.toml`, which is the file `deploy/k8s/run.sh` copies into
-    /// every cluster.
-    ///
-    /// 🔴 "The two dumps are equal" is also what a test comparing a value with
-    /// itself reports, so the comparison is shown to fail before it is
-    /// believed: one field is changed by hand and the same comparison has to
-    /// notice.
     #[test]
     fn no_overlay_is_byte_for_byte_the_old_load() {
         let _env = env_guard();
@@ -3151,7 +2314,6 @@ endpoint = "http://second:9000"
         let bundled = workspace.join("config/default.toml");
         let config_dir = bundled.parent().expect("config dir");
 
-        // The load as it was written before AENV_CONFIG_OVERLAY_PATH existed.
         let mut old = AppConfig::builder()
             .env()
             .file(&bundled)
@@ -3171,10 +2333,6 @@ endpoint = "http://second:9000"
              .env().file(path) produced"
         );
 
-        // 🔴 The self-check. A dump comparison that cannot fail proves nothing,
-        // and `{:#?}` skipping a field — `SandboxConfig` already has a Debug
-        // that redacts one — is exactly how it would silently stop being able
-        // to.
         let mut planted = old;
         planted.home_path = PathBuf::from("/planted-home-path");
         assert_ne!(
@@ -3190,14 +2348,6 @@ endpoint = "http://second:9000"
         );
     }
 
-    /// The main config file is merged the same way an overlay is, so with
-    /// overlays in play it reaches confique as a `toml::Table` rather than
-    /// through confique's own file source. That is a second code path over the
-    /// file every cluster runs, and this pins that it is not a second answer.
-    ///
-    /// The control is in the same test: an overlay that changes one value has
-    /// to produce a different dump, or "identical" would only mean the overlay
-    /// was never read.
     #[test]
     fn an_empty_overlay_leaves_the_main_file_alone() {
         let _env = env_guard();
@@ -3232,21 +2382,12 @@ endpoint = "http://second:9000"
         );
     }
 
-    /// 🔴 The reason this mechanism exists, in the shape the cluster runs it.
-    ///
-    /// `[backend.oss]` cannot be reached from the environment at all, and the
-    /// file it would otherwise live in is overwritten by every
-    /// `make k8s-apply`. Here the section arrives from two overlay files that
-    /// neither the main config nor each other could supply alone: the
-    /// endpoint, bucket, region and cache budget from a file this repository
-    /// tracks, and the credentials from a mounted Secret.
     #[test]
     fn two_overlays_assemble_the_backend_section_no_environment_can_reach() {
         let _env = env_guard();
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
         let dir = tempdir().expect("tempdir");
 
-        // The half that is safe to commit: everything except the credentials.
         let public = dir.path().join("oss.toml");
         std::fs::write(
             &public,
@@ -3256,7 +2397,6 @@ endpoint = "http://second:9000"
         )
         .expect("write the public overlay");
 
-        // The half that only ever comes from a Secret.
         let secret = dir.path().join("oss-credentials.toml");
         std::fs::write(
             &secret,
@@ -3287,9 +2427,6 @@ endpoint = "http://second:9000"
         assert_eq!(oss.access_key_id.as_deref(), Some("planted-key-id"));
         assert_eq!(oss.access_key_secret.as_deref(), Some("planted-key-secret"));
 
-        // 🔴 Control 1: the same main file, alone, has neither. This is what a
-        // cluster gets from an apply, and it is why the section has to come
-        // from somewhere the apply cannot reach.
         let alone = ConfigManager::load_config_file_with_overlays(&bundled, &[])
             .expect("load the main file alone");
         assert!(alone.backend.oss.is_none());
@@ -3298,11 +2435,6 @@ endpoint = "http://second:9000"
             SnapshotRepositoryBackendKind::PosixFs
         );
 
-        // 🔴 Control 2: neither half is sufficient, and they fail in opposite
-        // directions. The public half loads and leaves the credentials unset —
-        // which is the state a cluster whose Secret failed to mount would be
-        // in, if the mount were allowed to fail quietly. The credential half
-        // alone is not a valid section at all.
         let public_only =
             ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&public))
                 .expect("the public half alone loads");
@@ -3320,9 +2452,6 @@ endpoint = "http://second:9000"
              completed from somewhere"
         );
 
-        // 🔴 Control 3: order decides where they collide, so the file listed
-        // last is the one that can overrule a mounted Secret — worth knowing
-        // before writing the list into a manifest.
         let shadow = dir.path().join("shadow.toml");
         std::fs::write(&shadow, "[backend.oss]\naccess_key_id = \"shadowed\"\n")
             .expect("write shadow");
@@ -3354,22 +2483,12 @@ endpoint = "http://second:9000"
         );
     }
 
-    /// 🔴 A named overlay that is not on disk stops the load.
-    ///
-    /// confique's own file source treats a missing file as an empty layer, and
-    /// inheriting that here would make the one failure this mechanism exists to
-    /// prevent silent: a Secret that failed to mount, a node that starts on
-    /// `posix_fs`, an empty local snapshot store, and a catalog still naming
-    /// artifacts nothing can fetch. The error has to name the file and the
-    /// variable, because the operator reading it did not necessarily write the
-    /// manifest.
     #[test]
     fn a_named_overlay_that_is_not_on_disk_stops_the_load() {
         let _env = env_guard();
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
         let dir = tempdir().expect("tempdir");
 
-        // The control: the same call, with the file there, loads.
         let present = dir.path().join("present.toml");
         std::fs::write(&present, "[firecracker]\nsocket_poll_ms = 7\n").expect("write");
         assert_eq!(
@@ -3395,21 +2514,10 @@ endpoint = "http://second:9000"
         );
     }
 
-    /// 🔴 The one test that touches `AENV_CONFIG_OVERLAY_PATH`, because it is
-    /// process-global; everything else about overlays goes through
-    /// `load_config_file_with_overlays` directly.
-    ///
-    /// The overlay it mounts changes `firecracker.socket_poll_ms` and nothing
-    /// else, deliberately: while this test holds the variable set, any other
-    /// test in the process that loads a config sees the overlay too, and that
-    /// value is asserted on nowhere.
     #[test]
     fn the_overlay_variable_is_read_and_only_separators_means_unset() {
         let _env = env_guard();
 
-        // The global is initialised here rather than left to whichever test
-        // gets there first, so it cannot be built while the variable below is
-        // set and carry a tempdir that is about to be deleted.
         let _ = ConfigManager::global();
 
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml");
@@ -3420,9 +2528,6 @@ endpoint = "http://second:9000"
         std::env::remove_var(ENV_CONFIG_OVERLAY_PATH);
         assert!(ConfigManager::overlay_paths_from_env().is_empty());
 
-        // Unset, empty, and nothing-but-separators are the same thing. That is
-        // what lets a Deployment write "$(A):$(B)" and turn one half off by
-        // clearing a ConfigMap key instead of editing the manifest.
         for quiet in ["", "   ", ":", " : ", "::"] {
             std::env::set_var(ENV_CONFIG_OVERLAY_PATH, quiet);
             let paths = ConfigManager::overlay_paths_from_env();
@@ -3433,8 +2538,6 @@ endpoint = "http://second:9000"
             );
         }
 
-        // The counter-face: real entries are read, in order, and empty
-        // segments between them are skipped rather than becoming paths.
         for (value, expected) in [
             ("a.toml:b.toml", vec!["a.toml", "b.toml"]),
             (":a.toml::b.toml:", vec!["a.toml", "b.toml"]),
@@ -3451,7 +2554,6 @@ endpoint = "http://second:9000"
             );
         }
 
-        // End to end, through the entry point the server actually calls.
         let quiet = ConfigManager::new_from_path(&bundled).expect("load with the variable unset");
         assert_eq!(
             quiet.config().firecracker.socket_poll_ms,
@@ -3473,7 +2575,6 @@ endpoint = "http://second:9000"
         );
     }
 
-    /// Every struct named in this file, by name, with its body.
     fn struct_bodies(source: &str) -> Vec<(String, String)> {
         let mut out = Vec::new();
         let mut rest = source;
@@ -3483,8 +2584,7 @@ endpoint = "http://second:9000"
                 .chars()
                 .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
                 .collect();
-            // The body runs to the first line that is exactly a closing brace,
-            // which is what rustfmt guarantees for an item at column 0.
+            // Rustfmt closes top-level item bodies at column zero.
             let body_start = match after.find('{') {
                 Some(brace) => brace,
                 None => break,
@@ -3499,9 +2599,6 @@ endpoint = "http://second:9000"
         out
     }
 
-    /// The names of config structs that are reached as a bare `Option<_>` —
-    /// the ones confique deserializes with serde and never visits from the
-    /// environment.
     fn unreachable_config_structs(bodies: &[(String, String)]) -> Vec<String> {
         let known: std::collections::HashSet<&str> =
             bodies.iter().map(|(name, _)| name.as_str()).collect();
@@ -3521,7 +2618,7 @@ endpoint = "http://second:9000"
                 if !known.contains(inner) {
                     continue;
                 }
-                // Walk back over this field's attribute lines.
+                // Walk backward across this field's attributes.
                 let mut nested = false;
                 for prev in lines[..idx].iter().rev() {
                     let prev = prev.trim();
@@ -3549,13 +2646,6 @@ endpoint = "http://second:9000"
         unreachable
     }
 
-    /// The unreachable structs that nevertheless declare an environment
-    /// binding — the dead promises.
-    ///
-    /// 🔴 Doc comments are stripped first. Explaining *why* a struct must not
-    /// carry an `env` attribute requires writing the attribute down, and a
-    /// scanner that counted the explanation would make the explanation
-    /// impossible to write.
     fn dead_env_bindings(source: &str) -> Vec<String> {
         let bodies = struct_bodies(source);
         let unreachable = unreachable_config_structs(&bodies);
@@ -3579,12 +2669,6 @@ endpoint = "http://second:9000"
         dead
     }
 
-    /// The environment bindings confique actually reads: an `env` attribute on
-    /// a field of a struct it can reach.
-    ///
-    /// Doc comments are stripped for the reason [`dead_env_bindings`] strips
-    /// them — the prose has to be able to name an attribute without becoming
-    /// one.
     fn live_env_bindings(source: &str) -> Vec<String> {
         let bodies = struct_bodies(source);
         let unreachable = unreachable_config_structs(&bodies);
@@ -3616,12 +2700,6 @@ endpoint = "http://second:9000"
         live
     }
 
-    /// The `AENV_*` / `API_*` variables the `## Server` table of
-    /// `docs/src/configuration/env-vars.md` offers an operator.
-    ///
-    /// Rows whose name is struck through (`~~NAME~~`) are skipped: that is how
-    /// this file records a variable that has been removed, and a removal notice
-    /// is the opposite of a promise.
     fn documented_server_env_vars(doc: &str) -> Vec<String> {
         let section = match doc.split_once("\n## Server\n") {
             Some((_, rest)) => rest.split("\n## ").next().unwrap_or(rest),
@@ -3656,17 +2734,6 @@ endpoint = "http://second:9000"
         out
     }
 
-    /// 🔴 Every variable the documentation offers is one the process reads.
-    ///
-    /// This is the half of the `AENV_SNAPSHOT_STORE` problem that lived outside
-    /// the code. The attribute was dead, but what made it *cost* something was
-    /// `docs/src/configuration/env-vars.md` listing it in the table an operator
-    /// reads when a cluster's snapshot store has to move — a supported override
-    /// that has never had any effect, with nothing anywhere to say so.
-    ///
-    /// The rule: a name in the `## Server` table is either bound on a field
-    /// confique can reach, or is in the list below, which says where it *is*
-    /// read. A name that is neither is a promise nothing keeps.
     #[test]
     fn every_documented_server_variable_is_one_the_process_reads() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3684,8 +2751,6 @@ endpoint = "http://second:9000"
         let bound = live_env_bindings(&sources);
         let documented = documented_server_env_vars(&doc);
 
-        // 🔴 Both scanners are shown to work before their agreement is
-        // believed. Two empty lists agree perfectly.
         assert!(
             bound.contains(&"AENV_HOME_PATH".to_string())
                 && bound.contains(&"AENV_SNAPSHOT_REPOSITORY_BACKEND".to_string())
@@ -3713,8 +2778,6 @@ endpoint = "http://second:9000"
             "the documentation scan ran past the ## Server table into the SDK's own variables"
         );
 
-        // Read somewhere other than a confique attribute. Each one names where,
-        // so this list cannot quietly become a place to put a dead promise.
         let read_elsewhere = [
             ("AENV_CONFIG_PATH", "ENV_CONFIG_PATH, ConfigManager::new"),
             (
@@ -3745,9 +2808,6 @@ endpoint = "http://second:9000"
              for years."
         );
 
-        // 🔴 The counter-face for both scanners, on planted input: a binding
-        // that is only reachable by serde must not count as live, and a row
-        // that is not struck through must be read as a promise.
         let planted_doc = "\n## Server\n\n| Variable | Default | Description |\n\
                            |---|---|---|\n\
                            | `AENV_PLANTED_DEAD` | — | offered |\n\
@@ -3761,46 +2821,8 @@ endpoint = "http://second:9000"
         );
     }
 
-    /// 🔴 An `env` attribute on a field confique never reads is worse than no
-    /// attribute at all: it is a promise, and `docs/src/configuration/` repeats
-    /// it to operators as a supported variable.
-    ///
-    /// confique walks into a struct's fields only through a field marked
-    /// `#[config(nested)]`, and `nested` may not be `Option<_>` — the derive
-    /// rejects it outright (`confique-macro/src/parse.rs:127`). So a config
-    /// struct reached as a bare `Option<Something>` is deserialized by serde
-    /// from the file and nothing else: its environment bindings are dead,
-    /// silently, and the file always wins.
-    ///
-    /// `[backend]` is where this bites. `BackendConfig` is `nested`, but both
-    /// of its fields are `Option<_>`, so nothing under `[backend.posix_fs]` or
-    /// `[backend.oss]` can be set from the environment. That is why the OSS
-    /// endpoint, bucket and credentials this cluster runs on cannot simply be
-    /// given environment bindings and a `secretKeyRef`, and why
-    /// [`ENV_CONFIG_OVERLAY_PATH`] exists.
-    ///
-    /// 🔴 The expected set is now *empty*, and that is a change from when this
-    /// test was written. `AENV_SNAPSHOT_STORE` used to be here: declared on
-    /// `PosixFsBackendConfig::snapshot_store`, documented in
-    /// `docs/src/configuration/env-vars.md`, and never once read. It has been
-    /// removed rather than made to work — making it work means giving
-    /// `[backend]` non-`Option` nested fields, which changes what
-    /// `backend.posix_fs` resolves to under `repository_backend = "oss"`. The
-    /// overlay file is the supported replacement, and the documentation now
-    /// says so.
-    ///
-    /// An empty expected set is exactly the result a broken scanner reports, so
-    /// the scanner is run against a planted source first.
     #[test]
     fn no_new_env_binding_is_declared_where_confique_cannot_read_it() {
-        // 🔴 The non-empty half. A parser that found no structs, no fields, or
-        // no attributes reports the same clean result as a tree with no dead
-        // bindings — so make it find one that is deliberately there.
-        //
-        // 🔴 Written with a placeholder for the item keyword, because this
-        // scanner reads *this file*. Spelled out, the planted structs would be
-        // found by the real scan below and the test would fail on its own
-        // fixture.
         let planted = r#"
 #[derive(Debug, Deserialize, Clone, Config)]
 @@ITEM@@ PlantedOuterConfig {
@@ -4511,15 +3533,6 @@ endpoint = "http://second:9000"
         );
     }
 
-    /// The shadow scorer's one config knob, pinned on all three axes the
-    /// spec fixes: the TOML path, the environment variable, and the
-    /// default.
-    ///
-    /// 🔴 The env name comes off confique's own `META`, not off a source
-    /// scan. A scan can only say the string appears in this file; `META` is
-    /// what confique actually reads the environment with, so a typo in the
-    /// attribute fails here rather than becoming a knob that silently does
-    /// nothing in production.
     #[test]
     fn placement_shadow_k_defaults_to_three_and_binds_its_documented_env_var() {
         use confique::meta::{Expr, FieldKind, Integer, LeafKind};
@@ -4543,13 +3556,6 @@ endpoint = "http://second:9000"
         assert_eq!(AppConfig::default().cluster.placement_shadow_k, 3);
     }
 
-    /// `0` is refused rather than quietly meaning "shadow scoring off".
-    ///
-    /// 🔴 A zero-width sample would leave all four shadow series registered
-    /// and reporting — agreement would be filed as `false` forever, the
-    /// classification counters would keep ticking — while the number those
-    /// series exist to produce became meaningless. Silence is a readable
-    /// failure; a metric that is wrong is not.
     #[test]
     fn validate_rejects_a_zero_placement_shadow_k() {
         let mut config = AppConfig::default();
@@ -4561,7 +3567,6 @@ endpoint = "http://second:9000"
             "unexpected error: {err}"
         );
 
-        // And the default passes, so the refusal is not simply always on.
         AppConfig::default()
             .validate()
             .expect("the shipped default must load");
@@ -4578,53 +3583,17 @@ endpoint = "http://second:9000"
         );
     }
 
-    /// Whether a manifest *sets* `var`, as against mentioning it.
-    ///
-    /// 🔴 Comment lines are not a loophole, and here that is the whole point:
-    /// both manifests that used to carry this key now name it in order to say
-    /// it is deliberately absent. A predicate that could not tell a comment
-    /// from a setting would push those explanations out of the files — and the
-    /// explanation is the only thing standing between the next operator and a
-    /// runbook that still tells them to flip it.
-    ///
-    /// What is still caught is the variable on every line a deployment tool
-    /// reads: a `- name:` entry in a container's `env:`, a `KEY: value` under a
-    /// ConfigMap's `data:`, and a `KEY=value` kustomize literal.
+    /// Returns whether a manifest sets `var`, excluding comment-only mentions.
     fn manifest_sets(contents: &str, var: &str) -> bool {
         contents
             .lines()
             .any(|line| line.contains(var) && !line.trim_start().starts_with('#'))
     }
 
-    /// 🔴 No deployment manifest declares a node-service gate nothing reads.
-    ///
-    /// `AENV_NODE_SERVICE_ENABLED` was a seam for a design this tree decided
-    /// against: letting the pre-split single process serve the node sandbox service. Nothing in
-    /// the Rust tree ever read it, and there is no longer a role that could:
-    /// `aenv-node` always serves the node sandbox service and `aenv-api` never
-    /// does, so setting the variable could not change behaviour even in
-    /// principle.
-    ///
-    /// What it did cost was real. Being read by every node in the fleet, two
-    /// runbooks costed flipping it at a serial DaemonSet roll with a drain per
-    /// machine, and billed it as the *first* step of the cutover. That is a
-    /// fleet-wide roll bought for a no-op, and a dead switch in a manifest is
-    /// exactly the thing that gets copied forward by someone who assumes the
-    /// manifest knows something they do not.
-    ///
-    /// 🔴 The scan's whole result is an absence, so the proof that it *would*
-    /// find a setting lives in this same test rather than in a sibling one. A
-    /// separate control can be filtered out of a run or deleted on its own, and
-    /// what is left then passes identically against a scanner that reads
-    /// nothing at all.
     #[test]
     fn no_manifest_sets_a_node_service_gate_nothing_reads() {
         const VAR: &str = "AENV_NODE_SERVICE_ENABLED";
 
-        // 🔴 The non-empty half, ahead of the scan rather than beside it.
-        // These are the three forms a manifest in this tree can express the
-        // setting in; the predicate has to catch all three before the absence
-        // the scan reports means anything.
         for (form, shape) in [
             (
                 format!("            - name: {VAR}\n              value: \"true\""),
@@ -4639,8 +3608,6 @@ endpoint = "http://second:9000"
                  in that form and this test would still pass"
             );
         }
-        // And the direction the narrowing exists for, plus a line that merely
-        // resembles one: neither is a setting.
         assert!(!manifest_sets(
             &format!("            # {VAR} is deliberately absent, and here is why"),
             VAR
@@ -4650,13 +3617,6 @@ endpoint = "http://second:9000"
             VAR
         ));
 
-        // 🔴 Resolution, inverted from the usual direction. Elsewhere a scan
-        // like this proves the name it looks for is the one the config reads.
-        // Here the claim is that *nothing* reads it, so this asserts the
-        // absence of a reader — with the live neighbour as the control that
-        // `env = "..."` is the shape a reader takes in this file. Without that
-        // control the assertion would also pass in a file that had never used
-        // the attribute at all.
         let cfg = include_str!("cfg.rs");
         assert!(
             cfg.contains("env = \"AENV_NODE_SERVICE_ADDR\""),
@@ -4672,10 +3632,7 @@ endpoint = "http://second:9000"
 
         let deploy = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("deploy");
         let mut checked = 0;
-        // One real file from the walk, kept so the predicate can be shown to
-        // have teeth against an actual manifest and not only against the
-        // fragments above — a whole file has comments, blank lines, block
-        // scalars and indentation that a three-line literal does not.
+        // Keep one real manifest as an end-to-end scanner control.
         let mut sample: Option<(std::path::PathBuf, String)> = None;
         let mut stack = vec![deploy.clone()];
         while let Some(dir) = stack.pop() {
@@ -4705,10 +3662,6 @@ endpoint = "http://second:9000"
             }
         }
 
-        // 🔴 The same assertion the walk just made, on the same file, with one
-        // setting line added — so "no manifest sets it" is a fact about the
-        // tree rather than about the scan. Whichever file this is, it passed
-        // above and must fail here.
         let (sampled_path, sampled) =
             sample.expect("the walk read no file with more than one line");
         assert!(

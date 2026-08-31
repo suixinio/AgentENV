@@ -1,16 +1,4 @@
 //! What the rest of the system asks of the image layer.
-//!
-//! # 🔴 The half that has no `regctl`, no cache and no overlaybd
-//!
-//! Resolving an image reference into local bytes means fetching a manifest,
-//! pulling blobs and converting them into a local overlaybd image. A process
-//! that boots no microVMs does none of that — and must not link the code that
-//! could. What it *does* still handle is the same request shapes: it validates
-//! them, names them, and hands them to a machine that can.
-//!
-//! So the two halves are stated apart. This module holds the request and answer
-//! types both halves name; the implementations that touch registries, the layer
-//! cache and overlaybd live beside them in the half that owns those things.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -96,9 +84,6 @@ pub enum RuntimeImageOwner {
 }
 
 /// The node-local layer cache's view of what is still in use.
-///
-/// 🔴 The orchestrator holds one of these on both halves, and only one half has
-/// a layer cache to protect. See [`DisabledRuntimeImageRefs`].
 #[async_trait]
 pub trait RuntimeImageRefs: Send + Sync + std::fmt::Debug {
     async fn pin(&self, owner: RuntimeImageOwner, artifacts: RuntimeArtifactSet) -> Result<()>;
@@ -111,12 +96,6 @@ pub trait RuntimeImageRefs: Send + Sync + std::fmt::Debug {
 }
 
 /// Pins nothing, because there is no local layer cache on this machine.
-///
-/// 🔴 Not an `Option<Arc<dyn RuntimeImageRefs>>` on the orchestrator. Every
-/// pin has a matching release on some path, and an `Option` would make each of
-/// those paths a place where somebody has to remember that "no cache" is not
-/// the same as "release failed". A no-op implementation makes the two halves
-/// the same shape and leaves the release paths unconditional.
 #[derive(Debug, Default)]
 pub struct DisabledRuntimeImageRefs;
 

@@ -1,25 +1,6 @@
-//! The catalog a process that has none installs.
+//! Refusing catalog implementation for processes with no catalog access.
 //!
-//! # 🔴 Why a refusing implementation rather than `Option<Arc<dyn SnapshotCatalog>>`
-//!
-//! PostgreSQL is the snapshot catalog, and `[pg]` is `aenv-api`'s alone
-//! (`crates/aenv-api/src/pg/mod.rs`'s module doc, and `aenv-node`'s own
-//! `refuse_configured_pg_dsn`). So `aenv-node` composes a
-//! [`SnapshotRepository`][super::SnapshotRepository] out of an artifact store
-//! and *no catalog at all* — it stages bytes and the row is written by the half
-//! that owns the database.
-//!
-//! Making the repository's catalog optional would push that decision into every
-//! one of its ~15 delegating methods, at every call site, in a crate both
-//! binaries link. So one type says "not here" in the type system's stead, and
-//! says it loudly.
-//!
-//! 🔴 Loudly is the point. Until the catalog moved into PostgreSQL, `aenv-node`
-//! carried an object-storage catalog that answered these calls, and after the
-//! cutover it answered them out of a store nothing had written since —
-//! reporting *absence*, which callers act on by deleting artifacts and refusing
-//! resumes. An error is the one answer that cannot be mistaken for "no such
-//! snapshot".
+//! Refusal prevents missing access from being mistaken for settled absence.
 
 use async_trait::async_trait;
 
@@ -29,12 +10,9 @@ use super::interfaces::{
 use super::{RepositoryError, RepositoryResult};
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 
-/// Refuses every catalog operation, naming the process that has no catalog.
+/// Refuses every catalog operation.
 ///
-/// Installed by `aenv-node`'s repository assembly and by the durable halves
-/// `aenv-api` hands to `build_snapshot_backend`, which then swaps in the
-/// PostgreSQL catalog. A call that reaches this type is a call that was routed
-/// to the wrong half.
+/// Reaching this type means a catalog request was routed to the wrong process.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoSnapshotCatalog;
 
@@ -95,10 +73,6 @@ mod tests {
     use super::*;
     use crate::snapshot::repository::interfaces::CatalogReadScope;
 
-    /// 🔴 The default `absence_of` reads `get_scoped`, which reads `get`. A
-    /// refusal has to propagate rather than being turned into
-    /// `SnapshotAbsence::Settled` — "settled" means *the catalog says it is not
-    /// there*, and that is precisely the answer this type must never give.
     #[tokio::test]
     async fn absence_is_refused_rather_than_settled() {
         let catalog = NoSnapshotCatalog;
@@ -114,7 +88,6 @@ mod tests {
         );
     }
 
-    /// The scoped reads default onto the unscoped ones; both must refuse.
     #[tokio::test]
     async fn every_read_refuses() {
         let catalog = NoSnapshotCatalog;

@@ -1,12 +1,5 @@
 //! Shared vocabulary for a snapshot catalog write against PostgreSQL: what
 //! came back, or the specific reason the write did not happen.
-//!
-//! Originally shared between a now-deleted gRPC snapshot-catalog client and
-//! `aenv-api`'s direct-to-Postgres `PostgresSnapshotCatalog`. The gRPC client
-//! is gone — the snapshot catalog is PostgreSQL, and there is no other — so
-//! `PostgresSnapshotCatalog`
-//! (`crates/aenv-api/src/snapshot/repository/backends/postgres/writes.rs`) is
-//! the only remaining user of what is defined here.
 
 use anyhow::anyhow;
 
@@ -30,7 +23,7 @@ pub enum CatalogRefusal {
     GenerationMismatch {
         observed: Option<i64>,
     },
-    /// 🔴 Terminal. A superseded incarnation tried to write.
+    /// Terminal: a superseded incarnation tried to write.
     ExecutionSuperseded,
     BuildInProgress {
         active_build_id: String,
@@ -83,13 +76,9 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The record `publish_commit` opens its row from.
+/// Derives the row opened by `publish_commit`.
 ///
-/// A commit describes a snapshot, not a row, so the opening row is derived: a
-/// sandbox commit opens a sandbox row naming its sandbox, a template commit
-/// opens a template row. The alias is deliberately *not* carried here — the
-/// commit binds it, in the same transaction as the flip, and binding it twice
-/// would make a rename look like a collision.
+/// The commit retains the alias so binding happens atomically with publication.
 pub fn commit_opening_record(commit: &SnapshotCommit) -> SnapshotRecord {
     let source = match &commit.source {
         crate::snapshot::types::SnapshotPublishSource::Sandbox { source_sandbox_id } => {
@@ -102,11 +91,7 @@ pub fn commit_opening_record(commit: &SnapshotCommit) -> SnapshotRecord {
         },
     };
 
-    // 🔴 The commit's instant, not this call's. A replay runs hours or days
-    // after the snapshot was made, and stamping the replay's clock here is what
-    // rewrote every backfilled row's creation time to the moment the backfill
-    // ran — the column the listing orders by. `updated_at` is the replay's
-    // clock on purpose: a replay really is the last thing that touched the row.
+    // Preserve the commit's creation time across replay; only `updated_at` uses this clock.
     let now = now_unix_ms();
     SnapshotRecord {
         id: commit.id.clone(),
@@ -119,11 +104,7 @@ pub fn commit_opening_record(commit: &SnapshotCommit) -> SnapshotRecord {
     }
 }
 
-/// 🔴 `alias` comes from the write that was refused, not from whatever record
-/// happened to be in hand. `publish_commit` opens its row from a *derived*
-/// record that deliberately carries no alias — the commit binds it — so passing
-/// that record here reported an empty name to a user whose publish was refused
-/// over a name they had asked for.
+/// Builds an alias conflict from the refused write's alias, not the derived row.
 pub fn alias_conflict(
     alias: Option<&SnapshotAlias>,
     id: &SnapshotId,
@@ -135,10 +116,7 @@ pub fn alias_conflict(
             existing,
             new_id: id.clone(),
         },
-        // The holder is only reported so the error can name it. A holder that
-        // did not parse still means the name is taken, and reporting that as a
-        // decode failure would turn a refusal a caller can act on into one it
-        // cannot.
+        // An unreadable holder still means the alias is taken.
         Err(_) => RepositoryError::backend(
             "snapshot catalog refused an alias binding",
             anyhow!("the alias is held by '{holder}'"),
@@ -150,9 +128,6 @@ pub fn alias_conflict(
 mod tests {
     use super::*;
 
-    /// The row `publish_commit` opens carries no alias: the commit binds it, in
-    /// the same transaction as the flip. Binding it twice would make a rename
-    /// look like a collision with itself.
     #[test]
     fn the_opening_row_leaves_the_alias_to_the_commit() {
         let commit = SnapshotCommit {
@@ -177,10 +152,6 @@ mod tests {
         ));
     }
 
-    /// 🔴 The alias a refused publish reports is the one the caller asked for.
-    /// It used to be read off the derived opening record, which deliberately
-    /// has none, so a user whose publish lost a name was told the empty name
-    /// had collided.
     #[test]
     fn a_refused_alias_is_reported_by_the_name_the_caller_asked_for() {
         let holder = SnapshotId::generate();
@@ -201,9 +172,6 @@ mod tests {
         }
     }
 
-    /// A holder id that will not parse still means the name is taken. Reporting
-    /// it as a decode failure would turn a refusal the caller can act on into
-    /// one it cannot.
     #[test]
     fn an_unreadable_holder_still_reports_the_name_as_taken() {
         let error = alias_conflict(None, &SnapshotId::generate(), "not-a-uuid".to_string());

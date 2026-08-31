@@ -1,10 +1,5 @@
 //! The registry a snapshot's disk image was published to, parsed out of a
 //! `repoBlobUrl`.
-//!
-//! 🔴 Split out of `source_image` so that removing a publication does not need
-//! the code that *creates* one. Rollback is something the half that owns the
-//! catalog does when a snapshot row goes away; publishing is something only the
-//! machine holding overlaybd layers can do, and `source_image` reads those.
 
 use url::Url;
 
@@ -22,10 +17,7 @@ impl SourceRegistryRepository {
         let url = Url::parse(repo_blob_url).map_err(|e| RepositoryError::Unsupported {
             feature: format!("invalid ACR repoBlobUrl '{repo_blob_url}': {e}"),
         })?;
-        // 🔴 `feature = "test-support"` as well as `cfg(test)`: the fake
-        // registry these fixtures publish to is a loopback HTTP server, and
-        // the suite that drives it lives in `aenv-node` now, where this
-        // crate's `cfg(test)` is off.
+        // Cross-crate fake-registry tests permit loopback HTTP under `test-support`.
         let test_loopback_http = cfg!(any(test, feature = "test-support"))
             && url.scheme() == "http"
             && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"));

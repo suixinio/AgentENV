@@ -668,14 +668,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
             .shutdown()
             .await
             .map_err(|err| Error::internal_message("shutdown embedded P2P endpoint", err));
-        // 🔴 Attempted regardless of the router's own outcome. This only
-        // stops the catalog's RocksDB background compaction/flush ahead of
-        // time (see `PublishedArtifactCatalog::close`) and never touches the
-        // network, so a failed router shutdown is not a reason to skip it —
-        // and skipping it would leave this the one local RocksDB store in
-        // the process nothing ever closes, unlike the persisted-sandboxes
-        // store, the image cache metadata store, and the snapshot catalog
-        // mirror backlog, all reached from `NodeRuntime::shutdown`.
+        // Close the local catalog even when router shutdown fails.
         self.published_catalog
             .close(crate::local_store::DEFAULT_CLOSE_TIMEOUT)
             .await;
@@ -689,13 +682,7 @@ impl Drop for IrohBlobsP2pTransport {
             return;
         }
         let router = self.router.clone();
-        // 🔴 Asked, not assumed. `tokio::spawn` reads the current runtime out
-        // of a thread-local and panics when there is not one, and this value
-        // is held by the server's `main` for the whole of start-up — so every
-        // start-up that *fails* releases it somewhere no successful start ever
-        // goes. A designed refusal that ends in a panic teaches people to
-        // ignore panics, which is the expensive part. The rest of this
-        // codebase already asks: see `CustomExtensionHookGuard::drop`.
+        // Drop may run outside a Tokio runtime during failed startup.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn(async move {
@@ -871,16 +858,6 @@ mod tests {
         Ok((provider, consumer))
     }
 
-    /// 🔴 A `Drop` that spawns has to ask whether there is a runtime to spawn
-    /// on.
-    ///
-    /// This value is held by the server's `main` for the whole of start-up, so
-    /// every start-up that *fails* releases it on a path no successful start
-    /// ever takes — a refused catalog read side, a missing dependency, a
-    /// capability that is not there. An unconditional `tokio::spawn` turns each
-    /// of those designed refusals into a panic after the error has already been
-    /// printed, and a panic on a designed path is how people learn to ignore
-    /// panics.
     #[test]
     fn dropping_the_transport_without_a_runtime_does_not_panic() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -896,27 +873,10 @@ mod tests {
             ))
             .expect("the transport should start");
 
-        // The runtime goes first, which is the order a process tearing itself
-        // down after a failed start uses.
         drop(runtime);
         drop(transport);
     }
 
-    /// 🔴 Guards `shutdown`'s call to `published_catalog.close(...)`. This is
-    /// the fourth `LocalKvStore` a node can open — alongside the
-    /// persisted-sandboxes store, the image cache metadata store, and the
-    /// snapshot catalog mirror backlog — and, unlike the other three, nothing
-    /// closed it until this call was added. Deleting it leaves this file's
-    /// other tests green: `published_catalog_survives_transport_restart`
-    /// exercises `shutdown` too, but what makes that test pass is `drop`
-    /// releasing the store's RocksDB lock, not this bounded close — a slow or
-    /// hung background compaction on that store would only ever show up as
-    /// an unbounded wait at real process shutdown, never in that test. See
-    /// `crate::local_store::LocalKvCloseOutcome::TimedOut`'s doc for why that
-    /// wait is not caught by anything else either. Scanning the source text
-    /// directly is the same technique
-    /// `src/bin/aenv-node.rs::tests::the_shutdown_bounds_are_still_wired` uses
-    /// for the other three stores' closes.
     #[test]
     fn shutdown_still_closes_the_catalog_store() {
         let source = include_str!("transport.rs");

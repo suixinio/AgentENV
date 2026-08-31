@@ -1,56 +1,8 @@
-//! Test support: starting a real `redis-server` for a test binary, and the
-//! policy about what happens when there isn't one.
+//! Real `redis-server` bootstrap for Redis-backed test harnesses.
 //!
-//! # What this module is
-//!
-//! The *process bootstrap* every Redis-backed subsystem's harness needs, and
-//! nothing else: pick a free port, spawn `redis-server` under
-//! `PR_SET_PDEATHSIG`, wait for it to answer `PING`, hand back a
-//! [`RedisTestServer`] that can build `redis://127.0.0.1:<port>/<db>` URLs —
-//! plus [`redis_required`], the `AENV_REDIS_TEST_REQUIRED` predicate, and
-//! [`next_db`], the bounds check on a caller-owned database counter.
-//!
-//! Every one of those was byte-identical in three harnesses, which meant a fix
-//! to one copy — a readiness probe that hangs ten seconds on a binary that is
-//! not a Redis, say — silently missed the other two.
-//!
-//! # 🔴 What this module deliberately is not
-//!
-//! It is **not** a shared Redis, and **not** a shared database allocator.
-//! Each subsystem's harness still owns:
-//!
-//! * its own `OnceLock`, and therefore its own `redis-server` **process**.
-//!   Three server processes during a test run is the intended behaviour. One
-//!   shared server would put three suites' keyspaces in one process, where
-//!   `orchestrator::store::redis::harness`'s `flush_namespace()` would be
-//!   reaching into databases the other two suites are mid-test on;
-//! * its own owner thread, which holds the `Child` and never returns. That is
-//!   what makes `PR_SET_PDEATHSIG` mean "when this *process* ends" rather than
-//!   "when whichever test ran first ends" — see [`start`];
-//! * its own `static NEXT: AtomicU32` and its own `const DATABASES: u32 = 512`,
-//!   so three independent 512-database spaces. One shared allocator would let
-//!   two suites hand out the same logical database number, which surfaces as
-//!   cross-suite flakiness that is very hard to attribute to its cause.
-//!
-//! [`tests`] guards both of those properties by name, so that a future
-//! "simplification" into one server or one counter turns red instead of
-//! turning into intermittent, unattributable failures. That guard is the
-//! reason this module can exist at all.
-//!
-//! # The skip policy
-//!
-//! The Go half of this repository shipped a make target that silently skipped
-//! 152 tests and reported green. So:
-//!
-//! * `AENV_REDIS_TEST_REQUIRED=1` turns "no Redis" into a **failure**, not a
-//!   skip. `make test-with-redis` sets it.
-//! * Without it, a skip prints a line beginning `SKIPPED[redis]` to stderr, and
-//!   the make target greps for that line and fails if it finds one. A skip that
-//!   nobody can see is a skip that becomes permanent.
-//!
-//! A real server, never a fake. A fake would agree with whatever this code
-//! believes about `KEEPTTL`, `ZADD XX`, `cjson`'s number handling and script
-//! atomicity, which is precisely the set of things worth checking.
+//! Each subsystem owns a separate server process, database counter, and owner
+//! thread. Missing Redis is visible as `SKIPPED[redis]`, or fatal when
+//! `AENV_REDIS_TEST_REQUIRED=1`.
 
 use std::io;
 use std::net::TcpListener;
@@ -59,46 +11,27 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-/// A `redis-server` started for one test binary, owned by one subsystem's
-/// harness.
+/// Redis server owned by one subsystem's test harness.
 pub struct RedisTestServer {
     port: u16,
 }
 
 impl RedisTestServer {
-    /// `redis://127.0.0.1:<port>/<db>`.
-    ///
-    /// 🔴 A database, not a key prefix. Prefixing would change the `{global}`
-    /// hash tag's position in every key, and the hash tag is one of the things
-    /// under test.
+    /// Builds a URL selecting one logical Redis database.
     pub fn url(&self, db: u32) -> String {
         format!("redis://127.0.0.1:{}/{db}", self.port)
     }
 
-    /// The port this server is listening on. Two harnesses reporting the same
-    /// port would mean they had stopped owning separate processes; see
-    /// [`tests::the_three_redis_harnesses_own_distinct_redis_server_instances`].
+    /// Returns the distinct server port for this harness.
     pub fn port(&self) -> u16 {
         self.port
     }
 }
 
-/// Starts a `redis-server` owned by a thread that never returns, or reports
-/// why it could not on stderr and returns `None`.
-///
-/// 🔴 Call this exactly once per subsystem, from that subsystem's own
-/// `OnceLock`. It is not idempotent and it is not shared state: every call
-/// spawns another server and another owner thread.
-///
-/// `thread_name` names the owner thread and `subsystem` names the suite in the
-/// failure line, so a machine with a broken `redis-server` says which harness
-/// could not start one.
+/// Starts one Redis server and permanent owner thread for a subsystem harness.
 pub fn start(thread_name: &str, subsystem: &str, databases: u32) -> Option<RedisTestServer> {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    // 🔴 A thread that owns the child and never returns. It is what makes
-    // `PR_SET_PDEATHSIG` mean "when this process ends" rather than "when
-    // whichever test ran first ends", and it is also what keeps the `Child`
-    // handle from being dropped.
+    // The permanent thread retains the child handle until the test process exits.
     let owner = std::thread::Builder::new()
         .name(thread_name.to_string())
         .spawn(move || match spawn_server(databases) {
@@ -151,16 +84,7 @@ fn spawn_server(databases: u32) -> io::Result<(Child, u16)> {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        // 🔴 Die with the test process. A test binary that panics or is killed
-        // must not leave a Redis behind; over a few dozen runs that is a
-        // machine full of orphaned servers.
-        //
-        // 🔴 And note *which* thread does the spawning. `PR_SET_PDEATHSIG`
-        // fires when the creating **thread** exits, not when the process does.
-        // Spawning from whichever test thread happened to be first killed the
-        // server the moment that thread finished its test — 27 tests passed and
-        // the remaining 57 all failed with "connection refused". The owner is
-        // therefore a thread that never returns; see `start`.
+        // `PR_SET_PDEATHSIG` follows the spawning thread, so use the owner thread.
         unsafe {
             command.pre_exec(|| {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
@@ -202,8 +126,7 @@ fn wait_until_ready(child: &mut Child, port: u16) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last = io::Error::other("server never became ready");
     while Instant::now() < deadline {
-        // A binary that is not a Redis exits at once; waiting ten seconds for
-        // it turns a clear failure into a slow one.
+        // Fail promptly when the configured binary exits immediately.
         if let Ok(Some(status)) = child.try_wait() {
             return Err(io::Error::other(format!(
                 "the server process exited immediately with {status}"
@@ -231,16 +154,7 @@ pub fn redis_required() -> bool {
         .unwrap_or(false)
 }
 
-/// Takes the next logical database out of **the caller's own** counter.
-///
-/// 🔴 `counter` is borrowed, not owned by this module, and that is the whole
-/// point: each harness passes its own `static NEXT`, so the three subsystems
-/// never hand out the same database number for concurrent tests. Passing a
-/// counter that another harness also passes reintroduces exactly the collision
-/// this shape exists to prevent — [`tests`] fails when that happens.
-///
-/// `tests` names the suite in the panic, which is what tells whoever hits the
-/// bound which `DATABASES` to raise.
+/// Allocates the next logical database from the caller-owned counter.
 pub fn next_db(counter: &AtomicU32, databases: u32, tests: &str) -> u32 {
     let db = counter.fetch_add(1, Ordering::Relaxed);
     assert!(
@@ -250,23 +164,13 @@ pub fn next_db(counter: &AtomicU32, databases: u32, tests: &str) -> u32 {
     db
 }
 
-/// 🔴 The guard on the separation this module documents.
-///
-/// Extracting the process bootstrap makes "and now share the server too, and
-/// the counter" look like the obvious next step. It is not: see this module's
-/// own doc. These two tests are what makes taking that step fail loudly rather
-/// than produce cross-suite flakiness nobody can attribute.
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use super::{next_db, redis_required, RedisTestServer};
 
-    /// Every Redis-backed subsystem's harness, by module path, with the two
-    /// things that must not be shared between them.
-    ///
-    /// A new Redis-backed subsystem belongs in this list; that is the only
-    /// maintenance these guards need.
+    /// Redis subsystem harnesses and their independently owned resources.
     fn harnesses() -> [(
         &'static str,
         &'static AtomicU32,
@@ -291,14 +195,6 @@ mod tests {
         ]
     }
 
-    /// 🔴 Each harness allocates logical databases out of its own counter.
-    ///
-    /// Stated as pointer identity rather than as "bump one, watch the other
-    /// stay put", because the other suites in this binary are calling
-    /// `next_db` on all three counters concurrently while this test runs — a
-    /// value-based assertion here would be flaky in exactly the direction that
-    /// teaches people to delete it. Two harnesses passing one `static NEXT` is
-    /// the defect, and pointer identity is that defect stated exactly.
     #[test]
     fn the_three_redis_harnesses_allocate_logical_databases_from_independent_counters() {
         let harnesses = harnesses();
@@ -316,9 +212,6 @@ mod tests {
         }
     }
 
-    /// And the counters really are independent once they are distinct: this is
-    /// the value-based half of the property above, run on counters this test
-    /// owns so that nothing else in the binary can touch them.
     #[test]
     fn allocating_from_one_counter_does_not_advance_another() {
         const DATABASES: u32 = 512;
@@ -335,12 +228,6 @@ mod tests {
         assert_eq!(next_db(&yours, DATABASES, "yours"), 1);
     }
 
-    /// 🔴 Each harness owns its own `redis-server` process.
-    ///
-    /// Three processes during a test run is intended. Sharing one would put
-    /// three suites' keyspaces in one server, where the orchestrator store's
-    /// `flush_namespace()` reaches into databases the other two are mid-test
-    /// on.
     #[test]
     fn the_three_redis_harnesses_own_distinct_redis_server_instances() {
         let harnesses = harnesses();

@@ -33,12 +33,7 @@ struct HeartbeatNodeNotConfigured;
 #[derive(Clone)]
 struct ReporterConfig {
     scheduler_endpoint: String,
-    /// Resolved from `[cluster].scheduler_endpoint_file` by
-    /// [`crate::scheduler_endpoint::resolve_endpoint_file`] — see that
-    /// function, and [`crate::scheduler_endpoint::SchedulerEndpointSource`]
-    /// for what re-reading it while the process runs actually does. Never a
-    /// union with `scheduler_endpoint`: once read successfully at least
-    /// once, it overrides the static value outright.
+    /// Re-read at runtime; once resolved, overrides the static scheduler endpoint.
     scheduler_endpoint_file: Option<PathBuf>,
     interval: Duration,
 }
@@ -129,12 +124,7 @@ impl ObservabilityReporter {
                     }
                 }
 
-                // Resolved fresh on every iteration, deliberately — not once
-                // outside the loop. That is what makes a changed endpoint file
-                // take effect on the *next* heartbeat rather than the next
-                // restart: `current()` is where a hot-reloaded target actually
-                // becomes traffic instead of merely a value that changed
-                // somewhere.
+                // Resolve every iteration so endpoint reloads affect the next heartbeat.
                 let (scheduler_channel, current_endpoint) = channel_source.current();
 
                 match Self::send_heartbeat(
@@ -191,11 +181,7 @@ impl ObservabilityReporter {
                         let Some(events) = events else {
                             return;
                         };
-                        // Same reasoning as the heartbeat loop: fetched fresh
-                        // for this batch, not cached across batches, so a
-                        // hot-reloaded target applies to sandbox events too —
-                        // both share `channel_source`, so they always agree on
-                        // where "the scheduler" currently is.
+                        // Resolve every batch so events follow heartbeat endpoint reloads.
                         let (event_scheduler_channel, event_endpoint) =
                             event_channel_source.current();
                         if let Err(err) = Self::send_sandbox_events(
@@ -411,9 +397,6 @@ impl ObservabilityReporter {
                 cpu_config_json: snapshot.machine_info.cpu_config_json.unwrap_or_default(),
             }),
             snapshot: Some(scheduler::NodeSnapshot {
-                // An isolated node keeps heartbeating — it is healthy and still
-                // serving sandboxes — and says so here, which is what takes it
-                // out of scheduling without taking it out of the cluster.
                 status: if snapshot.draining {
                     scheduler::NodeStatus::Draining.into()
                 } else {
@@ -479,10 +462,7 @@ impl ObservabilityReporter {
         scheduler::SandboxEvent {
             sandbox_id: event.sandbox_id.to_string(),
             event_type: Self::map_sandbox_event_type(event.event_type).into(),
-            // The guard the receiver deletes a projection under. An empty value
-            // there means "no guard at all", and the receiver then declines to
-            // delete rather than deleting unguarded — so an event that goes out
-            // without this is an event that does nothing.
+            // The receiver uses this incarnation to guard projection deletion.
             execution_id: event.execution_id.to_string(),
             requested_cpu: event.resources.cpu_count,
             requested_memory_bytes: u64::from(event.resources.memory_mib) * 1024 * 1024,
@@ -503,17 +483,11 @@ impl ObservabilityReporter {
     }
 
     async fn unregister_node(&self) -> Result<()> {
-        // Whichever scheduler this reporter is currently heartbeating, not
-        // necessarily the one it started on — a node that switched targets
-        // mid-life should unregister itself from the one that actually holds
-        // its binding.
+        // Unregister from the scheduler currently receiving heartbeats.
         let (channel, _endpoint) = self.channel_source.current();
         self.unregister_node_on(channel).await
     }
 
-    /// The `UnregisterNode` call itself, against an explicit channel — used
-    /// by [`unregister_node`](Self::unregister_node) (the primary target,
-    /// retried up to three times by [`shutdown`](Self::shutdown)).
     async fn unregister_node_on(&self, channel: Channel) -> Result<()> {
         let mut request = Request::new(scheduler::UnregisterNodeRequest {
             node_id: self.service.node_id().to_string(),
@@ -678,10 +652,6 @@ mod tests {
         }
     }
 
-    /// The heartbeat is the repair path for a projection write that was lost,
-    /// so it has to carry the sandbox's own budget. A repair that installs the
-    /// receiver's default instead turns one dropped write into a permanently
-    /// short-lived record — and nothing anywhere reports that it happened.
     #[test]
     fn the_heartbeat_roster_carries_each_sandbox_budget() {
         let entry = SandboxRosterEntry {
@@ -703,10 +673,6 @@ mod tests {
         assert_eq!(request.roster[0].projection_ttl_secs, 86_460);
     }
 
-    /// 🔴 The control face: a node with no ceiling says 0, and 0 is the value
-    /// the receiver reads as "use your own default". It is never "do not
-    /// expire" — a record that outlives every path able to delete it is a route
-    /// pointing at a sandbox nobody can reach.
     #[test]
     fn a_roster_entry_without_a_budget_says_zero() {
         let entry = SandboxRosterEntry {
@@ -722,10 +688,6 @@ mod tests {
         assert_eq!(request.roster[0].projection_ttl_secs, 0);
     }
 
-    /// Every lifecycle event names the run it belongs to. The receiver guards a
-    /// projection delete with this value and declines to delete when it is
-    /// missing, so an event that goes out without one is an event that does
-    /// nothing at all.
     #[test]
     fn every_lifecycle_event_names_its_incarnation() {
         for event_type in [
@@ -798,9 +760,6 @@ mod tests {
         );
     }
 
-    /// 🔴 Exercised through the actual integration point rather than only
-    /// against `scheduler_endpoint::resolve_endpoint_file` directly: the
-    /// reporter must wire `[cluster].scheduler_endpoint_file` through.
     #[test]
     fn resolve_trims_and_picks_up_a_configured_endpoint_file() {
         let cluster = make_cluster_config_with_file(
@@ -824,21 +783,6 @@ mod tests {
     }
 }
 
-/// The one test in this file that goes over a real socket rather than
-/// inspecting [`crate::scheduler_endpoint::SchedulerEndpointSource`]'s state
-/// directly (that type's own file-reload behavior is covered where it now
-/// lives, `src/scheduler_endpoint.rs`).
-///
-/// 🔴 It exists because of what a real regression on this repository's dev
-/// cluster looked like: a config-reload change that read the new value fine,
-/// updated every place a human would check, passed every test that asserted
-/// on *values* — and never dialled anywhere else, because nothing rebuilt the
-/// channel. A test that only calls `SchedulerEndpointSource::current`
-/// directly would pass under that bug just the same, if `ObservabilityReporter`
-/// itself stopped calling `current()` per tick. This test instead runs the
-/// reporter's real background loop against two real gRPC servers and asks
-/// the only question that matters: after the switch, which one receives the
-/// next heartbeat.
 #[cfg(test)]
 mod against_a_scheduler {
     use std::net::SocketAddr;
@@ -854,10 +798,6 @@ mod against_a_scheduler {
     use crate::orchestrator::{Orchestrator, SandboxOrchestration};
     use crate::proto::scheduler::scheduler_server::{Scheduler, SchedulerServer};
 
-    /// A scheduler that does nothing but answer `Heartbeat` and
-    /// `UnregisterNode`, counting heartbeats. Enough to tell "traffic
-    /// reached this address" from "traffic did not" — which is the only
-    /// thing this test is about.
     #[derive(Default)]
     struct CountingScheduler {
         heartbeats: AtomicUsize,
@@ -958,8 +898,6 @@ mod against_a_scheduler {
         }
     }
 
-    /// A counting scheduler on a real port, serving until its shutdown sender
-    /// is dropped or fired.
     async fn scheduler_on_a_socket() -> (Arc<CountingScheduler>, SocketAddr, oneshot::Sender<()>) {
         let scheduler = Arc::new(CountingScheduler::default());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -990,10 +928,6 @@ mod against_a_scheduler {
         (scheduler, addr, tx)
     }
 
-    /// A cheap, real `ObservabilityService` — an in-memory orchestrator with
-    /// nothing in it. `node_snapshot()` over an empty orchestrator is exactly
-    /// as real as one holding sandboxes; this test is about where the
-    /// heartbeat goes, not what is in it.
     async fn test_service() -> Arc<ObservabilityService> {
         let orchestrator =
             Orchestrator::with_in_memory_store(crate::sandbox::mock::MockBackendFactory::new())
@@ -1030,14 +964,6 @@ mod against_a_scheduler {
         }
     }
 
-    /// T-P4-0. The reporter is pointed at scheduler A; the endpoint file is
-    /// rewritten to name scheduler B while the reporter keeps running; the
-    /// very next heartbeat must land on B, with no restart.
-    ///
-    /// This is the test the task's two required mutations must turn red:
-    /// dropping the channel rebuild, or dropping the change detection
-    /// entirely, both leave every heartbeat going to A forever, and this test
-    /// times out waiting for B to see one.
     #[tokio::test]
     async fn a_hot_reloaded_endpoint_actually_moves_the_traffic() {
         let (scheduler_a, addr_a, _shutdown_a) = scheduler_on_a_socket().await;
@@ -1069,8 +995,6 @@ mod against_a_scheduler {
             "nothing has told the reporter about B yet"
         );
 
-        // The hot-reload moment: rewrite the file, touch nothing else. No
-        // restart, no reconstruction of the reporter.
         std::fs::write(&file_path, format!("http://{addr_b}")).expect("rewrite the file to B");
 
         wait_until(StdDuration::from_secs(10), || {

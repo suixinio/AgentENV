@@ -30,13 +30,9 @@ pub struct SchedulerPeerDiscovery {
 }
 
 impl SchedulerPeerDiscovery {
-    /// Starts P2P peer discovery against the scheduler, hot-reloadable from
-    /// `[cluster].scheduler_endpoint_file` while the process runs — see
-    /// [`SchedulerEndpointSource::spawn_from_config`]. An invalid *static*
-    /// endpoint degrades to [`crate::p2p::discovery::NoopP2pPeerDiscovery`]
-    /// rather than failing this process's startup: unlike the paused
-    /// registry or resume placement, P2P is an optimization this process can
-    /// run correctly without.
+    /// Starts scheduler-backed P2P discovery with runtime endpoint reloads.
+    ///
+    /// Invalid static endpoints degrade to no discovery because P2P is optional.
     pub fn start(
         scheduler_endpoint: String,
         cluster: &ClusterConfig,
@@ -176,14 +172,7 @@ async fn refresh_scheduler_peers(
     sleep(jitter).await;
 
     loop {
-        // 🔴 The one place in this consumer that has to rebuild the client
-        // every iteration rather than holding one for the loop's lifetime.
-        // `SchedulerPeerDiscovery`'s other three methods each ask
-        // `endpoint_source.channel()` fresh per call already; this loop is
-        // long-running by construction, so a client built once outside it
-        // would keep talking to whatever channel was live at task-spawn time
-        // forever — the hot-reload would take effect for nothing this
-        // process does, `endpoint_source` notwithstanding.
+        // Rebuild per iteration so endpoint reloads affect this long-running loop.
         let mut client = SchedulerClient::new(endpoint_source.channel());
         match list_scheduler_p2p_peers(
             &mut client,

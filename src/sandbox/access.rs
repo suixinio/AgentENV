@@ -19,62 +19,22 @@ const MANAGED_SEED_BYTES: usize = 32;
 const SEED_HEX_LEN: usize = MANAGED_SEED_BYTES * 2;
 const MANAGED_SEED_FILE_MAX_LEN: usize = SEED_HEX_LEN + 1;
 
-/// The name of the environment variable an operator sets, quoted in the refusal
-/// so the message can be acted on without opening the configuration reference.
 const SEED_ENV_VAR: &str = "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED";
 
-/// How many leading bytes of `SHA-256(seed)` stand in for the seed in
-/// [`SEED_FINGERPRINT_METRIC`].
-///
-/// 🔴 A prefix of a hash, never the seed. What the label has to support is one
-/// question — "do these two processes hold the same seed?" — and eight bytes
-/// answer it. It is not a secret in the sense the seed is, but it is also not
-/// nothing: a seed guessable from a short list stays guessable through its
-/// hash, so this is a comparison aid and not a reason to relax how the seed
-/// itself is handled.
+/// Bytes of `SHA-256(seed)` exposed in the comparison-only metric label.
 const SEED_FINGERPRINT_BYTES: usize = 8;
 
-/// The gauge that makes "every replica holds the same seed" answerable from a
-/// scrape.
-///
-/// 🔴 Always `1`, and the value is not the point: the *label* is. A missing
-/// seed is caught at startup by [`AccessTokenSeedPolicy::MustBeConfigured`],
-/// but two replicas each configured with a different non-empty seed pass every
-/// check there is and still hand users tokens the other one rejects. Comparing
-/// this label across replicas is the only place that divergence is visible
-/// (`_sd-impl-phase3-role.md` §9.3 item 4).
+/// Gauge label used to compare configured seeds across replicas.
 const SEED_FINGERPRINT_METRIC: &str = "agentenv_access_token_seed_fingerprint";
 
-/// Whether this process may invent its own envd access-token seed when none is
-/// configured.
+/// Whether this process may generate an envd access-token seed.
 ///
-/// envd access tokens are `HMAC(seed, sandbox_id)`, so the seed is not a private
-/// detail of the process that holds it: it is the only thing that makes two
-/// processes agree on what a sandbox's token is.
+/// Replicas must share the seed because tokens are `HMAC(seed, sandbox_id)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessTokenSeedPolicy {
-    /// A single machine, which generates a seed and keeps it under
-    /// `$AENV_HOME/secrets/`. What `aenv-node` passes, and today's behaviour
-    /// verbatim: a developer running one should not need a secret to boot.
-    ///
-    /// Cross-*node* agreement still matters for cross-node recovery, but that
-    /// is a warning's job, not a refusal's — the deployment that needs it is
-    /// not the deployment that is broken without it. What tells the two apart
-    /// on a live cluster is the fingerprint gauge, not this;
-    /// see [`SandboxAccessTokenGenerator`].
+    /// A single machine may generate and persist its own seed.
     MayGenerate,
-    /// A replicated process, which must be *handed* the seed. What `aenv-api`
-    /// passes.
-    ///
-    /// 🔴 About replication rather than about being the deciding half. An
-    /// `aenv-api` Deployment runs more than one replica, and every one of them
-    /// mints tokens (`create`, `fork`), re-derives them (`resume`) and hands
-    /// them back (`GET /sandboxes/{id}`). Two replicas with two invented seeds
-    /// do not disagree loudly — the user is handed a token by whichever replica
-    /// the load balancer picked, and it stops working the moment another one
-    /// answers, with no error, no log and no metric
-    /// (`_sd-impl-phase3-role.md` §9.2). Refusing to start is the only form of
-    /// that fault anybody sees.
+    /// A replicated process must be given the shared seed.
     MustBeConfigured,
 }
 
@@ -112,12 +72,7 @@ impl SandboxAccessTokenGenerator {
         })
     }
 
-    /// Resolves the seed this process signs envd access tokens with, and
-    /// publishes its fingerprint.
-    ///
-    /// The fingerprint is published by *both* halves. Scraping it from two
-    /// nodes answers "do these two agree?", which is the same question two
-    /// `aenv-api` replicas need answered.
+    /// Resolves the signing seed and publishes its fingerprint.
     pub fn load_or_create(
         config: &AppConfig,
         seed_policy: AccessTokenSeedPolicy,
@@ -137,10 +92,7 @@ impl SandboxAccessTokenGenerator {
             return Self::new(seed);
         }
 
-        // 🔴 Before the managed file is even looked for. Falling back to a
-        // node-local seed is the failure, not a step on the way to it: the
-        // process would come up, serve requests, and mint tokens no sibling
-        // replica can verify.
+        // Reject before the node-local managed-seed fallback.
         if seed_policy.refuses_an_invented_seed() {
             bail!(
                 "aenv-api has no envd access-token seed configured. Set {SEED_ENV_VAR} (or \
@@ -168,11 +120,7 @@ impl SandboxAccessTokenGenerator {
         Self::new(&seed)
     }
 
-    /// The first [`SEED_FINGERPRINT_BYTES`] bytes of `SHA-256(seed)`, in
-    /// lowercase hex.
-    ///
-    /// Two processes holding the same seed produce the same string; two holding
-    /// different seeds do not. That is the whole contract.
+    /// Returns the comparison fingerprint: the leading hash bytes in lowercase hex.
     pub fn seed_fingerprint(&self) -> String {
         let digest = Sha256::digest(&self.seed);
         hex::encode(&digest[..SEED_FINGERPRINT_BYTES])
@@ -180,8 +128,7 @@ impl SandboxAccessTokenGenerator {
 
     fn publish_seed_fingerprint(&self, seed_policy: AccessTokenSeedPolicy) {
         let fingerprint = self.seed_fingerprint();
-        // The seed itself never reaches either sink; the fingerprint is what
-        // both carry.
+        // Only the fingerprint reaches logs and metrics.
         info!(
             seed_policy = ?seed_policy,
             fingerprint = %fingerprint,
@@ -384,30 +331,9 @@ fn is_valid_managed_seed(seed: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Creates the secret directory already private, in one step.
+/// Atomically creates only the leaf directory at mode 0700.
 ///
-/// 🔴 Creating it and then tightening it are two steps, and between them the
-/// directory exists at whatever the umask allowed — 0755 under the usual 022.
-/// That is not a harmless intermediate state: [`resolve_seed`] starts by
-/// validating this directory and treats anything other than 0700 as a hard
-/// error, with no retry. So a second caller arriving inside that window fails
-/// outright, on a directory this process was in the middle of securing. Worse
-/// than the failure is what it would mean if the window ever widened: a secret
-/// written into a world-readable directory.
-///
-/// `mkdir(2)` takes the mode with the directory, so there is no window to land
-/// in. Only the leaf is created this way; ancestors keep ordinary permissions,
-/// since making `$AENV_HOME` itself 0700 would lock out everything else that
-/// legitimately reads from it.
-///
-/// `AlreadyExists` is success: either a previous run created it, or a
-/// concurrent caller won the race. Both leave the caller's own validation to
-/// decide whether what is there is acceptable.
-///
-/// An unusual umask (one masking bits inside 0700) yields a *stricter*
-/// directory, which validation then rejects with the mode it found. Left to
-/// fail deliberately: forcing the mode afterwards would restore the very window
-/// this removes, and an operator running such a umask needs to know.
+/// Existing paths are validated by the caller; restrictive umasks are not corrected afterward.
 fn create_private_directory(path: &Path) -> io::Result<()> {
     if let Some(ancestors) = path.parent() {
         fs::create_dir_all(ancestors)?;
@@ -505,15 +431,6 @@ mod tests {
         Ok(create_private_directory(path)?)
     }
 
-    /// The directory has to be private the instant it exists, not a moment
-    /// after. Anything that creates it first and tightens it second leaves a
-    /// window in which it is 0755 — and `resolve_seed` rejects that outright,
-    /// so a concurrent caller landing in the window fails on a directory this
-    /// process is in the middle of securing.
-    ///
-    /// Asserted against the mode on disk rather than through `resolve_seed`,
-    /// because the window is invisible to any test that only looks at the end
-    /// state.
     #[test]
     #[cfg(unix)]
     fn the_secret_directory_is_private_from_the_moment_it_exists() -> Result<()> {
@@ -527,16 +444,12 @@ mod tests {
         let mode = fs::symlink_metadata(&secrets)?.permissions().mode() & 0o777;
         assert_eq!(mode, 0o700, "found {mode:04o}");
 
-        // The ancestor it had to create on the way keeps ordinary permissions:
-        // making $AENV_HOME itself 0700 would lock out everything else that
-        // legitimately reads from it.
         let ancestor = fs::symlink_metadata(temp.path().join("nested"))?
             .permissions()
             .mode()
             & 0o777;
         assert_ne!(ancestor, 0o700, "only the leaf should be locked down");
 
-        // Idempotent: a second run finds it already there and says so quietly.
         create_private_directory(&secrets)?;
 
         Ok(())
@@ -572,8 +485,6 @@ mod tests {
         assert!(!format!("{token:?}").contains(token.expose()));
     }
 
-    /// A config whose only variable is the seed, so the tests below differ from
-    /// each other by exactly one thing.
     fn config_with_seed(home: &Path, seed: Option<&str>) -> AppConfig {
         AppConfig {
             home_path: home.to_owned(),
@@ -601,24 +512,6 @@ mod tests {
         Ok(())
     }
 
-    /// 🔴 The refusal and the thing it refuses, one config apart.
-    ///
-    /// Asserting only that [`AccessTokenSeedPolicy::MustBeConfigured`] fails
-    /// would pass on a `load_or_create` that had simply stopped working;
-    /// asserting only that [`AccessTokenSeedPolicy::MayGenerate`] succeeds
-    /// would pass on the code as it was before this gate existed. The evidence
-    /// is that the same directory, the same absent seed and the same call give
-    /// opposite answers for the two policies — and that the refusing arm leaves
-    /// no managed file behind, which is what says it refused *instead of*
-    /// falling back rather than after having done so.
-    ///
-    /// 🔴 This seam is the only place the refusal can be covered, and the
-    /// reason is worth knowing before somebody goes looking for the same test
-    /// one layer up: `ConfigManager::set_global` injects
-    /// `TEST_ACCESS_TOKEN_HASH_SEED` into every `#[cfg(test)]` build
-    /// (`src/cfg.rs`), so an `Orchestrator::new(MustBeConfigured, ..)` in any
-    /// unit test always finds a configured seed and always succeeds. A test
-    /// there would look like it covered this and would not.
     #[test]
     fn the_api_half_refuses_to_invent_a_seed_and_the_node_half_still_may() -> Result<()> {
         {
@@ -652,11 +545,9 @@ mod tests {
         .expect_err("aenv-api must not invent a seed its siblings cannot derive");
 
         let message = format!("{error:#}");
-        // Actionable, in the words an operator would go looking for.
         assert!(message.contains(SEED_ENV_VAR), "{message}");
         assert!(message.contains("same value on every replica"), "{message}");
         assert!(message.contains("agentenv-runtime-secrets"), "{message}");
-        // Refused before the fallback, not after it.
         assert!(
             !managed_path.exists(),
             "aenv-api generated a seed on its way to refusing"
@@ -664,10 +555,6 @@ mod tests {
         Ok(())
     }
 
-    /// What satisfies the refusal, and what does not. A seed that is only
-    /// whitespace is the shape a Secret key present-but-empty takes, and it has
-    /// to be as loud as a missing one rather than quietly becoming a valid
-    /// zero-length key.
     #[test]
     fn a_configured_seed_is_what_the_api_half_wants_and_a_blank_one_is_not() -> Result<()> {
         let temp = TempDir::new()?;
@@ -696,11 +583,6 @@ mod tests {
         Ok(())
     }
 
-    /// 🔴 The half of the fingerprint that gives it any value: two different
-    /// seeds must produce two different labels. "The same seed hashes to the
-    /// same thing" is also true of a function that returns a constant, and a
-    /// constant is exactly the failure mode this metric exists to rule out —
-    /// two replicas reporting equal fingerprints while holding different seeds.
     #[test]
     fn the_fingerprint_tells_two_seeds_apart_and_agrees_with_itself() -> Result<()> {
         let alpha = SandboxAccessTokenGenerator::new("seed-alpha")?;
@@ -714,14 +596,10 @@ mod tests {
             "a fingerprint two different seeds share cannot answer whether two replicas agree"
         );
 
-        // Pinned to the digest rather than to itself: a fingerprint that is
-        // *some* stable function of the seed still fails the cluster if the two
-        // replicas run builds that compute it differently.
         assert_eq!(alpha.seed_fingerprint(), "ba316cd7abc9b7dc");
         assert_eq!(beta.seed_fingerprint(), "d9c30acfd5686611");
         assert_eq!(alpha.seed_fingerprint().len(), SEED_FINGERPRINT_BYTES * 2);
 
-        // And it is a hash, not the seed wearing a hat.
         assert!(!alpha.seed_fingerprint().contains("seed-alpha"));
         assert!(alpha
             .seed_fingerprint()
@@ -730,14 +608,6 @@ mod tests {
         Ok(())
     }
 
-    /// The gauge, read the way a scrape reads it.
-    ///
-    /// 🔴 Three loads in one test, and the third is the control: without a run
-    /// that publishes a *different* label, "the label matched" is satisfied by
-    /// a recorder that only ever saw one value. What is asserted is the shape
-    /// the §12 P4 probe compares across replicas — same seed, same label;
-    /// different seed, different label — plus the fact that neither label is
-    /// the seed.
     #[test]
     fn the_seed_fingerprint_is_published_where_two_replicas_can_be_compared() -> Result<()> {
         let temp = TempDir::new()?;
@@ -760,7 +630,6 @@ mod tests {
         Ok(())
     }
 
-    /// Every `fingerprint` label `load_or_create` published, at value 1.
     fn published_fingerprints(config: &AppConfig) -> Result<Vec<String>> {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 

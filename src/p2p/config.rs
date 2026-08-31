@@ -6,12 +6,6 @@ use crate::cfg::P2pConfig;
 pub use crate::cfg::P2pTransportKind;
 
 /// The backend id a transport kind advertises to peers.
-///
-/// 🔴 Not an inherent method on [`P2pTransportKind`]: that type is a *config*
-/// value — `[p2p].transport` — and lives with the rest of the config, which
-/// knows nothing about which transport implementations are linked into this
-/// process. The mapping from the configured name to a linked backend belongs
-/// to the half that links them.
 pub fn backend_id(kind: P2pTransportKind) -> Option<&'static str> {
     match kind {
         P2pTransportKind::Disabled => None,

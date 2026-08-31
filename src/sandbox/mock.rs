@@ -82,52 +82,11 @@ pub struct MockBehavior {
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
-    /// How many fork children this behaviour has handed out an address to.
-    ///
-    /// 🔴 What makes each child's address *its own*. A real backend gives every
-    /// fork child its own network slot, so no two of them — and not the source
-    /// either — answer on the same address. A mock that handed every child the
-    /// parent's would let "the field is filled in" pass on a build that filled
-    /// it in from the wrong sandbox.
     forked_children: AtomicUsize,
-    /// Whether fork children come back with no address at all.
-    ///
-    /// The failing half of the same question, and the one a real deployment
-    /// produces: the source is up and routable, and a child comes back from
-    /// wherever it started without the address the proxy route needs.
     fork_children_without_address: AtomicBool,
-    /// What the last `pause` was told about whether anyone would commit a
-    /// publishable capture.
-    ///
-    /// 🔴 Recorded rather than acted on. This backend produces the same capture
-    /// either way — like the Firecracker one it borrows artifacts somebody else
-    /// wrote — so nothing about its behaviour would reveal a caller that passed
-    /// the wrong value, and the value is what decides whether a *remote* pause
-    /// spends a durable write.
     pause_committer_waiting: Mutex<Option<bool>>,
-    /// What this backend's `update_custom_extension_params` most recently
-    /// applied, or `None` if it has never been called successfully.
-    ///
-    /// 🔴 Written only when the call succeeds — see
-    /// `MockSandboxBackend::update_custom_extension_params` — so this is
-    /// evidence of what the *runtime* holds, not of what was merely asked for.
-    /// A test that injects a failure and then reads this back proves the
-    /// runtime kept its old value rather than adopting one it never actually
-    /// received.
     last_custom_extension_params: Mutex<Option<Option<CustomExtensionParams>>>,
-    /// Whether captures come back as something a snapshot repository can stage.
-    ///
-    /// 🔴 Off by default, and the default is the interesting half. A capture
-    /// this repository cannot recognise is what a backend that has no publish
-    /// support produces, and the tests that assert an upload was *not*
-    /// attempted rely on that being the shape a plain mock hands back. Turning
-    /// it on is how a test says "and this one really could have been staged".
     captures_are_stageable: AtomicBool,
-    /// What `holding_node_id` answers. `None` — the default — matches every
-    /// backend that runs in this process, which is what this mock stands in
-    /// for by default. A test names a `&'static str` (a literal is always
-    /// enough) to make this backend answer the way `RemoteSandboxStub` does
-    /// once it has been placed on a real machine.
     holding_node_id: Mutex<Option<&'static str>>,
 }
 
@@ -148,9 +107,6 @@ impl MockBehavior {
 
     fn capture(&self) -> CapturedSandboxSnapshot {
         if self.captures_are_stageable.load(Ordering::SeqCst) {
-            // 🔴 `CallerOwnedArtifacts`, not `FirecrackerCapturedSnapshot`:
-            // the two are the same value — a manifest and no temporary
-            // directory — and this one is on the shared side of the split.
             CapturedSandboxSnapshot::local(crate::snapshot::CallerOwnedArtifacts::new(
                 crate::types::FirecrackerSnapshotManifest::for_test(32768, &[]),
             ))
@@ -167,9 +123,7 @@ impl MockBehavior {
             .expect("pause_committer_waiting mutex poisoned")
     }
 
-    /// What `update_custom_extension_params` last applied successfully, or
-    /// `None` if it never has. See the field doc for why this is not updated
-    /// on a failed call.
+    /// Returns the last successfully applied custom-extension parameters.
     pub fn last_custom_extension_params(&self) -> Option<Option<CustomExtensionParams>> {
         self.last_custom_extension_params
             .lock()
@@ -214,11 +168,6 @@ impl MockBehavior {
             .store(without, Ordering::SeqCst);
     }
 
-    /// The address the next fork child answers on, given its parent's.
-    ///
-    /// 🔴 Derived from the parent's rather than invented, so a parent that has
-    /// no address forks into children that have none either — a network slot
-    /// nobody could allocate does not become one when a sandbox is forked.
     fn next_fork_child_host_ip(
         &self,
         parent: Option<std::net::Ipv4Addr>,
@@ -370,14 +319,6 @@ impl MockBehavior {
 pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
-    /// 🔴 Recorded, not ignored.
-    ///
-    /// Every incarnation assertion worth making — a resume runs under a new
-    /// one, a snapshot does not change it, each fork child gets its own — is
-    /// only meaningful against what the backend actually received. Reading it
-    /// back off the metadata store instead would assert that the value written
-    /// there is the value written there. Keeping it here is what lets all of it
-    /// run under `cargo test --lib`, without root and without `/dev/kvm`.
     execution_id: ExecutionId,
 }
 
@@ -446,8 +387,7 @@ impl SandboxBackend for MockSandboxBackend {
             }
             return Err(pause_err);
         }
-        // Mirrors the real backend: a pause into a caller-owned artifact root
-        // can also be published, a pause into managed temporaries cannot.
+        // Only caller-owned pause artifacts are publishable.
         Ok(PausedSandboxCapture {
             state: Arc::new(MockSnapshot),
             publishable: artifact_root.map(|_| self.behavior.capture()),
@@ -478,10 +418,7 @@ impl SandboxBackend for MockSandboxBackend {
                 self.behavior
                     .apply_sync(MockOperation::ForkChild)
                     .map(|()| {
-                        // Each child runs under the incarnation its spec named,
-                        // never the parent's — and answers on its own address,
-                        // never the parent's, because a real backend hands each
-                        // child its own network slot.
+                        // Each child uses its specified incarnation and a distinct address.
                         Box::new(Self::new_with_host_ip(
                             Arc::clone(&self.behavior),
                             self.behavior.next_fork_child_host_ip(self.host_ip),
@@ -532,7 +469,6 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior
             .apply_async(MockOperation::UpdateCustomExtensionParams)
             .await?;
-        // Only reached on success — see `last_custom_extension_params`'s doc.
         *self
             .behavior
             .last_custom_extension_params
@@ -605,13 +541,6 @@ impl SandboxBackendFactory for MockBackendFactory {
         )))
     }
 
-    /// 🔴 Overridden, where every *local* factory is correct to inherit the
-    /// trait's refusal. This one is not a local factory: it is the in-process
-    /// stand-in for whichever factory a test's orchestrator would really have
-    /// had, and the only real implementation of this method
-    /// (`RemoteSandboxBackendFactory`) accepts. A mock that refused here would
-    /// make "the api half handed a create to a node without resolving it"
-    /// untestable without a socket.
     fn build_from_snapshot_record(
         &self,
         _record: &crate::snapshot::SnapshotRecord,

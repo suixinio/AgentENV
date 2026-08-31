@@ -8,26 +8,16 @@ fn main() {
     println!("cargo:rerun-if-env-changed=AENV_GIT_COMMIT");
     emit_git_rerun_inputs();
 
-    // The server stubs exist for the in-process fake controller the registry
-    // client's transport tests run against. That client's whole job is turning
-    // gRPC outcomes into the right kind of failure, and the outcomes worth
-    // testing — a deadline, a refused connection, a status that sounds like an
-    // answer — can only be produced by something on the other end of a socket.
+    // Server stubs let transport tests produce real gRPC failures.
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
         .compile_protos(
             &[
                 "services/api/proto/scheduler.proto",
-                // 🔴 Deliberately not added to `services/Makefile`'s explicit
-                // proto list: both ends of the node service are Rust, and a
-                // `.pb.go` nobody imports is one more generated artifact to
-                // keep in step.
+                // Rust-only proto; no Go artifact is generated.
                 "services/api/proto/node.proto",
-                // 🔴 The opposite call to the one above: this proto *is* on
-                // `services/Makefile`'s `PROTO_SRC`, because the gateway is
-                // written in Go and is the only caller of the service it
-                // describes. Both generators have to be re-run when it changes.
+                // The Go gateway consumes this proto, so both generators must run.
                 "services/api/proto/apiproxy/apiproxy.proto",
             ],
             &["services/api/proto"],
@@ -38,17 +28,6 @@ fn main() {
     println!("cargo:rustc-env=AENV_GIT_COMMIT={commit}");
 }
 
-/// Resolves the commit embedded in the binary via `AENV_GIT_COMMIT`
-/// (`src/identity.rs::build_commit` reads it back with `option_env!`).
-///
-/// `.dockerignore` excludes `.git` from the Docker build context to keep it
-/// small, so `resolve_git_commit()`'s `git rev-parse` has nothing to read
-/// from inside a container build — every image build must instead pass the
-/// commit in explicitly as `AENV_GIT_COMMIT` (Docker `ARG`/`ENV`, threaded
-/// through by `deploy/docker/Dockerfile.aenv-node` /
-/// `Dockerfile.aenv-api` and `Makefile`'s `k8s-build`), which we prefer here
-/// when present. Plain local `cargo build` runs still resolve the commit
-/// from `.git` since it is actually present on disk there.
 fn resolve_build_commit() -> String {
     std::env::var("AENV_GIT_COMMIT")
         .ok()

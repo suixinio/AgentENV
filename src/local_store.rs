@@ -5,47 +5,17 @@ use std::time::Duration;
 use anyhow::Context;
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 
-/// Default bound for [`LocalKvStore::close`], reused by every node-local
-/// RocksDB store's shutdown path so an operator reading shutdown logs across
-/// all of them only has one number to remember.
+/// Default timeout for node-local RocksDB shutdown.
 pub const DEFAULT_CLOSE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Outcome of [`LocalKvStore::close`]: whether RocksDB's background
-/// compaction/flush work actually stopped within the timeout, or is still
-/// running when the call gave up waiting on it.
+/// Whether RocksDB background work stopped before [`LocalKvStore::close`] timed out.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalKvCloseOutcome {
-    /// Background work stopped before the timeout elapsed. Whenever the last
-    /// `Arc<DB>` reference for this store eventually drops — right after this
-    /// call, or much later if something else still holds a clone — RocksDB's
-    /// own close (`rocksdb_close`, invoked from `DBWithThreadModeInner`'s
-    /// `Drop`) has nothing left to wait for and returns immediately.
+    /// Background work stopped before the timeout.
     Closed,
-    /// The timeout elapsed before background work stopped. The cancellation
-    /// request has already been made — RocksDB is still winding down on its
-    /// own, in the background — but nothing is waiting for it any more, so a
-    /// later, unbounded `Drop` of the last reference could still block for as
-    /// long as that work takes.
+    /// Background work is still winding down after cancellation was requested.
     ///
-    /// 🔴 In this process that later `Drop` is **not** bounded by
-    /// `shutdown_timeout` in `src/bin/aenv-node.rs`, whatever a stale version of
-    /// this comment used to claim. `main` there is `let result =
-    /// runtime.block_on(async_main()); runtime.shutdown_timeout(...);` —
-    /// `shutdown_timeout` only starts once `block_on` has already *returned*.
-    /// But the last `Arc<DB>` reference for a store like this one is dropped
-    /// from inside `async_main` itself: either directly, when a local holding
-    /// a clone (the API app's `Arc<SnapshotManager>`, say) goes out of scope,
-    /// or via `shutdown_cleanup.await?` joining a spawned task that drops its
-    /// own clone (`NodeRuntime::shutdown` consuming `self`). Either way that
-    /// drop — and, if it is the last reference, RocksDB's blocking close
-    /// inside it — has to finish before `async_main` can return, which is
-    /// before `block_on` can return, which is before `shutdown_timeout` is
-    /// even called. So a `TimedOut` here is not "logged and then bounded
-    /// later": if this store's last reference drops during this process's own
-    /// shutdown sequence, rather than being kept alive by something that
-    /// outlives it, that drop can hang `block_on` — and with it the whole
-    /// process — for as long as the outstanding compaction/flush work takes,
-    /// with nothing left in this file or `server.rs` to cut it short.
+    /// Dropping the last `Arc<DB>` may still block until that work finishes.
     TimedOut,
 }
 
@@ -149,28 +119,9 @@ impl LocalKvStore {
         })
     }
 
-    /// Boundedly stops this store's background compaction/flush work ahead of
-    /// its eventual `Drop`.
+    /// Requests cancellation of RocksDB background work and waits up to `timeout`.
     ///
-    /// 🔴 RocksDB's own close (`rocksdb_close`, called from
-    /// `DBWithThreadModeInner`'s `Drop`) waits, *unboundedly*, for any
-    /// in-progress background compaction/flush to finish before it returns —
-    /// which is what turns an ordinary `drop(store)` deep inside a
-    /// `spawn_blocking` closure into a wait `tokio::runtime::Runtime::drop`
-    /// can sit through forever (its `BlockingPool::drop` calls
-    /// `shutdown(None)`, and `None` means "no timeout"). RocksDB exposes
-    /// `cancel_all_background_work(wait: bool)` for exactly this: an `&self`,
-    /// non-consuming call that requests the same stop and, with `wait: true`,
-    /// blocks until it has actually happened. Running that call here, wrapped
-    /// in our own `tokio::time::timeout`, moves the wait to a call site that
-    /// bounds it and reports whether it finished — so the store's actual
-    /// `Drop`, whenever it runs and regardless of how many other
-    /// `LocalKvStore` clones still hold the same `Arc<DB>`, finds nothing left
-    /// to wait for.
-    ///
-    /// Because this never consumes or drops the underlying `Arc<DB>`, calling
-    /// it more than once (or on a store other code still uses) is harmless:
-    /// a later call just re-confirms background work is already stopped.
+    /// This does not consume the underlying `Arc<DB>` and is safe to call repeatedly.
     pub async fn close(&self, timeout: Duration) -> LocalKvCloseOutcome {
         let db = Arc::clone(&self.db);
         run_blocking_bounded(timeout, move || db.cancel_all_background_work(true)).await
@@ -309,21 +260,14 @@ impl LocalKvStore {
     }
 }
 
-/// Runs `f` on the blocking pool, bounded by `timeout`. The mechanism behind
-/// [`LocalKvStore::close`], factored out so it can be exercised with a
-/// deliberately stuck closure without needing real RocksDB internals to
-/// actually stall (which is slow to arrange and not reliably deterministic).
+/// Runs `f` on the blocking pool for at most `timeout`.
 async fn run_blocking_bounded<F>(timeout: Duration, f: F) -> LocalKvCloseOutcome
 where
     F: FnOnce() + Send + 'static,
 {
     match tokio::time::timeout(timeout, tokio::task::spawn_blocking(f)).await {
         Ok(Ok(())) => LocalKvCloseOutcome::Closed,
-        // `f` cannot itself return an error; a `JoinError` here only happens
-        // if the blocking task panicked or was cancelled, neither of which
-        // this call does. Treat it the same as "did not finish" rather than
-        // propagating a panic from a shutdown path whose whole job is to not
-        // make things worse.
+        // A panic or cancellation also means the work did not finish cleanly.
         Ok(Err(_)) => LocalKvCloseOutcome::TimedOut,
         Err(_) => LocalKvCloseOutcome::TimedOut,
     }
@@ -333,20 +277,6 @@ where
 mod tests {
     use super::*;
 
-    /// 🔴 The test load-bearing for the entire point of `close`: without the
-    /// `tokio::time::timeout` wrapper in `run_blocking_bounded`, a slow (or,
-    /// in the production case this guards against, RocksDB-background-work-is-
-    /// still-running) blocking closure would make the caller wait for however
-    /// long the closure takes — which, unbounded, is the exact failure mode
-    /// that left `server aenv-node` running past `terminationGracePeriodSeconds`
-    /// on every node that had actually run a VM.
-    ///
-    /// The closure sleeps well past the timeout rather than blocking forever:
-    /// a closure that never returns would still make *this* assertion pass,
-    /// but would then hang the test's own runtime teardown, which joins
-    /// exactly this kind of still-running blocking-pool thread unboundedly —
-    /// the same bug this whole file exists to close off, just relocated into
-    /// the test suite instead of fixed.
     #[tokio::test]
     async fn close_returns_promptly_when_the_blocking_closure_is_still_running() {
         const TIMEOUT: Duration = Duration::from_millis(100);

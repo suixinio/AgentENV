@@ -13,14 +13,9 @@ use super::value::{SnapshotAlias, SnapshotId};
 use super::version::SnapshotRuntimeVersions;
 use crate::types::{ImageConfigs, SandboxResources};
 
-/// 🔴 `Serialize`/`Deserialize` because phase 3 sends this *to* the node.
+/// Serializable request metadata sent to the node that stages snapshot bytes.
 ///
-/// It is the request half of the bytes-then-commit seam: `stage` takes it,
-/// `commit_staged` does not. Once `aenv-api` exists, the process that
-/// receives the pause is not the process that holds the sandbox, so this
-/// struct crosses a wire in the opposite direction to [`StagedSnapshot`]. It
-/// derived neither before, and every member it holds already derived both —
-/// they are all inside `CommittedSnapshot` too.
+/// The staged value travels back in the opposite direction for commit.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,

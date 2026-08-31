@@ -84,18 +84,13 @@ const E2B_TARGET_PORT_HEADER: &str = "e2b-sandbox-port";
 /// Set by the gateway when the control plane can name the incarnation it is
 /// routing to. Absent whenever it cannot, which is an ordinary answer.
 const EXPECT_EXECUTION_HEADER: &str = "x-agentenv-expect-execution-id";
-/// Answered on every proxy response, allowed or refused: the incarnation this
-/// node has alive for the sandbox, or nothing when it has none.
+/// Echoes the live incarnation on allowed and refused responses.
 ///
-/// It doubles as this node's capability signal — a gateway that never sees it
-/// knows the node is not taking part in fencing.
+/// Its presence also signals that the node participates in fencing.
 const EXECUTION_ECHO_HEADER: &str = "x-agentenv-execution-id";
-/// Sent with the refusal below. 🔴 Internal: the gateway translates the pair
-/// into the one shape clients see, and never passes it through.
+/// Internal refusal detail translated by the gateway.
 const REFUSAL_HEADER: &str = "x-agentenv-refusal";
-/// 🔴 The only refusal string on the wire. Not `stale_execution`, not a third
-/// spelling — the whole point is that one grep joins gateway, node and
-/// controller.
+/// Canonical superseded-incarnation refusal code shared across components.
 const REFUSAL_EXECUTION_SUPERSEDED: &str = "sandbox_execution_superseded";
 
 #[cfg(test)]
@@ -113,15 +108,7 @@ const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long a wake-up may take before the caller is told it did not happen.
-///
-/// 🔴 Declared in the file that no longer wakes anything, and read only by
-/// `crate::api::impls::resume_surface` — the gRPC surface the gateway's cold
-/// path calls. The local reverse proxy used to take the same decision on its
-/// own request path and shared this bound with it; the proxy half of that is
-/// deleted and the bound is not, because a wake-up driven by a request already
-/// in flight still must not run unbounded: it holds the gateway's request open
-/// and leaves the cluster row in `resuming` until the lease lapses.
+/// Bounds request-driven wake-up before the caller is told it failed.
 pub(in crate::api) fn auto_resume_deadline() -> Duration {
     #[cfg(test)]
     const DEADLINE: Duration = Duration::from_millis(100);
@@ -163,12 +150,7 @@ where
 {
     Router::new()
         .route(PROXY_ROUTE, any(proxy_via_prefix::<I>))
-        // `/proxy/` has nothing left after the prefix, so the wildcard route
-        // below cannot match it (catch-all params must be non-empty) and the
-        // exact route above does not either. Without this route it reaches
-        // `proxy_via_fallback`, which forwards the path unmodified and leaks
-        // the `/proxy` prefix into the sandbox. The distributed gateway builds
-        // exactly this shape whenever a client requests `/`.
+        // The wildcard cannot match an empty suffix; keep `/proxy/` from falling through.
         .route("/proxy/", any(proxy_via_prefix::<I>))
         .route("/proxy/{*proxy_path}", any(proxy_via_prefix::<I>))
         .fallback(proxy_via_fallback::<I>)
@@ -286,28 +268,18 @@ fn with_route_source(mut response: Response<Body>, source: HttpRouteSource) -> R
     response
 }
 
-/// What this node did with the incarnation the control plane named.
-///
-/// 🔴 Five values, not two. `pass_ahead` (a same-node pause/resume the control
-/// plane has not caught up with) and `pass_absent` (a cross-node resume whose
-/// VM is not up here yet) are both ordinary and both frequent; collapsing them
-/// into a plain "passed" throws away the only evidence that the two rules
-/// meant to allow them are working.
+/// Classifies the node's relation to the control plane's expected incarnation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FencingDecision {
     /// The control plane named the incarnation this node is running.
     Pass,
-    /// This node is running a *newer* incarnation than the one named. It is
-    /// ahead of the control plane by a heartbeat, and the traffic was routed
-    /// here, so there is no second live copy to protect against.
+    /// This node is ahead of the control plane and may serve the request.
     PassAhead,
     /// No header: the control plane could not name an incarnation.
     PassNoExpect,
-    /// This node has no live copy of the sandbox. Absence is not evidence of a
-    /// superseded run.
+    /// No live copy exists here; absence is not a stale incarnation.
     PassAbsent,
-    /// 🔴 The only refusal: this node's live incarnation is older than the one
-    /// the control plane named, so this node has been replaced.
+    /// The live incarnation is older than expected and must refuse.
     RefusedStale,
 }
 
@@ -323,14 +295,9 @@ impl FencingDecision {
     }
 }
 
-/// Compares what the control plane expects against what is alive here.
+/// Compares expected and live incarnations in order.
 ///
-/// 🔴 Ordered, not equal. `live > expect` is what a same-node pause/resume
-/// looks like from a control plane that is one heartbeat behind — TTL eviction
-/// runs on a one-second tick and the data plane resumes sandboxes by itself, so
-/// it happens constantly. Refusing on inequality would turn the most common
-/// legitimate path into a refusal, at the exact moment a user is waiting for a
-/// sandbox to wake up.
+/// A newer live incarnation is allowed while the control plane catches up.
 fn fencing_decision(expected: Option<ExecutionId>, live: Option<ExecutionId>) -> FencingDecision {
     let Some(expected) = expected else {
         return FencingDecision::PassNoExpect;
@@ -346,19 +313,12 @@ fn fencing_decision(expected: Option<ExecutionId>, live: Option<ExecutionId>) ->
 }
 
 fn parse_expect_execution_header(headers: &HeaderMap) -> Option<ExecutionId> {
-    // A header that will not parse is treated as absent rather than as a
-    // refusal: it is the control plane's mistake, and refusing on it would take
-    // a sandbox off the air for a malformed string.
+    // Malformed expectations degrade to absent rather than taking the sandbox offline.
     let raw = first_header_value(headers, &[EXPECT_EXECUTION_HEADER])?;
     ExecutionId::parse_str(raw).ok()
 }
 
-/// Stamps the incarnation this node has alive onto a response.
-///
-/// Applied to allowed and refused responses alike: the gateway uses its
-/// presence to tell a node that takes part in fencing from one that does not,
-/// so a node that answered it only when refusing would look silent exactly
-/// when everything is healthy.
+/// Echoes the live incarnation on allowed and refused responses.
 fn echo_execution(mut response: Response<Body>, live: Option<ExecutionId>) -> Response<Body> {
     if let Some(live) = live {
         if let Ok(value) = HeaderValue::from_str(&live.to_string()) {
@@ -370,13 +330,9 @@ fn echo_execution(mut response: Response<Body>, live: Option<ExecutionId>) -> Re
     response
 }
 
-/// 🔴 412, and the code matters more than the body.
+/// Returns the canonical 412 superseded-incarnation response.
 ///
-/// Not 404: on this path the platform reads 404 as "the sandbox is gone" and
-/// rebuilds the workspace from its template, which destroys the user's work.
-/// Not 410 either: `/proxy` already uses it for "not proxyable in this state".
-/// 412 is the free slot, and the gateway rewrites it into the one shape clients
-/// see.
+/// 404 would permit a destructive workspace rebuild; 410 is already used elsewhere.
 fn execution_superseded_response(
     sandbox_id: SandboxId,
     expected: ExecutionId,
@@ -405,18 +361,9 @@ fn execution_superseded_response(
         .expect("static superseded proxy response is valid")
 }
 
-/// Which incarnation is about to serve this request.
+/// Returns the incarnation that served the resolved request.
 ///
-/// 🔴 Read *after* the request has been resolved, not when it arrived. This
-/// path resumes paused sandboxes by itself, so a sandbox with no live
-/// incarnation when the request came in has one by the time it is served —
-/// and reporting the earlier answer would leave the gateway reading a node
-/// that has just done exactly the right thing as a node that is not taking
-/// part in fencing at all, which is the one signal the rollout watches.
-///
-/// `on_arrival` is the fallback for the reverse case: a route that has gone
-/// away again since. What was true when the request arrived is a better answer
-/// than nothing.
+/// Falls back to the arrival-time value if the route disappeared meanwhile.
 async fn execution_that_served(
     api_impl: &ApiImpl,
     sandbox_id: SandboxId,
@@ -438,10 +385,7 @@ async fn proxy_request(
     let is_websocket_request = is_websocket_upgrade_request(request.headers());
     let (parts, body) = request.into_parts();
 
-    // 🔴 Before anything else on this path, and in particular before the
-    // auto-resume inside `resolve_proxy_request`. Resolving first would let
-    // traffic addressed to a replaced incarnation wake the sandbox up — the
-    // node would perform the very act it is about to refuse.
+    // Fence before resolution can wake a superseded sandbox.
     let sandbox_id = parse_sandbox_id_header(&parts.headers).ok();
     let live_execution = match sandbox_id {
         Some(sandbox_id) => api_impl.orchestrator().live_execution_id(&sandbox_id).await,
@@ -455,7 +399,6 @@ async fn proxy_request(
     )
     .increment(1);
     if decision == FencingDecision::RefusedStale {
-        // Both are `Some` on this branch by construction.
         return echo_execution(
             execution_superseded_response(
                 sandbox_id.expect("a refusal names a sandbox"),
@@ -883,12 +826,7 @@ async fn resolve_proxy_request(
                 sandbox_id,
             )))
         }
-        // 🔴 One answer for a paused sandbox, whatever its `auto_resume`
-        // says, and deliberately so: from the caller's side "this process does
-        // not wake sandboxes" and "this sandbox does not wake on traffic" are
-        // one fact — the sandbox is paused and this request will not change
-        // that. Waking it is the gateway's cold path, which asks
-        // `crate::api::grpc::resume` before traffic ever reaches a proxy.
+        // Proxying never wakes paused sandboxes; the gateway cold path does.
         Ok(ProxyLookupResult::Paused { .. }) => {
             return Err(proxy_error_response(
                 &ProxyRequestError::SandboxUnavailable(sandbox_id, SandboxState::Paused),
@@ -1186,19 +1124,9 @@ fn map_upstream_response(response: Response<Incoming>, upstream_uri: &Uri) -> Re
     Response::from_parts(parts, Body::new(body.map_err(axum::Error::new)))
 }
 
-/// Turns redirect targets that point back at the sandbox's own address into
-/// path-relative ones.
+/// Rewrites redirects back to the sandbox's internal address as relative paths.
 ///
-/// The upstream authority is an internal runtime address (`10.x.y.z:5173`):
-/// it is reachable from this node only, and the request carries it to the
-/// upstream in `Host`, so applications that build absolute URLs from `Host`
-/// hand it right back in `Location`. Passing that through both leaks the
-/// sandbox network layout to the client and points the client's next request
-/// at an address it cannot reach — a redirect loop that looks like the
-/// application misbehaving.
-///
-/// Only self-references are rewritten: an absolute URL to any other host is the
-/// application's own business (an OAuth hop, a CDN) and must survive verbatim.
+/// Redirects to any other host remain unchanged.
 fn rewrite_upstream_self_references(headers: &mut HeaderMap, upstream_uri: &Uri) {
     for name in [header::LOCATION, header::CONTENT_LOCATION] {
         let Some(rewritten) = headers
@@ -1217,15 +1145,13 @@ fn rewrite_upstream_self_references(headers: &mut HeaderMap, upstream_uri: &Uri)
 /// Returns the path-relative form of `value` when it addresses the sandbox
 /// itself, or `None` when the value must be left untouched.
 fn relative_self_reference(value: &str, upstream_uri: &Uri) -> Option<String> {
-    // `Uri` parses fragments away, so keep the fragment out of the parse and
-    // append it verbatim afterwards instead of dropping it.
+    // Preserve fragments outside `Uri`, which discards them.
     let (absolute, fragment) = match value.split_once('#') {
         Some((absolute, fragment)) => (absolute, Some(fragment)),
         None => (value, None),
     };
 
-    // A scheme-relative reference (`//host/path`) names an authority too, so
-    // borrow the upstream scheme to parse it as the absolute URL it stands for.
+    // Borrow the upstream scheme to parse scheme-relative references.
     let target = match absolute.strip_prefix("//") {
         Some(scheme_relative) => {
             format!("{}://{scheme_relative}", upstream_uri.scheme_str()?).parse::<Uri>()
@@ -1238,9 +1164,7 @@ fn relative_self_reference(value: &str, upstream_uri: &Uri) -> Option<String> {
         return None;
     }
 
-    // `path()` is `/` for an empty path, which keeps a query-only URL an
-    // absolute-path reference instead of a query-relative one that would leave
-    // the client on its current path.
+    // Keep query-only targets absolute-path relative rather than query relative.
     let mut relative = target.path().to_owned();
     if let Some(query) = target.query() {
         relative.push('?');
@@ -1254,11 +1178,7 @@ fn relative_self_reference(value: &str, upstream_uri: &Uri) -> Option<String> {
     Some(relative)
 }
 
-/// Compares two URLs by host and effective port rather than by authority text,
-/// so a self-reference that omits the scheme's default port still matches.
-///
-/// The upstream URL always carries an explicit port, so a target whose port
-/// cannot be determined never compares equal.
+/// Compares URL host and effective port, including omitted default ports.
 fn points_at_same_endpoint(target: &Uri, upstream_uri: &Uri) -> bool {
     let (Some(target_host), Some(upstream_host)) = (target.host(), upstream_uri.host()) else {
         return false;
@@ -1386,12 +1306,6 @@ fn tungstenite_message_to_axum(message: TungsteniteMessage) -> Option<WebSocketM
 mod tests {
     use super::*;
 
-    /// The envd access token header, named here and not beside the routing
-    /// constants because the proxy does not read it: it forwards every header
-    /// it is given untouched, and only these tests care that this particular
-    /// one arrives intact. Checking it was `authorize_secure_envd_auto_resume`'s
-    /// job, and waking a sandbox — with the token check that gates it — belongs
-    /// to `crate::api::impls::resume_surface` now.
     const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
     use std::{
         convert::Infallible,
@@ -1791,20 +1705,10 @@ mod tests {
         .await
     }
 
-    /// The wiring that makes an `ApiImpl` the half that owns sandboxes and
-    /// runs none — `aenv-api`.
-    ///
-    /// 🔴 The default for this module, and not because the data plane runs
-    /// there: it is the half whose router attaches no user-REST gate and whose
-    /// proxy path may take the auto-resume arm, which is every behaviour the
-    /// tests below observe. The node half is asked for by name, twice, where
-    /// the difference is the point.
     fn api_half() -> crate::api::ResumeWiring {
         crate::api::ResumeWiring::api_half_for_test()
     }
 
-    /// The wiring that makes an `ApiImpl` the half that runs sandboxes and
-    /// decides nothing about who owns them — `aenv-node`.
     fn node_half() -> crate::api::ResumeWiring {
         crate::api::ResumeWiring::node_local(
             crate::identity::NodeIdentity::from_config(&Default::default()).id,
@@ -1815,12 +1719,6 @@ mod tests {
         build_api_with(Vec::new(), api_half()).await
     }
 
-    /// 🔴 An `ApiImpl` that genuinely *is* the half under test.
-    ///
-    /// Before the wake-up decision moved, which half a router was gated as
-    /// reached it only through `server::new`'s own parameter, so a test could
-    /// hand a node router an `ApiImpl` that believed otherwise. Both now read
-    /// the one fact off the `ApiImpl`, so that divergence cannot be built.
     pub async fn build_api_as(wiring: crate::api::ResumeWiring) -> Arc<ApiImpl> {
         build_api_with(Vec::new(), wiring).await
     }
@@ -2028,19 +1926,6 @@ mod tests {
         assert!(!is_send_request_failure_text(&"client error (Connect)"));
     }
 
-    /// 🔴 The role gate against the **real** assembled router.
-    ///
-    /// Every other test of it uses a stand-in for the generated router, because
-    /// the generated one needs a whole `ApiImpl`. This one has one, so it is
-    /// the only place the layer, the generated route table and the merged data
-    /// plane are exercised together — and the failure it exists to catch is
-    /// exactly the one a stand-in cannot show: a gate that takes the port down
-    /// instead of taking three route groups away.
-    ///
-    /// Four faces, and the middle two are the ones that matter. Without the
-    /// the pre-split single process comparison, a `POST /sandboxes` that 404s because the route
-    /// is broken passes. Without the data-plane call, a gate that refused
-    /// everything on the port passes.
     #[tokio::test]
     async fn a_node_refuses_user_rest_while_its_sandbox_data_plane_keeps_answering() {
         let create = || {
@@ -2060,8 +1945,6 @@ mod tests {
             "a node must answer the user-facing create as if the route were not there"
         );
 
-        // ...and the same request on the other half reaches the handler, so
-        // the 404 above is which half this is and not a broken route.
         let api = server::new(build_api().await);
         assert_ne!(
             api.oneshot(create()).await.unwrap().status(),
@@ -2069,8 +1952,6 @@ mod tests {
             "on aenv-api the create route still exists"
         );
 
-        // 🔴 The port is not what was taken away: the sandbox data plane on the
-        // same router still answers, from its own handler.
         let response = node
             .clone()
             .oneshot(
@@ -2090,7 +1971,6 @@ mod tests {
             "the data plane answered, which is what makes the 404 above specific"
         );
 
-        // And kubelet can still tell whether this pod is alive.
         assert_ne!(
             node.oneshot(
                 Request::builder()
@@ -2106,17 +1986,6 @@ mod tests {
         );
     }
 
-    /// 🔴 A refused route and a route that was never there are the same
-    /// response.
-    ///
-    /// This is the comparison `_sd-impl-phase3-role.md` §15.4 asks for, and it
-    /// can only be made here: the thing being compared against is the data
-    /// plane's fallback, which no stand-in router has. It also caught the
-    /// version of this that shipped first — an empty-bodied 404, which is
-    /// nothing like what an absent route on this server produces, and which no
-    /// JSON client can parse.
-    ///
-    /// Status, content type and body, with only the path differing.
     #[tokio::test]
     async fn a_refused_route_is_indistinguishable_from_one_that_never_existed() {
         let node = server::new(build_api_as(node_half()).await);
@@ -2148,9 +2017,7 @@ mod tests {
             }
         };
 
-        // A route the generated router has, that this role refuses.
         let refused = answer("/sandboxes").await;
-        // A path no router on this process has ever had.
         let absent = answer("/definitely-not-a-route").await;
 
         assert_eq!(refused.0, StatusCode::NOT_FOUND);
@@ -2162,8 +2029,6 @@ mod tests {
             "a node's refusal must not be tellable from a route that never existed"
         );
 
-        // The probe has resolution: the same route on the rollback role is not
-        // a 404 at all, so the equality above is about the role.
         let all = server::new(build_api().await);
         assert_ne!(
             all.oneshot(
@@ -2377,8 +2242,6 @@ mod tests {
 
     async fn start_redirecting_upstream() -> SocketAddr {
         async fn redirect_handler(headers: HeaderMap, uri: Uri) -> Response<Body> {
-            // Mirror what a dev server does: build the absolute URL out of the
-            // Host header it was handed, which is the sandbox's own address.
             let host = headers
                 .get(HOST)
                 .and_then(|value| value.to_str().ok())
@@ -2413,13 +2276,9 @@ mod tests {
         let sandbox_id = SandboxId::new();
 
         for (path, expected) in [
-            // Self-reference: the internal ip:port must not reach the client.
             ("/proxy/", "/next?x=1"),
-            // A fragment survives the rewrite.
             ("/proxy/fragment", "/next?a=1#section"),
-            // A query-only self-reference stays an absolute-path reference.
             ("/proxy/query-only", "/?x=1"),
-            // Anything else is the application's own business.
             ("/proxy/external", "https://example.invalid/elsewhere"),
             ("/proxy/relative", "/already-relative"),
         ] {
@@ -2456,13 +2315,9 @@ mod tests {
 
         for (value, expected) in [
             ("http://10.0.0.1:5173/next", Some("/next")),
-            // A query-only URL must not become a query-relative reference.
             ("http://10.0.0.1:5173?x=1", Some("/?x=1")),
-            // Fragments are preserved verbatim.
             ("http://10.0.0.1:5173/next#section", Some("/next#section")),
-            // Scheme-relative references name the same endpoint.
             ("//10.0.0.1:5173/next", Some("/next")),
-            // Other hosts, other ports, and relative values stay untouched.
             ("https://example.invalid/next", None),
             ("http://10.0.0.2:5173/next", None),
             ("http://10.0.0.1:5174/next", None),
@@ -2475,15 +2330,12 @@ mod tests {
             );
         }
 
-        // An application that drops the scheme's default port still points at
-        // the sandbox.
         let upstream: Uri = "http://10.0.0.1:80/current".parse().unwrap();
         assert_eq!(
             relative_self_reference("http://10.0.0.1/next", &upstream).as_deref(),
             Some("/next")
         );
 
-        // Hosts compare case-insensitively.
         let upstream: Uri = "http://sandbox.invalid:5173/current".parse().unwrap();
         assert_eq!(
             relative_self_reference("http://SANDBOX.INVALID:5173/next", &upstream).as_deref(),
@@ -3190,8 +3042,6 @@ mod execution_fencing_tests {
 
     use super::tests::{build_api, spawn_upstream};
 
-    /// An upstream that counts what reaches it, so "the request was refused"
-    /// can be told apart from "the request was served and then relabelled".
     async fn start_counting_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
@@ -3206,7 +3056,6 @@ mod execution_fencing_tests {
         (spawn_upstream(router).await, hits)
     }
 
-    /// Builds a node that is running `sandbox_id` under `live`.
     async fn app_running_under(sandbox_id: SandboxId, live: ExecutionId) -> axum::Router {
         let api = build_api().await;
         api.orchestrator()
@@ -3228,9 +3077,6 @@ mod execution_fencing_tests {
         builder.body(Body::empty()).unwrap()
     }
 
-    /// Two incarnations in a known order. UUIDv7 is time-ordered, so the second
-    /// one minted is the later one — which is what the whole comparison relies
-    /// on.
     fn older_and_newer() -> (ExecutionId, ExecutionId) {
         let first = ExecutionId::new();
         let second = ExecutionId::new();
@@ -3238,11 +3084,6 @@ mod execution_fencing_tests {
         (first, second)
     }
 
-    /// T-A5N-1. The control plane names an incarnation newer than the one alive
-    /// here: this node has been replaced and must refuse.
-    ///
-    /// 🔴 Also asserts the upstream was never contacted. A refusal decided after
-    /// the request has already been served is not a refusal.
     #[tokio::test]
     async fn a_proxy_request_naming_a_dead_execution_is_refused() {
         let (upstream, hits) = start_counting_upstream().await;
@@ -3270,8 +3111,6 @@ mod execution_fencing_tests {
         );
     }
 
-    /// T-A5N-2. The control group. Without it, "refuse everything" passes the
-    /// test above.
     #[tokio::test]
     async fn a_proxy_request_naming_the_live_execution_passes_through() {
         let (upstream, hits) = start_counting_upstream().await;
@@ -3288,13 +3127,6 @@ mod execution_fencing_tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
-    /// T-A5N-6. 🔴 This node is *ahead* of the control plane.
-    ///
-    /// A same-node pause and resume mints a new incarnation, and the control
-    /// plane learns about it a heartbeat later. In between, every request
-    /// carries the previous incarnation as its expectation. An equality test
-    /// would refuse all of them — and it would do it at the moment a user is
-    /// waiting for their sandbox to come back.
     #[tokio::test]
     async fn a_node_ahead_of_the_control_plane_still_serves() {
         let (upstream, hits) = start_counting_upstream().await;
@@ -3315,11 +3147,6 @@ mod execution_fencing_tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
-    /// T-A5N-7. 🔴 Absence is not evidence.
-    ///
-    /// During a cross-node resume the gateway sends traffic to the claiming
-    /// node while its VM is still coming up. Reading "I do not have it" as "I
-    /// have an older one" would refuse every request in that window.
     #[tokio::test]
     async fn a_sandbox_this_node_does_not_have_is_not_a_superseded_execution() {
         let sandbox_id = SandboxId::new();
@@ -3341,9 +3168,6 @@ mod execution_fencing_tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// T-A5N-7b. The paused half of the same rule: a sandbox parked here has no
-    /// live incarnation, so its record must not be read as a stale one — the
-    /// data plane's own resume path depends on this request getting through.
     #[tokio::test]
     async fn a_paused_sandbox_is_not_a_superseded_execution() {
         let sandbox_id = SandboxId::new();
@@ -3371,9 +3195,6 @@ mod execution_fencing_tests {
         assert_ne!(response.status(), StatusCode::PRECONDITION_FAILED);
     }
 
-    /// T-A5N-3. No header is an ordinary answer: the control plane only names an
-    /// incarnation when it can, and treating silence as a refusal would take
-    /// every unknown sandbox off the air.
     #[tokio::test]
     async fn a_proxy_request_without_the_expect_header_is_not_refused() {
         let (upstream, hits) = start_counting_upstream().await;
@@ -3389,12 +3210,6 @@ mod execution_fencing_tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
-    /// T-A5N-4. 🔴 The refusal code, pinned.
-    ///
-    /// 404 on this path means "no such sandbox", and the platform answers that
-    /// by rebuilding the workspace from its template — the user's work is gone.
-    /// 410 is already spoken for on `/proxy` ("not proxyable in this state").
-    /// The refusal is 412 and nothing else.
     #[tokio::test]
     async fn the_refusal_is_never_four_oh_four_or_gone() {
         let (upstream, _hits) = start_counting_upstream().await;
@@ -3415,11 +3230,6 @@ mod execution_fencing_tests {
         assert_eq!(status, StatusCode::PRECONDITION_FAILED);
     }
 
-    /// T-A5N-5. The echo is on every answer, refused or not.
-    ///
-    /// It is how a gateway tells a node that takes part in fencing from one that
-    /// does not. A node that only echoed when refusing would look silent for as
-    /// long as everything was healthy.
     #[tokio::test]
     async fn every_proxy_response_names_the_execution_that_served_it() {
         let (upstream, _hits) = start_counting_upstream().await;
@@ -3457,8 +3267,6 @@ mod execution_fencing_tests {
         );
     }
 
-    /// The comparison itself, away from the HTTP shell — one case per branch,
-    /// so a merged branch cannot hide behind another's coverage.
     #[test]
     fn the_comparison_is_ordered_and_only_refuses_older() {
         let (older, newer) = older_and_newer();
@@ -3497,15 +3305,6 @@ mod execution_echo_tests {
 
     use super::tests::build_api;
 
-    /// 🔴 The echo names the run that is about to serve the request, not the
-    /// one that was live when it arrived.
-    ///
-    /// The data plane wakes paused sandboxes by itself. A request that does
-    /// that finds no live incarnation on arrival and a brand-new one by the
-    /// time it is answered — and answering with the first would make every
-    /// successful wake-up look, to the gateway, like a node that has no fencing
-    /// at all. That count is a release gate, so a false one there stops a
-    /// rollout on a node that is working perfectly.
     #[tokio::test]
     async fn the_echo_names_the_incarnation_that_is_live_now() {
         let api = build_api().await;
@@ -3527,8 +3326,6 @@ mod execution_echo_tests {
             "the answer must come from the sandbox that is live now"
         );
 
-        // ...and the other direction: a route that has gone away again since
-        // leaves what was true on arrival as the best answer there is.
         api.orchestrator()
             .remove_proxy_route_for_test(&sandbox_id)
             .await;

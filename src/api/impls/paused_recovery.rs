@@ -1,18 +1,7 @@
-//! Cross-node resume, and keeping a node's local paused records honest.
+//! Cross-node resume and local-record reconciliation.
 //!
-//! A pause leaves the sandbox resumable on its own node through the node-local
-//! persister. That is the fast path and it is untouched here. What this module
-//! adds is the slow path: rebuilding a sandbox from the shared snapshot
-//! repository on a node that has never run it — including when the node that
-//! paused it is gone for good — and, on the other side of that move, making
-//! sure the node it came from stops claiming to hold it.
-//!
-//! Publishing itself lives in [`PausedSandboxCoordinator`](super::PausedSandboxCoordinator),
-//! which the orchestrator drives directly so that every pause reaches the
-//! cluster, not just the ones that arrive through the API.
-//!
-//! Everything here is inert unless the paused-sandbox registry is configured
-//! with a cluster backend.
+//! Cluster-backed resumes rebuild from shared snapshots, while periodic
+//! reconciliation removes local claims superseded by cluster truth.
 
 use std::time::{Duration, Instant};
 
@@ -28,47 +17,29 @@ use crate::orchestrator::{
 use crate::snapshot::{CatalogReadScope, SnapshotAbsence};
 use crate::types::{ExecutionId, SandboxId};
 
-/// 本节点既没有本地副本、又没拿到认领权时，一次 resume 该怎么收场。
+/// Outcome when this node has neither a local copy nor a resume claim.
 ///
-/// 🔴 这个枚举存在的唯一理由：**404 的下游契约是「沙箱没了，可以重建」**。
-/// 平台侧收到 resume 的 404 会把 `externalID` 清空并从模板重建沙箱
-/// （`apps/agent-platform/internal/sandbox/aenv/service.go`，注释自己写着
-/// 「工作区回到模板初始态」）。所以「另一发 resume 正在把它拉起来」
-/// 绝不能落成 404 —— 那会把一次良性竞态变成用户工作区被重置。
-///
-/// e2b 在同一处竞态上的答案是让输家**拿到赢家的结果**：`Reserve` 命中 pending
-/// 就订阅赢家的完成通知（`e2b/packages/api/internal/sandbox/reservations/redis/reservation.go`），
-/// 命中 storage index 就直接读回既有沙箱（`.../sandbox/store.go`）。它从不把
-/// 输家答成「不存在」。这里对齐的是那个保证，不是它的 Redis 形状。
+/// Only confirmed cluster absence may become `Unknown` and downstream 404.
 pub enum MissingLocalResume {
-    /// 集群也不认识它。**唯一**允许回 404 的情形。
+    /// The cluster confirms no such sandbox.
     Unknown,
-    /// 另一发 resume 已经把它拉起来了，而且赢家就在本节点 —— 直接返回成品。
+    /// A competing resume completed locally.
     Resumed(Box<SandboxMetadata>),
-    /// 有人正在处理它，或它属于别的节点。可重试，但不是「不存在」。
+    /// Another transition or holder owns the sandbox.
     Busy { holder: String },
-    /// 登记表答不上来。宁可报错，也不许说「不存在」。
+    /// The registry could not determine the answer.
     Undecided(String),
 }
 
-/// [`missing_local_verdict`] 的结论。抽成纯函数是为了能穷举测试：
-/// 这里判错一次的代价是用户工作区，而它的输入只有三样事实。
+/// Pure classification of registry and local-store observations.
 enum MissingLocalVerdict {
-    /// 集群没有这一行。
     Unknown,
-    /// 本地已经有一台跑着的同 ID 沙箱 —— 赢家落定了。
     Ready,
-    /// 赢家在本节点且仍在进行中，它的成品会出现在本地 store，值得等。
     Wait { holder: String },
-    /// 别人管着它。等不出结果，交给调用方重试。
     Busy { holder: String },
 }
 
-/// 据三样事实判定：集群怎么说、本地 store 怎么说、本节点是谁。
-///
-/// `paused` 也归入 [`MissingLocalVerdict::Busy`]：走到这里说明我们刚在
-/// `claim_for_resume` 上输掉一次认领而赢家又已经释放，重试一次就能拿到 ——
-/// 那是「稍后再来」，同样不是「不存在」。
+/// Classifies a missing local resume without converting uncertainty into absence.
 fn missing_local_verdict(
     entry: Option<&PausedSandboxEntry>,
     local: Option<&SandboxMetadata>,
@@ -78,8 +49,6 @@ fn missing_local_verdict(
         return MissingLocalVerdict::Unknown;
     };
 
-    // 赢家把沙箱加进本地 store 之后，这里就能看到成品 —— 与 e2b 输家
-    // 从 storage 读回赢家那台是同一件事。
     if local.is_some_and(|m| m.state == SandboxState::Running) {
         return MissingLocalVerdict::Ready;
     }
@@ -107,31 +76,11 @@ pub enum CrossNodeResume {
     Failed(String),
 }
 
-/// Who the cluster says may resume a sandbox.
-///
-/// Both resume paths — off this node's own disk, and from the shared snapshot
-/// repository — pass through this one decision. They have to: each ends with a
-/// live sandbox, so arbitrating them separately is what lets two nodes bring the
-/// same sandbox up at once. Routing cannot substitute for it, because the
-/// gateway hands a resume to an arbitrary node whenever the scheduler holds no
-/// binding, and bindings live in memory with a short TTL and are lost outright
-/// when the scheduler restarts.
+/// Cluster arbitration shared by local and snapshot-backed resume paths.
 pub(in crate::api) enum ResumeArbitration {
-    /// The registry has no say: it is not cluster-backed, or it does not track
-    /// this sandbox. Whatever is on local disk is the whole truth.
-    ///
-    /// Carries a claim token all the same. 🔴 That is the point: both granting
-    /// answers hand one out, so this decision is the single place a resume can
-    /// acquire the right to start, and there is no second constructor for the
-    /// paths that have no cluster to ask.
+    /// Local truth may proceed under the returned incarnation.
     Proceed(ClaimedExecution),
-    /// This node holds the claim, and must release it if the resume fails. The
-    /// row travels with it so a rebuild never has to claim a second time —
-    /// claiming twice would deadlock against this node's own claim.
-    ///
-    /// 🔴 The token carries the incarnation *the registry wrote*, not the one
-    /// this node proposed. They normally agree; when they do not, the row's
-    /// value is the one `mark_running` has to quote.
+    /// This node holds the registry claim and must release it on failure.
     Held(Box<PausedSandboxEntry>, ClaimedExecution),
     /// The newest snapshot is still being published by another node, which is
     /// therefore the only node that can serve this resume.
@@ -146,13 +95,13 @@ pub(in crate::api) enum ResumeArbitration {
     Unavailable { reason: String },
 }
 
-/// Why a node's local paused record is no longer the truth.
+/// Why a local paused record is superseded.
 enum Superseded {
-    /// The cluster has moved past this sandbox: resumed elsewhere, or deleted.
+    /// The cluster moved past this sandbox.
     Gone,
-    /// Another node holds it now.
+    /// Another node holds it.
     HeldBy(String),
-    /// Another node has claimed it and is bringing it back up.
+    /// Another node is resuming it.
     ClaimedBy(String),
 }
 
@@ -167,53 +116,26 @@ impl Superseded {
 }
 
 impl ApiImpl {
-    /// Asks the cluster who may resume this sandbox, taking the claim when the
-    /// answer is "this node".
+    /// Acquires the cluster's resume decision and claim for this sandbox.
     ///
-    /// Fails open on anything that is not a clear "someone else has it", with
-    /// one exception: a registry that cannot answer about a sandbox it was
-    /// told about. See [`unreachable_arbitration`] for why that one is
-    /// different.
+    /// Registry outages fail closed for records previously announced to the cluster.
     pub(in crate::api) async fn arbitrate_resume(
         &self,
         sandbox_id: SandboxId,
     ) -> ResumeArbitration {
-        // Minted before the claim so the registry can write it in the same
-        // statement that names this node as the claimant: a `resuming` row then
-        // names the run that is about to happen instead of the stopped one it
-        // replaces, and the resume window stays fenced.
+        // Mint before claiming so the resuming row is fenced by the new incarnation.
         let proposed = ExecutionId::new();
 
         if !self.paused.registry().is_cluster_backed() {
-            // No cluster to ask, so this local decision is the whole of the
-            // arbitration — and it is still the only mint point.
+            // With no cluster registry, local truth is authoritative.
             return ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed));
         }
 
-        // A claim that lands writes `resuming` with this node's name on it, and
-        // a claim whose response is lost writes it just the same — so this node
-        // stops being able to release rows by identity from here on, not from
-        // whenever the answer comes back.
+        // A successful or lost claim response can already have written this node's name.
         self.paused.note_taking_sandbox_live().await;
 
-        // 🔴 Always this process's own identity, and deliberately never the
-        // real machine `Orchestrator::paused_origin_node_id` can sometimes
-        // name up front. `claimed_by_node_id` exists for mutual exclusion and
-        // self-recognition (`arbitration`'s "is this answer naming *me*"
-        // check below), and both of those require an identity unique to *this
-        // deciding process* — a value read out of shared cluster state fails
-        // that: two different api replicas resuming the same sandbox can read
-        // the identical "real machine" hint from the same shared record, both
-        // claim under it, and the loser's self-comparison would then read the
-        // winner's claim as its own. A process's own identity cannot collide
-        // that way.
-        //
-        // This was briefly the real machine (a0487f0), which is also what made
-        // `mark_running`'s guard reject the claim it was supposed to confirm:
-        // the row's `claimed_by_node_id` named this process, but the write
-        // quoted the real machine instead. Reverted for that reason — see
-        // `PausedSandboxCoordinator::mark_sandbox_running` for how the real
-        // machine still reaches `origin_node_id`, just not through here.
+        // Claims use this deciding process's identity so replicas cannot confuse
+        // another replica's claim with their own.
         let claimant = self.paused.node_id().to_string();
 
         let claim = match self
@@ -224,8 +146,7 @@ impl ApiImpl {
         {
             Ok(claim) => claim,
             Err(err) => {
-                // What this node's own copy remembers is the only thing left to
-                // decide on, so read it before answering.
+                // Fall back only according to what the local record proves.
                 let registration = self
                     .orchestrator
                     .paused_record_cluster_registration(sandbox_id)
@@ -241,41 +162,17 @@ impl ApiImpl {
             }
         };
 
-        // The same identity the claim was just taken under: an answer naming
-        // *this claim's own claimant* is not a refusal (see `arbitration`'s
-        // doc), and the two have to agree or a node resuming its own sandbox
-        // — the case that matters most here — would read its own claim as
-        // somebody else's.
+        // Classify the response under the same identity used to claim.
         arbitration(claim, &claimant, proposed)
     }
 
-    /// Returns a claim after the resume it was taken for failed.
-    /// 有界地等「本节点上另一发 resume」落定，然后据实回答本节点该回什么。
-    ///
-    /// 只在 resume 已经确认**本地没有副本**、且仲裁**没有给出认领权**之后调用。
-    /// 这两个条件合起来在单发请求下意味着"沙箱真没了"，但在并发下不是：
-    /// 同一台沙箱的两发 resume 会被网关派到同一个非 origin 节点，赢家拿到认领权、
-    /// 输家的 `claim_for_resume` 撞上自己节点的 `resuming` 行 —— 而
-    /// `Conflict{origin == 本节点}` 被 [`arbitration`] 判为 `Proceed`（那条判断
-    /// 对赢家是对的：它确实持有认领权）。输家于是既无本地副本又无 entry。
-    ///
-    /// 🧪 实测（pve-sg dev，2026-08-18，隔离 origin 后两发并发，2/2 复现）：
-    /// 修复前输家稳定拿到 404 / ~0.19s，而沙箱正在另一节点上健康运行。
     const MISSING_LOCAL_WAIT: Duration = Duration::from_secs(5);
     const MISSING_LOCAL_POLL: Duration = Duration::from_millis(200);
 
-    /// How often to retry a failed release of the previous process's holdings.
-    ///
-    /// Short on purpose, and not configurable: the whole point is to land
-    /// inside the window between this process starting and it taking its first
-    /// sandbox live, which on a busy node is seconds. A missed window costs a
-    /// node restart, while an extra query every five seconds costs nothing —
-    /// the retry stops at the first success, and only runs at all after a
-    /// failure.
+    /// Retry cadence while startup release remains safely fenced.
     const STALE_RELEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
     pub async fn resolve_missing_local_resume(&self, sandbox_id: SandboxId) -> MissingLocalResume {
-        // 单机形态：登记表没有话语权，本地没有就是真没有 —— 保持原语义。
         if !self.paused.registry().is_cluster_backed() {
             return MissingLocalResume::Unknown;
         }
@@ -287,8 +184,7 @@ impl ApiImpl {
         loop {
             let entry = match self.paused.registry().get(&sandbox_id).await {
                 Ok(entry) => entry,
-                // 读不到就不下结论。这是本方法的全部意义：说错成"不存在"
-                // 会让调用方重建，而重建是不可逆的。
+                // Registry errors remain undecided, never absent.
                 Err(err) => return MissingLocalResume::Undecided(err.to_string()),
             };
             let local = match self.orchestrator.get_sandbox(&sandbox_id).await {
@@ -301,7 +197,7 @@ impl ApiImpl {
                 MissingLocalVerdict::Ready => {
                     return match local {
                         Some(metadata) => MissingLocalResume::Resumed(Box::new(metadata)),
-                        // 判定说 Ready 就一定有 local；这条只为不写 unwrap。
+                        // Defensive fallback for an inconsistent observation pair.
                         None => MissingLocalResume::Busy { holder },
                     };
                 }
@@ -309,7 +205,7 @@ impl ApiImpl {
                 MissingLocalVerdict::Wait { holder: who } => {
                     holder = who;
                     if Instant::now() >= deadline {
-                        // 等不到不等于没有。超时同样回 Busy（可重试），不回 404。
+                        // Timeout remains retryable rather than becoming absence.
                         warn!(
                             %sandbox_id,
                             holder,
@@ -325,21 +221,12 @@ impl ApiImpl {
         }
     }
 
-    /// Hands back a claim taken for a resume that did not happen.
-    ///
-    /// Visible to the data plane as well as to the REST routes: every path that
-    /// can take a claim has to be able to give it back, or a failed wake-up
-    /// leaves the row in `resuming` until its lease lapses and nothing else can
-    /// touch the sandbox in the meantime.
+    /// Releases a resume claim after the corresponding resume failed.
     pub(in crate::api) async fn abandon_claim(&self, sandbox_id: SandboxId, generation: i64) {
         self.release_claim(&sandbox_id, generation).await;
     }
 
-    /// Rebuilds a sandbox from the claim this node already holds.
-    ///
-    /// Reached when the local resume reported the sandbox unknown — this node
-    /// has never run it, or has already discarded its copy — while the cluster
-    /// still has a snapshot to rebuild it from.
+    /// Rebuilds a sandbox from a claim already held by this node.
     pub async fn restore_claimed_sandbox(
         &self,
         entry: PausedSandboxEntry,
@@ -347,18 +234,14 @@ impl ApiImpl {
     ) -> CrossNodeResume {
         let sandbox_id = entry.sandbox_id;
 
-        // The claim only matches rows that name a snapshot, so this cannot be
-        // None here; treat it as a failed claim rather than panicking.
+        // A granted claim must name the snapshot to rebuild.
         let Some(snapshot_id) = entry.snapshot_id.clone() else {
             self.release_claim(&sandbox_id, entry.generation).await;
 
             return CrossNodeResume::Failed("paused sandbox has no published snapshot".to_string());
         };
 
-        // A granted claim carries the record; rebuilding from a default one
-        // would produce a sandbox with a different identity and configuration
-        // from the one the user paused, and say nothing about it. Hand the
-        // claim back instead so the sandbox stays claimable.
+        // Missing metadata cannot be safely reconstructed from defaults.
         let Some(metadata) = entry.metadata.clone() else {
             self.release_claim(&sandbox_id, entry.generation).await;
 
@@ -374,19 +257,7 @@ impl ApiImpl {
             "restoring paused sandbox from another node's snapshot"
         );
 
-        // 🔴 Read at `AnyStatus`, and the destructive branch below is why.
-        //
-        // The resolvable reading answers "absent" for two states that could not
-        // be further apart: a snapshot that is genuinely gone, and one whose row
-        // exists but has not been flipped to `ready` — which on a node reading
-        // PostgreSQL is every pause whose commit was owed because the scheduler
-        // was unreachable, until the compensator replays it. This call treats
-        // absence as proof and *deletes the registry row*, so at the resolvable
-        // reading a mirror that is momentarily behind destroys the only
-        // cluster-wide record of a paused sandbox that is perfectly intact.
-        //
-        // So the question is asked in two parts: is there a row at all, and is
-        // it finished. Only the first answers the destructive branch.
+        // Read at any status so an unfinished row is not mistaken for destructive absence.
         let record = match self
             .snapshot_manager
             .get_scoped(snapshot_id.to_string(), CatalogReadScope::AnyStatus)
@@ -394,9 +265,7 @@ impl ApiImpl {
         {
             Ok(Some(record)) if record.committed.is_some() => record,
             Ok(Some(_)) => {
-                // The row is there and the publish never finished — or has not
-                // reached this read side yet. Retryable, and above all not a
-                // reason to throw the row away.
+                // The row exists but is not yet runnable; preserve the registry claim.
                 warn!(
                     %sandbox_id,
                     %snapshot_id,
@@ -410,22 +279,7 @@ impl ApiImpl {
                 );
             }
             Ok(None) => {
-                // 🔴 Not yet. A read answers what one store holds; the branch
-                // below destroys the cluster's only record of this sandbox. The
-                // two are only the same question once nothing else can
-                // contradict the absence — the other catalog, and the queue of
-                // writes neither of them has taken yet.
-                //
-                // What the scope fixed above was a row that exists and is not
-                // `ready`. What it could not see is a pause whose *entire*
-                // catalog write is still owed: `publish_commit` makes two
-                // central calls and skips the second when the first found the
-                // scheduler unreachable, so PostgreSQL holds no row at all
-                // while the bytes sit in object storage, intact. Read at any
-                // scope on the read side, that snapshot is missing — and the
-                // store that took the write says otherwise. When *neither*
-                // store took it, only this node's queue does, which is why the
-                // question below asks both.
+                // Destructive absence requires agreement beyond one read-side lookup.
                 match self.snapshot_manager.absence_of(&snapshot_id).await {
                     Ok(SnapshotAbsence::Settled) => {}
                     Ok(SnapshotAbsence::Unsettled { because }) => {
@@ -443,7 +297,7 @@ impl ApiImpl {
                         );
                     }
                     Err(err) => {
-                        // A question nobody answered is not an absence.
+                        // An unanswered existence query is not absence.
                         warn!(
                             error = ?err,
                             %sandbox_id,
@@ -459,13 +313,8 @@ impl ApiImpl {
                     }
                 }
 
-                // The registry names a snapshot the repository no longer has.
-                // Releasing the claim would just make the next resume fail the
-                // same way, so drop the record and report it as unknown.
                 warn!(%sandbox_id, %snapshot_id, "paused snapshot is missing from the repository");
-                // Conditional on the row this resume claimed. If it has moved
-                // on since, the snapshot it names is not the one that was
-                // missing and the row is not this caller's to drop.
+                // Remove only the exact claimed generation whose snapshot is settled absent.
                 match self
                     .paused
                     .registry()
@@ -492,20 +341,7 @@ impl ApiImpl {
             }
         };
 
-        // 🔴 The row, and only the row. `resolve_runnable` is not a lookup: it
-        // downloads `vm_state.bin` onto this machine's disk, materializes the
-        // memory and rootfs overlaybd `image.json` files, and leases all of it
-        // in this process's local artifact cache. A restore driven from the
-        // deciding half boots nothing here — `RemoteSandboxBackendFactory`
-        // reads only the catalog row back out and sends it on, and the node
-        // resolves it against the cache its own VM mmaps. `record` is already
-        // in hand from the read above, so this costs nothing at all.
-        //
-        // 🔴 The `resolve_runnable` arm that used to sit opposite this one,
-        // taken when `ApiImpl::runs_sandbox_runtime()`, is deleted for the same
-        // reason `sandboxes_post`'s was: `aenv-node` never reaches this surface
-        // (`crate::api::role_gate` answers it with 404 there) and does its
-        // resuming over gRPC instead.
+        // Remote orchestration needs the catalog row, not node-local runnable artifacts.
         let source = SandboxLaunchSource::SnapshotRecord(Box::new(record));
 
         let request = restore_request(&metadata, source, timeout);
@@ -516,10 +352,7 @@ impl ApiImpl {
             .await
         {
             Ok(metadata) => {
-                // The sandbox is live again, wherever the rebuild actually
-                // placed it. Repointing the row is what tells its former node
-                // that its copy is stale, and keeps the snapshot around as
-                // this sandbox's durable fallback.
+                // Repoint cluster ownership to the machine that actually accepted the restore.
                 let holding_node_id = self
                     .orchestrator()
                     .sandbox_holding_node_id(&sandbox_id)
@@ -544,19 +377,9 @@ impl ApiImpl {
         }
     }
 
-    /// Renews this node's lease on every registry row it is the holder of.
+    /// Renews leases for every local sandbox row held by this node.
     ///
-    /// What lapsing costs is narrower than it looks. For a sandbox that is
-    /// live, nothing: no lease state makes another node willing to rebuild it,
-    /// because reaching the database and being alive are not the same thing.
-    /// For one that is parked with an unpublished snapshot, it is the signal
-    /// that this node has given up on it, and the cluster will bring the
-    /// sandbox back elsewhere from the previous snapshot — losing the last
-    /// pause's work. Renewal is what buys the time not to do that.
-    ///
-    /// The whole local roster goes in, whatever state each sandbox is in — the
-    /// registry decides which rows this node actually holds, so nothing here
-    /// has to duplicate that judgement.
+    /// The registry decides which submitted rows this node actually owns.
     pub async fn renew_paused_leases(&self) {
         if !self.paused.registry().is_cluster_backed() {
             return;
@@ -575,11 +398,7 @@ impl ApiImpl {
             }
         };
 
-        // The deadline comes from the live sandbox, not from the row: the row's
-        // metadata is a snapshot of what the sandbox looked like when it was
-        // paused, and a timeout set or extended since then only exists here.
-        // Reclamation compares against this, so a stale value would retire a
-        // sandbox that still had time left.
+        // Use the live deadline; paused-row metadata may be stale after timeout changes.
         let held: Vec<HeldSandbox> = sandboxes
             .into_iter()
             .map(|metadata| HeldSandbox {
@@ -605,28 +424,9 @@ impl ApiImpl {
         }
     }
 
-    /// Hands back the sandboxes the previous process on this node died holding.
+    /// Releases holdings left by the previous process on this machine.
     ///
-    /// 🔴 **Startup only, and before the listener opens.** It releases rows by
-    /// node identity, and this node's identity is the machine's — so once this
-    /// process is actually running sandboxes, the very rows it would release
-    /// are its own. Call it while it holds nothing and it is exact; call it a
-    /// second later and it hands live sandboxes to whoever resumes them next.
-    ///
-    /// Why this exists at all. A row saying "running on this node" can be stale
-    /// for two reasons that look identical from the database: the process that
-    /// wrote it died, or it is merely cut off from PostgreSQL. Only the first
-    /// makes the sandbox safe to rebuild elsewhere, and no timeout can tell
-    /// them apart — which is why `claim_for_resume` refuses live rows outright
-    /// and why the decision is made here instead. Being the successor process
-    /// on that machine *is* the proof: the previous process's VMs were its
-    /// children in its PID namespace and went with it.
-    ///
-    /// e2b reaches the same end from its control plane, which has the one thing
-    /// we do not: a single authority that knows which nodes exist. It never
-    /// rebuilds a live sandbox somewhere else either — a resume that finds the
-    /// sandbox in its store is refused (`sandbox_resume.go`, StateRunning ⇒
-    /// 409), and its orphan sweep only kills what the store has no record of.
+    /// Startup must call this before the process can put its identity on a live row.
     pub async fn release_stale_node_holdings(&self) -> StaleReleaseOutcome {
         if !self.paused.registry().is_cluster_backed() {
             return StaleReleaseOutcome::Released;
@@ -635,27 +435,9 @@ impl ApiImpl {
         self.paused.release_stale_holdings().await
     }
 
-    /// Keeps trying to release what the previous process left behind, for as
-    /// long as doing so is still exact.
+    /// Retries startup holding release only while this process has taken nothing live.
     ///
-    /// 🔴 Why a failed release used to be permanent, and why that is the wrong
-    /// shape. `claim_for_resume` refuses `running` and `resuming` rows outright
-    /// — no lease, no timeout, nothing else in the system releases them — so a
-    /// single failed attempt at startup left every sandbox the previous process
-    /// was running unresumable until somebody restarted the node again. The
-    /// only evidence in the failure was one `warn!` that does not survive the
-    /// next restart.
-    ///
-    /// Retrying is safe for the same reason the startup call is: the fence is
-    /// not a deadline but the state of this process, and it stays open exactly
-    /// while this process has done nothing that could put its node's name on a
-    /// live row. A retry that lands inside that window is indistinguishable
-    /// from the startup call landing late; one that arrives after it is refused
-    /// outright, not merely deprioritised.
-    ///
-    /// It gives up only when the window closes, and says so loudly when it
-    /// does: at that point rows really are stranded until the next start, and
-    /// that is worth an operator's attention rather than a debug line.
+    /// Once fenced, releasing by node identity is unsafe and retries stop.
     pub async fn retry_stale_node_holdings_release(&self) {
         loop {
             tokio::time::sleep(Self::STALE_RELEASE_RETRY_INTERVAL).await;
@@ -688,24 +470,9 @@ impl ApiImpl {
         }
     }
 
-    /// Reclaims sandboxes that outlived their deadline on a node nobody has
-    /// heard from since.
+    /// Reclaims expired rows from nodes that stopped reporting.
     ///
-    /// Unlike everything else in this module, this pass is not about *this*
-    /// node — any node runs it against the whole cluster, and running it from
-    /// several at once is harmless because the statement is a single
-    /// conditional `UPDATE`. That is deliberate: it exists for the case where a
-    /// machine never comes back, so it cannot depend on that machine doing
-    /// anything.
-    ///
-    /// It is the counterpart to the node-local eviction task. A reachable node
-    /// evicts its own expired sandboxes — pausing them properly, publishing a
-    /// fresh snapshot — which is the outcome we want and the reason this waits
-    /// for a lapsed lease before touching anything. e2b does not need the
-    /// distinction because its eviction was never on the node to begin with:
-    /// it runs in the control plane off a cluster-wide expiry index, and drops
-    /// the sandbox from its store even when the node cannot be reached to be
-    /// told (`e2b/packages/api/internal/orchestrator/delete_instance.go:104`).
+    /// The cluster operation is conditional and safe for multiple concurrent callers.
     pub async fn reclaim_expired_sandboxes(&self) {
         if !self.paused.registry().is_cluster_backed() {
             return;
@@ -730,41 +497,17 @@ impl ApiImpl {
         }
     }
 
-    /// Drops the cluster record and the snapshot for a sandbox that is gone.
-    ///
-    /// Only used where the orchestrator cannot do it itself: a delete for a
-    /// sandbox this node does not hold, which exists in the cluster purely as a
-    /// published snapshot.
+    /// Deletes cluster state and snapshot for a sandbox confirmed gone.
     pub async fn forget_paused_sandbox(&self, sandbox_id: SandboxId) {
-        // No handle: this call stopped nothing, so it has no real machine to
-        // report. `forget_sandbox`'s fallback (this process's own identity)
-        // is the correct answer here, not a stopgap — a `Running` row this
-        // path finds was never touched by this delete, and must be left
-        // alone exactly as if a real holder had been read and found to
-        // differ.
+        // With no local handle, a live row belonging to another holder must remain untouched.
         self.paused.forget_sandbox(sandbox_id, None).await;
     }
 
-    /// Brings this node's copies of sandboxes back in line with the cluster.
+    /// Reconciles local paused and running copies against cluster ownership.
     ///
-    /// Runs at startup and then on a timer, over both halves of the node's
-    /// roster, because a node can be out of step in two different ways and only
-    /// one of them used to be checked:
-    ///
-    /// - a **paused** record for a sandbox another node has since resumed —
-    ///   dead weight that still gets advertised in the heartbeat roster, so the
-    ///   scheduler's binding flaps between the two nodes;
-    /// - a **running** copy of a sandbox another node has taken over — two live
-    ///   VMs writing to their own rootfs layers from the same starting point.
-    ///
-    /// The second is the expensive one and the one the lease cannot prevent:
-    /// the lease decides *who may take over*, and a node whose lease lapsed
-    /// because it was partitioned rather than dead comes back still running its
-    /// copy. Nothing tells it. Noticing is entirely on it, which is why this is
-    /// periodic and why it covers running sandboxes too.
+    /// Runs periodically because a partitioned node receives no takeover notification.
     pub async fn reconcile_local_records(&self) {
-        // A disabled registry reports every sandbox as missing, which this
-        // would read as "all of them moved on".
+        // A disabled registry would make every local record appear missing.
         if !self.paused.registry().is_cluster_backed() {
             return;
         }
@@ -774,9 +517,7 @@ impl ApiImpl {
         self.reap_superseded_running_sandboxes().await;
     }
 
-    /// Forgets registrations for sandboxes this node no longer has, so the map
-    /// tracks the current roster instead of every resume the process ever
-    /// served.
+    /// Prunes registrations for sandboxes no longer in the local roster.
     async fn retain_running_registrations(&self) {
         match self.orchestrator.list_sandbox_ids().await {
             Ok(ids) => self
@@ -788,21 +529,7 @@ impl ApiImpl {
         }
     }
 
-    /// Tears down running copies of sandboxes the cluster says are held
-    /// elsewhere.
-    ///
-    /// The mirror image of e2b's orphan sweep, which reconciles each node's
-    /// reported sandbox list against the store and kills whatever the store
-    /// does not account for (`e2b/packages/api/internal/sandbox/store.go:141`,
-    /// *"Redis is the source of truth — divergent sandboxes are orphans …
-    /// Kill them"*). Same invariant, opposite direction: e2b's control plane
-    /// pulls and kills, and here the node that has fallen out of step is the
-    /// one that notices and stands down.
-    ///
-    /// Only sandboxes this process registered are considered, and the registry
-    /// row is judged against the identity it was registered under rather than
-    /// this node's current ID — the same rule the paused half follows, for the
-    /// same reason (§8.4: the ID is a pod name and changes under the node).
+    /// Tears down registered running copies whose cluster row names another owner.
     async fn reap_superseded_running_sandboxes(&self) {
         let running = match self
             .orchestrator
@@ -820,8 +547,7 @@ impl ApiImpl {
             }
         };
 
-        // Only sandboxes this process registered can be judged at all, so the
-        // roster is narrowed before the registry is asked anything.
+        // Query only sandboxes with a confirmed cluster registration.
         let registered: Vec<(SandboxId, String)> = running
             .into_iter()
             .filter_map(|metadata| {
@@ -838,20 +564,13 @@ impl ApiImpl {
         let rows = match self.paused.registry().get_many(&ids).await {
             Ok(rows) => rows,
             Err(err) => {
-                // One unreadable answer must not cascade into tearing down the
-                // node's sandboxes.
+                // An unreadable batch cannot authorize any teardown.
                 warn!(error = %err, "registry unreadable; stopping running-sandbox reconciliation");
 
                 return;
             }
         };
-        // 🔴 The same rule one level finer. The error arm above covers a batch
-        // that failed outright; this covers a batch that came back short — a
-        // row the backend read but could not decode is dropped from `entries`,
-        // and without this it would arrive here as an absence and be torn down
-        // as "held elsewhere". A sandbox whose row cannot be read is a sandbox
-        // nothing is known about, which is the one state that must not license
-        // destroying it.
+        // Partial batch answers leave unanswered sandboxes untouched.
         let answered = rows.answered();
         if !rows.covers(&ids) {
             warn!(
@@ -862,9 +581,7 @@ impl ApiImpl {
         }
 
         for (sandbox_id, registered_as) in registered {
-            // Not answered for: judge nothing. `AnsweredRows::get` is what
-            // makes this step impossible to skip -- there is no way to reach
-            // the row, or its absence, without it.
+            // Unanswered ids remain undecided.
             let Some(row) = answered.get(&sandbox_id) else {
                 continue;
             };
@@ -896,15 +613,7 @@ impl ApiImpl {
         }
     }
 
-    /// Drops local paused records the cluster has moved past.
-    ///
-    /// A node that keeps a paused record for a sandbox another node has since
-    /// resumed does more than waste disk: it keeps reporting that sandbox in
-    /// its heartbeat roster, so the scheduler's binding for it flaps between
-    /// the two nodes and traffic for a perfectly healthy sandbox lands half the
-    /// time on the node that only has a corpse of it. Left long enough, a
-    /// resume aimed here would start a second copy, and the two would write to
-    /// their own rootfs layers from the same starting point.
+    /// Drops local paused records superseded by cluster ownership.
     async fn reconcile_local_paused_records(&self) {
         let paused = match self
             .orchestrator
@@ -922,10 +631,7 @@ impl ApiImpl {
             }
         };
 
-        // Records that predate the registry, or that were written while it was
-        // node-local, carry no cluster registration — for those the local copy
-        // is the only copy and the registry's silence says nothing. Dropping
-        // them here also keeps them out of the query below.
+        // Registry silence says nothing about records never registered.
         let mut registered = Vec::with_capacity(paused.len());
         for metadata in paused {
             match self
@@ -948,18 +654,14 @@ impl ApiImpl {
         let rows = match self.paused.registry().get_many(&ids).await {
             Ok(rows) => rows,
             Err(err) => {
-                // Never guess when the registry cannot answer: one unreadable
-                // response must not cascade into deleting local records.
+                // An unreadable response cannot authorize local deletion.
                 warn!(error = %err, "registry unreadable; stopping paused-record reconciliation");
 
                 return;
             }
         };
 
-        // 🔴 See `reap_superseded_running_sandboxes` for the reasoning: an id the
-        // batch could not answer for must not reach the `None => Gone` arm
-        // below, which deletes the record *and* its artifacts — on this path
-        // the local copy is frequently the only copy.
+        // Partial batch answers leave unanswered local records untouched.
         let answered = rows.answered();
         if !rows.covers(&ids) {
             warn!(
@@ -971,10 +673,7 @@ impl ApiImpl {
 
         let mut discarded = 0usize;
         for (sandbox_id, registration) in registered {
-            // Outer `None`: the batch did not answer for this sandbox, so
-            // nothing is known about it and nothing may be deleted. Inner
-            // `None`: registered once, no row now -- resumed elsewhere, or
-            // deleted.
+            // Outer absence means unanswered; an answered missing row means gone.
             let Some(row) = answered.get(&sandbox_id) else {
                 continue;
             };
@@ -1012,13 +711,9 @@ impl ApiImpl {
         }
     }
 
-    /// Discards this node's paused record when the cluster says the sandbox has
-    /// moved on, so a resume cannot start a second copy.
+    /// Discards a local paused copy only when cluster state confirms supersession.
     ///
-    /// Returns whether a record was discarded. Any doubt — registry disabled,
-    /// registry unreachable, row still ours — leaves the local record alone:
-    /// refusing a resume that would have worked is worse than the narrow race
-    /// this closes.
+    /// Registry uncertainty preserves the local record.
     pub async fn discard_if_superseded(&self, sandbox_id: SandboxId) -> bool {
         if !self.paused.registry().is_cluster_backed() {
             return false;
@@ -1027,12 +722,7 @@ impl ApiImpl {
         let superseded = match self.superseded_by_cluster(sandbox_id).await {
             Ok(Some(superseded)) => superseded,
             Ok(None) => return false,
-            // 🔴 Worth a line of its own. Keeping the copy is right, but the
-            // reason is not "the row is still ours" — it is that nobody could
-            // be asked, and the resume that follows this call is about to lose
-            // its other defence to the same outage. Once the registry is
-            // another service rather than a database connection this stops
-            // being rare, and without this it is invisible.
+            // Log registry uncertainty distinctly from an owned row.
             Err(()) => {
                 debug!(
                     %sandbox_id,
@@ -1058,16 +748,9 @@ impl ApiImpl {
         }
     }
 
-    /// Decides whether this node's paused copy of a sandbox has been superseded.
-    ///
-    /// `Ok(None)` means keep it. `Err(())` means the registry could not answer,
-    /// which is never a reason to discard anything.
+    /// Determines whether cluster state supersedes this node's paused copy.
     async fn superseded_by_cluster(&self, sandbox_id: SandboxId) -> Result<Option<Superseded>, ()> {
-        // Never reason about a record the cluster was never told about: for
-        // those the local copy is the only copy, and absence from the registry
-        // carries no information at all. This is also what makes switching an
-        // existing node from the node-local backend to a cluster one safe —
-        // every record it already holds is untouched.
+        // Never judge a local copy the cluster was not told about.
         let registration = match self
             .orchestrator
             .paused_record_cluster_registration(sandbox_id)
@@ -1092,7 +775,6 @@ impl ApiImpl {
         };
 
         let Some(entry) = entry else {
-            // Registered once, no row now: resumed elsewhere, or deleted.
             return Ok(Some(Superseded::Gone));
         };
 
@@ -1115,35 +797,10 @@ impl ApiImpl {
     }
 }
 
-/// Decides a resume the registry could not arbitrate, from what this node's own
-/// copy remembers.
+/// Chooses whether a registry outage may fall back to local resume.
 ///
-/// 🔴 This is the one direction the rest of this module's caution does not
-/// cover. Everywhere else a registry that cannot answer means *stop*; here it
-/// used to mean *go*, unconditionally — and the two failures are the same
-/// failure. `running` and `resuming` are never claimable, and the last thing
-/// enforcing that is the claim coming back as a conflict; when the registry is
-/// unreachable that check is simply absent. The same outage also makes
-/// `discard_if_superseded` keep a stale local copy instead of dropping it, so
-/// the two defences against bringing a sandbox up twice go together, and what
-/// is left is a node resuming a sandbox from a copy it has no reason to still
-/// believe in. Two VMs then diverge from one snapshot, each writing its own
-/// rootfs layers, with the gateway alternating between them.
-///
-/// That was survivable while the registry was a database in the same cluster
-/// with a permanently open pool. It is not once reaching it means reaching
-/// another service, whose ordinary rolling restart opens the window on purpose.
-///
-/// **Narrow, not blanket.** Only a local record that was announced *under a
-/// known identity* changes the answer. The alternatives carry no information:
-/// a record the cluster was never told about has its only copy right here, and
-/// one announced by a build that did not store the identity it used cannot be
-/// judged against the row either — which is exactly how [`supersession`] treats
-/// the same three cases. Refusing those would fail resumes that were never at
-/// risk.
-///
-/// The cost is a retryable failure while the registry is unreachable. Two live
-/// copies of one sandbox is not retryable.
+/// Only records never announced under a known cluster identity may proceed;
+/// announced records fail closed to avoid a second live copy.
 fn unreachable_arbitration(
     registration: Option<ClusterRegistration>,
     sandbox_id: SandboxId,
@@ -1183,27 +840,15 @@ fn unreachable_arbitration(
     }
 }
 
-/// Turns the registry's answer into a decision about this node.
-///
-/// Split out from the call that produces it because whether a node may bring a
-/// sandbox up is the judgement that decides how many copies of it exist. The
-/// one case worth stating twice: an answer naming *this* node is not a refusal.
-/// A node is regularly told "not ready, held by X" or "conflict, held by X"
-/// where X is itself — its own in-flight publish, its own pause that never
-/// published, its own already-running sandbox — and reading those as refusals
-/// would make a node unable to resume its own sandboxes.
+/// Converts one registry claim result into this node's resume decision.
 fn arbitration(claim: ResumeClaim, node_id: &str, proposed: ExecutionId) -> ResumeArbitration {
     match claim {
         ResumeClaim::Claimed { entry, .. } => {
-            // 🔴 The row's incarnation wins over the one proposed above. A
-            // controller that predates incarnations answers with none, and the
-            // proposed value is then the honest fallback — it is what this node
-            // will run under, and the old controller ignores it either way.
+            // Prefer the incarnation written by the registry, falling back for old rows.
             let granted = entry.execution_id.unwrap_or(proposed);
             ResumeArbitration::Held(entry, ClaimedExecution::from_claim(granted))
         }
-        // The cluster does not track this sandbox, so there is nobody to
-        // arbitrate with and a local copy, if any, is the whole truth.
+        // Untracked sandboxes have no cluster owner to arbitrate with.
         ResumeClaim::NotFound => ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed)),
         ResumeClaim::NotReady { origin_node_id } if origin_node_id == node_id => {
             ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed))
@@ -1215,12 +860,7 @@ fn arbitration(claim: ResumeClaim, node_id: &str, proposed: ExecutionId) -> Resu
             ResumeArbitration::Proceed(ClaimedExecution::from_claim(proposed))
         }
         ResumeClaim::NotReady { origin_node_id } => ResumeArbitration::NotReady { origin_node_id },
-        // 🔴 Both reasons block, and deliberately so. `ClaimLost` means the row
-        // is claimable again and a retry would be legitimate, but retrying is
-        // not this function's decision to make: it answers one question, and
-        // the caller that receives Blocked is the one that knows whether
-        // retrying is safe for the resume it is serving. The reason is carried
-        // this far so that caller can eventually see it.
+        // Both conflict reasons block this attempt; callers decide whether to retry.
         ResumeClaim::Conflict {
             origin_node_id,
             reason: _,
@@ -1228,28 +868,14 @@ fn arbitration(claim: ResumeClaim, node_id: &str, proposed: ExecutionId) -> Resu
     }
 }
 
-/// Decides whether a local paused copy has been superseded by what the registry
-/// says, judged against the identity that copy was registered under.
+/// Determines whether cluster ownership supersedes a local paused copy.
 ///
-/// Kept separate from the I/O around it because this is the judgement that
-/// decides whether a node deletes its own copy of a sandbox, and getting it
-/// wrong in either direction is expensive: too eager throws away a user's
-/// workspace, too shy leaves two nodes claiming the same sandbox.
-///
-/// Note what it is *not* compared against: the node's current ID. That ID is
-/// only as stable as whatever supplies it — under Kubernetes it is commonly the
-/// pod name, which changes on every pod recreation — so a node restarting would
-/// read every one of its own rows as another node's and discard the lot.
+/// Compare with the identity recorded at registration, not the node's current id.
 fn supersession(
     entry: &PausedSandboxEntry,
     registration: &ClusterRegistration,
 ) -> Option<Superseded> {
-    // True whatever this node is called: a row that says the sandbox is live,
-    // or being brought up, cannot be describing the paused copy sitting here.
-    // A claim is safe to yield to without checking who took it — a node only
-    // claims once it has found it holds no local record, and a row reaches
-    // `Resuming` only from a state that names a snapshot, so there is always a
-    // durable copy behind what gets discarded.
+    // Live or resuming rows supersede a paused local copy.
     match entry.state {
         PausedRegistryState::Running => {
             return Some(Superseded::HeldBy(entry.origin_node_id.clone()))
@@ -1265,9 +891,7 @@ fn supersession(
         _ => {}
     }
 
-    // Parked, but under someone else's name: another node has paused it since,
-    // so this copy is a leftover. Only decidable when this record remembers the
-    // identity it was registered under.
+    // A parked row under another registered holder supersedes this copy.
     match registration {
         ClusterRegistration::As(node_id) if entry.origin_node_id != *node_id => {
             Some(Superseded::HeldBy(entry.origin_node_id.clone()))
@@ -1276,12 +900,7 @@ fn supersession(
     }
 }
 
-/// Counts what reconciliation found the cluster had moved past.
-///
-/// Worth a metric rather than only a log line: every increment here is a copy of
-/// a sandbox that this node believed it held and did not, so a rate that is
-/// anything but near-zero means nodes are routinely losing sandboxes to each
-/// other — a lease or partition problem, not a reconciliation one.
+/// Records paused/running supersession outcomes.
 fn record_supersession(kind: &'static str, outcome: &'static str) {
     metrics::counter!(
         "agentenv_paused_registry_superseded_total",
@@ -1291,48 +910,10 @@ fn record_supersession(kind: &'static str, outcome: &'static str) {
     .increment(1);
 }
 
-/// Decides whether a running copy on this node has been superseded, judged
-/// against the identity the registry confirmed this node as holder under.
+/// Determines whether cluster ownership supersedes a registered running copy.
 ///
-/// Deliberately narrower than [`supersession`]: that one decides the fate of a
-/// *paused* record, whose artifacts are the sandbox. This one decides the fate
-/// of a live VM, so it only ever fires when the row positively names someone
-/// else — or has ceased to exist, which for a row this node was confirmed the
-/// holder of means the sandbox was removed cluster-wide while this node was
-/// away.
-///
-/// `entry: None` is only reachable for a sandbox this process registered, which
-/// is the whole reason the caller must not invoke this without one. For an
-/// unregistered sandbox — anything created here and never resumed from the
-/// cluster — `None` means nothing at all, and reading it as "gone" would tear
-/// down a sandbox seconds after it was created.
-///
-/// # 🔴 Two identities in, deliberately never the same argument
-///
-/// Mirrors the claimant/holder split [`live_elsewhere`] already makes for the
-/// delete path (819affc) — this is the same judgement made by the periodic
-/// reap instead of by a delete, and it needs the same two values for the same
-/// reason. `registered_as` is the **holder**: the real machine
-/// `running_registrations` recorded this sandbox under (`origin_node_id` is
-/// always a holder too, since 259d0de). `claimant_node_id` is always
-/// `self.paused.node_id()` — this process's own identity — and is what a
-/// `Resuming` row's `claimed_by_node_id` must be compared against, because
-/// that field is itself always a claimant, written by `claim_for_resume`'s
-/// guard.
-///
-/// Comparing `claimed_by_node_id` against `registered_as` instead (as this
-/// function once did) types-checks — both are `&str` — but compares a Pod
-/// name against a machine name on the api half, which are never equal even
-/// when the claim is this very process's own still-unconfirmed resume: a
-/// resume sets the local copy live (and `list_sandboxes_filtered` visible to
-/// this reap) *before* `mark_running` confirms and flips the row past
-/// `Resuming`, so every reap tick that lands in that window would have read
-/// its own in-flight resume as "claimed by someone else" and deleted the
-/// sandbox it had just brought up. On the pre-split single process this was never observable
-/// — one process is both claimant and holder, so the two arguments were
-/// always the same string — which is exactly why a test built on a single
-/// shared constant for both axes cannot catch it; see
-/// `our_own_claim_is_not_superseded_even_when_holder_and_claimant_differ`.
+/// Holder identity and claimant identity are distinct; resuming rows compare
+/// their claimant against this process, not against the machine holder.
 fn running_supersession(
     entry: Option<&PausedSandboxEntry>,
     registered_as: &str,
@@ -1343,17 +924,13 @@ fn running_supersession(
     };
 
     match entry.state {
-        // Held by whoever the row names, and it is not us.
+        // Stable states are owned by the row's holder.
         PausedRegistryState::Running
         | PausedRegistryState::Paused
         | PausedRegistryState::Publishing
         | PausedRegistryState::LocalOnly => (entry.origin_node_id != registered_as)
             .then(|| Superseded::HeldBy(entry.origin_node_id.clone())),
-        // Someone is bringing it up. `origin_node_id` still names the node
-        // whose disk holds the artifacts — which during a takeover is us — so
-        // only the claimer answers the question, and the claimer is a
-        // claimant: judge it against our own claimant identity, not the
-        // holder this running copy was registered under.
+        // Resuming rows are owned by their claimant, not their artifact holder.
         PausedRegistryState::Resuming => {
             let claimer = entry
                 .claimed_by_node_id
@@ -1365,17 +942,7 @@ fn running_supersession(
     }
 }
 
-/// Builds the launch request that brings a paused sandbox back.
-///
-/// Every field is carried over from the record the pausing node wrote, so the
-/// restored sandbox keeps the timeout policy, metadata, network policy and
-/// extension params it had. `env_vars` is intentionally absent: environment is
-/// applied at first boot and is already baked into the snapshot.
-///
-/// 🔴 `source` is passed in rather than built here, because which of the two
-/// snapshot launch sources a restore uses is a property of the half doing the
-/// restoring and not of the paused record. Everything else about the request
-/// is identical either way, which is the point.
+/// Builds a restore request from persisted metadata and the selected launch source.
 fn restore_request(
     metadata: &SandboxMetadata,
     source: SandboxLaunchSource,
@@ -1383,15 +950,7 @@ fn restore_request(
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
         source,
-        // A restore is a resume: the request's timeout wins when it set one,
-        // otherwise the sandbox keeps the timeout it was paused with.
-        //
-        // 🔴 Never `AfterConfiguredDefault`. This orchestrator is restoring a
-        // sandbox whose deadline is already decided — by the request or by the
-        // record — so reaching for a configured default here would be inventing
-        // a deadline for a sandbox that came with one. A record that carries
-        // none carries none: `NotKeptHere` says "keep none", which is what the
-        // paused record says, and not "use fifteen seconds".
+        // Existing absence of a deadline remains absence; never invent a default.
         expiry: match timeout {
             NewTimeout::Set(duration) | NewTimeout::EnsureMinimum(duration) => {
                 SandboxExpiry::After(duration)
@@ -1409,12 +968,9 @@ fn restore_request(
         network_policy: metadata.network_policy.clone(),
         secure: metadata.secure,
         custom_extension_params: metadata.custom_extension_params.clone(),
-        // Carried over like everything else here: a restore is the same
-        // sandbox, so whoever owned the record still owns it.
+        // Preserve the control-plane owner across runs.
         control_plane_config: metadata.control_plane_config.clone(),
-        // 🔴 *Not* carried over. A restore is a new run of the sandbox, and
-        // reusing the incarnation the record was paused under would give the
-        // new run the identity of the one that ended.
+        // A restore mints a new incarnation.
         execution_id: None,
     }
 }
@@ -1438,28 +994,19 @@ mod tests {
 
     const SELF: &str = "node-a";
     const OTHER: &str = "node-b";
-    /// A holder identity distinct from `SELF`/`OTHER`, standing in for the
-    /// real machine on the api half — where the holder a running copy is
-    /// registered under is a machine name, structurally never equal to the
-    /// claimant identity (`self.paused.node_id()`, a Pod name) any resume
-    /// claim is taken under. Only used by `running_supersession` tests that
-    /// must tell those two axes apart.
+    /// Machine holder distinct from both claimant identities.
     const HOLDER: &str = "aenv-worker-07";
 
-    /// An API built over the given registry and nothing else that touches the
-    /// host: enough to drive the startup-time release and its retry.
+    /// Minimal API fixture for startup release behavior.
     async fn api_over(registry: Arc<dyn PausedSandboxRegistry>) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().unwrap();
 
         api_rooted(root.path(), registry).await
     }
 
-    /// The same, over a record store the caller owns — so a test can seed a
-    /// paused record into it first.
+    /// Fixture rooted in a caller-owned record store.
     ///
-    /// The store is opened here and stays open, which is why seeding has to
-    /// happen before this is called: it is a RocksDB directory and only one
-    /// handle at a time may hold it.
+    /// Seed it before opening because RocksDB permits one handle.
     async fn api_rooted(
         root: &std::path::Path,
         registry: Arc<dyn PausedSandboxRegistry>,
@@ -1485,21 +1032,11 @@ mod tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 `node_local`, i.e. the `aenv-node` half: these fixtures
-            // predate the split and assert the behaviour of a process that
-            // runs the sandboxes it answers for.
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ))
     }
 
-    /// Writes a paused record into the store at `root` and reports its id.
-    ///
-    /// 🔴 The record names the other virtualization mode on purpose. A store
-    /// opened afterwards keeps a record it cannot rebuild a VM from, but
-    /// discards one it *should* be able to and then cannot — and this test
-    /// wants the record, not a resumable sandbox. Seeded the obvious way, the
-    /// record is gone by the time the assertion runs and every one of these
-    /// tests passes for the wrong reason.
+    /// Seeds a persisted paused record that startup retains for inspection.
     async fn seed_paused_record(
         root: &std::path::Path,
         registered_as: Option<&str>,
@@ -1535,19 +1072,7 @@ mod tests {
         sandbox_id
     }
 
-    /// A metadata store that can answer `paused_handle` with `Remote` for one
-    /// chosen sandbox, the way a store shared across api replicas does — by
-    /// reference, not by handle — without needing a real capture behind it:
-    /// `arbitrate_resume` only ever asks which machine the row names.
-    ///
-    /// Delegates everything else to an ordinary in-memory store, which cannot
-    /// produce `Remote` on its own — `SandboxMetadata::paused_state` is
-    /// `#[serde(skip)]`, but this store keeps records as live Rust values
-    /// rather than round-tripping them, so nothing ever strips the handle. A
-    /// store that could produce `Remote` honestly needs the same delegation
-    /// `SerialisingStore` (`orchestrator::tests`) uses for the same reason;
-    /// this one is a narrower, single-purpose copy local to this module, since
-    /// that one is private to its own.
+    /// Metadata-store fixture that reports one sandbox as remote without a live handle.
     struct RemoteOriginStore {
         inner: InMemoryMetadataStore,
         remote: std::sync::Mutex<Option<(SandboxId, Option<String>)>>,
@@ -1705,9 +1230,6 @@ mod tests {
         }
     }
 
-    /// An API over a store that can name a sandbox's real origin before any
-    /// resume of it has been attempted, and a registry that records the
-    /// identity every claim was taken under.
     async fn api_with_remote_origin(
         store: RemoteOriginStore,
         registry: Arc<CountingRegistry>,
@@ -1733,38 +1255,10 @@ mod tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 The half this test is about: `aenv-api`, which owns paused
-            // sandboxes it does not run. It used to say so with a `role`
-            // argument beside a `node_local` wiring that said the opposite;
-            // `ApiImpl` reads the one fact off the wiring now.
             crate::api::ResumeWiring::api_half_for_test(),
         ))
     }
 
-    /// 🔴 The regression guard for the double-live risk found while
-    /// reviewing a0487f0's own claimant change (reverted above), not a
-    /// hypothetical.
-    ///
-    /// a0487f0 claimed under `Orchestrator::paused_origin_node_id` when a
-    /// store could name the sandbox's real machine — "node-203" here, exactly
-    /// what a store shared across api replicas (Redis, or any backend that
-    /// serialises and reads records back rather than keeping live handles)
-    /// answers identically to *every* replica that asks, because it is
-    /// cluster state, not process state. Two different api replicas racing to
-    /// resume the same sandbox would then both compute the identical
-    /// claimant and both call `claim_for_resume("node-203", ...)`; the loser
-    /// reads back `Conflict{origin_node_id: "node-203"}`, compares it against
-    /// its own claimant — also "node-203" — and `arbitration`'s "is this
-    /// naming me" check reads that as `Proceed`, exactly as it must for the
-    /// winner. Both replicas go on to resume the same sandbox.
-    ///
-    /// The registry here answers every claim with `Conflict{"node-203"}` —
-    /// the shape either replica's *own* claim, or the other replica's claim
-    /// taken under the same shared hint, looks like from this side. The only
-    /// thing that can tell them apart is whether this call's own claimant is
-    /// "node-203" too. It must not be: `self.paused.node_id()` is this
-    /// process's own identity, unique to this deciding process, however many
-    /// other replicas the shared store answers "node-203" to.
     #[tokio::test]
     async fn two_replicas_reading_the_same_origin_hint_do_not_mistake_each_others_claim_for_their_own(
     ) {
@@ -1796,11 +1290,6 @@ mod tests {
         );
     }
 
-    /// Every claim — with a known real-machine hint on record, or none at all
-    /// — is taken under this process's own identity. `RemoteOriginStore`'s two
-    /// states (a chosen sandbox names a machine, everything else answers
-    /// `NotPaused`) are exercised together so a build that claims under the
-    /// hint in one case but not the other has nowhere to hide.
     #[tokio::test]
     async fn a_claim_is_always_taken_under_this_process_never_the_shared_origin_hint() {
         let store = RemoteOriginStore::new();
@@ -1824,12 +1313,6 @@ mod tests {
         );
     }
 
-    /// The self-comparison in `arbitration` must still recognise this
-    /// process's *own* earlier claim: `Conflict`/`NotReady` naming
-    /// `self.paused.node_id()` itself is not a refusal. `NotFound` — what the
-    /// tests above exercise — never reaches that comparison, so this
-    /// configures the registry to answer a conflict directly, naming exactly
-    /// the identity a claim from this same process is taken under.
     #[tokio::test]
     async fn a_conflict_naming_this_process_own_identity_is_not_a_refusal() {
         // One throwaway instance just to learn this test's own node identity —
@@ -1863,11 +1346,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The narrow case, and the only one that changes. A copy this node
-    /// announced to the cluster is one the cluster has a say over, and with the
-    /// registry unreachable nothing is left to enforce that `running` and
-    /// `resuming` are never claimable. Proceeding here is how one sandbox comes
-    /// to be live twice.
     #[tokio::test]
     async fn an_unreachable_registry_refuses_a_resume_for_a_copy_the_cluster_knows_about() {
         let root = tempfile::tempdir().unwrap();
@@ -1887,18 +1365,6 @@ mod tests {
         );
     }
 
-    /// 🔴 What the refusal actually looks like to the only thing that reads it.
-    ///
-    /// The guardrail is worth nothing if the refusal reaches the caller as a
-    /// 404: the downstream contract for a 404 on this route is "the sandbox is
-    /// gone, rebuild it", which resets the user's workspace to its template —
-    /// exactly the outcome the guardrail exists to prevent, arrived at by a
-    /// different road. So the status is pinned here, along with the wording,
-    /// which is deliberately unique to this branch.
-    ///
-    /// 500 rather than 503 is on purpose; see the branch's own comment. The
-    /// assertion is that it is *not a 404 and not a success*, not that it is
-    /// the number 500 for its own sake.
     #[tokio::test]
     async fn a_resume_nobody_could_arbitrate_is_retryable_not_a_missing_sandbox() {
         use agentenv_http_server::apis::sandboxes::{
@@ -1935,9 +1401,6 @@ mod tests {
         );
     }
 
-    /// The other side of the narrowing. A copy the cluster was never told about
-    /// is the only copy there is, so the registry's silence about it carries no
-    /// information and refusing would fail a resume that was never at risk.
     #[tokio::test]
     async fn an_unreachable_registry_still_proceeds_for_a_copy_the_cluster_never_saw() {
         let root = tempfile::tempdir().unwrap();
@@ -1959,8 +1422,6 @@ mod tests {
         ));
     }
 
-    /// Nothing local at all: there is no copy here to duplicate, so the resume
-    /// goes on to discover that for itself.
     #[tokio::test]
     async fn an_unreachable_registry_still_proceeds_when_this_node_holds_nothing() {
         let api = api_over(Arc::new(CountingRegistry::unreachable())).await;
@@ -1971,8 +1432,6 @@ mod tests {
         ));
     }
 
-    /// A node-local registry has no say at all, so an unreachable one cannot
-    /// arise and the resume never asks.
     #[tokio::test]
     async fn a_node_local_registry_never_refuses_a_resume() {
         let api = api_over(Arc::new(DisabledPausedSandboxRegistry)).await;
@@ -1983,8 +1442,6 @@ mod tests {
         ));
     }
 
-    /// The four things a local record can say, and what each is worth when the
-    /// registry cannot be reached.
     #[test]
     fn only_a_copy_announced_under_a_known_identity_refuses_a_resume() {
         let sandbox_id = crate::types::SandboxId::new();
@@ -2026,10 +1483,6 @@ mod tests {
         ));
     }
 
-    /// 🔴 The second defence, failing in the same outage as the first. Keeping
-    /// the copy is right — but "the row is still ours" and "nobody could be
-    /// asked" are different reasons for the same silence, and only one of them
-    /// means a resume is about to run unarbitrated.
     #[tokio::test]
     async fn a_registry_that_cannot_be_asked_says_so_before_keeping_the_local_copy() {
         let root = tempfile::tempdir().unwrap();
@@ -2046,9 +1499,6 @@ mod tests {
         );
     }
 
-    /// 🔴 One missed renewal is nothing; the configured TTL is held to three
-    /// renewal intervals so that two may be missed. It is the run that matters,
-    /// and no single failure can report one.
     #[tokio::test]
     async fn consecutive_failed_renewals_are_counted() {
         let api = api_over(Arc::new(CountingRegistry::unreachable())).await;
@@ -2060,8 +1510,6 @@ mod tests {
         assert_eq!(api.paused.consecutive_renew_failures(), 3);
     }
 
-    /// A run that has ended is not a run: the count is of failures *in a row*,
-    /// so one renewal landing clears whatever came before it.
     #[tokio::test]
     async fn a_renewal_that_lands_ends_the_run() {
         let api = api_over(Arc::new(CountingRegistry::unreachable_for(2))).await;
@@ -2074,8 +1522,6 @@ mod tests {
         assert_eq!(api.paused.consecutive_renew_failures(), 0);
     }
 
-    /// The single-node default. There is no cluster to hand anything back to,
-    /// so this must settle without a retry task ever being spawned.
     #[tokio::test]
     async fn a_node_local_registry_has_nothing_to_release() {
         let api = api_over(Arc::new(DisabledPausedSandboxRegistry)).await;
@@ -2086,22 +1532,13 @@ mod tests {
         );
     }
 
-    /// Runs a retry loop that is supposed to finish, and fails the test rather
-    /// than hanging the suite if it does not.
-    ///
-    /// Under `start_paused` the clock advances whenever the runtime idles, so a
-    /// loop that never settles burns virtual time as fast as the CPU allows and
-    /// would otherwise spin until somebody killed the run. That is precisely
-    /// what removing the fence produces, so the bound is what turns it into a
-    /// readable failure.
+    /// Bounds a paused-time retry fixture so failures cannot spin indefinitely.
     async fn run_bounded(work: impl std::future::Future<Output = ()>) {
         tokio::time::timeout(Duration::from_secs(600), work)
             .await
             .expect("the retry loop should settle rather than run forever");
     }
 
-    /// The scheduler-is-rolling case: the release fails at startup and lands on
-    /// a later attempt, without anyone having restarted the node.
     #[tokio::test(start_paused = true)]
     async fn the_retry_keeps_going_until_the_release_lands() {
         let registry = Arc::new(CountingRegistry::new(3, false));
@@ -2121,9 +1558,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The retry is bounded by the fence, not by a count or a clock. A node
-    /// that has taken a sandbox live must never release rows by node identity
-    /// again, however badly the earlier attempt failed.
     #[tokio::test(start_paused = true)]
     async fn the_retry_stops_once_this_node_holds_a_sandbox() {
         let registry = Arc::new(CountingRegistry::always_failing());
@@ -2168,13 +1602,6 @@ mod tests {
         }
     }
 
-    /// 🔴 The claim token carries the registry's incarnation, not the one this
-    /// node proposed.
-    ///
-    /// They normally agree — the registry writes what the claim asked for. When
-    /// they do not, the row's value is the one `mark_running` matches on, so
-    /// running under the proposed one instead fails every cross-node resume,
-    /// and fails it by matching no row rather than by returning an error.
     #[test]
     fn a_granted_claim_hands_back_the_registrys_incarnation() {
         let mut entry = entry(PausedRegistryState::Resuming, SELF, Some(SELF));
@@ -2195,10 +1622,6 @@ mod tests {
         assert_eq!(claimed.execution_id(), registry_side);
     }
 
-    /// ...and falls back to the proposed one when the registry named none,
-    /// which is what a controller from before incarnations answers. The resume
-    /// still has to run under something, and the honest something is the value
-    /// this node was going to use anyway.
     #[test]
     fn a_claim_from_an_older_controller_runs_under_the_proposed_incarnation() {
         let mut entry = entry(PausedRegistryState::Resuming, SELF, Some(SELF));
@@ -2219,9 +1642,6 @@ mod tests {
         assert_eq!(claimed.execution_id(), proposed);
     }
 
-    /// The steady state after a cross-node recovery. Until this node notices,
-    /// it keeps advertising the sandbox in its heartbeat roster and the
-    /// scheduler binding flaps between the two nodes.
     #[test]
     fn a_row_held_by_another_node_supersedes_the_local_copy() {
         let superseded = supersession(
@@ -2232,8 +1652,6 @@ mod tests {
         assert!(matches!(superseded, Some(Superseded::HeldBy(node)) if node == OTHER));
     }
 
-    /// A pause that happened elsewhere counts just the same: whoever the row
-    /// names as origin owns the sandbox, whatever state it is in.
     #[test]
     fn a_paused_row_owned_by_another_node_also_supersedes() {
         let superseded = supersession(
@@ -2244,9 +1662,6 @@ mod tests {
         assert!(matches!(superseded, Some(Superseded::HeldBy(_))));
     }
 
-    /// The claim window. `origin` still points here because the artifacts are
-    /// still here, so origin alone cannot catch this — and resuming locally
-    /// anyway is exactly how two live copies of one sandbox get started.
     #[test]
     fn a_claim_by_another_node_supersedes_our_own_row() {
         let superseded = supersession(
@@ -2257,8 +1672,6 @@ mod tests {
         assert!(matches!(superseded, Some(Superseded::ClaimedBy(node)) if node == OTHER));
     }
 
-    /// Our row, our sandbox: the ordinary paused case, and by far the most
-    /// common one. Discarding here would delete a live user's workspace.
     #[test]
     fn our_own_paused_row_is_not_superseded() {
         assert!(supersession(
@@ -2268,10 +1681,6 @@ mod tests {
         .is_none());
     }
 
-    /// The case the running pass exists for: this node was partitioned, its
-    /// lease lapsed, another node legitimately took the sandbox over, and the
-    /// partition then healed with the original VM still running. Two live
-    /// copies of one sandbox until this fires.
     #[test]
     fn a_running_row_naming_another_node_supersedes_our_live_copy() {
         let superseded = running_supersession(
@@ -2283,8 +1692,6 @@ mod tests {
         assert!(matches!(superseded, Some(Superseded::HeldBy(node)) if node == OTHER));
     }
 
-    /// The takeover ran on and paused the sandbox before this node noticed.
-    /// Every parked state answers the same way — whoever the row names owns it.
     #[test]
     fn a_parked_row_naming_another_node_supersedes_our_live_copy() {
         for state in [
@@ -2302,8 +1709,6 @@ mod tests {
         }
     }
 
-    /// Mid-takeover. `origin_node_id` still points here because the artifacts
-    /// are here, so only the claimer can answer — exactly as in the paused half.
     #[test]
     fn a_claim_by_another_node_supersedes_our_live_copy() {
         let superseded = running_supersession(
@@ -2315,8 +1720,6 @@ mod tests {
         assert!(matches!(superseded, Some(Superseded::ClaimedBy(node)) if node == OTHER));
     }
 
-    /// The ordinary case, and by far the most common: our row, our sandbox.
-    /// Firing here would tear down a healthy sandbox on every reconcile.
     #[test]
     fn our_own_running_row_is_not_superseded() {
         assert!(running_supersession(
@@ -2327,15 +1730,6 @@ mod tests {
         .is_none());
     }
 
-    /// This node claimed it and is bringing it back up. `origin_node_id` may
-    /// still name the node the artifacts came from, so judging by origin alone
-    /// would have this node tear down the sandbox it is in the middle of
-    /// resuming.
-    ///
-    /// `registered_as` (the holder) happens to equal the claimant here, which
-    /// is the the pre-split single process shape — one process is both. That coincidence is
-    /// exactly what let this comparison ship broken: see the next test for
-    /// the shape that actually catches it.
     #[test]
     fn our_own_claim_is_not_superseded() {
         assert!(running_supersession(
@@ -2346,20 +1740,6 @@ mod tests {
         .is_none());
     }
 
-    /// The api-half shape of the same case: the running copy was confirmed
-    /// under a real machine (`HOLDER`), never a Pod name, and the claim is
-    /// still judged against the claimant (`SELF`) — the two arguments are
-    /// deliberately different strings.
-    ///
-    /// 🔴 This is the test that catches the bug the doc comment on
-    /// `running_supersession` describes. A version that compared
-    /// `claimed_by_node_id` against `registered_as` (as the function did
-    /// before this test existed) reads `SELF != HOLDER` as true and answers
-    /// `Superseded::ClaimedBy(SELF)` — this node discarding the very sandbox
-    /// it just resumed, in the confirmation window before `mark_running` has
-    /// flipped the row past `Resuming`. `our_own_claim_is_not_superseded`
-    /// above cannot catch that: it uses `SELF` for both axes, which is only
-    /// ever true on the pre-split single process.
     #[test]
     fn our_own_claim_is_not_superseded_even_when_holder_and_claimant_differ() {
         assert!(running_supersession(
@@ -2370,10 +1750,6 @@ mod tests {
         .is_none());
     }
 
-    /// The mirror image: a genuinely different claimant supersedes even when
-    /// the running copy's holder is a real machine, not a Pod name — the
-    /// comparison must still be claimant-vs-claimant, not holder-vs-claimant,
-    /// in the direction that does supersede too.
     #[test]
     fn a_claim_by_another_node_supersedes_our_live_copy_even_when_holder_and_claimant_differ() {
         let superseded = running_supersession(
@@ -2385,8 +1761,6 @@ mod tests {
         assert!(matches!(superseded, Some(Superseded::ClaimedBy(node)) if node == OTHER));
     }
 
-    /// A row this node was confirmed the holder of, now absent: the sandbox was
-    /// removed cluster-wide while this node could not see it.
     #[test]
     fn a_vanished_row_supersedes_our_live_copy() {
         assert!(matches!(
@@ -2395,8 +1769,6 @@ mod tests {
         ));
     }
 
-    /// A pause whose publish failed keeps a `local_only` row naming this node.
-    /// That row is the marker saying the local copy is the *only* copy.
     #[test]
     fn our_own_local_only_row_is_not_superseded() {
         assert!(supersession(
@@ -2406,12 +1778,6 @@ mod tests {
         .is_none());
     }
 
-    /// 🔴 The one that bites hardest. `AENV_NODE_ID` is commonly the pod name
-    /// (`metadata.name` in the DaemonSet), so it changes every single time the
-    /// pod is recreated — an ordinary rollout. Comparing the registry row
-    /// against the node's *current* ID would then read every one of its own
-    /// paused rows as another node's, and the first reconciliation pass after a
-    /// rollout would delete every paused sandbox on the node.
     #[test]
     fn a_restart_under_a_new_node_id_does_not_supersede_our_own_records() {
         let ours = entry(PausedRegistryState::Paused, "agentenv-old-pod", None);
@@ -2425,8 +1791,6 @@ mod tests {
         );
     }
 
-    /// Records announced by an older build carry no identity, so nothing about
-    /// ownership can be concluded — but "it is running elsewhere" still can.
     #[test]
     fn anonymous_registration_still_yields_to_a_live_holder() {
         assert!(supersession(
@@ -2441,11 +1805,6 @@ mod tests {
         .is_none());
     }
 
-    /// 🔴 The regression that would break every ordinary resume. A node that
-    /// holds a sandbox is routinely told "held by X" where X is itself, and
-    /// treating that as a refusal would leave it unable to resume its own
-    /// sandboxes while another node, seeing no local copy, could not resume
-    /// them either.
     #[test]
     fn an_answer_naming_this_node_is_not_a_refusal() {
         for claim in [
@@ -2467,9 +1826,6 @@ mod tests {
         }
     }
 
-    /// The second-copy case. Another node holding the sandbox is the one answer
-    /// that must stop a local resume dead, however resumable the local copy
-    /// looks.
     #[test]
     fn another_node_holding_the_sandbox_blocks_a_local_resume() {
         assert!(matches!(
@@ -2495,8 +1851,6 @@ mod tests {
         ));
     }
 
-    /// A sandbox the cluster does not track is nobody's business but this
-    /// node's, so the registry must not stand in the way of resuming it.
     #[test]
     fn an_untracked_sandbox_resumes_without_arbitration() {
         assert!(matches!(
@@ -2505,9 +1859,6 @@ mod tests {
         ));
     }
 
-    /// The claim carries the row so the rebuild can use it directly. Claiming
-    /// again would find this node's own fresh claim in the way and deadlock the
-    /// resume against itself.
     #[test]
     fn a_granted_claim_carries_the_row_for_the_rebuild() {
         let row = entry(PausedRegistryState::Paused, SELF, None);
@@ -2524,13 +1875,6 @@ mod tests {
         assert_eq!(held.snapshot_id, snapshot);
     }
 
-    /// A claim always wins over a local paused copy, whoever took it.
-    ///
-    /// Safe because of two invariants that hold together: a node only claims
-    /// after finding it has no local record, so "the claimer is us" cannot
-    /// coexist with the record being judged here; and a row can only reach
-    /// `Resuming` from `Paused`/`Running` with a snapshot, so there is always a
-    /// durable copy in the repository behind whatever gets discarded.
     #[test]
     fn any_claim_supersedes_a_local_paused_copy() {
         for claimer in [Some(OTHER), None] {
@@ -2545,7 +1889,6 @@ mod tests {
         }
     }
 
-    /// 唯一允许回 404 的输入：集群也没有这一行。
     #[test]
     fn no_registry_row_is_the_only_missing_verdict() {
         assert!(matches!(
@@ -2554,8 +1897,6 @@ mod tests {
         ));
     }
 
-    /// 并发 resume 的输家：本节点持有认领权（是赢家那一发拿的），本地还没成品。
-    /// 必须等，不能答"不存在" —— 这是 2026-08-18 实测那个 404 的正解。
     #[test]
     fn a_resume_in_flight_on_this_node_is_waited_for_not_reported_missing() {
         let row = entry(PausedRegistryState::Resuming, "other", Some("self"));
@@ -2565,7 +1906,6 @@ mod tests {
         ));
     }
 
-    /// 赢家落定之后，输家从本地 store 读回同一台 —— 与 e2b 输家读回赢家结果同义。
     #[test]
     fn a_running_local_copy_settles_the_wait() {
         let row = entry(PausedRegistryState::Resuming, "other", Some("self"));
@@ -2579,7 +1919,6 @@ mod tests {
         ));
     }
 
-    /// 任何"别人管着它"的行都不是 404：等在本节点等不到，交给调用方重试。
     #[test]
     fn rows_held_elsewhere_are_busy_never_missing() {
         for row in [
@@ -2598,7 +1937,6 @@ mod tests {
         }
     }
 
-    /// 我们自己的 paused 行同样不是 404：说明刚输掉一次认领而赢家已释放，重试即可。
     #[test]
     fn our_own_paused_row_is_busy_not_missing() {
         let row = entry(PausedRegistryState::Paused, "self", None);
@@ -2609,17 +1947,6 @@ mod tests {
     }
 }
 
-/// 🔴 The one place in the tree where "the catalog says no such snapshot"
-/// deletes something.
-///
-/// A cross-node resume reads the snapshot the registry names, and on absence it
-/// drops the registry row — the cluster's only record that the paused sandbox
-/// exists. Read at the resolvable scope, absence covers two states that could
-/// not be further apart: a snapshot that is genuinely gone, and one whose row
-/// exists but has not been flipped to `ready`. On a node reading PostgreSQL the
-/// second is every pause whose commit was owed because the scheduler was
-/// unreachable, until the compensator replays it — so a mirror that is briefly
-/// behind destroys a paused sandbox that is entirely intact.
 #[cfg(test)]
 mod cross_node_resume_scope_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2644,15 +1971,11 @@ mod cross_node_resume_scope_tests {
         TemplateBuildErrorReason,
     };
 
-    /// A catalog holding one row that has not been committed: present to a
-    /// scoped read, absent to the resolvable one. That is a pause mid-publish,
-    /// and it is what PostgreSQL shows while a commit is still owed.
+    /// Catalog fixture exposing one uncommitted row only at `AnyStatus`.
     struct UncommittedSnapshotCatalog {
         row: Option<SnapshotRecord>,
         scoped_reads: Arc<AtomicUsize>,
-        /// What the catalog says when asked whether an absence is the last
-        /// word. `None` is a catalog with nothing behind it, which answers from
-        /// the row like the trait's default does.
+        /// Optional settled-absence response.
         absence: Option<RepositoryResult<SnapshotAbsence>>,
     }
 
@@ -2686,9 +2009,6 @@ mod cross_node_resume_scope_tests {
             Ok(None)
         }
 
-        /// The one row this double holds is uncommitted, and a listing
-        /// answers at `Resolvable` scope, which an uncommitted row is not in —
-        /// so empty is the same answer the row would have produced anyway.
         async fn list_page(
             &self,
             _filter: SnapshotListFilter,
@@ -2733,8 +2053,6 @@ mod cross_node_resume_scope_tests {
         }
     }
 
-    /// An uncommitted sandbox row for `id`: the shape a pause has between its
-    /// bytes landing and its commit.
     fn uncommitted(id: &SnapshotId) -> SnapshotRecord {
         SnapshotRecord {
             id: id.clone(),
@@ -2798,9 +2116,6 @@ mod cross_node_resume_scope_tests {
                 &NodeIdentity::from_config(&Default::default()),
             ),
             Vec::new(),
-            // 🔴 `node_local`, i.e. the `aenv-node` half: these fixtures
-            // predate the split and assert the behaviour of a process that
-            // runs the sandboxes it answers for.
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ));
         (api, scoped_reads)
@@ -2826,8 +2141,6 @@ mod cross_node_resume_scope_tests {
         }
     }
 
-    /// A row that exists but has not been committed must not cost the sandbox
-    /// its registry row.
     #[tokio::test]
     async fn a_snapshot_that_has_not_finished_publishing_does_not_drop_the_registry_row() {
         let snapshot_id = SnapshotId::generate();
@@ -2856,21 +2169,11 @@ mod cross_node_resume_scope_tests {
         );
     }
 
-    /// 🔴 The other half, and the one the scope alone could not reach.
-    ///
-    /// A pause's *entire* catalog write is one call, and it is skipped outright
-    /// when the opening statement found the scheduler unreachable — so the
-    /// central catalog holds no row at all and every read of it, at every
-    /// scope, truthfully reports nothing. Reproduced on a cluster: the resume
-    /// answered 404, the registry row went to zero, the origin node's local
-    /// record was reconciled away behind it, and the sandbox was gone for good
-    /// while its bytes sat in object storage, intact.
     #[tokio::test]
     async fn a_snapshot_whose_publish_is_still_queued_does_not_drop_the_registry_row() {
         let snapshot_id = SnapshotId::generate();
         let registry = Arc::new(CountingRegistry::new(0, false));
         let (api, _) = api_with_absence(
-            // Absent at every scope — there is no row anywhere to find.
             None,
             Some(Ok(SnapshotAbsence::unsettled(
                 "the central catalog is owed a 'publish_commit' for it",
@@ -2895,7 +2198,6 @@ mod cross_node_resume_scope_tests {
         );
     }
 
-    /// A question nobody answered is not an absence either.
     #[tokio::test]
     async fn a_catalog_that_cannot_settle_an_absence_does_not_drop_the_registry_row() {
         let snapshot_id = SnapshotId::generate();
@@ -2925,9 +2227,6 @@ mod cross_node_resume_scope_tests {
         );
     }
 
-    /// The control: a snapshot the catalog does not hold at *any* status really
-    /// is gone, and the row really should go with it — otherwise every resume
-    /// of it fails the same way for ever.
     #[tokio::test]
     async fn a_snapshot_no_row_exists_for_still_drops_the_registry_row() {
         let snapshot_id = SnapshotId::generate();
@@ -2950,31 +2249,6 @@ mod cross_node_resume_scope_tests {
     }
 }
 
-/// 🔴 Whether a cross-node resume turns a paused sandbox's snapshot into bytes
-/// on its own disk before asking a node to bring the sandbox back.
-///
-/// A cross-node resume already has the catalog row in hand — it just read it,
-/// at `AnyStatus`, to decide whether the registry row was still worth keeping.
-/// What followed used to be an unconditional `resolve_runnable` on that row,
-/// which is not a second lookup: it downloads `vm_state.bin` onto this
-/// machine, materializes the memory and rootfs overlaybd `image.json` files and
-/// leases all of it in the local artifact cache. The api Pod reopens none of
-/// it. `RemoteSandboxBackendFactory` reads the catalog row back out of the
-/// `RunnableSnapshot` and sends exactly that, and the node resolves it against
-/// the cache its own VM mmaps.
-///
-/// # 🔴 Why the fixture proves it rather than describing it
-///
-/// Same construction as `sandbox::warm_start_source_tests`: the resolver is
-/// `MockSnapshotRuntimeResolver`, which fails every call, so a restore that
-/// resolved could not have completed. Answering `Restored` over a resolver
-/// that refuses is the proof.
-///
-/// 🔴 There used to be a second arm here, running the same restore through a
-/// `ResumeWiring::node_local` surface and asserting it *did* resolve. It went
-/// with the `resolve_runnable` branch it covered: `aenv-node` never reaches
-/// this surface — `crate::api::role_gate` answers the user-facing REST routes
-/// with 404 there — and resumes over gRPC instead.
 #[cfg(test)]
 mod cross_node_resume_source_tests {
     use std::sync::Arc;
@@ -2991,13 +2265,7 @@ mod cross_node_resume_source_tests {
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
 
-    /// One API surface whose catalog holds a ready snapshot and whose runtime
-    /// resolver refuses every call.
-    ///
-    /// 🔴 The orchestrator's seed policy is the permissive one, for the reason
-    /// `sandbox::warm_start_source_tests::surface` gives; and the factory is
-    /// `MockBackendFactory` because the question is what this half *sends*,
-    /// not whether this machine can run a VM.
+    /// API fixture whose ready snapshot cannot be resolved into local runtime files.
     async fn api_with(row: SnapshotRecord) -> Arc<ApiImpl> {
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
@@ -3028,8 +2296,6 @@ mod cross_node_resume_source_tests {
         ))
     }
 
-    /// The claim a resume arrives with: a row this node already won, naming the
-    /// snapshot the sandbox was paused into.
     fn claimed_entry(snapshot_id: SnapshotId) -> PausedSandboxEntry {
         let sandbox_id = SandboxId::new();
         PausedSandboxEntry {

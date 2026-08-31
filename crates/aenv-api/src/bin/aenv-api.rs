@@ -285,7 +285,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         .await?
     };
 
-    // 🔴 Start the warm-up timeout when the heartbeat listener is actually bound.
+    // Start the warm-up timeout when the heartbeat listener is actually bound.
     native_warmup_handle.rebase_deadline(
         std::time::SystemTime::now(),
         Duration::from_secs(config.cluster.native_warmup_timeout_secs),

@@ -1,22 +1,6 @@
-//! The catalog build reaper: ends builds whose builder stopped saying it was
-//! alive, as a cluster-wide singleton.
-//!
-//! 🔴 Not optional wherever `builds_one_active_per_template` exists (see
-//! `0001_initial_schema.sql`'s own comment on that index): a build stranded at
-//! `building`/`waiting` holds its template shut until something ends it, and
-//! this is that something.
-//!
-//! 🔴 A cluster-wide singleton, not "every `aenv-api` replica runs its own
-//! copy". Go had exactly one `scheduler` process ever running this loop;
-//! Rust is N replicas. `src/pg::election::spawn_singleton_task` — PostgreSQL
-//! session-scoped advisory locks, `AdvisoryLockKey::CatalogBuildReaper`,
-//! reserved for exactly this — is what makes "one at a time" true here
-//! without N replicas racing to scan and update the same rows. See
-//! `docs/proposals/_sd-phase4-stageB-catalog.md` §9 risk 4 for why the
-//! obvious alternative (copy `src/orchestrator/`'s auto-eviction task, which
-//! runs unelected on every replica) is a reference *against*, not for: that
-//! task is safe unelected because it only touches each replica's own
-//! in-memory state, and this one touches a table every replica shares.
+//! Cluster-singleton catalog build reaper.
+//! A full-TTL warm-up prevents a new leader from reaping builds whose
+//! heartbeats it has not yet had time to observe.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -30,24 +14,15 @@ use crate::pg::{spawn_singleton_task, AdvisoryLockKey, LeaderContext, SingletonT
 
 use super::metrics::{record_build_reaper_warmup_pass, record_builds_reaped};
 
-/// What one reaped build was.
 struct ReapedBuild {
     build_id: Uuid,
     template_id: Uuid,
     node_id: Option<String>,
 }
 
-/// Starts the reaper. Returns the handle to shut it down with — see this
-/// crate's own warning on [`SingletonTaskHandle`]: its `shutdown()` must be
-/// awaited on its own path, never pushed into a `Vec<tokio::task::JoinHandle<()>>`
-/// and `.abort()`-ed, or the advisory lock this replica may be holding leaks
-/// until the pool itself is torn down.
+/// Starts the reaper, disabled when interval or TTL is zero.
 ///
-/// `interval <= Duration::ZERO` or `ttl <= Duration::ZERO` disables the
-/// reaper outright (logged once), matching Go's `RunBuildReaper` refusing to
-/// start under the same condition — a reaper with no TTL would either never
-/// fire or fire on every row immediately, and neither is "disabled" spelled
-/// correctly.
+/// Await the returned handle's shutdown to release its advisory lock.
 pub fn spawn(
     pool: PgPool,
     cluster_id: Uuid,
@@ -69,16 +44,7 @@ pub fn spawn(
         "snapshot catalog build reaper started"
     );
 
-    // 🔴 When *this* leader session first ran the reaper body at all — the
-    // Rust analogue of Go's `openedAt`. A replica that has just become
-    // leader (a fresh election, or this whole process just started) has no
-    // evidence about whether a heartbeat it has never had the chance to
-    // observe is stale or merely unheard-from during a rollout; without this
-    // window, a leadership handoff during a fleet-wide builder restart would
-    // reap every build in flight on its very first pass. `Mutex` rather than
-    // an `AtomicU64` of millis: `Instant` has no meaningful bit-pattern to
-    // store atomically, and this is one lock acquired once per `interval`,
-    // never contended.
+    // Warm each leadership session for a full TTL before judging heartbeats.
     let opened_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
 
     Some(spawn_singleton_task(
@@ -133,23 +99,11 @@ pub fn spawn(
     ))
 }
 
-/// The reason recorded on both the `builds` row and the `snapshots` row it
-/// held — matches Go's `reapedBuildError` exactly, since both are read by the
-/// same node-side `TemplateBuildErrorReason` decoder.
 fn reaped_build_error() -> serde_json::Value {
     serde_json::json!({"message": "build heartbeat lapsed", "step": null})
 }
 
-/// One reaping pass: ends builds whose heartbeat has lapsed and the template
-/// rows they were holding, in one transaction — the Rust equivalent of
-/// `reapBuildsSQL` + `failReapedTemplatesSQL` run back to back.
-///
-/// 🔴 Both statements or neither. `builds_one_active_per_template` stops
-/// blocking a template the moment its build row leaves the active group, but
-/// `markSnapshotBuildingSQL`'s own predicate (`status IN ('waiting',
-/// 'error')`) refuses a template still sitting at `building` — so freeing one
-/// half without the other leaves the template unbuildable through a
-/// different door.
+// Updates stale builds and their template rows in one transaction.
 async fn reap_once(
     conn: &mut sqlx::PgConnection,
     cluster_id: Uuid,
@@ -226,8 +180,6 @@ mod pg {
     use crate::pg::harness::isolated_schema_pool_or_skip;
     use crate::snapshot::repository::backends::postgres::migrate;
 
-    /// Inserts one `snapshots` row (a template, `building`) and one `builds`
-    /// row, with a heartbeat `age_ms` milliseconds in the past.
     async fn seed_stale_build(pool: &PgPool, cluster_id: Uuid, age_ms: i64) -> (Uuid, Uuid) {
         let template_id = Uuid::new_v4();
         let build_id = Uuid::new_v4();
@@ -305,8 +257,6 @@ mod pg {
                 .expect("reading the snapshot status should succeed");
         assert_eq!(snapshot_status, "error");
 
-        // 🔴 The whole reason both statements exist: the partial unique
-        // index no longer blocks a fresh build of this template.
         let admits: Option<Uuid> = sqlx::query_scalar(
             "SELECT id FROM builds WHERE template_id = $1 AND status_group IN ('pending', 'in_progress')",
         )
@@ -348,11 +298,6 @@ mod pg {
         assert_eq!(build_status, "building");
     }
 
-    /// The warmup window, exercised through the real `spawn()` — not the
-    /// logic re-derived inline. A row whose heartbeat is already stale
-    /// relative to the *table's* clock must survive every tick until this
-    /// leader has been observing for a full TTL, then be reaped on the
-    /// first tick after.
     #[tokio::test]
     async fn a_fresh_leader_does_not_reap_until_it_has_watched_for_a_full_ttl() {
         let pool = isolated_schema_pool_or_skip!(
@@ -363,9 +308,7 @@ mod pg {
             .expect("migration should succeed");
 
         let cluster_id = Uuid::new_v4();
-        // Already far stale by the time the reaper ever looks at it — the
-        // warmup window is the only thing standing between this row and the
-        // very first tick.
+        // Seed a row stale enough that only leader warm-up can protect it.
         let (_, build_id) = seed_stale_build(&pool, cluster_id, 1_000_000).await;
 
         let tick = Duration::from_millis(30);

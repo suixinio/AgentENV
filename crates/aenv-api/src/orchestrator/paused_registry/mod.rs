@@ -1,10 +1,4 @@
-//! `aenv-core`'s paused-sandbox registry, plus the PostgreSQL backend.
-//!
-//! The shared half — the trait, the error type, `build_paused_registry` and
-//! its `local` arm — is `aenv-core`'s and is re-exported here
-//! unchanged. What this crate adds is the `postgres` arm's implementation:
-//! the schema bootstrap, the SQL, the leader-elected reconcile/reclaim loops
-//! and the per-replica lease renewal.
+//! Paused-sandbox registry with the PostgreSQL backend added to `aenv-core`.
 
 pub use aenv_core::orchestrator::paused_registry::*;
 
@@ -26,15 +20,10 @@ mod pg {
     use crate::node_registry::registry::NodeRegistry;
     use crate::pg::harness::isolated_schema_pool_or_skip;
 
-    // 🔴 Copy of `aenv-core`'s own `build_tests::identity` helper rather than
-    // an import of it: that lives in a `#[cfg(test)]` module, which is not
-    // compiled when `aenv-core` is a dependency. Kept identical in shape so
-    // the two suites still describe the same identity.
     fn identity() -> NodeIdentity {
         NodeIdentity::from_config(&Default::default())
     }
 
-    /// The `postgres` arm's factory, as `build_paused_registry` now takes it.
     fn factory(pool: &sqlx::PgPool) -> PgPausedRegistryFactory {
         PgPausedRegistryFactory::new(pool.clone())
     }
@@ -143,19 +132,6 @@ mod pg {
         }
     }
 
-    /// 🔴 D1's central startup guard, proved with a real (reachable) pool
-    /// this time: a `postgres` backend still refuses to start without a node
-    /// registry, even once the *other* precondition
-    /// (`the_postgres_backend_without_a_pool_is_a_startup_failure`, in
-    /// `build_tests`) is satisfied.
-    ///
-    /// 🔴 Unconditional now. M1 narrowed this guard to `aenv-api`
-    /// specifically, because the pre-split single process's own identity
-    /// coincided with `origin_node_id` for everything it ran and `renew_lease`
-    /// already covered what D2 Fix A exists to cover; a sibling test pinned
-    /// that exemption. No process is both halves any more, `aenv-api` is
-    /// `build_paused_registry`'s only caller, and the exemption's test went
-    /// with the shape it was about.
     #[tokio::test]
     async fn the_postgres_backend_without_a_node_registry_is_a_startup_failure() {
         let pool = isolated_schema_pool_or_skip!(
@@ -176,9 +152,6 @@ mod pg {
         );
     }
 
-    /// The happy path: a real pool and a (fake, but present) node registry
-    /// build a working, cluster-backed registry, and the schema bootstrap
-    /// this function is documented to run actually leaves the table usable.
     #[tokio::test]
     async fn the_postgres_backend_builds_a_working_cluster_backed_registry() {
         let pool = isolated_schema_pool_or_skip!(
@@ -196,9 +169,6 @@ mod pg {
 
         assert!(registry.is_cluster_backed());
 
-        // The migration this call is documented to run actually happened:
-        // the table is queryable without the caller having to migrate it
-        // separately first.
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM paused_sandboxes")
             .fetch_one(&pool)
             .await
@@ -206,15 +176,6 @@ mod pg {
         assert_eq!(count, 0);
     }
 
-    /// 🔴 B2(1)'s own wiring pin: `build_paused_registry`'s `postgres` arm
-    /// must actually call `postgres::attempt_initial_grace_entry` before it
-    /// returns -- proving the connection, not just
-    /// `postgres::grace::attempt_initial_entry`'s own isolated pg-gated
-    /// tests (`postgres::grace::pg`), which exercise the function directly
-    /// but say nothing about whether `build_paused_registry` ever calls it.
-    /// A `paused_registry_grace` row for this cluster must exist the moment
-    /// this call returns, with no leader-elected background loop having run
-    /// yet.
     #[tokio::test]
     async fn building_the_postgres_backend_enters_grace_synchronously() {
         let pool = isolated_schema_pool_or_skip!(

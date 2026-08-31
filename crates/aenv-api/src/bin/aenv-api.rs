@@ -1,11 +1,8 @@
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-// jemalloc tuning: purge dirty/muzzy pages after 1s instead of the default
-// 10s, and do the purging on a background thread (the `background_threads`
-// cargo feature is already enabled). Burst allocations (RocksDB opens, image
-// resolution, template builds) otherwise linger as retained RSS long after
-// the burst is over.
+// Purge dirty/muzzy pages after 1s on background threads so burst allocations
+// do not linger as retained RSS.
 #[used]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]
@@ -45,20 +42,6 @@ use anyhow::Context as _;
 use clap::Parser;
 use tracing::{info, warn};
 
-/// 🔴 No `--role`. This binary *is* the api half, and it is that because of
-/// what it does not link — no overlaybd, no ublk, no Firecracker
-/// (`make check-crate-boundaries`). There was a `--role` flag (and an
-/// `AENV_ROLE` environment variable) through the transition, accepted and
-/// checked rather than obeyed, so that manifests written for the
-/// single-process image kept starting. Nothing passes it any more — see
-/// `deploy/k8s/base/` — and a flag that can only be confirmed is a flag that
-/// cannot select anything.
-///
-/// 🔴 And no `--setup-only`/`--setup-host` either, which `aenv-node` does
-/// have. This half has no `/dev/kvm`, no ublk and no downloaded runtime
-/// assets, so there is nothing here to provision; the flags used to exist and
-/// be refused at startup by a role predicate that no longer exists, and not
-/// declaring them at all is the same refusal one layer earlier.
 #[derive(Debug, Parser)]
 #[command(name = "aenv-api")]
 struct ApiCli {
@@ -67,9 +50,6 @@ struct ApiCli {
     config: Option<std::path::PathBuf>,
 }
 
-/// 🔴 Not `#[tokio::main]` — see `aenv-node`'s `main` for the whole argument.
-/// This half opens fewer RocksDB stores than the node one does, but it still
-/// opens some, so the same bound applies.
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -97,32 +77,6 @@ async fn async_main() -> anyhow::Result<()> {
     server_main::serve(config, assembly).await
 }
 
-/// This replica's `[pg]` connection pool. Required, not optional.
-///
-/// 🔴 `[pg]` is not a mode this half may run without. The snapshot catalog is
-/// PostgreSQL and there is no other — object storage stopped being one at the
-/// Stage B cutover — so a replica with no `[pg]` has no catalog at all. That
-/// used to be discovered *last*, by `build_snapshot_backend` at the far end of
-/// `assemble_api`, after the catalog build reaper, the paused-registry factory
-/// and the paused-registry background tasks had already been wired against a
-/// `None` pool and had all silently done nothing. Refusing here, at
-/// construction, is the same discipline every other unsafe-default in
-/// `assemble_api` already follows: fail before building the things that would
-/// quietly degrade.
-///
-/// 🔴 Requiring the pool is *not* the same as selecting the PostgreSQL paused
-/// registry. `[orchestrator.paused_registry].backend` still decides that, and
-/// `"local"` is still a supported value — see `assemble_api`'s own comment at
-/// the `PgPausedRegistryFactory` construction.
-///
-/// 🔴 There is no node-side counterpart, and there cannot be: `aenv-node` does
-/// not link `sqlx` (`make check-crate-boundaries`), and it refuses to start at
-/// all if `[pg].dsn` is configured (`refuse_configured_pg_dsn`, in that
-/// binary's own `async_main`). This is the one process that may hold
-/// PostgreSQL credentials, the connection budget and the schema; see
-/// `src/pg/mod.rs`'s own module doc. `config.pg` therefore stays
-/// `Option<PgConfig>` in the shared `AppConfig` — it is this binary that has
-/// no optional case, not the config type.
 async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<sqlx::PgPool> {
     let settings = PgPoolSettings::from_config(config.pg.as_ref())?.context(
         "[pg] is required for aenv-api: [pg].dsn is unset or blank, and PostgreSQL is the only \
@@ -136,29 +90,11 @@ async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<sqlx::PgPool> {
          pg-dsn.toml both do",
     )?;
     let pool = pg::connect(&settings).await?;
-    // 🔴 Before this pool reaches anything that queries the catalog tables —
-    // the build reaper (`spawn_pg_singleton_tasks`, started right after this
-    // returns) and `build_snapshot_backend`'s `PostgresSnapshotCatalog`
-    // construction both assume the schema already exists. See
-    // `aenv_api::snapshot::repository::backends::migrate_catalog_schema`'s own
-    // doc: idempotent, advisory-lock-guarded, safe on every start and across
-    // a fleet of replicas racing to call it at once.
+    // Catalog tables must exist before reapers or catalog clients start.
     aenv_api::snapshot::repository::backends::migrate_catalog_schema(&pool).await?;
     Ok(pool)
 }
 
-/// The catalog build reaper's own cadence: how often the cluster-elected
-/// leader scans for stale builds, and how far behind a heartbeat may fall
-/// before the leader ends the build it belongs to.
-///
-/// 🔴 No dedicated config knob (Stage B, per its own docs/proposals, adds no
-/// new config axis beyond what `snapshot.catalog.{write,read}` already
-/// give). `ttl` is derived from the existing
-/// `[snapshot.catalog].build_heartbeat_interval_secs` — the node-side
-/// cadence a builder renews its lease on — the same "roughly a third of the
-/// TTL is the usual margin" reasoning that field's own doc comment states,
-/// inverted: two renewals may be lost to a rollout or a slow network before
-/// a build that is still running gets taken away from it.
 fn reaper_cadence(config: &AppConfig) -> (std::time::Duration, std::time::Duration) {
     let heartbeat_interval = config.snapshot.catalog.build_heartbeat_interval_secs.max(1);
     let interval = std::time::Duration::from_secs(30);
@@ -166,14 +102,6 @@ fn reaper_cadence(config: &AppConfig) -> (std::time::Duration, std::time::Durati
     (interval, ttl)
 }
 
-/// Starts the catalog build reaper for this process. See
-/// `aenv_api::snapshot::repository::backends::spawn_catalog_build_reaper`'s
-/// own doc on why the handle must be shut down through its own `shutdown()`
-/// path rather than folded into `paused_upkeep`.
-///
-/// 🔴 That function keeps its `Option<sqlx::PgPool>` parameter — it is shared
-/// library code, and "no pool" is a state it must still be able to express.
-/// This bin-private wrapper has no such case: `build_pg_pool` refused already.
 fn spawn_pg_singleton_tasks(
     config: &AppConfig,
     pg_pool: sqlx::PgPool,
@@ -190,165 +118,17 @@ fn spawn_pg_singleton_tasks(
     .collect()
 }
 
-/// `aenv-api`: the deciding half.
-///
-/// It owns sandboxes and runs none of them. Everything it constructs is either
-/// a decision (the cluster store, the paused registry, placement) or a surface
-/// (the full REST route set, the wake-up gRPC); everything a machine needs is
-/// absent, and absent because this binary does not link the crate that would
-/// build it.
-///
-/// # 🔴 What it refuses to start without, and why each refusal is loud
-///
-/// Three settings have no safe default here, and each of them fails startup
-/// rather than degrading:
-///
-/// - **a cluster metadata store.** The in-memory one is a single process's
-///   private ledger. A replica using it would hold an opinion about sandboxes
-///   no other replica shared, and the two would not disagree visibly — each
-///   would simply answer 404 for the other's sandboxes.
-/// - **a scheduler endpoint.** A create has to be placed and a wake-up has to
-///   be located, and there is no local machine to fall back to. Worse than
-///   having nowhere to put a sandbox: with no placement source every placement
-///   answers `Unconstrained`, so a sandbox pinned to one machine's disk would
-///   be woken on another — which succeeds, by rebuilding it from an older
-///   snapshot.
-/// - **the wake-up listener's port.** Bound at assembly, because the gateway's
-///   cold path is the only way a paused sandbox comes back, and a replica
-///   serving HTTP with no gRPC surface refuses every wake-up with a connection
-///   error the gateway reads as "try again later".
-///
-/// # 🔴 What it constructs that `aenv-node` does not
-///
-/// [`RemoteSandboxBackendFactory`], which is what makes an `Orchestrator`
-/// written entirely in terms of local backends drive sandboxes on other
-/// machines — and which is also the thing that puts this control plane's
-/// ownership marker on every create it sends
-/// (`SandboxBackendFactory::stamps_control_plane_ownership`).
-///
-/// # 🔴 What is here and does not work yet
-///
-/// - **A cold create — retired.** This bullet used to say
-///   `RemoteSandboxBackendFactory::build` refuses outright — the build spec it
-///   is handed has already been resolved into paths on a local disk and the
-///   user's image reference is gone by then — so `POST /sandboxes-cold` was
-///   refused at the door (`ApiImpl::runs_sandbox_runtime`, read before
-///   anything is resolved, in `crate::api::impls`) rather than failing on the
-///   way there with a missing-`regctl` error. Kept here rather than deleted so
-///   it is not re-derived from the same reasoning. It no longer holds:
-///   `sandboxes_cold_post` now builds `SandboxLaunchSource::UnresolvedImage`
-///   instead of resolving anything when `!self.runs_sandbox_runtime()`, and
-///   `SandboxBackendFactory::build_from_image_ref`
-///   (`RemoteSandboxBackendFactory`'s implementation, the method `build`
-///   still refuses for) ships the reference — and each attached drive's own
-///   reference — to a node exactly as unresolved as a snapshot id already
-///   was. `NodeSandboxService::create`'s `Source::Image` arm resolves it
-///   there, node-side, into the same `SandboxLaunchSource::Image` a local
-///   cold create already builds, and the node's `Create` reply also carries
-///   the resolved context and image configs back
-///   (`SandboxRuntimeInfo::resolved_image_facts`) so this half's own record of
-///   the sandbox is not left with placeholders it invented.
-/// - **Publishing a pause.** Pausing and resuming a sandbox on another machine
-///   both work — `Pause` leaves the capture on the node and a reference in the
-///   cluster store, `Orchestrator::resume_sandbox` reads that reference back
-///   through `MetadataStore::paused_handle`, and `Resume` asks the machine
-///   holding the capture to reopen it. What is not served is the *published*
-///   arm: staging a captured snapshot on the node is not wired up, so this half
-///   sends `publish: false` and a node asked to publish refuses rather than
-///   answering with nothing. The consequence worth reading twice: **a sandbox
-///   paused through this half is resumable only on the machine that paused
-///   it**, so losing that machine loses the sandbox.
-///
-///   🔴 This bullet carried a second consequence — that deleting a paused
-///   sandbox left its capture on the node, "because a delete reaches a backend
-///   only through a live handle and a paused sandbox has none". That is no
-///   longer true, and it is retired here rather than silently dropped so it is
-///   not re-derived from the same reasoning. A delete that finds no local
-///   handle now goes through `Orchestrator::absent_handle`, which adopts the
-///   sandbox as an attaching `RemoteSandboxStub`; `attach` places the stub even
-///   when `Describe` answers `NotFound` — which is exactly what a node answers
-///   for a sandbox it is holding paused, because `Describe` reports what is
-///   *live* — so `stop` finds a placed, unpaused stub and sends `Delete`. On
-///   the node, `fenced` reads the incarnation off the record when there is no
-///   live handle, and the delete takes the paused record and its artifacts with
-///   it (`delete_record_and_artifacts`).
-/// - **A snapshot.** `RemoteSandboxStub::snapshot` sends `Checkpoint` and the
-///   node answers `Unimplemented`: *checkpoint is not served yet: staging a
-///   captured snapshot on the node is not wired up*. Same missing piece as the
-///   published arm above, reached from the other direction — a checkpoint's
-///   whole product is the staged snapshot, so there is nothing else the call
-///   could return. The refusal is classified non-terminal, so
-///   `Orchestrator::capture_snapshot` rolls the sandbox back to `Running`
-///   rather than tearing it down: the caller gets an error and keeps the
-///   sandbox. Unlike the two door refusals in this list it is not caught here —
-///   the request goes to the node and the answer comes back.
-/// - **Patching custom extension params — retired.** This bullet used to say
-///   `PATCH /sandboxes/{id}/custom-extension-params` answered the caller and
-///   updated the store while the running sandbox never learned the new
-///   value, because `SandboxBackend::update_custom_extension_params` was
-///   infallible by signature and the stub could only forward it from a
-///   spawned task, fire-and-forget, into a node that answered `Unimplemented`.
-///   Kept here rather than deleted so it is not re-derived from the same
-///   reasoning. It no longer holds: the method is now `async ... ->
-///   Result<()>` like every other property update on this backend
-///   (`RemoteSandboxStub::update_custom_extension_params`, mirroring
-///   `update_network_policy`), the node answers for real
-///   (`NodeSandboxService::update_params` ->
-///   `Orchestrator::replace_sandbox_custom_extension_params`, the same
-///   assign-then-persist tail `patch_sandbox_custom_extension_params` already
-///   used locally), and a failure on either side is returned to the `PATCH`
-///   caller with the metadata store left untouched — see
-///   `Orchestrator::apply_custom_extension_params`.
-/// - **Building a template — retired.** This bullet used to say
-///   `TemplateBuilder` drives a `FirecrackerSandbox` directly, outside the
-///   orchestrator entirely, so a build here would reach for `/dev/kvm` in a
-///   Pod that has none — and that `POST /v2/templates/{id}/builds/{id}`
-///   refused at the door instead of losing the build in a background task.
-///   Kept here rather than deleted so it is not re-derived from the same
-///   reasoning. It no longer holds: `TemplateBuildRunner` (the piece that
-///   needs `/dev/kvm`) is ordinary Rust that runs wherever it is called, so
-///   the door now dispatches to a node instead of refusing —
-///   `run_the_build_on_a_node` in `src/api/impls/template.rs`, using this
-///   function's own `placement` to pick one and
-///   `NodeSandboxService::build_template` (`src/node_server/service.rs`) to
-///   run it there. The door still refuses, but only when there is truly
-///   nowhere to send the build — see `ApiImpl::node_placement` and the
-///   refusal's own condition in `v2_templates_template_id_builds_build_id_post`.
 async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
-    // 🔴 What this half does and does not do used to be seven `debug_assert`s
-    // over a now-deleted role enum, stated here so somebody adding a line to this
-    // function would read them. They are all constants of this binary now and
-    // each one has moved to where it is actually spent: no sandbox runtime and
-    // no host sweep (nothing here constructs either, and this crate does not
-    // link the code that would), no heartbeat (`reporter: None`, below), no
-    // drain (`drains_on_shutdown: false`, below), sandbox ownership and the
-    // user-facing REST surface and the wake-up decision (all three off
-    // `ResumeWiring::cluster_in_process`, below).
     let identity = NodeIdentity::from_config(&config.node_identity);
     let identity_for_registry = identity.clone();
-
-    // 🔴 Both settings are read and refused *before* anything is connected, and
-    // the order is the point rather than tidiness: a replica misconfigured in
-    // two ways should be told about the one it can see from its own config
-    // rather than about the Redis it could not reach on the way to finding out.
-    // It is also what makes each refusal testable without a service running —
-    // and an untested refusal branch is the shape this programme has already
-    // paid for twice.
     let store_config = cluster_store_config(&config.orchestrator.store)?;
-    // `aenv-api` runs its own node registry unconditionally: kube discovery
-    // (or a one-shot static seed), the heartbeat-receiving gRPC service, and
-    // the warm-up gate that guards it. Built here, before `cluster_placement`
-    // runs, so that function can hand `NativeNodePlacement` a handle on each
-    // — see `start_native_node_registry`'s own doc comment.
+
     let NativeNodeRegistryBits {
         registry: native_registry_handle,
         warmup: native_warmup_handle,
         grpc_service: node_registry_grpc_service,
         tasks: mut node_registry_upkeep,
     } = start_native_node_registry(&config.cluster).await?;
-    // Task's own "D3": wires the binding store into the Scheduler-compatible
-    // gRPC surface this replica serves natively — the surface
-    // `report_sandbox_event`/`heartbeat`/`record_assignment` run on.
     let binding_store = build_binding_store(&config.binding_store).await?;
     let binding_store_handle = Arc::clone(&binding_store);
     let max_projection_ttl = Duration::from_secs(config.binding_store.max_projection_ttl_secs);
@@ -364,10 +144,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             max_projection_ttl,
         )
         .with_artifact_store(artifact_store);
-    // The shared-roster fix: mirrors this replica's heartbeat-derived state
-    // into the shared backend so every `aenv-api` replica sees the whole
-    // cluster's roster. Its background task is folded into this role's own
-    // upkeep the same way the kube-discovery/metrics tasks already are.
     if let Some(task) = wire_shared_node_observed_store(
         &config.cluster.node_registry_store,
         &native_registry_handle,
@@ -376,55 +152,10 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     {
         node_registry_upkeep.push(task);
     }
-    // 🔴 P1 (task's own "phase4-close"): moved up from after
-    // `Orchestrator::new` (see the historical comments still attached to
-    // `pg_pool`/`node_registry_for_paused`/`build_paused_registry` below).
-    // `NativeNodePlacement`'s `place_existing` — and, since resume placement
-    // stopped dialling this process's own listener, `ResumeWiring`'s
-    // `NativePlacementSource` too — now answer `LookupNode`'s paused-registry
-    // stage in-process through the same `node_registry_grpc_service` both are
-    // handed a clone of, so that service has to be `.with_paused_registry(...)`
-    // *before* `cluster_placement` runs rather than after — which means
-    // `paused_registry`, and the `pg_pool` its `postgres` backend needs,
-    // now have to exist this early too. Nothing between here and their old
-    // position needed either built any later than this.
-    //
-    // The commit side of snapshots, the resolver, and the builder's
-    // scheduling half all still need this same `pg_pool` — see the
-    // (unmoved) `snapshot_manager` construction below. No P2P transport is
-    // passed there, and `[snapshot].p2p_enabled` is not consulted: P2P
-    // moves bytes between machines that hold them, and this process holds
-    // none.
-    //
-    // 🔴 This is where a missing `[pg]` now fails. It used to fail at
-    // `build_snapshot_backend`, at the very bottom of this function — after
-    // the reaper, the paused-registry factory and the paused-registry
-    // background tasks below had each been handed a `None` and quietly
-    // become no-ops. See `build_pg_pool`'s own doc.
     let pg_pool = build_pg_pool(config).await?;
     let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
-    // Stage C's own use of Stage A's registry: `Arc<AtomicNodeRegistry>`
-    // coerced to `Arc<dyn NodeRegistry>`, cloned rather than moved --
-    // `native_registry_handle` itself is still needed below, by the binding
-    // sweeper. `build_paused_registry`/
-    // `spawn_paused_registry_background_tasks` both still take this as an
-    // `Option` — a `Local` paused-registry backend has no use for a node
-    // registry at all — even though `aenv-api` always has one to hand them.
     let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> =
         Some(Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>);
-    // The `postgres` arm's own constructor. `build_paused_registry` keeps the
-    // arm, its refusal message and its roster guard; the pool, the schema
-    // bootstrap and the restart-grace entry live behind this.
-    //
-    // 🔴 Constructing it is not selecting it. `PgPausedRegistryFactory::new`
-    // only holds the pool — the schema bootstrap and the restart-grace entry
-    // are in `build`, which `build_paused_registry` calls from its `Postgres`
-    // arm alone. `[orchestrator.paused_registry].backend = "local"` still
-    // builds `DisabledPausedSandboxRegistry` and never touches this factory,
-    // exactly as it did when the factory was `None` for want of a pool. The
-    // thing that decides whether the PostgreSQL paused registry is *used* is
-    // that setting, and it always was; before `[pg]` became mandatory, pg
-    // presence could only ever veto it, never select it.
     let paused_registry_factory = PgPausedRegistryFactory::new(pg_pool.clone());
     let paused_registry = build_paused_registry(
         &config.orchestrator.paused_registry,
@@ -433,18 +164,8 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         node_registry_for_paused.clone(),
     )
     .await?;
-    // Task's own "Stage D remainder": `lookup_node`'s stage 3. Wired onto
-    // the same service `cluster_placement` is about to hand
-    // `NativeNodePlacement` a clone of.
     let node_registry_grpc_service =
         node_registry_grpc_service.with_paused_registry(Arc::clone(&paused_registry));
-
-    // `NativeNodePlacement` answers `place_new`/`place_existing`/
-    // `record_placement` from this same in-process
-    // `node_registry_grpc_service` (a clone -- `spawn_grpc_surface` below
-    // still gets the original, moved in). See `cluster_placement`'s own doc
-    // comment for why placement needs no `[cluster].scheduler_endpoint` at
-    // all any more.
     let placement = cluster_placement(
         &native_registry_handle,
         config.cluster.node_service_port,
@@ -454,27 +175,9 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let store = RedisMetadataStore::connect(store_config)
         .await
         .context("connect the cluster metadata store")?;
-    // 🔴 The persister is `Disabled` and not file-backed. A file-backed one
-    // would write paused-sandbox artifacts to this Pod's disk for sandboxes
-    // whose bytes are on other machines, and then load them back at startup as
-    // sandboxes this replica believes it can resume. The durable record of a
-    // paused sandbox is the cluster store's row and the registry's, not a file
-    // here.
-    //
-    // 🔴 And `MustBeConfigured` is what makes the envd access-token seed
-    // mandatory. Two replicas that each invented one would hand users tokens
-    // the other cannot verify, and nothing about that is visible until a user's
-    // token stops working (`_sd-impl-phase3-role.md` §9.2). Refused here, at
-    // construction, before the listener opens.
     let orchestrator = Orchestrator::new(
         aenv_api::sandbox::AccessTokenSeedPolicy::MustBeConfigured,
         store,
-        // 🔴 A clone, not the original: `ApiImpl` needs its own handle on the
-        // same placement source to pick a node for a template build it
-        // cannot run itself (`POST /v2/templates/{id}/builds/{id}`,
-        // `run_the_build_on_a_node` in `src/api/impls/template.rs`) — the same
-        // question `place_new` already answers for a fresh sandbox create,
-        // asked here for a build sandbox instead of a user one.
         RemoteSandboxBackendFactory::new(Arc::clone(&placement)),
         DisabledSandboxPersister,
         aenv_api::image::DisabledRuntimeImageRefs::shared(),
@@ -483,14 +186,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let orchestration: Arc<dyn SandboxOrchestration> =
         Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>;
 
-    // The snapshot catalog, over the one pool this replica built — the only
-    // thing `build_snapshot_backend` needs from PostgreSQL, and the reason it
-    // no longer takes the pool itself.
-    //
-    // 🔴 `None` here is not a mode any more, and it is no longer even
-    // reachable: `build_pg_pool` refused a missing `[pg]` at the top of this
-    // function. `build_snapshot_backend` keeps its own `Option` and its own
-    // refusal — it is shared with `aenv-node`, which always passes `None`.
     let pg_catalog =
         Some(aenv_api::snapshot::repository::backends::pg_snapshot_catalog(config, &pg_pool));
     let snapshot_backend = aenv_api::snapshot::repository::backends::build_snapshot_backend(
@@ -499,15 +194,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         aenv_api::snapshot::repository::backends::CentralCatalogUse::AsConfigured,
     )?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(snapshot_backend, None));
-    // 🔴 The receiving side only. `ObservabilityReporter` is not started: a
-    // heartbeat reports a machine, and this replica is not one — reporting
-    // itself would put a node in the scheduler's table that can never run
-    // anything, and the scheduler would place sandboxes on it.
-    //
-    // `cpu_template_helper` is `None` rather than the configured path: the
-    // helper is one of the downloaded runtime assets, this Pod has none of
-    // them, and the CPUID intersection it feeds is about the machines that
-    // boot microVMs.
+    // API replicas receive metrics but must not report themselves as schedulable nodes.
     let observability = if config.observability.enabled {
         Some(Arc::new(
             ObservabilityService::new(
@@ -522,11 +209,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         None
     };
 
-    // 🔴 `Some(...)`, not "postgres is selected". This function keeps its
-    // `Option<sqlx::PgPool>` parameter deliberately — the paused-registry
-    // backend is genuinely optional — and its *first* statement is
-    // `if config.backend != Postgres { return default }`. A `"local"` backend
-    // still starts no reconcile/reclaim/renewal loops with a pool in hand.
     let paused_registry_tasks = spawn_paused_registry_background_tasks(
         &config.orchestrator.paused_registry,
         &identity_for_registry,
@@ -549,45 +231,13 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             observability,
             paused_wiring,
             config.sandbox_proxy.domains.clone(),
-            // 🔴 `WakeSite::Remote`, and it carries two facts rather than one.
-            // The pin is honoured by the orchestration surface below, which
-            // places the wake-up on the machine the paused state names, rather
-            // than by a same-machine check this process cannot make. And it
-            // is what `ApiImpl::runs_sandbox_runtime` reads to know it is in
-            // this binary and not `aenv-node` — see its own doc.
-            //
-            // 🔴 A clone of the *fully wired* `node_registry_grpc_service`, and
-            // that is the whole safety property of this line. Resume placement
-            // used to open a tonic channel to `[cluster].scheduler_endpoint` —
-            // `agentenv-api:8002`, this process's own listener — and make a
-            // network `LookupNode` call that arrived back at this same value.
-            // It now calls `lookup_node` on it directly, exactly as
-            // `NativeNodePlacement::place_existing` already does. The clone has
-            // to happen *after* `with_binding_store`/`with_artifact_store`
-            // (above) and `with_paused_registry` (above, moved up for
-            // `cluster_placement`): without the binding store `LookupNode` is
-            // `Unimplemented`, and without the paused registry it can never
-            // answer `PINNED`, so every unpublished pause would come back as a
-            // preference and be woken on a machine that does not have its
-            // bytes. `resume_placement_is_wired_after_every_builder` is the
-            // guard on that ordering.
+            // Clone only after the binding, artifact, and paused-registry builders.
             ResumeWiring::cluster_in_process(node_registry_grpc_service.clone()),
         )
-        // 🔴 What `!runs_sandbox_runtime()` names, and the one
-        // `v2_templates_...`'s remote branch exists for: a template build has
-        // to go somewhere, and the earlier clone into the factory is what
-        // makes handing this process the same placement source free. See
-        // `ApiImpl::with_node_placement`.
         .with_node_placement(placement),
     );
 
-    // The same three passes, in the same order, and for the same reasons the
-    // pre-split single process ran them — with one difference worth naming.
-    // There, "this process holds nothing yet" was a statement about a machine;
-    // here it is a statement about a replica, and it holds because a replica's
-    // identity is its own (`AENV_NODE_ID` is the Pod's name). Two replicas
-    // sharing one identity would make the release below hand back the *other*
-    // replica's live holdings.
+    // Replica identities must be unique because stale-release is identity-scoped.
     let stale_release = api_impl.release_stale_node_holdings().await;
     api_impl.renew_paused_leases().await;
     api_impl.reconcile_local_records().await;
@@ -601,12 +251,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             retrier.retry_stale_node_holdings_release().await;
         }));
     }
-    // The node registry's own background tasks (kube discovery, its metrics
-    // refresh loop) stop the same way and at the same point as the rest of
-    // this role's upkeep — see `spawn_paused_record_upkeep`'s callers for why
-    // that point is "before the shutdown pauses start" and not later.
     paused_upkeep.append(&mut node_registry_upkeep);
-    // Task's own "D4": the heartbeat-timeout binding sweep.
     if config.binding_store.sweep_enabled {
         let cluster_id = config.node_identity.cluster_id.clone().unwrap_or_default();
         let sweeper = Arc::new(aenv_api::binding_store::sweep::BindingSweeper::new(
@@ -621,7 +266,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             sweeper.run(registry, store, interval).await;
         }));
     }
-    // B1: the postgres backend's per-replica renewal loop.
     paused_upkeep.append(&mut paused_registry_upkeep);
 
     let grpc = {
@@ -641,51 +285,24 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         .await?
     };
 
-    // 🔴 The warm-up clock, for real this time: `start_native_node_registry`
-    // had to arm `WarmupGate` before this listener existed (it hands the
-    // gate to `NodeRegistryGrpcService`, which the closure above serves) —
-    // see that construction's own comment. Now that the listener has
-    // actually bound and can receive a `Heartbeat` RPC, rebase the deadline
-    // to start counting from here, not from wherever assembly happened to be
-    // earlier. See `WarmupGate::rebase_deadline`'s own doc comment for why
-    // this is safe to call unconditionally, including on a gate that has
-    // already gone warm.
+    // 🔴 Start the warm-up timeout when the heartbeat listener is actually bound.
     native_warmup_handle.rebase_deadline(
         std::time::SystemTime::now(),
         Duration::from_secs(config.cluster.native_warmup_timeout_secs),
     );
 
     Ok(Assembly {
-        // 🔴 No user-REST gate: this half serves the whole user-facing
-        // surface, and `server::new_control_plane_only` reads that off the
-        // `ApiImpl` itself. The gate exists to stop a *node* answering it.
-        //
-        // 🔴 `_control_plane_only` is the other half of the same sentence, and
-        // it is *not* read off the `ApiImpl`: this replica mounts no `/proxy`
-        // routes, no host-routed fallback and no sandbox host classifier,
-        // because it runs no sandbox to forward a byte to. See
-        // `server::new_control_plane_only`'s own doc comment.
         app: server::new_control_plane_only(api_impl),
         orchestration,
         upkeep: paused_upkeep,
         pg_singleton_tasks,
         reporter: None,
         runtime: None,
-        // 🔴 An API replica is not a placement target, so it has nothing to
-        // withdraw from scheduling on the way down. `aenv-node` passes `true`;
-        // see `Assembly`'s own field doc.
         drains_on_shutdown: false,
         grpc: Some(grpc),
     })
 }
 
-/// The store settings this replica shares with the others, or why there are
-/// none.
-///
-/// 🔴 The in-memory store is refused rather than accepted with a warning. A
-/// warning at startup is read once, by whoever was watching; the failure it
-/// would be warning about is two replicas each answering 404 for the other's
-/// sandboxes, which is indistinguishable from a sandbox that was deleted.
 fn cluster_store_config(
     config: &aenv_api::cfg::OrchestratorStoreConfig,
 ) -> anyhow::Result<aenv_api::orchestrator::RedisStoreConfig> {
@@ -699,21 +316,7 @@ fn cluster_store_config(
             config.backend.as_str()
         );
     }
-    // 🔴 Six settings from configuration and the rest from the store's own
-    // defaults, which is a decision and not laziness. `RedisStoreConfig` has
-    // around twenty timing parameters whose *relationships* carry correctness
-    // — `transition_key_ttl > wait_transition_timeout > lock_ttl`,
-    // `stale_cutoff > transition_key_ttl`, `record_ttl_grace >
-    // transition_key_ttl` — and `validate` refuses a combination that breaks
-    // them. Exposing them individually would let a deployment set one and be
-    // refused at startup for a reason about a different one. The two Redis
-    // client timeouts added here are the exception: they bound the
-    // connection layer, not this store's own business-logic durations, and
-    // do not participate in any of `validate`'s ordering invariants — their
-    // *defaults* are chosen so `response_timeout < write_budget`, but that
-    // is not itself `validate`-enforced (see `RedisStoreConfig::response_timeout`'s
-    // own doc for why: some tests deliberately shrink `write_budget` far
-    // below any sane connection timeout).
+    // Store-owned timing defaults preserve `RedisStoreConfig::validate` ordering invariants.
     Ok(aenv_api::orchestrator::RedisStoreConfig {
         url: config.redis_url.clone(),
         key_prefix: config.redis_key_prefix.clone(),
@@ -724,26 +327,6 @@ fn cluster_store_config(
     })
 }
 
-/// Where this half asks where sandboxes go: always [`NativeNodePlacement`],
-/// which wraps the local node registry (`resolve_node`/`node_membership`)
-/// and a clone of the same `node_registry_grpc_service` `assemble_api`
-/// serves `Schedule`/`LookupNode`/`RecordAssignment` from over the wire
-/// (`place_new`/`place_existing`/`record_placement`) — see that type's own
-/// module doc for the P1 fix this replaced ("all five forward to the
-/// scheduler" -> "all five answer locally").
-///
-/// 🔴 P1 (task's own "phase4-close"): the doc comment this replaced said
-/// "`Native` is not a way to run `aenv-api` without a scheduler," and
-/// that was the bug: three of `NativeNodePlacement`'s five methods used to
-/// forward to a `SchedulerNodePlacement` regardless, so `aenv-api` under
-/// `Native` was simultaneously the gRPC server for `Schedule`/`LookupNode`/
-/// `RecordAssignment` (Stage D) and a client of the Go scheduler for those
-/// same three calls, never reaching its own answers. Scaling that scheduler
-/// to zero left every create failing. `SchedulerNodePlacement` — and the
-/// `Scheduler` alternative this function used to choose between — are gone
-/// now, along with the Go scheduler process itself; this always builds a
-/// `NativeNodePlacement`, and infallibly, because there is nothing left for
-/// it to fail to connect to.
 fn cluster_placement(
     registry: &Arc<AtomicNodeRegistry>,
     node_service_port: u16,
@@ -758,29 +341,13 @@ fn cluster_placement(
     ))
 }
 
-/// Bundles what `assemble_api` needs running before `cluster_placement` can
-/// hand a [`NativeNodePlacement`] a registry to read: the registry itself,
-/// the heartbeat-receiving gRPC service that feeds it (task's own "D5"), and
-/// the background tasks that keep both current (kube discovery, the
-/// observed-nodes metrics gauge). Callers merge `tasks` into the role's own
-/// `upkeep` and pass `grpc_service` to `aenv_api::api::grpc::serve_on`.
 struct NativeNodeRegistryBits {
     registry: Arc<AtomicNodeRegistry>,
-    /// The same `Arc` handed to `grpc_service` below — cloned out here too
-    /// so `cluster_placement` can give `NativeNodePlacement` a handle on the
-    /// gate a heartbeat this process actually receives opens. See
-    /// `NativeNodePlacement`'s own module doc for why an unwired gate would
-    /// leave every `resolve_node`/`node_membership` call answering as
-    /// confidently absent as a registry that had just started.
     warmup: Arc<WarmupGate>,
     grpc_service: NodeRegistryGrpcService,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-/// How often the observed-nodes-by-status gauge refreshes, and the interval
-/// `runKubernetesDiscoveryWithRetry`'s Go counterpart's initial/maximum
-/// reconnect backoff bracket (`services/scheduler/cmd/main.go`'s
-/// `runKubernetesDiscoveryWithRetry`).
 const NODE_REGISTRY_METRICS_INTERVAL: Duration = Duration::from_secs(15);
 const KUBE_DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const KUBE_DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -798,39 +365,20 @@ async fn start_native_node_registry(
             window: Duration::from_secs(discovery.empty_sync_window_secs),
         },
     ));
-    // 🔴 This is only the gate's *initial* arming — `now` here is when
-    // assembly reached this point, well before the gRPC listener this
-    // registry's `Heartbeat` RPC arrives on actually binds.
-    // `assemble_api` rebases this deadline (`WarmupGate::rebase_deadline`)
-    // once that listener is actually up; see that call site's own comment
-    // and `AENV_CLUSTER_NATIVE_WARMUP_TIMEOUT_SECS`'s doc comment (`cfg.rs`)
-    // for why the two clocks must not be the same one.
+    // `assemble_api` rebases this deadline after the heartbeat listener binds.
     let warmup = Arc::new(WarmupGate::new(
         Arc::clone(&registry) as Arc<dyn aenv_api::node_registry::registry::NodeRegistry>,
         Duration::from_secs(config.native_warmup_timeout_secs),
         std::time::SystemTime::now(),
     ));
     let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup))
-        // The placement shadow scorer's sampling width. `0` was already
-        // refused by `AppConfig::validate`, so nothing here has to decide
-        // what a zero-width sample would mean.
         .with_placement_shadow_k(config.placement_shadow_k);
 
-    // Mirrors `services/scheduler/cmd/main.go`'s own
-    // `switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode))`:
-    // Kubernetes gets a background watch task; static is a one-shot seed
-    // with none.
     let mut tasks = Vec::new();
     match config.node_discovery_mode {
         aenv_api::cfg::ClusterNodeDiscoveryMode::Kubernetes => {
             let namespace = discovery.namespace.trim();
             let service_name = discovery.service_name.trim();
-            // 🔴 Refused here, before anything is connected — the same
-            // discipline `cluster_placement`'s own doc comment names: a
-            // misconfigured replica should be told about the setting it can
-            // see from its own config, rather than have a retry loop fail
-            // silently in the background forever for a reason a startup log
-            // line would have caught immediately.
             if namespace.is_empty() || service_name.is_empty() {
                 anyhow::bail!(
                     "aenv-api needs [cluster.kubernetes_discovery].namespace and .service_name \
@@ -850,10 +398,7 @@ async fn start_native_node_registry(
                 ignore_pod_selector: discovery.ignore_pod_selector.clone(),
                 no_schedule_pod_selector: discovery.no_schedule_pod_selector.clone(),
             };
-            // Same validation `KubernetesDiscovery::new` runs internally, run
-            // once here so a bad selector fails startup instead of failing
-            // the same way, silently, on every iteration of the retry loop
-            // below forever.
+            // Validate before starting the retry loop.
             validate_optional_pod_selector(
                 &kube_config.ignore_pod_selector,
                 "ignore_pod_selector",
@@ -883,12 +428,6 @@ async fn start_native_node_registry(
             let nodes = aenv_api::node_registry::static_discovery::nodes_from_static_config(
                 &config.static_discovery_nodes,
             );
-            // 🔴 One-shot seed, not a background task: unlike Kubernetes
-            // discovery, a statically-configured node list never changes at
-            // runtime, so there is nothing to watch — mirrors
-            // `services/scheduler/cmd/main.go`'s own static branch, which
-            // calls `registry.Set(nodes, nil)` exactly once and spawns no
-            // goroutine.
             registry.set(nodes, Vec::new(), std::time::SystemTime::now());
         }
     }
@@ -913,33 +452,6 @@ async fn start_native_node_registry(
     })
 }
 
-/// Task's own "D3": constructs the binding store `assemble_api` wires into
-/// `NodeRegistryGrpcService` (`with_binding_store`) unconditionally. Mirrors
-/// `RedisMetadataStore::connect`'s own error-wrapping style — a connection
-/// failure here is a startup refusal, not a background retry, the same
-/// discipline `cluster_placement`'s own comment names for every other
-/// config-driven refusal in this function.
-///
-/// 🔴 There is no backend to select. `[binding_store].backend`
-/// (`AENV_BINDING_STORE_BACKEND`, `"in_memory"` | `"redis"`) used to choose,
-/// and this function refused `"in_memory"` unconditionally — `aenv-api` is a
-/// multi-replica Deployment (`deploy/k8s/base/agentenv-api-deployment.yaml`'s
-/// `replicas: 2`), an in-memory binding store is one replica's private
-/// routing table, and every symptom of two replicas disagreeing about a
-/// sandbox's node is silent (a gateway routing-projection read, or
-/// `NativeNodePlacement::place_existing` on *this* replica, simply missing a
-/// binding another replica wrote). Nothing at this layer could tell "one
-/// replica, alone, safe" from "one of several, silently wrong," so the
-/// refusal never had a case it did not apply to. A setting with one legal
-/// value is not a setting: the field, its enum and the refusal arm are
-/// deleted, and this constructs Redis.
-///
-/// 🔴 `InMemoryBindingStore` itself is not deleted — the binding-store
-/// contract suite (`aenv_core::binding_store::contract`) runs the same
-/// assertions against both backends, which is what keeps a fix made to one
-/// and forgotten for the other from being invisible. It is gated behind
-/// `#[cfg(any(test, feature = "test-support"))]` instead, so it cannot be
-/// reached from a production build at all.
 async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<dyn BindingStore>> {
     let settings = BindingStoreSettings {
         binding_ttl: Duration::from_secs(config.binding_ttl_secs),
@@ -958,26 +470,6 @@ async fn build_binding_store(config: &BindingStoreConfig) -> anyhow::Result<Arc<
     Ok(Arc::new(store) as Arc<dyn BindingStore>)
 }
 
-/// The shared-roster fix: wires `aenv-api`'s Stage A node registry's
-/// heartbeat-derived (`observed`) state into Redis so every replica sees
-/// the whole cluster's roster, not just the nodes whose heartbeat happens
-/// to be pinned to it — see `aenv_api::node_registry::redis`'s own module
-/// doc for the full design.
-///
-/// Mirrors `build_binding_store`'s own multi-replica guardrail exactly, for
-/// the same reason: nothing at this layer can distinguish "one replica,
-/// alone, safe" from "one of several, silently split," and this is called
-/// unconditionally from `assemble_api`, the same as `build_binding_store`
-/// is. So `NodeRegistryObservedBackendKind::InMemory` is refused here
-/// unconditionally too, regardless of how many replicas are actually
-/// running.
-///
-/// On success, spawns the background task
-/// (`aenv_api::node_registry::redis::run_shared_observed_sync`) that keeps
-/// `registry` in sync going forward and returns its `JoinHandle` for the
-/// caller to fold into its own upkeep — the same pattern
-/// `start_native_node_registry` already uses for the kube-discovery and
-/// metrics tasks.
 async fn wire_shared_node_observed_store(
     config: &ClusterNodeRegistryStoreConfig,
     registry: &Arc<AtomicNodeRegistry>,
@@ -1001,17 +493,7 @@ async fn wire_shared_node_observed_store(
             })
             .await?;
             let rx = registry.enable_shared_observed_publishing();
-            // 🔴 Best-effort, not a startup refusal: the connection above
-            // already proved Redis is reachable, so a failure here is a
-            // transient blip on an otherwise-good connection —
-            // `run_shared_observed_sync`'s own periodic pull will retry
-            // within `DEFAULT_PULL_INTERVAL` regardless. Doing this pull
-            // now rather than waiting for the loop's first tick matters
-            // for correctness, not just latency: without it, a freshly
-            // (re)started replica's `Inner.all_configs_ready` gate would
-            // see only the nodes it has personally heartbeated with so far
-            // for up to a whole `DEFAULT_PULL_INTERVAL` — exactly the
-            // partial-cluster view this fix exists to close.
+            // The periodic pull retries an initial best-effort failure.
             match store.pull_all().await {
                 Ok(remote) => registry.merge_remote_snapshot(remote),
                 Err(err) => {
@@ -1034,22 +516,7 @@ async fn wire_shared_node_observed_store(
     }
 }
 
-/// Mirrors `services/scheduler/cmd/main.go`'s `runKubernetesDiscoveryWithRetry`:
-/// (re)connects and runs discovery, and on any failure — connecting or the
-/// watch loop itself ending — waits an exponentially growing backoff and
-/// tries again. Never returns under normal operation; callers drive it as a
-/// background task.
-///
-/// 🔴 Does not special-case an in-cluster-config failure the way Go's
-/// version does (`errors.Is(err, rest.ErrNotInCluster)` stops retrying
-/// outright there): `kube::Config::infer` does not expose an equivalently
-/// precise "this will never succeed" signal to distinguish from "the
-/// apiserver is transiently unreachable", so every failure here is treated
-/// as retryable. The cost is a Pod that will never have in-cluster
-/// credentials logging a warning every `KUBE_DISCOVERY_MAX_BACKOFF` forever
-/// instead of failing loudly once — a known, narrower gap than the retry
-/// loop's own reason for existing (a transiently unreachable apiserver at
-/// startup must not be fatal).
+// Retry all discovery failures; `kube::Config::infer` has no permanent-failure signal.
 async fn run_kubernetes_discovery_with_retry(
     config: KubernetesDiscoveryConfig,
     registry: Arc<AtomicNodeRegistry>,
@@ -1071,27 +538,7 @@ async fn run_kubernetes_discovery_with_retry(
     }
 }
 
-/// Keeps this node's standing in the cluster registry current, in both
-/// directions.
-///
-/// Outward, it renews the lease on every sandbox this node holds. That lease is
-/// the only evidence the registry has that the node is still there, and letting
-/// it lapse is what invites another node to take the sandbox over — so this
-/// loop stopping is itself the signal that the node has gone.
-///
-/// Inward, a node that loses a sandbox to another node is never told about it:
-/// the resume happens elsewhere, against a registry row this node does not
-/// watch. Until it notices, it keeps the sandbox in its heartbeat roster, the
-/// scheduler's binding for that sandbox flaps between the two nodes, and — if
-/// the sandbox is still running here — two live copies of it write to their own
-/// rootfs layers.
-///
-/// 🔴 **Two tasks, not one.** Reconciliation tears sandboxes down, and a
-/// teardown waits on whatever operation currently holds the sandbox; one that
-/// drags on would, in a shared loop, stop the renewals as well. The node would
-/// then declare *all* of its own sandboxes abandoned while it was busy standing
-/// one of them down, and other nodes would take them over. Renewal must not be
-/// able to starve behind anything.
+// Renewal and reconciliation stay separate so a teardown cannot starve lease renewal.
 fn spawn_paused_record_upkeep(
     api_impl: Arc<ApiImpl>,
     interval: Duration,
@@ -1113,10 +560,6 @@ fn spawn_paused_record_upkeep(
         loop {
             ticker.tick().await;
             api_impl.reconcile_local_records().await;
-            // Cluster-wide rather than node-local, and deliberately not on the
-            // startup path: the rows it collects have been stranded for at
-            // least a sandbox lifetime already, so nothing is gained by making
-            // the listener wait for it.
             api_impl.reclaim_expired_sandboxes().await;
         }
     });
@@ -1129,17 +572,6 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    /// 🔴 What this binary's command line does *not* accept.
-    ///
-    /// Both groups are absences, and an absence comes back by accident: a flag
-    /// re-added "for compatibility" restores exactly what was removed here.
-    ///
-    /// - `--role` (and `AENV_ROLE`, which no argument reads any more). A
-    ///   manifest still passing it has not been migrated, and starting anyway
-    ///   would hide that.
-    /// - `--setup-only`/`--setup-host`, which are gone from this binary rather
-    ///   than refused by it. `--setup-host` provisions KVM, ublk and host
-    ///   networking; there is nothing here that could use any of it.
     #[test]
     fn the_api_binary_accepts_neither_a_role_nor_a_provisioning_mode() {
         ApiCli::command().debug_assert();
@@ -1166,18 +598,6 @@ mod tests {
         );
     }
 
-    /// 🔴 `[pg]` is not optional for this half, and the refusal is at
-    /// construction rather than at the far end of `assemble_api`.
-    ///
-    /// `build_snapshot_backend` also refuses a missing catalog, but it runs
-    /// last — after the catalog build reaper, the paused-registry factory and
-    /// the paused-registry background tasks have each been handed a `None`
-    /// pool and quietly become no-ops. That ordering is what this guards: an
-    /// unconfigured `[pg]` must not get far enough to build any of them.
-    ///
-    /// `AppConfig::default()` has no `[pg]` at all, so this reaches the
-    /// refusal without dialling anything — the message is produced before
-    /// `pg::connect` is called.
     #[tokio::test]
     async fn the_api_half_refuses_to_assemble_without_a_postgres_catalog() {
         let config = AppConfig::default();
@@ -1191,13 +611,6 @@ mod tests {
             Ok(_) => panic!("aenv-api has no catalog at all without [pg]"),
             Err(err) => format!("{err:#}"),
         };
-        // The setting, which binary is being talked about, and — because
-        // `[pg]` has no `env =` binding and cannot have one (confique will
-        // not descend into `AppConfig::pg`'s `Option`) — the mechanism that
-        // actually supplies it. A message naming `AENV_PG_DSN` would send an
-        // operator to set an environment variable nothing reads;
-        // `build_snapshot_backend` and `aenv-snapshot-image` each carry the
-        // same guard over their own copy of this wording.
         assert!(err.contains("[pg]"), "{err}");
         assert!(err.contains("[pg].dsn"), "{err}");
         assert!(err.contains("aenv-api"), "{err}");
@@ -1208,18 +621,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The two refusals `aenv-api` takes on its own configuration, each
-    /// pushed up rather than assumed.
-    ///
-    /// Both are read before anything is connected, which is what makes them
-    /// testable at all — and an untested refusal branch is the shape §15.3
-    /// records: `guard_read_side`'s three refusals never ran outside a unit
-    /// test, and one disjunct in one of them has never run at all.
-    ///
-    /// A version of this role that quietly fell back to the local orchestrator
-    /// would be a process that reaches for `/dev/kvm` on a replica supposed to
-    /// hold none of a machine's state — and on a host where that reach
-    /// succeeded, it would work well enough to be believed.
     #[test]
     fn the_api_half_refuses_a_ledger_no_other_replica_can_see() {
         let mut config = AppConfig::default();
@@ -1232,17 +633,9 @@ mod tests {
         let err = cluster_store_config(&config.orchestrator.store)
             .expect_err("the in-memory store is one process's private ledger");
         let err = err.to_string();
-        // The setting, the environment variable that overrides it, and what
-        // goes wrong — an operator reading this in a CrashLoopBackOff has the
-        // log line and nothing else.
         assert!(err.contains("orchestrator.store"), "{err}");
         assert!(err.contains("AENV_ORCHESTRATOR_STORE_BACKEND"), "{err}");
         assert!(err.contains("in-memory"), "{err}");
-        // 🔴 And the spelling a deployment would have to write, quoted from
-        // `as_str` rather than from prose. An operator reading this message has
-        // to be able to copy the value out of it; a message that named the
-        // backend in words only would be telling them what is wrong without
-        // telling them what to type.
         assert!(
             err.contains(MetadataStoreBackendKind::InMemory.as_str()),
             "{err}"
@@ -1253,15 +646,7 @@ mod tests {
             "the two backends must not answer to the same name"
         );
 
-        // 🔴 The control. Without it this test passes just as well against a
-        // function that refuses every configuration, including the right one.
-        //
-        // 🔴 Every value set here differs from what `RedisStoreConfig::default()`
-        // would supply, and that is the point rather than arbitrary. Only five
-        // of that struct's ~twenty fields come from configuration; the rest
-        // arrive through `..Default::default()`, so a field this function
-        // forgot to carry would silently take the default — and if the test
-        // used the default value, the assertion would agree with it.
+        // Use non-default values so omitted mappings cannot pass accidentally.
         config.orchestrator.store.backend = MetadataStoreBackendKind::Redis;
         config.orchestrator.store.redis_url = "redis://cluster-redis:6379".to_string();
         config.orchestrator.store.redis_key_prefix = "agentenv:probe".to_string();
@@ -1292,21 +677,11 @@ mod tests {
         assert!(!store.distributed_lock_enabled);
         assert_eq!(store.response_timeout, Duration::from_millis(1234));
         assert_eq!(store.connect_timeout, Duration::from_millis(2345));
-        // The settings that are deliberately *not* configurable still arrive,
-        // and arrive at the values whose ordering `validate` checks.
         store
             .validate()
             .expect("the defaults this function leans on must be a valid combination");
     }
 
-    /// 🔴 P1 (task's own "phase4-close"): `cluster_placement` needs no
-    /// `[cluster].scheduler_endpoint` at all — the doc comment this test
-    /// guards against regressing said "`Native` is not a way to run
-    /// `aenv-api` without a scheduler," and that was the bug this fixed.
-    /// Now that `SchedulerNodePlacement` is deleted along with the
-    /// `Scheduler` alternative this function used to choose between, the
-    /// signature itself enforces it: there is no scheduler-endpoint
-    /// parameter left to require one from, and construction cannot fail.
     #[test]
     fn cluster_placement_builds_a_native_placement_with_no_scheduler_endpoint() {
         let config = AppConfig::default();
@@ -1323,9 +698,6 @@ mod tests {
         ));
         let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup));
 
-        // Infallible now — this is a construction smoke test, not a
-        // refusal/success pair, because there is no longer a failure mode
-        // to pair it against.
         let _placement = cluster_placement(
             &registry,
             config.cluster.node_service_port,
@@ -1334,21 +706,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The binding store is Redis, and only Redis.
-    ///
-    /// This used to be a refusal/control pair: `[binding_store].backend`
-    /// defaulted to `"in_memory"`, `build_binding_store` refused that value
-    /// unconditionally, and the control below proved the refusal was about
-    /// the backend rather than about the function failing for any reason at
-    /// all. The field and its enum are deleted — a setting whose only legal
-    /// value was `"redis"` is not a setting — so only the control survives,
-    /// and it now carries the whole claim on its own: `AppConfig::default()`,
-    /// with nothing selecting anything, still reaches Redis.
-    ///
-    /// The URL is one nothing listens on, so what this asserts is *which
-    /// store was constructed*, read off the failure: a connection attempt to
-    /// the configured Redis. A regression that reintroduced an in-memory
-    /// fallback would return `Ok` here instead.
     #[tokio::test]
     async fn the_api_half_binds_sandboxes_through_redis_with_nothing_selecting_it() {
         let mut config = AppConfig::default().binding_store;
@@ -1366,12 +723,6 @@ mod tests {
         );
     }
 
-    /// The shared-roster fix's own copy of
-    /// `the_api_half_refuses_a_ledger_no_other_replica_can_see` above
-    /// — same shape, same reasoning, a third multi-replica ledger
-    /// (`Inner.observed`, `src/node_registry/registry.rs`). Before this
-    /// guard existed, `AtomicNodeRegistry`'s heartbeat-derived state had no
-    /// cross-replica sharing at all and nothing refused starting that way.
     #[tokio::test]
     async fn the_api_half_refuses_a_node_registry_no_other_replica_can_see() {
         let config = AppConfig::default().cluster.node_registry_store;
@@ -1397,10 +748,6 @@ mod tests {
         );
         assert!(err.contains("redis"), "{err}");
 
-        // The control, again: the redis backend at least attempts to
-        // connect rather than being refused outright — a *different* error
-        // (a connection failure, not the multi-replica refusal) against a
-        // URL nothing is listening on.
         let mut redis_config = AppConfig::default().cluster.node_registry_store;
         redis_config.backend = NodeRegistryObservedBackendKind::Redis;
         redis_config.redis_url = "redis://127.0.0.1:1/0".to_string();
@@ -1415,12 +762,6 @@ mod tests {
         );
     }
 
-    /// An empty `[cluster.kubernetes_discovery]` namespace/service_name is a
-    /// hard refusal — `start_native_node_registry`'s own guard, checked
-    /// before anything else in the function runs. Kept (trimmed) as the only
-    /// test in this crate that exercises this refusal path directly, after
-    /// the dual-report-endpoint test it used to share a body with was
-    /// removed alongside that field.
     #[tokio::test]
     async fn native_placement_refuses_an_unconfigured_kubernetes_discovery() {
         let unconfigured_discovery = aenv_api::cfg::ClusterConfig {
@@ -1436,14 +777,6 @@ mod tests {
         );
     }
 
-    /// Static discovery's own success path — the control for
-    /// `native_placement_refuses_an_unconfigured_kubernetes_discovery` above:
-    /// the same function, under `[cluster].node_discovery_mode = "static"`,
-    /// must succeed with `[cluster.kubernetes_discovery]` left completely
-    /// unconfigured, seed the registry from `static_discovery_nodes`, and
-    /// spawn no background discovery task — mirrors
-    /// `services/scheduler/cmd/main.go`'s static branch
-    /// (`registry.Set(nodes, nil)`, called once, no goroutine).
     #[tokio::test]
     async fn native_placement_seeds_the_registry_from_static_discovery() {
         let config = aenv_api::cfg::ClusterConfig {
@@ -1492,12 +825,6 @@ mod tests {
         }
     }
 
-    /// The static branch's own validation
-    /// (`services/shared/config/config.go`'s `scheduler.nodes must not be
-    /// empty`): an empty `[cluster].static_discovery_nodes` under
-    /// `node_discovery_mode = "static"` is refused the same way an
-    /// unconfigured `[cluster.kubernetes_discovery]` is refused under the
-    /// default Kubernetes mode.
     #[tokio::test]
     async fn native_placement_refuses_an_empty_static_discovery_node_list() {
         let config = aenv_api::cfg::ClusterConfig {
@@ -1515,11 +842,6 @@ mod tests {
         );
     }
 
-    /// The body of the named item in this file's own source text.
-    ///
-    /// Shared by the call-site guards below, which scan rather than execute:
-    /// deleting a call site is a change no unit test of the called function
-    /// can see.
     fn body_of(source: &str, name: &str) -> String {
         let start = source
             .find(name)
@@ -1541,35 +863,10 @@ mod tests {
         panic!("{name} has no closing brace");
     }
 
-    /// 🔴 Resume placement is handed a `NodeRegistryGrpcService` that has
-    /// already been through *every* builder.
-    ///
-    /// `ResumeWiring::cluster_in_process` takes the service by value and
-    /// nothing about the type records which builders have been applied to it,
-    /// so the ordering inside `assemble_api` is the whole guarantee. Move the
-    /// `ResumeWiring` construction above `with_paused_registry` and every
-    /// unpublished pause — `local_only`, `publishing` — stops coming back
-    /// `PINNED`: stage 3 of `lookup_node` never runs, the answer is
-    /// `NotFound`, and the platform's contract for `NotFound` is "rebuild it
-    /// from its template", which resets the user's workspace. Move it above
-    /// `with_binding_store` and every wake-up fails with `Unimplemented`
-    /// instead. Neither shows up in a type error, and neither is visible in
-    /// this crate's other tests, which all build the service themselves.
-    ///
-    /// `src/api/impls/resume_surface.rs`'s
-    /// `a_partly_wired_service_cannot_answer_a_pin_and_says_so_differently`
-    /// proves those two answers really do differ; this proves *this* call site
-    /// is on the right side of them.
     #[test]
     fn resume_placement_is_wired_after_every_builder() {
         let source = include_str!("aenv-api.rs");
-        // 🔴 Comment lines stripped first, and this is not tidiness: every one
-        // of these needles is also *named in a comment* in this function, and
-        // some of those comments sit above the code they describe. A scan over
-        // the raw body finds the comment, not the call, and then reports the
-        // ordering of prose — which does not move when the code does. That is
-        // exactly how this guard passed a mutation that moved the clone above
-        // `with_paused_registry` before this line existed.
+        // Strip comments so prose cannot satisfy the ordering checks.
         let assemble: String = body_of(source, "async fn assemble_api(config: &AppConfig)")
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -1581,8 +878,6 @@ mod tests {
                 .find(needle)
                 .unwrap_or_else(|| panic!("assemble_api no longer contains {needle}"))
         };
-        // The strip has to actually remove something, or the filter above could
-        // silently become a no-op and take the guard back to scanning prose.
         assert!(
             !assemble.contains("🔴"),
             "no comment line survived the strip, so this is scanning the raw body again"
@@ -1601,10 +896,6 @@ mod tests {
             );
         }
 
-        // 🔴 The mutation control, same reasoning as the scans below: a
-        // `body_of` that returned the whole file would satisfy the ordering
-        // above for the wrong reason, and `async fn assemble_api` sits before
-        // the body's opening brace, so a correct extraction never contains it.
         assert!(
             !assemble.contains("async fn assemble_api"),
             "the scan is reading more than assemble_api's body, so the ordering above \

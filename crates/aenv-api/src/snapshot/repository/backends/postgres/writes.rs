@@ -1,10 +1,4 @@
-//! The writes — a Rust port of
-//! `services/scheduler/internal/catalog/queries_admin.go`, minus the
-//! `PausedHalf` transaction join (see `mod.rs`'s module doc on why that is
-//! not ported) and minus build admission's own file split (Go keeps
-//! `queries_admin.go` and `queries_resolved.go` apart so neither set of
-//! statements is edited while looking at the other; this module and
-//! `reads.rs` keep the same split).
+//! Transactional PostgreSQL catalog writes and build admission.
 
 use anyhow::anyhow;
 use sqlx::PgPool;
@@ -26,8 +20,6 @@ use super::convert::{
 };
 use super::reads::backend_error;
 
-/// `buildAdmissionKey` — reused literally, see `src/pg/lock_keys.rs`'s
-/// `GO_BUILD_ADMISSION_LOCK_KEY`.
 use crate::pg::GO_BUILD_ADMISSION_LOCK_KEY;
 
 fn refused(operation: &'static str, refusal: CatalogRefusal) -> RepositoryError {
@@ -55,13 +47,8 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Transaction A — the row before the bytes
-// ─────────────────────────────────────────────────────────────────────────
 
-/// Opens a row before any bytes exist, and binds its alias in the same
-/// transaction if it has one — matches `insertSnapshotSQL` +
-/// `releaseOtherAliasesSQL` + `bindAliasSQL`.
+/// Opens a pre-byte row and binds its alias atomically.
 pub async fn begin_snapshot(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -114,8 +101,6 @@ pub async fn begin_snapshot(
     .map_err(backend_error("begin_snapshot"))?;
 
     if inserted.is_none() {
-        // Rolling back is a formality (nothing was written), but explicit
-        // beats relying on drop order.
         let _ = tx.rollback().await;
         return Ok(CatalogWrite::Refused(CatalogRefusal::AlreadyExists));
     }
@@ -148,10 +133,7 @@ pub async fn begin_snapshot(
     }))
 }
 
-/// Releases any other alias this snapshot held, then claims `alias`.
-/// `Ok(None)` on success, `Ok(Some(refusal))` when another live snapshot
-/// holds the name — matches `releaseOtherAliasesSQL` + `bindAliasSQL` +
-/// `aliasHolderSQL`.
+// Replaces this snapshot's old alias and claims the new one in the transaction.
 async fn bind_alias(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cluster_id: Uuid,
@@ -191,29 +173,7 @@ async fn bind_alias(
             .await
             .map_err(backend_error("bind_alias"))?;
 
-    // 🔴 The name is already this snapshot's own — a no-op success, not a
-    // conflict. This branch is the one thing the port of `bindAlias` left
-    // behind: Go's is `strings.EqualFold(holder, snapshot)` -> `return nil,
-    // nil`, under its own doc comment "Binding a name this snapshot already
-    // holds is a no-op success: the two callers that bind — opening a row and
-    // committing it — are both allowed to name the same alias, and a retry of
-    // either must not become a conflict with itself." The OSS backend states
-    // the same rule (`backends/oss/catalog.rs::bind_alias`: "If it already
-    // points to `id`, return success"), which left PostgreSQL as the only
-    // backend that refused itself.
-    //
-    // Both of this module's callers reach that state on every v3 template
-    // build: `POST /v3/templates` opens the row with the alias bound to the
-    // new template's own id (`begin_snapshot`), and the build's own
-    // `publish_commit` binds the same (alias, id) pair a second time
-    // (`commit_snapshot`). Without this branch that second bind falls through
-    // the `ON CONFLICT ... DO NOTHING` above and is reported as `AliasTaken`
-    // naming the caller itself — "alias 'x' already points to '<id>', cannot
-    // rebind to '<id>'", the same id printed twice, on every build.
-    //
-    // Compared as `Uuid` rather than as text: the holder is read as the
-    // `uuid` column itself, so this is the canonical value comparison Go can
-    // only approximate with a case-insensitive string match.
+    // Rebinding an alias to the same snapshot is idempotent.
     if holder == Some(snapshot_id.to_uuid()) {
         return Ok(None);
     }
@@ -223,25 +183,14 @@ async fn bind_alias(
     }))
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Transaction B — the flip
-// ─────────────────────────────────────────────────────────────────────────
 
-/// Flips a row to `ready` — the only statement that produces one. Binds the
-/// alias (if any) and closes the template's active build (if any) in the
-/// same transaction — matches `commitSnapshotSQL` + `finishActiveBuildSQL`.
+// Arguments for atomically committing a ready snapshot.
 struct CommitArgs<'a> {
     id: &'a SnapshotId,
     committed_payload: Vec<u8>,
     alias: Option<&'a SnapshotAlias>,
     resources: SandboxResources,
-    /// The commit's own source axis (template vs sandbox) — this statement
-    /// never changes `source_kind` in the database (the axis is fixed at
-    /// `begin_snapshot`), but the in-memory record this call hands back must
-    /// still report it correctly rather than assuming every commit is a
-    /// template. A sandbox commit whose returned record silently claimed to
-    /// be a template would lose `source_sandbox_id` from every caller that
-    /// trusts this return value instead of re-reading the row.
+    // Preserve the commit's template-versus-sandbox source in the returned record.
     source: SnapshotSource,
 }
 
@@ -310,9 +259,6 @@ async fn commit_snapshot(
         }
     }
 
-    // 🔴 Unconditional — every commit takes its template's active build off
-    // the queue, which is harmless (one probe of a partial index matching
-    // nothing) for a pause with no build in flight. See `finishActiveBuildSQL`.
     sqlx::query(
         "UPDATE builds
             SET status = 'ready', finished_at_ms = $3, error_reason = NULL
@@ -334,10 +280,7 @@ async fn commit_snapshot(
             RepositoryError::backend("re-decode the payload this call just wrote", error)
         })?;
 
-    // 🔴 A `Ready` template carries its build's own finish time; a sandbox
-    // snapshot has no build state at all (`SnapshotSource::Sandbox` carries
-    // only the id it was captured from) -- see `decode_row`'s identical
-    // branch for the read path this must agree with.
+    // Only template snapshots carry build finish timestamps.
     let source = match args.source {
         SnapshotSource::Template { .. } => SnapshotSource::Template {
             build: crate::snapshot::types::TemplateBuildInfo {
@@ -361,8 +304,7 @@ async fn commit_snapshot(
     }))
 }
 
-/// Reads what a fenced write's row carries now, for the refusal — matches
-/// `observedSnapshotStatusSQL`.
+// Reads current state to classify a fenced write.
 async fn observed_refusal(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     cluster_id: Uuid,
@@ -383,12 +325,8 @@ async fn observed_refusal(
     })
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Transaction C — the failure
-// ─────────────────────────────────────────────────────────────────────────
 
-/// Moves a row to `error`, and (when asked) ends its active build in the
-/// same transaction — matches `failSnapshotSQL` + `failActiveBuildSQL`.
+// Moves a snapshot and its optional active build to error atomically.
 async fn fail_snapshot(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -440,13 +378,8 @@ async fn fail_snapshot(
     Ok(CatalogWrite::Applied(()))
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Delete
-// ─────────────────────────────────────────────────────────────────────────
 
-/// Soft-deletes a row and drops the alias pointing at it — matches
-/// `softDeleteSnapshotSQL` + `dropAliasesOfSnapshotSQL`. Idempotent: deleting
-/// an already-deleted row succeeds and answers `false`.
+// Soft-deletes the row and alias idempotently.
 async fn delete_snapshot(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -491,30 +424,10 @@ async fn delete_snapshot(
     Ok(true)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Build admission
-// ─────────────────────────────────────────────────────────────────────────
 
-/// Admits one build: the cluster-wide ceiling, the per-template exclusion,
-/// and the template's `waiting|error -> building` transition, all in one
-/// transaction — matches `queries_admin.go`'s "Build admission" section
-/// exactly, down to the ceiling check running under a `pg_advisory_xact_lock`
-/// and the reasoning in `buildAdmissionKey`'s comment for why: under READ
-/// COMMITTED two concurrent admissions cannot see each other's uncommitted
-/// rows, so counting after inserting lets both through. The per-template
-/// exclusion needs no such lock — it is fenced by the row-level lock the
-/// `UPDATE` below already takes on the template's own row, the same
-/// guarantee `builds_one_active_per_template`'s unique index gives Go's
-/// insert.
+/// Admits a build atomically under the cluster ceiling and per-template exclusion.
 ///
-/// `max_concurrent_builds` is the *already-resolved* ceiling — 0 meaning
-/// "enforce a ceiling of zero", not "unlimited" — matching
-/// [`super::PostgresSnapshotCatalog::with_max_concurrent_builds`]'s own
-/// resolution of a configured `0` up to the default before it ever reaches
-/// here; only a negative value disables the check. That mirrors
-/// `store_postgres.go:809`'s `if s.maxConcurrentBuilds > 0`, including
-/// skipping the lock and the cluster-wide `count(*)` entirely once the
-/// ceiling is off — `store_postgres.go`'s own version of the same skip.
+/// Negative ceiling disables admission counting; zero is an enforced ceiling.
 pub async fn start_build(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -613,12 +526,7 @@ pub async fn start_build(
                     error_reason: None,
                 },
             },
-            // 🔴 Resources are left at their prior values by this statement
-            // (it only ever touches `status`/`updated_at_ms`/`build_error`),
-            // so this synthetic record cannot report them without a second
-            // read this call has no reason to pay for — `try_start_build`'s
-            // trait-level caller only reads `StartedBuild::build_id`, per
-            // `interfaces.rs`'s own doc on the type.
+            // The status-only update does not read resources back.
             resources: SandboxResources::default(),
             created_at_unix_ms: started_at_ms,
             updated_at_unix_ms: started_at_ms,
@@ -628,9 +536,7 @@ pub async fn start_build(
     }))
 }
 
-/// One heartbeat — matches `renewBuildLeaseSQL`. `false` means the build is
-/// no longer the live one (the reaper freed it, or it never existed) and the
-/// builder must stop.
+// Renews a live build; `false` tells the builder to stop.
 async fn renew_build_lease(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -651,10 +557,6 @@ async fn renew_build_lease(
     Ok(updated.rows_affected() > 0)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Trait-facing composition — what `impl SnapshotCatalog for
-// PostgresSnapshotCatalog` (`mod.rs`) delegates to
-// ─────────────────────────────────────────────────────────────────────────
 
 pub async fn create(
     pool: &PgPool,
@@ -704,8 +606,6 @@ pub async fn publish_commit(
             committed_payload,
             alias: commit.alias.as_ref(),
             resources: commit.resources,
-            // `opening.source` was derived from `commit.source` by
-            // `commit_opening_record` above and carries the same axis.
             source: opening.source,
         },
         true,

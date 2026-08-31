@@ -1,15 +1,6 @@
-//! The fencing write path: `begin_pause`, `complete_pause`, `mark_local_only`,
-//! `claim_for_resume`, `release_claim`, `mark_running`,
-//! `renew_sandbox_deadline`, `remove`.
-//!
-//! Every function here is a direct, single-connection-pool port of its
-//! `services/scheduler/internal/registry/store_postgres.go` namesake; see
-//! `sql.rs` for the SQL text itself. **D1's concurrency claim for every
-//! statement in this file**: each is a single CAS'd `UPDATE`/`INSERT ...
-//! RETURNING`, so PostgreSQL's own row-level locking serialises two
-//! `aenv-api` replicas racing the same sandbox -- neither statement here
-//! needs the caller to hold any lock of its own. See the Stage C report's
-//! "D1" section for the exhaustive per-statement review.
+//! Fenced paused-registry writes.
+//! Each operation relies on PostgreSQL row locking and generation/execution
+//! predicates, so replicas need no caller-side lock.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -36,19 +27,9 @@ fn invalid(sandbox_id: &str, reason: impl Into<String>) -> PausedRegistryError {
     }
 }
 
-/// `BeginPause` (`store.go`) + `classifyRefusedPause` (`store_postgres.go:
-/// 598-634`), ported verbatim.
+/// Begins a pause and classifies refusals in the same transaction.
 ///
-/// 🔴 **B5**: the write and the classification re-read it falls back to on a
-/// refusal now share one transaction (`registry.pool.begin()`), not two
-/// independent pool calls. `store_postgres.go`'s own `BeginPause` runs both
-/// inside one Go `*sql.Tx`, and that is not an optional tidiness choice: a
-/// classification re-read on a *different* physical connection can observe a
-/// version of the row the write itself never saw (a concurrent writer landing
-/// between the two calls), which can report "another cluster owns this" about
-/// a row that was actually fenced, or the reverse -- and the two answers this
-/// backend gives a caller for those are opposite (`InvalidRecord`, which is a
-/// bug report, versus `ExecutionFenced`, which means stop retrying for good).
+/// The shared transaction prevents classification against a newer row version.
 pub async fn begin_pause(
     registry: &PostgresPausedSandboxRegistry,
     entry: &PausedSandboxEntry,
@@ -63,11 +44,7 @@ pub async fn begin_pause(
             reason: "sandbox metadata is not serializable".to_string(),
             source: Some(e.into()),
         })?;
-    // 🔴 The execution id fenced against is the record's own
-    // (`metadata.execution_id`), not `entry.execution_id` -- mirrors
-    // `central.rs::begin_pause`'s identical choice: the run being paused,
-    // read off the metadata rather than a separate argument a caller could
-    // quote a different one through.
+    // Fence on the execution ID inside metadata, the record being paused.
     let execution_id = metadata.execution_id;
 
     let mut tx = registry
@@ -88,10 +65,7 @@ pub async fn begin_pause(
         .map_err(|e| backend_err("begin_pause", e))?;
 
     let Some((generation, previous_snapshot_id)) = row else {
-        // Nothing was written (the upsert's own WHERE refused it), so
-        // letting `tx` drop unrolled-back here is harmless -- there is
-        // nothing to undo. The classification read below runs on this same,
-        // still-open transaction regardless.
+        // Classify on the same still-open transaction.
         return Err(classify_refused_pause(
             &mut *tx,
             registry.cluster_id,
@@ -101,9 +75,7 @@ pub async fn begin_pause(
         .await);
     };
 
-    // Committed here, before the (unrelated, non-race-sensitive) snapshot id
-    // parsing below -- a parse failure on `previous_snapshot_id` must not
-    // roll back a pause that already durably succeeded.
+    // Commit before parsing the unrelated previous snapshot ID.
     tx.commit()
         .await
         .map_err(|e| backend_err("begin_pause", e))?;
@@ -121,18 +93,8 @@ pub async fn begin_pause(
     })
 }
 
-/// `classifyRefusedPause` (`store_postgres.go:598-634`), ported: **reads
-/// outside the cluster filter on purpose** -- the row `begin_pause` was
-/// refused against may belong to a different cluster entirely, and which of
-/// those two things happened is exactly what this distinguishes. (Go's
-/// version also renders the observed incarnation into its error text; the
-/// Rust `PausedRegistryError::ExecutionFenced`/`InvalidRecord` variants carry
-/// only `sandbox_id` by design -- the detail is logged instead, at `debug`,
-/// rather than smuggled into the error's `Display`.)
-///
-/// `conn` is generic over [`sqlx::Executor`] rather than pinned to `&PgPool`
-/// so [`begin_pause`] can hand it `&mut *tx` -- see that function's own B5
-/// doc comment for why the transaction matters here.
+// Reads without a cluster filter to distinguish cross-cluster ownership from
+// execution fencing, using the caller's transaction.
 async fn classify_refused_pause<'e, E>(
     conn: E,
     cluster_id: Uuid,
@@ -158,11 +120,7 @@ where
     match row {
         Err(e) => backend_err("begin_pause", e),
         Ok(None) => {
-            // The row was there when the upsert ran -- that is why it
-            // matched nothing -- and is gone now. Fenced, not retryable: the
-            // row this pause meant to continue no longer exists, and
-            // re-sending would insert a fresh one, resurrecting a sandbox
-            // somebody deleted.
+            // A disappeared refused row is fenced; retrying could resurrect it.
             tracing::debug!(
                 sandbox_id,
                 %execution_id,
@@ -183,8 +141,7 @@ where
                 sandbox_id: sandbox_id.to_string(),
             }
         }
-        // Told rather than silently rewritten: the row belongs to somebody
-        // else's cluster.
+        // Cross-cluster rows are reported instead of rewritten.
         Ok(Some(_)) => invalid(
             sandbox_id,
             "registry already holds this sandbox for a different cluster",
@@ -192,7 +149,7 @@ where
     }
 }
 
-/// `CompletePause` (`completePauseSQL`, `store_postgres.go:648-664`).
+/// Completes a publishing pause.
 pub async fn complete_pause(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
@@ -218,7 +175,7 @@ pub async fn complete_pause(
     Ok(())
 }
 
-/// `MarkLocalOnly` (`markLocalOnlySQL`, `store_postgres.go:694-703`).
+/// Marks a publishing pause local-only.
 pub async fn mark_local_only(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
@@ -242,10 +199,7 @@ pub async fn mark_local_only(
     Ok(())
 }
 
-/// `ClaimForResume` (`store_postgres.go:815-930`), ported: `durable_only`
-/// selects `claim_for_resume_durable_only_sql` in place of the full
-/// three-way test -- the Rust equivalent of Go's
-/// `!s.grace.allowsLeaseTakeover()` gate (see [`super::grace`]).
+/// Claims a sandbox, optionally restricting takeover to durable paused rows.
 pub async fn claim_for_resume(
     registry: &PostgresPausedSandboxRegistry,
     durable_only: bool,
@@ -310,9 +264,7 @@ async fn claim_for_resume_not_claimed(
     }
 }
 
-/// `ReleaseClaim` (`releaseClaimSQL`, `store_postgres.go:971-986`): a
-/// seizure, so zero rows affected is a plain, non-error `false` -- somebody
-/// else already moved the row on, which is what this call wanted.
+/// Releases a resuming claim; a non-match is successful `false`.
 pub async fn release_claim(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
@@ -330,19 +282,9 @@ pub async fn release_claim(
     Ok(result.rows_affected() > 0)
 }
 
-/// `MarkRunning` (`store_postgres.go:1196-1294`), ported: **D3's split**
-/// stays split all the way through the bind list -- `node_id` (claimant,
-/// `$2`, compared in every WHERE branch) and `holder_node_id` (`$7`, written
-/// unconditionally into `origin_node_id`, compared only inside branch ③'s
-/// retry check) are two distinct parameters end to end, never merged into
-/// one before reaching SQL.
+/// Marks a sandbox running with distinct claimant and holder identities.
 ///
-/// 🔴 **B5**: the write and its "nothing matched" re-read now share one
-/// transaction. `store_postgres.go`'s own `MarkRunning` doc names exactly
-/// why this is load-bearing rather than an optional tidiness pass: the
-/// re-read "now decides whether the caller retries or stops for good, and a
-/// classification made against a version of the row this statement never saw
-/// can send a node either way for no reason".
+/// Write and refusal classification share one transaction.
 pub async fn mark_running(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
@@ -351,10 +293,7 @@ pub async fn mark_running(
     execution_id: ExecutionId,
     expires_at: Option<DateTime<Utc>>,
 ) -> RegistryResult<MarkRunningOutcome> {
-    // `holderNodeID empty means "same as nodeID"` -- `MarkRunning`'s own doc
-    // (`store.go`), ported verbatim: an older caller with nothing more
-    // precise to say, or any backend that runs its own sandboxes (where
-    // `node_id` already names the real machine).
+    // An empty holder means the claimant is also the physical holder.
     let holder = if holder_node_id.trim().is_empty() {
         node_id
     } else {
@@ -386,10 +325,7 @@ pub async fn mark_running(
         return Ok(MarkRunningOutcome::Adopted);
     }
 
-    // Nothing matched. Re-read, on the same transaction as the write above,
-    // to tell "untracked", "someone else holds it" and "this node's
-    // incarnation is stale" apart -- `MarkRunning`'s own re-read,
-    // `store_postgres.go:1258-1282`.
+    // Classify a non-match on the same transaction as the write.
     let Some(entry) = super::reads::get_via_conn(&mut *tx, registry.cluster_id, sandbox_id).await?
     else {
         tx.commit()
@@ -398,10 +334,7 @@ pub async fn mark_running(
         return Ok(MarkRunningOutcome::Untracked);
     };
 
-    // Read straight off the statement above: branches ① and ③ are the only
-    // two carrying an incarnation clause, so a row eligible for either can
-    // have failed on nothing else. Branch ③'s half compares against
-    // `holder`, mirroring which identity that branch's WHERE clause reads.
+    // Resuming and idempotent-running branches fence on different identities.
     let stale_incarnation = (entry.state == PausedRegistryState::Resuming
         && entry.claimed_by_node_id.as_deref() == Some(node_id))
         || (entry.state == PausedRegistryState::Running && entry.origin_node_id == holder);
@@ -419,17 +352,9 @@ pub async fn mark_running(
     Ok(MarkRunningOutcome::HeldElsewhere)
 }
 
-/// `RenewSandboxDeadline` (`renewSandboxDeadlineSQL`,
-/// `store_postgres.go:1296-1382`): no node identity in the WHERE at all --
-/// fenced on `execution_id` alone.
+/// Renews a deadline under execution fencing.
 ///
-/// 🔴 **B5**: write and re-read now share one transaction, for the same
-/// reason as [`mark_running`]'s identical fix -- `renew_sandbox_deadline`'s
-/// own doc on the trait ([`crate::orchestrator::paused_registry::
-/// PausedSandboxRegistry::renew_sandbox_deadline`]) is explicit that
-/// `Superseded` versus `NotTracked` decides whether a caller retries or
-/// gives up for good, and a classification made off a different connection's
-/// view of the row can send it either way for no reason.
+/// Write and refusal classification share one transaction.
 pub async fn renew_sandbox_deadline(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,
@@ -469,9 +394,7 @@ pub async fn renew_sandbox_deadline(
     Ok(outcome)
 }
 
-/// `Remove` (`removeSQL`, `store_postgres.go:1872-1909`): a non-match is a
-/// plain, non-error `false` -- the row this caller meant to delete is
-/// already gone, which is what it wanted.
+/// Removes one generation; a non-match is successful `false`.
 pub async fn remove(
     registry: &PostgresPausedSandboxRegistry,
     sandbox_id: &SandboxId,

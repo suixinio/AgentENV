@@ -1,10 +1,5 @@
-//! The row and the domain, and the one place either is turned into the
-//! other.
-//!
-//! 🔴 Same contract as the proto version: a row this build cannot make sense
-//! of must reach the caller as an error, never as a plausible-looking record
-//! it invented by guessing. `status` is read and matched by name, not
-//! flattened; an unknown value is refused here, by name.
+//! Strict conversion between PostgreSQL catalog rows and snapshot records.
+//! Unknown statuses, source kinds, or malformed payloads are errors.
 
 use serde::Deserialize;
 use sqlx::postgres::PgRow;
@@ -18,12 +13,7 @@ use crate::snapshot::types::{
 };
 use crate::types::SandboxResources;
 
-/// Which encoding of [`CommittedSnapshot`] this build writes into
-/// `committed_payload`. Matches `central/convert.rs`'s `COMMITTED_PAYLOAD_SCHEMA`
-/// — the two backends encode the same Rust type the same way (`serde_json`),
-/// so there is no reason for the version numbers to diverge, and every
-/// reason for them not to: a payload this build wrote through one backend
-/// must decode through the other unchanged.
+/// Schema version shared with the central backend's committed payload.
 pub const COMMITTED_PAYLOAD_SCHEMA: i32 = 1;
 
 pub const STATUS_WAITING: &str = "waiting";
@@ -34,16 +24,9 @@ pub const STATUS_ERROR: &str = "error";
 pub const SOURCE_KIND_TEMPLATE: &str = "template";
 pub const SOURCE_KIND_SANDBOX: &str = "sandbox";
 
-/// One row as `reads.rs`'s queries scan it — column order matches
-/// `SNAPSHOT_COLUMNS` in that file exactly; [`sqlx::FromRow`] below binds by
-/// name, not position, but the two are kept in the same order anyway so a
-/// reviewer can check them side by side.
+/// Runtime-decoded row matching the catalog query columns.
 ///
-/// 🔴 A hand-written [`sqlx::FromRow`] impl rather than `#[derive(FromRow)]`
-/// on purpose — the derive lives behind sqlx's `macros` feature, which this
-/// crate does not enable (`Cargo.toml`'s own comment: runtime-query API
-/// only, `sqlx::query`/`query_as`, never the compile-time macros). This impl
-/// costs the same handful of `try_get` calls the derive would generate.
+/// Implemented manually because this crate does not enable sqlx macros.
 pub struct CatalogRow {
     pub id: String,
     pub cluster_id: String,
@@ -101,8 +84,7 @@ fn malformed(row_id: &str, reason: impl Into<String>) -> RepositoryError {
     }
 }
 
-/// Turns one row into a record, refusing anything it cannot read — never a
-/// plausible-looking record for a row it did not understand.
+/// Strictly decodes one catalog row for `expected_cluster`.
 pub fn decode_row(row: CatalogRow, expected_cluster: Uuid) -> RepositoryResult<SnapshotRecord> {
     let id = SnapshotId::parse(&row.id).map_err(|_| malformed(&row.id, "id is not a uuid"))?;
 
@@ -141,17 +123,7 @@ pub fn decode_row(row: CatalogRow, expected_cluster: Uuid) -> RepositoryResult<S
         SOURCE_KIND_TEMPLATE => SnapshotSource::Template {
             build: TemplateBuildInfo {
                 status,
-                // 🔴 Deliberately `None`/`None` here, unlike the central
-                // backend's `decode_row`. The build's own timestamps are a
-                // LEFT JOIN LATERAL onto the newest `builds` row in Go's
-                // query, which this module's `reads.rs` does not join —
-                // nothing in the `SnapshotCatalog` trait surface this backs
-                // reads `build_started_at_ms`/`build_finished_at_ms` off a
-                // `SnapshotRecord`; the record's own `TemplateBuildInfo` only
-                // carries them for the object-store backends' benefit, which
-                // populate them from their own local bookkeeping. Wiring the
-                // join is tracked in the Stage B report's "not done" list
-                // rather than silently answered with a wrong value.
+                // Build timestamps are not selected by this catalog query.
                 started_at_unix_ms: None,
                 finished_at_unix_ms: None,
                 error_reason: decode_build_error(&row.id, row.build_error.as_ref())?,
@@ -239,9 +211,7 @@ fn decode_committed(
     }
 }
 
-/// Encodes a committed payload for the `bytea` column — matches
-/// `central/convert.rs::encode_committed` (same type, same `serde_json`
-/// encoding, same schema version).
+/// Encodes the versioned committed payload as JSON bytes.
 pub fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResult<Vec<u8>> {
     serde_json::to_vec(committed).map_err(|error| RepositoryError::Backend {
         message: "serialize committed snapshot payload for the catalog".to_string(),
@@ -249,10 +219,7 @@ pub fn encode_committed(committed: &CommittedSnapshot) -> RepositoryResult<Vec<u
     })
 }
 
-/// Encodes a build failure for the `jsonb` column. Always an object — see
-/// `central/convert.rs::encode_build_error`'s comment on why a bare-string
-/// encoding (which `TemplateBuildErrorReason`'s `Deserialize` also accepts,
-/// for legacy rows) is never written here.
+/// Encodes build failure details as a JSON object.
 pub fn encode_build_error(reason: &TemplateBuildErrorReason) -> serde_json::Value {
     serde_json::json!({"message": reason.message, "step": reason.step})
 }

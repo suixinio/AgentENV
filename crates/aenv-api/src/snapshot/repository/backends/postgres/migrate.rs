@@ -1,54 +1,7 @@
-//! Brings the catalog schema in a PostgreSQL database to the shape this build
-//! expects.
-//!
-//! Two conventions, both deliberate: a version table
-//! (`catalog_schema_migrations`) rather than a migration framework — a
-//! directory that changes roughly once a release does not earn a build-time
-//! tool — and a session-scoped PostgreSQL advisory lock so that two processes
-//! racing to migrate the same database (two `aenv-api` replicas starting at
-//! once) serialize rather than corrupt the ledger.
-//!
-//! # One version today, and the machinery for the next one
-//!
-//! `MIGRATIONS` carries a single entry: `0001_initial_schema.sql`, the squash
-//! of the five incremental files this catalog was built up through. The
-//! database they migrated was never released, so there was nothing to preserve
-//! and no second migrator to agree with about version numbers.
-//!
-//! 🔴 That does **not** make this an "apply one file" script, and it must not
-//! become one. Everything a real version 2 needs is here and stays here: the
-//! ledger, the ordering/density check, `preflight`, `verify_applied`,
-//! `RELATIONS_BY_VERSION`, and `apply_one`'s per-migration transaction. Adding
-//! a version is appending to two `const` arrays and dropping a `.sql` file
-//! beside this one.
-//!
-//! # Rolling it back
-//!
-//! There is no down migration. A rollback is dropping what was created:
-//!
-//! ```text
-//! DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;
-//! DROP TABLE IF EXISTS catalog_schema_migrations;
-//! ```
-//!
-//! Both lines. The second is the one an operator forgets — it is not one of
-//! the tables the change was about — and forgetting it is silent: the next
-//! start believes every version is already applied, creates nothing, and
-//! every catalog query then fails on a missing relation with no way forward
-//! short of re-running this file's `DROP` by hand.
-//!
-//! # Why `preflight` and `verify_applied` both exist
-//!
-//! `preflight` refuses to create a table that is already there under an *empty*
-//! ledger — somebody else's table, whoever they are — because every statement
-//! in a migration file is `IF NOT EXISTS`, so marching ahead would leave a
-//! schema that looks migrated and rejects writes on a column this ledger never
-//! added. `verify_applied` refuses the opposite shape: a ledger that claims
-//! work the database no longer has, which is what a rollback that dropped the
-//! tables and forgot the ledger looks like. It checks every recorded version's
-//! own relations rather than only the ones a rollback would touch, and skips
-//! versions it does not recognise so that a database some future migrator got
-//! ahead on does not fail every start here.
+//! Versioned catalog migrations serialized by a session-scoped schema lock.
+//! Preflight refuses owned relations under an empty ledger; verification
+//! refuses recorded versions whose relations disappeared.
+//! Each migration and ledger write commit atomically.
 
 use anyhow::{Context, Result};
 use sqlx::postgres::PgPool;
@@ -62,16 +15,7 @@ struct Migration {
     body: &'static str,
 }
 
-/// Every migration this build carries, in the order they must apply.
-///
-/// 🔴 Order here is asserted by a test (`migrations_are_ordered_and_versions_are_dense`)
-/// rather than merely hoped for — `apply` trusts this order and does not sort
-/// it. A `const` array read top to bottom is the whole directory in this build,
-/// so sorting it a second time at runtime would only hide a mistake in this
-/// list instead of catching it at compile-adjacent test time. The check keeps
-/// meaning something the day a second entry lands: it is what makes appending
-/// a version 3 while a version 2 is still on a branch fail here rather than in
-/// a half-migrated database.
+// Ordered, dense migration list; tests enforce the sequence.
 const MIGRATIONS: &[Migration] = &[Migration {
     version: 1,
     name: "0001_initial_schema.sql",
@@ -84,19 +28,9 @@ CREATE TABLE IF NOT EXISTS catalog_schema_migrations (
     applied_at_ms BIGINT  NOT NULL
 )";
 
-/// Brings the catalog schema to the shape this build expects.
+/// Applies every unrecorded catalog migration on one lock-holding connection.
 ///
-/// Takes the schema lock on one pinned connection (advisory locks are
-/// session-scoped, so the lock and the unlock must be the same session), runs
-/// every migration this database has not recorded, and releases the lock
-/// before returning either way.
-///
-/// 🔴 Callers should treat a failure here as a reason to refuse to serve the
-/// catalog rather than to crash the process outright wherever that choice is
-/// available to them. The only caller (`PostgresSnapshotCatalog::connect`)
-/// runs this synchronously during backend assembly, before anything is wired
-/// to serve traffic, so there is no "already serving, now the schema turns out
-/// to be broken" state to guard against.
+/// Unlocks before returning and closes the connection if lock state is uncertain.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     let mut conn = pool
         .acquire()
@@ -111,11 +45,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 
     let apply_result = apply(&mut conn).await;
 
-    // 🔴 Released before the outcome is reported: whatever failed above may
-    // have left the connection's server-side state
-    // in a way that makes even the unlock fail; if so, close the connection
-    // outright rather than let a lock-holding session drift back into the
-    // pool for some other borrower to inherit.
+    // Never return a connection with uncertain advisory-lock state to the pool.
     match sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(GO_SCHEMA_LOCK_KEY)
         .execute(&mut *conn)
@@ -159,13 +89,7 @@ async fn apply(conn: &mut sqlx::PgConnection) -> Result<()> {
     Ok(())
 }
 
-/// The relations each migration version is expected to have created, in
-/// version order — what `preflight` refuses to overwrite and what
-/// `verify_applied` demands still exists.
-///
-/// 🔴 `active_templates` is a view and is listed anyway: `to_regclass`
-/// resolves a view the same as a table, and a rollback that took the view
-/// without the ledger is the same broken state as one that took a table.
+// Relations required by each recorded migration version, including views.
 const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[(
     1,
     &[
@@ -184,11 +108,7 @@ fn owned_relations() -> Vec<&'static str> {
         .collect()
 }
 
-/// `to_regclass` resolves against the connection's `search_path`, which is
-/// what keeps this consistent between a
-/// production connection (the `public` schema) and this module's own
-/// `pg::` tests (each running in its own schema-scoped connection via
-/// `isolated_schema_pool`).
+// `to_regclass` resolves against this connection's search path.
 async fn relation_exists(conn: &mut sqlx::PgConnection, relation: &str) -> Result<bool> {
     let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
         .bind(relation)
@@ -198,10 +118,7 @@ async fn relation_exists(conn: &mut sqlx::PgConnection, relation: &str) -> Resul
     Ok(found.is_some())
 }
 
-/// Refuses to create a table that already exists and was not created by this
-/// ledger. Only fires on an empty ledger:
-/// once anything is recorded, these relations are this ledger's by
-/// construction and their existence is expected.
+// Refuses owned relations under an empty migration ledger.
 async fn preflight(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Result<()> {
     if !applied.is_empty() {
         return Ok(());
@@ -228,11 +145,7 @@ async fn preflight(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Res
     )
 }
 
-/// Refuses a ledger that claims work the database no longer has: checked
-/// against every recorded version's relations, not only the ones a
-/// half-finished rollback would touch. Versions this build does not recognise
-/// are skipped — that is a database a newer (or differently versioned)
-/// migrator touched, and this one has no idea what those files created.
+// Refuses recorded migrations whose expected relations are missing.
 async fn verify_applied(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Result<()> {
     if applied.is_empty() {
         return Ok(());
@@ -281,13 +194,8 @@ async fn apply_one(conn: &mut sqlx::PgConnection, migration: &Migration) -> Resu
         .await
         .with_context(|| format!("begin transaction for catalog migration {}", migration.name))?;
 
-    // 🔴 `sqlx::raw_sql`, not `sqlx::query`. The extended (prepared-statement)
-    // protocol `query()` uses accepts exactly one statement; these files are
-    // several, some containing PL/pgSQL bodies with their own internal
-    // semicolons inside `$$ ... $$` dollar-quoting (0001's two trigger
-    // functions). `raw_sql` sends the file as one simple-query message and
-    // lets PostgreSQL's own parser split it, which is the same thing `psql`
-    // does for a multi-statement body.
+    // Migration files require the simple-query protocol for multiple statements
+    // and dollar-quoted PL/pgSQL bodies.
     sqlx::raw_sql(migration.body)
         .execute(&mut *tx)
         .await
@@ -336,11 +244,7 @@ mod pg {
         );
     }
 
-    /// `information_schema.tables` is not filtered by `search_path` on its
-    /// own, so two isolated-schema tests both creating a `snapshots` table
-    /// would each see the other's row here unless the query names its own
-    /// schema explicitly. `current_schema()` is what `isolated_schema_pool`'s
-    /// `after_connect` hook set on this exact connection.
+    // Scope information_schema to the test connection's current schema.
     async fn table_exists_in_current_schema(pool: &sqlx::PgPool, table: &str) -> bool {
         sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables \
@@ -397,9 +301,6 @@ mod pg {
         assert_eq!(count, MIGRATIONS.len() as i64);
     }
 
-    /// The rollback command this module's doc comment quotes actually works,
-    /// against a database this module actually migrated — not asserted only
-    /// in prose.
     #[tokio::test]
     async fn the_documented_rollback_command_actually_rolls_back() {
         let pool =
@@ -421,21 +322,11 @@ mod pg {
             );
         }
 
-        // And migrating again from a rolled-back database works, the same as
-        // a first start would.
         migrate(&pool)
             .await
             .expect("re-migrating after rollback should succeed");
     }
 
-    /// Two competitors racing to migrate the same schema must not corrupt the
-    /// ledger — the whole reason for the advisory lock. Both competitors
-    /// share one isolated-schema pool (rather than one pool each) precisely
-    /// so they race over the *same* tables: `pool.acquire()` still hands each
-    /// concurrent `migrate()` call its own physical connection, which is
-    /// exactly what two `aenv-api` replicas each holding their own pool
-    /// would look like, without racing every *other* concurrently-running
-    /// test over the shared `public` schema's table names.
     #[tokio::test]
     async fn two_concurrent_migrators_do_not_corrupt_the_ledger() {
         let pool =
@@ -453,19 +344,11 @@ mod pg {
         assert_eq!(recorded, vec![1], "no duplicate or missing ledger rows");
     }
 
-    /// A database already holding these tables under an empty ledger — some
-    /// other tool's `snapshots`, or a rollback that dropped the ledger and
-    /// nothing else. `migrate()` must refuse rather than march ahead over a
-    /// table it did not create, because every statement in the file is
-    /// `IF NOT EXISTS` and would quietly do nothing.
     #[tokio::test]
     async fn preflight_refuses_a_snapshots_table_that_predates_the_ledger() {
         let pool = isolated_schema_pool_or_skip!(
             "preflight_refuses_a_snapshots_table_that_predates_the_ledger"
         );
-        // A stand-in for a table some other migrator created — no columns
-        // this build would recognize, deliberately, since preflight only
-        // checks existence, never shape.
         sqlx::query("CREATE TABLE snapshots (id INT)")
             .execute(&pool)
             .await
@@ -480,8 +363,6 @@ mod pg {
             "got: {message}"
         );
 
-        // And it did not quietly create anything else either — the ledger is
-        // still empty, not partially populated.
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM catalog_schema_migrations")
             .fetch_one(&pool)
             .await
@@ -492,18 +373,12 @@ mod pg {
         );
     }
 
-    /// The half-finished-rollback shape `verify_applied` exists for: the four
-    /// owned tables dropped, `catalog_schema_migrations` left behind. A
-    /// second `migrate()` must refuse rather than believe the ledger and
-    /// silently create nothing.
     #[tokio::test]
     async fn verify_applied_refuses_a_ledger_whose_tables_are_gone() {
         let pool =
             isolated_schema_pool_or_skip!("verify_applied_refuses_a_ledger_whose_tables_are_gone");
         migrate(&pool).await.expect("migration should succeed");
 
-        // The rollback command's first line, without its second — the exact
-        // mistake this guard exists to catch.
         sqlx::raw_sql("DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;")
             .execute(&pool)
             .await
@@ -519,12 +394,6 @@ mod pg {
         );
     }
 
-    /// A version this build's own `RELATIONS_BY_VERSION` has no entry for —
-    /// standing in for a migration a *different* migrator applied under a
-    /// version number this build has never heard of — must not be refused.
-    /// Refusing it would mean two independently-versioned migrators could
-    /// never share a database without this build failing every start the
-    /// moment the other one gets ahead.
     #[tokio::test]
     async fn an_unrecognized_version_in_the_ledger_is_skipped_not_refused() {
         let pool = isolated_schema_pool_or_skip!(
@@ -544,26 +413,7 @@ mod pg {
             .expect("a ledger row this build does not recognize must not block a start");
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // What the schema actually is
-    //
-    // 🔴 These four lists are the reason a squashed migration is safe to edit.
-    // Every statement in `0001_initial_schema.sql` is `IF NOT EXISTS` /
-    // `OR REPLACE`, so *deleting* one is silent: the file still applies, the
-    // ledger still records version 1, every other test here still passes, and
-    // the constraint or index that was supposed to stop a bad row is simply
-    // gone. Nothing else in this crate reads `pg_constraint`. So these
-    // assertions are spelled as whole sorted sets rather than as `contains`
-    // checks — a set comparison fails on a deletion, which is the direction
-    // that matters, and a `contains` check does not.
-    //
-    // A deliberate change to the schema is meant to fail these and be updated
-    // here in the same commit. That is the point: the update is where somebody
-    // states, in the diff, which rule they are removing.
-    // ─────────────────────────────────────────────────────────────────────
 
-    /// Everything in the test connection's own schema, so two isolated-schema
-    /// tests cannot see each other's tables.
     async fn schema_facts(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
         sqlx::query_scalar(sql)
             .fetch_all(pool)
@@ -600,20 +450,6 @@ mod pg {
         );
     }
 
-    /// 🔴 The auto-named column CHECKs (`snapshots_cpu_count_check`,
-    /// `snapshots_status_check`, …) are listed beside the hand-named ones on
-    /// purpose. PostgreSQL derives those names from the table and column, so
-    /// they are stable, and pinning them is what catches an inline `CHECK`
-    /// being dropped out of a `CREATE TABLE` — which no named-constraint list
-    /// would notice.
-    ///
-    /// 🔴 There is deliberately no `snapshots_disk_size_mib_check` here.
-    /// `disk_size_mib` carries no inline positivity CHECK: 0 means "not known
-    /// until the build produces a rootfs", and an insert-time `> 0` refused
-    /// every v3 template create. The two named rules below
-    /// (`snapshots_disk_size_floor`, `snapshots_ready_has_disk_size`) are what
-    /// replaced it, and this assertion fails if somebody puts the inline one
-    /// back.
     #[tokio::test]
     async fn the_applied_schema_has_exactly_these_constraints() {
         let pool =
@@ -663,12 +499,6 @@ mod pg {
         );
     }
 
-    /// 🔴 `unique` and `partial` are asserted, not just the names. Both carry
-    /// the rule rather than the performance: `builds_one_active_per_template`
-    /// is what makes "one live build per template" an impossibility instead of
-    /// a race two concurrent POSTs can lose, and it only means that while it is
-    /// UNIQUE *and* predicated on the active status groups. An index recreated
-    /// without either half still answers every query and enforces nothing.
     #[tokio::test]
     async fn the_applied_schema_has_exactly_these_indexes() {
         let pool = isolated_schema_pool_or_skip!("the_applied_schema_has_exactly_these_indexes");
@@ -707,12 +537,6 @@ mod pg {
         );
     }
 
-    /// 🔴 The function each trigger calls is part of the assertion. `status_group`
-    /// is never written by a caller — every read path's partial indexes are
-    /// predicated on it — so a trigger left pointing at the wrong function, or
-    /// dropped from one of the two tables that carry the column, produces rows
-    /// whose `status_group` disagrees with their `status` and which the listing
-    /// index therefore cannot see.
     #[tokio::test]
     async fn the_applied_schema_has_exactly_these_triggers() {
         let pool = isolated_schema_pool_or_skip!("the_applied_schema_has_exactly_these_triggers");

@@ -1,15 +1,6 @@
-//! `PostgresSnapshotCatalog`: a `SnapshotCatalog` implementation that talks to
-//! PostgreSQL directly, in-process — the Stage B replacement for the gRPC hop
-//! to `services/scheduler` that a now-deleted client used to make.
-//!
-//! 🔴 `aenv-node` must never hold one of these, and cannot: it does not link
-//! this crate. See `crate::pg`'s own module doc, and that binary's
-//! `refuse_configured_pg_dsn`, which refuses startup outright if `[pg].dsn` is
-//! configured at all.
-//!
-//! Wired into `build_snapshot_backend` by [`pg_snapshot_catalog`] below: this
-//! is the snapshot catalog, and since the object-storage catalog was removed it
-//! is the only one. Object storage holds byte artifacts and no rows.
+//! Direct PostgreSQL snapshot catalog for control-plane processes.
+//! Object storage holds byte artifacts only; catalog rows live here.
+//! `aenv-node` must not link this crate or hold database credentials.
 
 pub mod convert;
 pub mod metrics;
@@ -33,19 +24,10 @@ use crate::snapshot::repository::interfaces::{
 use crate::snapshot::repository::RepositoryResult;
 use crate::snapshot::types::{SnapshotId, SnapshotRecord, TemplateBuildErrorReason};
 
-/// Cluster-wide concurrent-build ceiling `PostgresSnapshotCatalog::new`
-/// starts at, and what an explicit `0` passed to
-/// [`PostgresSnapshotCatalog::with_max_concurrent_builds`] resolves to —
-/// mirrors Go's own default (`defaultMaxConcurrentBuilds`,
-/// `store_postgres.go:27`, re-read from `config.snapshot.catalog` at
-/// [`pg_snapshot_catalog`]'s call site). A *negative* value removes the
-/// ceiling entirely (see `with_max_concurrent_builds`'s own doc); `0` is
-/// never unlimited on either side.
+/// Default cluster-wide concurrent-build ceiling; zero resolves to this value.
 pub const DEFAULT_MAX_CONCURRENT_BUILDS: i32 = 20;
 
-/// A `SnapshotCatalog` backed by a direct, in-process connection pool to the
-/// shared control-plane PostgreSQL database, rather than an RPC hop to
-/// `services/scheduler`.
+/// Snapshot catalog backed by the shared control-plane PostgreSQL pool.
 pub struct PostgresSnapshotCatalog {
     pool: PgPool,
     cluster_id: Uuid,
@@ -54,12 +36,7 @@ pub struct PostgresSnapshotCatalog {
 }
 
 impl PostgresSnapshotCatalog {
-    /// Wraps an already-connected, already-migrated pool. The pool itself is
-    /// built by `src/pg::connect` and migrated by
-    /// `crate::snapshot::repository::backends::postgres::migrate::migrate` —
-    /// this type never dials PostgreSQL or applies schema changes on its
-    /// own; "how to reach the database" and "what to do once connected"
-    /// stay two separate concerns.
+    /// Wraps an already-connected and migrated pool.
     pub fn new(pool: PgPool, cluster_id: Uuid, node_id: String) -> Self {
         Self {
             pool,
@@ -69,23 +46,8 @@ impl PostgresSnapshotCatalog {
         }
     }
 
-    /// Overrides the cluster-wide build ceiling `new` started at — the
-    /// production caller is [`pg_snapshot_catalog`]
-    /// below, which passes
-    /// `config.snapshot.catalog.max_concurrent_builds` here on every
-    /// `PostgresSnapshotCatalog` it builds; tests call it directly to drive
-    /// admission at a ceiling other than the default.
-    ///
-    /// Mirrors Go's own resolution in `NewStoreWithPool`
-    /// (`store_postgres.go:134-137`): `0` takes [`DEFAULT_MAX_CONCURRENT_BUILDS`]
-    /// — matching a config that was left unset, not "no ceiling" — while any
-    /// other value, including negative, passes straight through. A negative
-    /// value is what actually removes the ceiling: `writes::start_build`
-    /// only takes the advisory lock and runs the cluster-wide `count(*)`
-    /// when `max_concurrent_builds > 0` (`store_postgres.go:809`'s
-    /// `if s.maxConcurrentBuilds > 0`), so 0 and a positive number are both
-    /// enforced and only a negative number skips the check (and its cost)
-    /// entirely.
+    /// Sets the build ceiling. Zero uses [`DEFAULT_MAX_CONCURRENT_BUILDS`];
+    /// negative disables the ceiling.
     pub fn with_max_concurrent_builds(mut self, max: i32) -> Self {
         self.max_concurrent_builds = if max == 0 {
             DEFAULT_MAX_CONCURRENT_BUILDS
@@ -130,10 +92,6 @@ impl PostgresSnapshotCatalog {
     }
 }
 
-// 🔴 P6: `metrics::record_catalog_outcome` is wired here, on the
-// `SnapshotCatalog` trait surface — which is now the *only* path any
-// deployment calls. `build_snapshot_backend` wires this `Arc<dyn
-// SnapshotCatalog>` straight into the repository, with nothing in front of it.
 #[async_trait]
 impl SnapshotCatalog for PostgresSnapshotCatalog {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
@@ -150,8 +108,6 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
         )
     }
 
-    /// Resolvable rows only — see [`Self::get_scoped`] for the surface that
-    /// must see a `building`/`waiting`/`error` row.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
         PostgresSnapshotCatalog::get_scoped(self, id_or_alias, CatalogReadScope::Resolvable).await
     }
@@ -229,21 +185,7 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
     }
 }
 
-/// The snapshot catalog, over the one `[pg]` pool this process built — what
-/// [`build_snapshot_backend`][super::build_snapshot_backend] takes, and the
-/// only catalog there is.
-///
-/// # 🔴 The `PostgresSnapshotCatalog` construction lives here, not in the
-/// shared assembly
-///
-/// The shared assembly used to take an `Option<&sqlx::PgPool>` and build this
-/// itself, which put `sqlx` — and with it a database credential — inside code
-/// every role links. Everything that touches the pool is on this side of the
-/// seam now; the shared assembly takes the result.
-///
-/// `max_concurrent_builds` is read from `config` here, and it is the only
-/// place it is read on the production path — see
-/// `max_concurrent_builds_from_config_reaches_admission`.
+/// Builds the production PostgreSQL catalog from the process pool and config.
 pub fn pg_snapshot_catalog(config: &AppConfig, pool: &PgPool) -> Arc<dyn SnapshotCatalog> {
     let identity = crate::identity::NodeIdentity::from_config(&config.node_identity);
     let catalog = Arc::new(
@@ -251,13 +193,7 @@ pub fn pg_snapshot_catalog(config: &AppConfig, pool: &PgPool) -> Arc<dyn Snapsho
             .with_max_concurrent_builds(config.snapshot.catalog.max_concurrent_builds),
     );
     if config.snapshot.catalog.max_concurrent_builds < 0 {
-        // 🔴 Legal, and deliberate (see `SnapshotCatalogConfig::max_concurrent_builds`'s
-        // own doc for why negative rather than zero means this) — still worth
-        // a line at startup, matching
-        // `services/scheduler/cmd/main.go::announceBuildQueue`'s own warning:
-        // with no ceiling the only thing bounding concurrent builds is how
-        // many VMs the fleet can boot, and the first symptom is nodes running
-        // out of memory rather than a refusal anybody can read.
+        // Negative explicitly disables the cluster-wide build ceiling.
         tracing::warn!(
             target: "agentenv",
             max_concurrent_builds = config.snapshot.catalog.max_concurrent_builds,
@@ -269,20 +205,9 @@ pub fn pg_snapshot_catalog(config: &AppConfig, pool: &PgPool) -> Arc<dyn Snapsho
     catalog as Arc<dyn SnapshotCatalog>
 }
 
-/// Starts the catalog build reaper for this process, when `pool` is `Some`
-/// (i.e. `[pg]` is configured) — a thin `pub` bridge so `src/bin/aenv-api.rs`
-/// (a separate crate from this library) can reach
-/// `reaper::spawn`, which stays `pub(crate)` like the rest of that
-/// module. `None` (no interval/ttl configured, or no pool at all) means
-/// nothing was started, matching [`reaper::spawn`]'s own `None`
-/// case.
+/// Starts the optional catalog-build-reaper singleton.
 ///
-/// 🔴 The returned handle must be shut down through
-/// `aenv_core::pg::SingletonTaskHandle::shutdown()`, never pushed into a
-/// `Vec<tokio::task::JoinHandle<()>>` and `.abort()`-ed — see that type's
-/// own documentation on why: this replica's PostgreSQL advisory lock, if it
-/// is currently leader, would otherwise leak until the pool itself is torn
-/// down.
+/// Shut down the returned handle asynchronously to release its advisory lock.
 pub fn spawn_catalog_build_reaper(
     pool: Option<sqlx::PgPool>,
     cluster_id: uuid::Uuid,
@@ -292,22 +217,9 @@ pub fn spawn_catalog_build_reaper(
     reaper::spawn(pool?, cluster_id, interval, ttl)
 }
 
-/// Brings the catalog schema in `pool`'s database to the shape this build
-/// expects. A thin `pub` bridge to `migrate::migrate`, which stays
-/// `pub(crate)` like the rest of that module — see
-/// [`spawn_catalog_build_reaper`]'s own doc for why `src/bin/aenv-api.rs` (a
-/// separate crate from this library) needs one of these per function it
-/// calls into `postgres::`.
+/// Migrates the catalog schema before any catalog or reaper uses the pool.
 ///
-/// 🔴 Must run to completion before anything else touches the `snapshots` /
-/// `aliases` / `builds` tables through this pool — the catalog build reaper
-/// (`spawn_catalog_build_reaper`) and `build_snapshot_backend`'s
-/// `PostgresSnapshotCatalog` construction both assume the schema already
-/// exists and neither one migrates it itself (see `PostgresSnapshotCatalog`'s
-/// own module doc). Idempotent and safe to call on every start — the
-/// migration runner's own session-scoped advisory lock (`GO_SCHEMA_LOCK_KEY`)
-/// is what lets a fleet of `aenv-api` replicas call this concurrently
-/// without racing each other.
+/// Idempotent concurrent calls serialize on the schema advisory lock.
 pub async fn migrate_catalog_schema(pool: &sqlx::PgPool) -> Result<()> {
     migrate::migrate(pool).await
 }
@@ -324,10 +236,6 @@ mod pg {
     use crate::types::SandboxResources;
     use migrate::migrate;
 
-    /// A fresh, migrated, schema-isolated catalog, or an early `return` out
-    /// of the calling test — see [`isolated_schema_pool_or_skip`], which
-    /// this expands to. A macro rather than an `async fn` because that macro
-    /// itself needs a string *literal* (its skip message), not a value.
     macro_rules! catalog {
         ($test:literal) => {{
             let pool = isolated_schema_pool_or_skip!($test);
@@ -363,7 +271,6 @@ mod pg {
         }
     }
 
-    // ── create / get / list ────────────────────────────────────────────
 
     #[tokio::test]
     async fn a_created_template_is_waiting_and_readable_only_at_any_status() {
@@ -423,7 +330,6 @@ mod pg {
         }
     }
 
-    // ── publish_commit ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn publish_commit_opens_and_flips_a_row_in_one_call() {
@@ -450,14 +356,6 @@ mod pg {
         );
     }
 
-    /// Regression: `commit_snapshot`'s in-memory return value used to
-    /// hardcode `SnapshotSource::Template` regardless of what was actually
-    /// committed, so a sandbox (pause) commit's immediate return value would
-    /// silently claim to be a template and lose `source_sandbox_id` — even
-    /// though the row written to the database was always correct (`reads.rs`
-    /// decodes it right back). Any caller trusting `publish_commit`'s return
-    /// value directly, rather than re-reading the row, would have seen the
-    /// wrong thing.
     #[tokio::test]
     async fn publish_commit_of_a_sandbox_snapshot_reports_its_source_correctly() {
         let catalog = catalog!("publish_commit_of_a_sandbox_snapshot_reports_its_source_correctly");
@@ -495,20 +393,11 @@ mod pg {
             .create(record.clone())
             .await
             .expect("create should succeed");
-        // The real flow: create (waiting) -> try_start_build (waiting ->
-        // building) -> publish_commit (building -> ready). Without the
-        // middle step the row is still `waiting`, and `commit_snapshot`'s own
-        // fencing (`WHERE status = 'building'`) correctly refuses it -- that
-        // refusal is a different, already-covered case
-        // (`committing_a_row_that_is_not_building_is_refused`), not this one.
         catalog
             .try_start_build(&record.id)
             .await
             .expect("starting the build should succeed");
 
-        // A template build commits into the row `create` opened and
-        // `try_start_build` moved to `building` -- `begin_snapshot`'s
-        // ALREADY_EXISTS must be swallowed, not refused.
         let commit = commit_for(record.id.clone(), None);
         let published = catalog
             .publish_commit(commit)
@@ -517,15 +406,6 @@ mod pg {
         assert_eq!(published.id, record.id);
     }
 
-    /// Regression for the v3 template build path failing with `AliasTaken`
-    /// against its *own* id every time: `POST /v3/templates` pre-binds the
-    /// alias to the new template's id via `create` (`begin_snapshot` ->
-    /// `bind_alias`), and the build's own `publish_commit` later binds the
-    /// same alias again onto the same id via `commit_snapshot` ->
-    /// `bind_alias`. That second bind must be a no-op, not a conflict --
-    /// `bind_alias`'s `INSERT ... ON CONFLICT DO NOTHING` was unconditionally
-    /// reporting `AliasTaken` on any conflict, including one where the
-    /// row already found by `SELECT snapshot_id` is this exact snapshot.
     #[tokio::test]
     async fn publish_commit_rebinding_its_own_alias_is_idempotent_not_alias_taken() {
         let catalog =
@@ -551,17 +431,6 @@ mod pg {
         );
     }
 
-    /// The other side of the idempotence fix above: the branch must recognise
-    /// *this* snapshot, not accept anyone. A different snapshot reaching for a
-    /// name someone else still holds must still be refused, must still name
-    /// the real holder, and must leave both rows where they were.
-    ///
-    /// Deliberately staged so the steal is attempted by `commit_snapshot`'s
-    /// `bind_alias` rather than `begin_snapshot`'s: `publish_commit` over a
-    /// row that already exists never reaches the opening bind (the id insert
-    /// conflicts first and `AlreadyExists` is swallowed), so the commit-time
-    /// bind is the only one that runs -- and it is the one whose refusal has
-    /// to take the flip to `ready` back out with it.
     #[tokio::test]
     async fn publish_commit_refuses_to_steal_an_alias_held_by_a_different_snapshot() {
         let catalog =
@@ -624,13 +493,8 @@ mod pg {
             .publish_commit(commit)
             .await
             .expect_err("a ready row must know its disk size");
-        // The refusal surfaces as a backend error carrying the CHECK
-        // constraint's own message; this only pins that publishing a
-        // zero-sized ready row is rejected, not the exact wording.
         let _ = error;
 
-        // The failed attempt must not have moved the row off `building`, or
-        // this second, real-sized commit would itself be fenced out.
         let mut commit = commit_for(record.id, None);
         commit.resources.disk_size_mib = 2048;
         catalog
@@ -639,7 +503,6 @@ mod pg {
             .expect("a real disk size at commit time must succeed");
     }
 
-    // ── delete ───────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn deleting_drops_the_row_and_its_alias() {
@@ -657,14 +520,12 @@ mod pg {
         assert!(catalog.get(&record.id.to_string()).await.unwrap().is_none());
         assert!(catalog.resolve_alias("to-delete").await.unwrap().is_none());
 
-        // Idempotent.
         catalog
             .delete_record(&record)
             .await
             .expect("deleting an already-deleted row should still succeed");
     }
 
-    // ── listing / keyset pagination ────────────────────────────────────
 
     #[tokio::test]
     async fn listing_pages_newest_first_and_the_cursor_walks_every_row_once() {
@@ -677,8 +538,7 @@ mod pg {
                 .await
                 .expect("publish should succeed");
             ids.push(record.id);
-            // Ensure distinct millisecond timestamps so ordering is
-            // unambiguous without relying on id tie-breaking.
+            // Distinct timestamps avoid depending on ID tie-breaking.
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
 
@@ -709,11 +569,6 @@ mod pg {
         assert_eq!(seen, expected);
     }
 
-    /// 🔴 A filter with no `limit` is not a filter asking for every row — it
-    /// asks for `DEFAULT_LIST_PAGE_LIMIT`, and this is the only place that is
-    /// asserted against real SQL. It replaces the test for the unbounded
-    /// `list`, deleted with that method: what mattered about it was that an
-    /// unspecified limit drops no rows, and that is what this still says.
     #[tokio::test]
     async fn a_listing_with_no_limit_returns_the_default_page() {
         let catalog = catalog!("a_listing_with_no_limit_returns_the_default_page");
@@ -776,7 +631,6 @@ mod pg {
         ));
     }
 
-    // ── build admission ─────────────────────────────────────────────────
 
     #[tokio::test]
     async fn a_second_build_of_the_same_template_is_refused_while_one_is_active() {
@@ -800,16 +654,6 @@ mod pg {
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
     }
 
-    /// The concurrent form of the test above, and the one that actually
-    /// exercises `builds_one_active_per_template` rather than the
-    /// `pg_advisory_xact_lock` serializing two sequential calls that would
-    /// have been refused anyway. Two `try_start_build` calls launched at the
-    /// same instant simulate two `aenv-api` replicas racing to admit the
-    /// same template's build — under READ COMMITTED, a read-modify-write
-    /// implementation (SELECT the active-build count, then INSERT) would let
-    /// both through, which is exactly the defect `queries_admin.go`'s
-    /// `buildAdmissionKey` comment explains the advisory lock exists to
-    /// close. Only one of the two calls here may succeed.
     #[tokio::test]
     async fn two_concurrent_admissions_for_the_same_template_leave_only_one_winner() {
         let catalog =
@@ -832,9 +676,6 @@ mod pg {
             "exactly one of two concurrent admissions for the same template must win: {outcomes:?}"
         );
 
-        // And the loser's own error is the ordinary in-progress refusal, not
-        // some other failure mode (a raw unique-violation leaking through,
-        // for instance).
         let loser = if first.is_ok() { second } else { first };
         assert!(matches!(
             loser.unwrap_err(),
@@ -913,15 +754,6 @@ mod pg {
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
     }
 
-    /// 🔴 Regression for the exact defect P1 fixes: an explicit `0` used to
-    /// mean "no ceiling" (`writes.rs`'s old `max_concurrent_builds > 0 &&`
-    /// guard never fired for `0`), which silently dropped Go's cluster-wide
-    /// ceiling the moment `write = "both"`/`"postgres"` came up with no
-    /// override. `with_max_concurrent_builds(0)` must resolve to exactly
-    /// [`DEFAULT_MAX_CONCURRENT_BUILDS`] (20, matching Go's own default) —
-    /// admitting the 20th build and refusing the 21st proves both halves at
-    /// once: `0` is *bounded* (not unlimited) and bounded at the *right*
-    /// number, not some other finite one.
     #[tokio::test]
     async fn zero_resolves_to_the_default_ceiling_not_to_unlimited() {
         let pool =
@@ -956,9 +788,6 @@ mod pg {
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
     }
 
-    /// The other half of the same proof: a *negative* ceiling — not `0` — is
-    /// what actually removes the check, past the point `0`'s own default
-    /// would have refused at.
     #[tokio::test]
     async fn a_negative_ceiling_removes_it_entirely() {
         let pool = isolated_schema_pool_or_skip!("a_negative_ceiling_removes_it_entirely");
@@ -1018,16 +847,11 @@ mod pg {
         );
     }
 
-    // ── fencing ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn committing_a_row_that_is_not_building_is_refused() {
         let catalog = catalog!("committing_a_row_that_is_not_building_is_refused");
         let id = SnapshotId::generate();
-        // Never opened at all -- the commit's own begin_snapshot pre-step
-        // opens it as `building`, then the commit itself flips it. Publish
-        // it once, then try to publish the exact same id again: the second
-        // commit finds a `ready` row, not a `building` one, and must refuse.
         let commit = commit_for(id.clone(), None);
         catalog
             .publish_commit(commit)
@@ -1042,18 +866,6 @@ mod pg {
         let _ = error;
     }
 
-    // ── metrics (P6) ─────────────────────────────────────────────────────
-
-    /// 🔴 `agentenv_scheduler_catalog_rpc_total` and
-    /// `agentenv_scheduler_catalog_rejected_total` were declared and
-    /// entirely unwired before this — see `metrics.rs`'s own former "not
-    /// wired to anything yet" note. This drives the `SnapshotCatalog` trait
-    /// surface (not `#[tokio::test]`: `metrics::with_local_recorder` is
-    /// thread-local, so the driven calls have to run on the very thread that
-    /// installed the recorder, which a `#[tokio::test]` runtime does not
-    /// guarantee — same reason `composite.rs`'s own metrics tests build
-    /// their runtime by hand) and checks both series actually moved: one
-    /// ordinary call, and one call admission refuses.
     #[test]
     fn a_call_and_a_rejection_are_both_recorded() {
         use metrics_util::debugging::DebuggingRecorder;
@@ -1065,11 +877,7 @@ mod pg {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
 
-        // 🔴 `::metrics::`, the crate root — bare `metrics::` in this scope
-        // resolves to `postgres::metrics` (this file's own submodule,
-        // brought in by `use super::*` above), which shadows the
-        // `with_local_recorder` free function the external `metrics` crate
-        // exports.
+        // Qualify the crate root because this module shadows `metrics`.
         ::metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
                 let pool =
@@ -1094,11 +902,7 @@ mod pg {
             });
         });
 
-        // 🔴 One `snapshot()` call, not two through separate `counter_total`
-        // calls: `Snapshotter::snapshot()` drains what it reports —a second
-        // call sees zero even though the first genuinely observed the
-        // recorded counters — so both totals have to be read off the same
-        // snapshot.
+        // Snapshot once because reading drains the recorder.
         let sample = snapshotter.snapshot().into_vec();
         let total_of = |name: &str| -> u64 {
             sample

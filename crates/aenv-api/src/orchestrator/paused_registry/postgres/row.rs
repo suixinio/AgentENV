@@ -1,14 +1,5 @@
-//! Row decoding shared by every query that reads `paused_sandboxes` through
-//! [`super::sql::ENTRY_COLUMNS`] -- the Rust analogue of Go's `scanEntry`/
-//! `scanClaim` (`store_postgres.go:1930-2033`).
-//!
-//! Mirrors `central.rs`'s own `decode_entry`: refuse anything that cannot be
-//! read rather than pass on a plausible-looking record, and treat metadata
-//! the same way that backend already does (decoded into
-//! [`SandboxMetadata`] at the trait boundary) even though Go's own `Entry`
-//! keeps it as opaque `json.RawMessage` -- that split is a pre-existing
-//! choice of the Rust trait layer this backend has to honour, not something
-//! introduced here.
+//! Shared strict decoding for every `paused_sandboxes` query using
+//! [`super::sql::ENTRY_COLUMNS`].
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -19,10 +10,7 @@ use crate::orchestrator::store::SandboxMetadata;
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
 
-/// Every column [`super::sql::ENTRY_COLUMNS`] selects, decoded only as far as
-/// `sqlx` can do losslessly (uuid columns stay `String`, matching Go's own
-/// `::text` casts and its comment on why: independence from whichever uuid
-/// codec the driver happens to register).
+/// Lossless SQL row matching [`super::sql::ENTRY_COLUMNS`].
 #[derive(Debug, sqlx::FromRow)]
 pub struct EntryRow {
     pub sandbox_id: String,
@@ -41,10 +29,7 @@ pub struct EntryRow {
     pub execution_started_at: Option<DateTime<Utc>>,
 }
 
-/// `claim_for_resume_sql`/`claim_for_resume_durable_only_sql`'s result set:
-/// [`ENTRY_COLUMNS`](super::sql::ENTRY_COLUMNS) plus the trailing
-/// `previous_state` column those two statements alone add (`claimed.*,
-/// previous.previous_state` -- `scanClaim`, `store_postgres.go:1980-2033`).
+/// Claim row with the state that preceded the update.
 #[derive(Debug, sqlx::FromRow)]
 pub struct ClaimRow {
     pub sandbox_id: String,
@@ -85,11 +70,7 @@ impl ClaimRow {
     }
 }
 
-/// Decodes a claim result into the entry plus the state it moved *from* --
-/// the trait's [`super::super::ResumeClaim::Claimed::previous_state`] must
-/// never be read off the post-UPDATE row (always `Resuming`), which is
-/// exactly the bug [`super::super::types`]'s own doc warns silently
-/// mis-reported every ordinary resume as a takeover for months.
+/// Decodes the claimed entry and its pre-claim state.
 pub fn decode_claim(row: ClaimRow) -> RegistryResult<(PausedSandboxEntry, PausedRegistryState)> {
     let previous_state = PausedRegistryState::parse(&row.previous_state).ok_or_else(|| {
         invalid(
@@ -101,19 +82,7 @@ pub fn decode_claim(row: ClaimRow) -> RegistryResult<(PausedSandboxEntry, Paused
     Ok((entry, previous_state))
 }
 
-/// The same row, fully parsed -- for internal callers ([`super::reconcile`],
-/// [`super::reclaim`]) that need the lease/execution-start columns Go's own
-/// `Sandbox` type (`registry.go`) carries and the trait-facing
-/// [`PausedSandboxEntry`] does not.
-///
-/// 🔴 Not every field is read by [`super::reconcile::compute_reconcile`]
-/// today (`cluster_id`/`generation`/`claimed_by_node_id`/`paused_at`/
-/// `execution_id`/`execution_started_at`) -- this type mirrors Go's
-/// `Sandbox` row shape in full deliberately, matching every column
-/// [`super::sql::ENTRY_COLUMNS`] actually selects, rather than trimming it
-/// down to today's one consumer's exact needs. A future internal reader
-/// (a debug/inspection endpoint, a richer reconcile pass) should not have to
-/// widen a narrowed struct or add a second query.
+/// Fully parsed internal registry row.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct RegistryRow {
@@ -133,12 +102,7 @@ pub struct RegistryRow {
 }
 
 impl RegistryRow {
-    /// `LEASE_EXPIRED` (`store_postgres.go`'s `leaseExpired`), evaluated in
-    /// Rust for callers (`super::reconcile`) that need the same predicate
-    /// without a round trip -- `COALESCE(lease_expires_at, updated_at) <
-    /// now`. A row written before the lease column existed reads as already
-    /// expired, the safe direction: a live holder refreshes it within one
-    /// interval, a dead one never does.
+    /// Applies `COALESCE(lease_expires_at, updated_at) < now`.
     pub fn lease_expired(&self, now: DateTime<Utc>) -> bool {
         self.lease_expires_at.unwrap_or(self.updated_at) < now
     }
@@ -152,9 +116,6 @@ fn invalid(sandbox_id: &str, reason: impl Into<String>) -> PausedRegistryError {
     }
 }
 
-/// Parses the identity/state columns every caller needs regardless of
-/// whether it wants metadata decoded -- shared by [`decode_entry`] and
-/// [`decode_registry_row`].
 struct ParsedIdentity {
     sandbox_id: SandboxId,
     cluster_id: Uuid,
@@ -176,9 +137,7 @@ fn parse_identity(row: &EntryRow) -> RegistryResult<ParsedIdentity> {
             Some(SnapshotId::parse(raw).map_err(|e| invalid(&row.sandbox_id, e.to_string()))?)
         }
     };
-    // A durable row must name the snapshot it can be rebuilt from -- mirrors
-    // `Sandbox.Invalid()` (registry.go:158-160) and `central.rs::decode_entry`'s
-    // identical check.
+    // Durable paused rows must name the snapshot they can restore.
     if state == PausedRegistryState::Paused && snapshot_id.is_none() {
         return Err(invalid(
             &row.sandbox_id,
@@ -201,8 +160,7 @@ fn parse_identity(row: &EntryRow) -> RegistryResult<ParsedIdentity> {
     })
 }
 
-/// The trait-facing decode: [`PausedSandboxEntry`]'s 11 fields, metadata
-/// decoded into [`SandboxMetadata`] (mirrors `central.rs::decode_entry`).
+/// Decodes a trait-facing paused entry, including metadata.
 pub fn decode_entry(row: EntryRow) -> RegistryResult<PausedSandboxEntry> {
     let identity = parse_identity(&row)?;
     let metadata: SandboxMetadata =
@@ -227,11 +185,7 @@ pub fn decode_entry(row: EntryRow) -> RegistryResult<PausedSandboxEntry> {
     })
 }
 
-/// The `ListRegistrySandboxes` decode: [`PausedRegistryListEntry`]'s
-/// columns -- the lease/execution-id fields [`decode_entry`] leaves out
-/// (see that struct's own doc), metadata left undecoded like
-/// [`decode_registry_row`] (the wire response has no field for it and
-/// nothing downstream reads it).
+/// Decodes the administrative listing fields.
 pub fn decode_list_entry(row: EntryRow) -> RegistryResult<PausedRegistryListEntry> {
     let identity = parse_identity(&row)?;
     Ok(PausedRegistryListEntry {
@@ -250,8 +204,7 @@ pub fn decode_list_entry(row: EntryRow) -> RegistryResult<PausedRegistryListEntr
     })
 }
 
-/// The internal decode: every column, metadata left undecoded (nothing
-/// internal to this backend needs it -- reconcile/reclaim never read it).
+/// Decodes the complete internal row without parsing unused metadata.
 pub fn decode_registry_row(row: EntryRow) -> RegistryResult<RegistryRow> {
     let identity = parse_identity(&row)?;
     Ok(RegistryRow {

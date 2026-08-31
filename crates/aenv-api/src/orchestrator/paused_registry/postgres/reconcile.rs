@@ -1,59 +1,7 @@
-//! The reconcile leader loop -- a Rust port of `computeRegistryReconcile` +
-//! `RunRegistryReconcile` (`services/scheduler/internal/reconcile.go`).
-//!
-//! Runs as a cluster-wide singleton
-//! ([`crate::pg::election::spawn_singleton_task`],
-//! `AdvisoryLockKey::PausedRegistryReconcile`) -- see [`super::grace`]'s
-//! module doc for why this loop, not the reclaim loop, is the one that owns
-//! entering the restart grace window.
-//!
-//! # B1: D2 Fix A no longer lives here
-//!
-//! An earlier version of this module also renewed `Running`/parked-state
-//! leases from a fresh heartbeat roster (D2 Fix A, `151d00b`) as part of
-//! this same leader-elected pass, using
-//! [`crate::node_registry::registry::NodeRegistry::rosters_in_cluster`].
-//! That was wrong under N `aenv-api` replicas for a structural reason, not
-//! a bug in the renewal logic itself: `AtomicNodeRegistry` is a per-process,
-//! in-memory roster with **no synchronisation between replicas** -- each
-//! node's gRPC heartbeat connection is a long-lived HTTP/2 stream pinned to
-//! whichever one `agentenv-api` Pod it happened to dial, so any single
-//! replica's own `rosters_in_cluster` answer only ever covers the subset of
-//! nodes whose heartbeats landed on *that* replica. Running Fix A only on
-//! the reconcile *leader* -- one specific replica -- meant every node whose
-//! heartbeat was not pinned to that one replica had no renewal path for its
-//! `running` rows at all, silently reintroducing the exact "running row
-//! lease freeze" failure Fix A was written to close (see this crate's own
-//! memory note by that name), just steady-state instead of after a failover.
-//!
-//! Fix A now runs on [`super::replica_renewal`] instead: every replica, on
-//! its own timer, unelected, renews from *its own* roster alone.
-//! `renew_parked_leases`/`renew_live_leases` are idempotent, caller-asserted
-//! `UPDATE`s (their own WHERE re-checks `origin_node_id` against the
-//! asserted identity -- see `lease.rs`'s doc), so nothing about them ever
-//! needed leadership; the leader-election here was serialising something
-//! that did not require serialising. Running the same renewal
-//! independently, unelected, on every replica means the *union* of what
-//! every replica's own roster covers is what ends up renewed -- which, since
-//! every node's heartbeat is pinned to exactly one replica, is the entire
-//! cluster. See `postgres::contract`'s pg-gated
-//! `two_replicas_each_holding_part_of_the_roster_together_renew_every_running_row`
-//! for the union claim proved directly against two independent rosters.
-//!
-//! What stays leader-elected here, and why: [`super::grace::enter`] (a
-//! per-cluster write that really must run exactly once per coverage-gap
-//! epoch, not once per replica) and D4's metrics below (a per-tick read that
-//! is cheap to run once and pointless to run N times over).
-//!
-//! # D4: the monitoring gap this port closes
-//!
-//! Go's `strandedRows`/`parkedLeaseExpiring` metrics only ever counted
-//! `publishing`/`local_only` rows -- `running`/`resuming` rows have their own
-//! `liveLeaseLapsed`/`liveDeadlinePassed` counters computed right alongside
-//! them, but the two families were never folded into one exported gauge, so
-//! an operator watching only the "stranded" family never saw a `running`
-//! row's lease going unrenewed. [`ReconcileOutcome::at_risk_rows`] is the
-//! unified figure this port exposes from day one -- see its own doc.
+//! Cluster-singleton reconcile loop.
+//! Grace entry and roster-free metrics stay leader-elected; heartbeat-derived
+//! lease renewal runs per replica in [`super::replica_renewal`].
+//! Metrics include parked and live rows in one at-risk total.
 
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
@@ -69,38 +17,25 @@ use crate::orchestrator::paused_registry::PausedRegistryState;
 
 use super::row::RegistryRow;
 
-/// `defaultRegistryLeaseWarnWindow` (`reconcile.go:16`), verbatim: how far
-/// ahead of a lease's own deadline this loop starts warning.
 const LEASE_WARN_WINDOW: Duration = Duration::from_secs(30);
 
-/// `computeRegistryReconcile`'s result (`registryReconcileResult`,
-/// `reconcile.go`), ported -- minus the renewal-candidate lists B1 moved to
-/// [`super::replica_renewal`].
+/// Reconcile counters derived from one registry snapshot.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReconcileOutcome {
-    /// `publishing`/`local_only` rows with no snapshot at all -- a pause that
-    /// never finished publishing and never will unless its origin node comes
-    /// back.
+    /// Parked rows without a durable snapshot.
     pub stranded_rows: u64,
-    /// `publishing`/`local_only` rows whose lease is within
-    /// [`LEASE_WARN_WINDOW`] of lapsing.
+    /// Parked rows close to lease expiry.
     pub parked_lease_expiring: u64,
-    /// `running`/`resuming` rows whose lease has already lapsed.
+    /// Live rows with lapsed leases.
     pub live_lease_lapsed: u64,
-    /// `running` rows (only -- `resuming` has no user deadline of its own)
-    /// whose `sandbox_expires_at` has passed while the lease has not.
+    /// Running rows past their user deadline while the lease remains live.
     pub live_deadline_passed: u64,
-    /// Rows [`super::reclaim`]'s next pass would actually act on: `running`
-    /// rows with both conditions, or `resuming` rows with the lease alone
-    /// (Fix B -- see `sql.rs::RECLAIM_RELEASED_RESUMING_SQL`'s doc).
+    /// Rows the next reclaim pass can act on.
     pub reclaimable_now: u64,
 }
 
 impl ReconcileOutcome {
-    /// D4's unified figure: every row this pass found evidence of neglect
-    /// for, live or parked, folded into the one number an operator watching
-    /// a single gauge would actually see. Go's own metrics never exported
-    /// this sum -- see this module's own doc.
+    /// Returns the total parked and live rows showing neglect.
     pub fn at_risk_rows(&self) -> u64 {
         self.stranded_rows
             + self.parked_lease_expiring
@@ -109,10 +44,7 @@ impl ReconcileOutcome {
     }
 }
 
-/// `computeRegistryReconcile` (`reconcile.go`), ported: a pure function over
-/// the rows already read, so it is testable without a database (see the
-/// `#[cfg(test)] mod tests` below) the same way Go's own version is tested
-/// without one in `reconcile_test.go`.
+/// Computes reconcile counters from already-read rows.
 pub fn compute_reconcile(rows: &[RegistryRow], now: DateTime<Utc>) -> ReconcileOutcome {
     let mut outcome = ReconcileOutcome::default();
 
@@ -147,9 +79,7 @@ pub fn compute_reconcile(rows: &[RegistryRow], now: DateTime<Utc>) -> ReconcileO
     outcome
 }
 
-/// One reconcile pass against the live database: list rows, compute D4's
-/// metrics, log. Grace's own entry (`super::grace::enter`) happens in the
-/// caller, on the same connection, before this runs -- see [`spawn`]'s doc.
+/// Reads rows, records metrics, and returns one reconcile outcome.
 pub async fn reconcile_once(
     registry: &PostgresPausedSandboxRegistry,
 ) -> anyhow::Result<ReconcileOutcome> {
@@ -189,27 +119,6 @@ pub async fn reconcile_once(
     Ok(outcome)
 }
 
-/// D4-adjacent (task's own "Stage D remainder"): ports the subset of Go's
-/// `recordRegistryReconcile` (`metrics.go`) that this port can compute
-/// honestly from rows alone. **Deliberately excludes** `registry_ghost`,
-/// `registry_untracked`, `registry_stale_copy`, `registry_holder_conflict`,
-/// `registry_rows_without_roster`, `registry_roster_stale`, and the
-/// heartbeat-lease-renewal candidate/renewed/failure gauges: every one of
-/// those cross-references registry rows against a node's *heartbeat
-/// roster*, and this module's own B1 doc (above) explains why that
-/// cross-reference cannot run here -- `AtomicNodeRegistry` is a per-replica,
-/// in-memory view covering only the nodes whose heartbeat happens to be
-/// pinned to *this* `aenv-api` Pod, not the cluster's. Computing those six
-/// metrics from a partial roster would not degrade gracefully, it would
-/// actively lie: a node whose heartbeat landed on a different replica reads
-/// as `ghost`/`untracked` here even though it is perfectly healthy. Go's
-/// single-process scheduler has no such gap, which is exactly why this
-/// reconcile port is the leader-elected, roster-free half (see the module
-/// doc's "B1" section) and [`super::replica_renewal`] is the per-replica,
-/// roster-scoped half -- the split this metrics function respects too.
-/// `registry_enabled` also has no counterpart: this whole module is only
-/// ever spawned under the Postgres backend (see [`spawn`]), so the series'
-/// own presence in a scrape already says what the gauge would have.
 fn record_reconcile_metrics(
     cluster_id: Uuid,
     rows: &[RegistryRow],
@@ -218,9 +127,7 @@ fn record_reconcile_metrics(
 ) {
     let cluster_label = cluster_id.to_string();
 
-    // Seeded from the enum rather than a literal list so a state that reports
-    // zero rows still publishes a zero gauge -- a series that disappears and a
-    // series that reads zero mean different things to an alert.
+    // Seed every state so zero and missing remain distinct metrics.
     let mut by_state: std::collections::HashMap<&'static str, u64> = PausedRegistryState::ALL
         .iter()
         .map(|s| (s.as_str(), 0))
@@ -262,51 +169,23 @@ fn record_reconcile_metrics(
 fn record_reconcile_read_failure(cluster_id: Uuid) {
     metrics::counter!(READ_FAILURES_METRIC, "cluster_id" => cluster_id.to_string()).increment(1);
 }
-
-/// Ports `agentenv_scheduler_registry_rows{state}`.
 const REGISTRY_ROWS_METRIC: &str = "agentenv_api_paused_registry_rows";
-/// Ports `agentenv_scheduler_registry_stranded_rows`.
 const STRANDED_ROWS_METRIC: &str = "agentenv_api_paused_registry_stranded_rows";
-/// Ports `agentenv_scheduler_registry_parked_lease_expiring`.
 const PARKED_LEASE_EXPIRING_METRIC: &str = "agentenv_api_paused_registry_parked_lease_expiring";
-/// Ports `agentenv_scheduler_registry_live_lease_lapsed`.
 const LIVE_LEASE_LAPSED_METRIC: &str = "agentenv_api_paused_registry_live_lease_lapsed";
-/// Ports `agentenv_scheduler_registry_live_deadline_passed`.
 const LIVE_DEADLINE_PASSED_METRIC: &str = "agentenv_api_paused_registry_live_deadline_passed";
-/// Ports `agentenv_scheduler_registry_reclaimable_now`.
 const RECLAIMABLE_NOW_METRIC: &str = "agentenv_api_paused_registry_reclaimable_now";
-/// No Go counterpart -- this port's own D4 unified figure (see
-/// [`ReconcileOutcome::at_risk_rows`]'s own doc).
 const AT_RISK_ROWS_METRIC: &str = "agentenv_api_paused_registry_at_risk_rows";
-/// Ports `agentenv_scheduler_registry_reconcile_duration_seconds`.
 const RECONCILE_DURATION_METRIC: &str = "agentenv_api_paused_registry_reconcile_duration_seconds";
-/// Ports `agentenv_scheduler_registry_last_success_timestamp_seconds`.
 const LAST_SUCCESS_METRIC: &str = "agentenv_api_paused_registry_last_success_timestamp_seconds";
-/// Ports `agentenv_scheduler_registry_read_failures_total`.
 const READ_FAILURES_METRIC: &str = "agentenv_api_paused_registry_read_failures_total";
 
-/// A single reconcile-task tick's own time budget, independent of `interval`.
-///
-/// `SingletonTaskHandle::shutdown` does not preempt a `body` call already in
-/// flight (`src/pg/election.rs`'s own 🔴 doc) -- graceful shutdown waits out
-/// whatever this tick is doing. This task's half of honouring that contract
-/// is a server-side `SET statement_timeout`, applied once per newly-acquired
-/// leader connection (see [`bound_statement_timeout`]) -- **not**
-/// `tokio::time::timeout` wrapping the query future: this task reuses one
-/// `PgConnection` across every tick for as long as it stays leader (the
-/// connection [`crate::pg::election::spawn_singleton_task`] is holding the
-/// advisory lock on), and dropping a query future client-side mid-flight
-/// leaves that shared connection's wire protocol desynced for whatever tick
-/// runs next on it -- a self-inflicted outage worse than the slow query it
-/// was meant to bound. A server-side statement timeout aborts the statement
-/// on PostgreSQL's own side and hands the same connection back usable,
-/// surfacing as an ordinary `sqlx::Error`. [`reclaim_task::TICK_BUDGET`] is
-/// the reclaim loop's identical counterpart, for the identical reason.
+
+// Bound leader-session statements server-side. Cancelling a client future on
+// the pinned advisory-lock connection can leave its protocol desynchronized.
 const TICK_BUDGET: Duration = Duration::from_secs(25);
 
-/// Applies [`TICK_BUDGET`] as this session's `statement_timeout`, once per
-/// newly-detected leadership epoch (cheap, but no reason to repeat it every
-/// tick on an unchanged session).
+// Applies the server-side budget once per leadership session.
 async fn bound_statement_timeout(conn: &mut sqlx::PgConnection) {
     if let Err(err) = sqlx::query(&format!(
         "SET statement_timeout = '{}s'",
@@ -319,20 +198,8 @@ async fn bound_statement_timeout(conn: &mut sqlx::PgConnection) {
     }
 }
 
-/// Starts the reconcile leader loop
-/// (`AdvisoryLockKey::PausedRegistryReconcile`). On every tick this
-/// replica holds leadership: detects a new epoch on its own connection
-/// (see [`super::grace::is_new_epoch`]) and, if so, runs
-/// [`super::grace::enter`] first -- recording the epoch as seen only once
-/// `enter` actually succeeds (B2(b) -- see [`super::grace::record_epoch_entered`]'s
-/// own doc for why) -- then always runs one [`reconcile_once`] pass.
-///
-/// `interval <= Duration::ZERO` disables the loop, matching
-/// [`super::reclaim_task::spawn`]'s identical convention (and Go's own
-/// `RunRegistryReconcile`, which substitutes a 30s default instead --
-/// this port refuses instead, since `PausedRegistryConfig::reconcile_interval`
-/// already floors at one second and a zero here can only mean a caller
-/// bypassed that floor).
+/// Starts the reconcile singleton, entering grace once per successful session
+/// epoch before running reconcile passes. A zero interval disables the loop.
 pub fn spawn(
     pool: PgPool,
     registry: Arc<PostgresPausedSandboxRegistry>,
@@ -357,8 +224,7 @@ pub fn spawn(
                             .await
                         {
                             Ok(_) => {
-                                // 🔴 B2(b): recorded only now, after success --
-                                // see `grace::record_epoch_entered`'s own doc.
+                                // Record the epoch only after grace entry succeeds.
                                 super::grace::record_epoch_entered(&last_pid, pid);
                             }
                             Err(err) => {
@@ -372,14 +238,8 @@ pub fn spawn(
                     }
                 }
 
-                // 🔴 `tokio::time::timeout` here, unlike around `grace::enter`
-                // above: `reconcile_once` runs every one of its queries against
-                // `registry.pool` (a fresh, ephemeral connection per query),
-                // never against `ctx.conn` -- dropping this future on timeout
-                // drops at most one such ephemeral connection, which the pool
-                // reclaims cleanly. `ctx.conn` is the one connection this
-                // safety valve must never be used on (see [`TICK_BUDGET`]'s
-                // own doc).
+                // This timeout is safe because reconcile uses ephemeral pool connections,
+                // never the pinned advisory-lock connection.
                 match tokio::time::timeout(TICK_BUDGET, reconcile_once(&registry)).await {
                     Ok(Ok(_outcome)) => {}
                     Ok(Err(err)) => {
@@ -425,10 +285,6 @@ mod tests {
         }
     }
 
-    /// D4's own regression pin: a `running` row with a lapsed lease counts
-    /// in [`ReconcileOutcome::at_risk_rows`], the same as a stranded
-    /// `publishing` row -- not just in a `running`-only counter nobody
-    /// watching "stranded" would see.
     #[test]
     fn at_risk_rows_folds_running_and_resuming_into_the_same_total_as_parked() {
         let mut stranded = row(PausedRegistryState::Publishing, "node-a");
@@ -447,9 +303,6 @@ mod tests {
         );
     }
 
-    /// D2 Fix B's own metric split, mirrored: a `resuming` row is
-    /// reclaimable on a lapsed lease alone, a `running` row needs the
-    /// deadline too.
     #[test]
     fn reclaimable_now_matches_fix_bs_split_conditions() {
         let mut resuming_lapsed_only = row(PausedRegistryState::Resuming, "node-a");
@@ -467,10 +320,6 @@ mod tests {
         );
     }
 
-    /// A `publishing` row with a snapshot and a lease well inside the warn
-    /// window contributes to neither `stranded_rows` nor
-    /// `parked_lease_expiring` -- the healthy, uninteresting case, pinned so
-    /// a change that makes every row "at risk" is caught.
     #[test]
     fn a_healthy_parked_row_is_not_at_risk() {
         let r = row(PausedRegistryState::Publishing, "node-a");
@@ -482,13 +331,6 @@ mod tests {
     }
 }
 
-/// Task's own "Stage D remainder": proves `reconcile_once` actually reports
-/// [`record_reconcile_metrics`] against a real database end to end -- the
-/// pure-function tests above cover `compute_reconcile`'s arithmetic, but
-/// nothing until this exercised the metric emission wired onto its result
-/// (the same "was the Ok(_outcome) actually read from" gap
-/// `record_assignment`/`heartbeat`'s binding-execution metric test closes
-/// for the RPC layer).
 #[cfg(test)]
 mod pg {
     use uuid::Uuid;
@@ -535,9 +377,6 @@ mod pg {
         migrate(&pool).await.expect("migration should succeed");
 
         let cluster_id = Uuid::new_v4();
-        // One healthy `running` row (fresh lease, has a snapshot) and one
-        // `publishing` row with no snapshot at all -- stranded, per
-        // `compute_reconcile`.
         seed_row(&pool, cluster_id, "running", "node-a", true).await;
         seed_row(&pool, cluster_id, "publishing", "node-b", false).await;
 

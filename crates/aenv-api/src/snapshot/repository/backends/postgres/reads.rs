@@ -1,11 +1,5 @@
-//! The reads that resolve a snapshot — a Rust port of
-//! `services/scheduler/internal/catalog/queries_resolved.go`.
-//!
-//! 🔴 Every one of these carries `status_group = 'ready'` when the caller
-//! asks for it, same as Go's file-level rule: the statements that must *not*
-//! carry it (the build-status read) belong to a different module for the
-//! same reason Go keeps them in a different file — so neither set is edited
-//! by accident while looking at the other. See `writes.rs`.
+//! Scoped PostgreSQL snapshot reads.
+//! Resolvable scope always applies the shared ready predicate.
 
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -18,16 +12,10 @@ use crate::snapshot::types::{SnapshotId, SnapshotRecord};
 
 use super::convert::{decode_row, CatalogRow};
 
-/// `status_group = 'ready'` — the whole of the rule, in one place, matching
-/// `queries_resolved.go`'s `readyPredicate`.
+/// Shared ready-row predicate.
 const READY_PREDICATE: &str = "s.status_group = 'ready'";
 
-/// Every column [`CatalogRow`] scans, in scan order — matches
-/// `queries_resolved.go`'s `snapshotColumns` column-for-column, including the
-/// `::text` casts on the two uuid columns (see that file's own comment: the
-/// decoder must not depend on which uuid codec happens to be registered, and
-/// an id compared against a keyset cursor must be compared in the same form
-/// the cursor holds it).
+// Columns scanned by `CatalogRow`, including text-cast UUIDs for cursor parity.
 const SNAPSHOT_COLUMNS: &str = "s.id::text                AS id,
        s.cluster_id::text        AS cluster_id,
        s.source_kind             AS source_kind,
@@ -46,10 +34,7 @@ const SNAPSHOT_COLUMNS: &str = "s.id::text                AS id,
        s.published               AS published,
        s.origin_node_id          AS origin_node_id";
 
-/// At most one alias names this snapshot — safe to join rather than subquery
-/// because `aliases_one_per_snapshot` (`0001_initial_schema.sql`) makes a
-/// second alias row for the same snapshot a schema violation rather than a
-/// possibility.
+// Schema guarantees at most one alias per snapshot, so the join cannot duplicate rows.
 const ALIAS_JOIN: &str =
     "LEFT JOIN aliases a ON a.snapshot_id = s.id AND a.cluster_id = s.cluster_id";
 
@@ -60,10 +45,7 @@ fn scope_predicate(scope: CatalogReadScope) -> &'static str {
     }
 }
 
-/// Reads one row by id or alias, at an explicitly chosen scope. Tries `id`
-/// first and falls back to `alias`, matching `queries_resolved.go`'s own
-/// comment on why: an alias is allowed to look exactly like a uuid, so the
-/// shape of the string is a hint rather than an answer.
+/// Reads by ID first, then alias because aliases may be UUID-shaped.
 pub async fn get_scoped(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -86,7 +68,7 @@ pub async fn get_scoped(
         if let Some(row) = row {
             return decode_row(row, cluster_id).map(Some);
         }
-        // Fall through: an id-shaped string may still be somebody's alias.
+        // A UUID-shaped string may still be an alias.
     }
 
     let sql = format!(
@@ -102,13 +84,7 @@ pub async fn get_scoped(
     row.map(|row| decode_row(row, cluster_id)).transpose()
 }
 
-/// Resolves an alias to a snapshot id, at an explicitly chosen scope.
-///
-/// 🔴 No pin projection here (unlike Go's `resolveAliasSQL`, which also
-/// selects `published`/`origin_node_id`) — the general `SnapshotCatalog`
-/// trait this backs has no pin-aware resolution surface; see
-/// `docs/proposals/_sd-phase4-open-questions-resolved.md` Q3 and the Stage B
-/// report's "not done" list for what pin-aware resolution would need.
+/// Resolves an alias within the selected read scope.
 pub async fn resolve_alias_scoped(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -134,12 +110,7 @@ pub async fn resolve_alias_scoped(
     .transpose()
 }
 
-/// One keyset page, pushed all the way into the `WHERE`/`ORDER BY`/`LIMIT` —
-/// the pushdown that is the whole point of this backend existing, and the only
-/// listing there is: the unbounded `list_scoped` beside it went with
-/// `SnapshotCatalog::list`, whose callers (the mirror's history backfill, the
-/// population comparison behind the read-side switch) were deleted with the
-/// migration they served.
+/// Returns one keyset page with filtering, ordering, and limit pushed into SQL.
 pub async fn list_page_scoped(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -152,10 +123,7 @@ pub async fn list_page_scoped(
     }
 
     let mut binder = Binder::new(cluster_id);
-    // 🔴 limit + 1: reading one row past the page is what says whether there
-    // is another one, matching `listSnapshotsSQL`'s own comment — comparing
-    // the page size to the limit instead ends every listing whose total is a
-    // multiple of the limit one page early, silently.
+    // Read one extra row to determine whether a next page exists.
     let sql = list_sql(&mut binder, filter, scope, limit as i64 + 1);
     let rows: Vec<CatalogRow> = binder
         .apply(sqlx::query_as(&sql))
@@ -179,9 +147,7 @@ pub async fn list_page_scoped(
     Ok((records, next))
 }
 
-/// Accumulates bound parameters and hands back their `$n` placeholders, so a
-/// filter that is present and one that is absent cannot renumber each other
-/// — the same discipline `queries_resolved.go`'s `args` type exists for.
+// Maintains stable `$n` numbering across optional filters.
 struct Binder {
     values: Vec<Value>,
 }
@@ -228,9 +194,7 @@ impl Binder {
     }
 }
 
-/// Builds the listing query. `limit` is always the page size plus one — see
-/// [`list_page_scoped`] on why the extra row; there is no unbounded form of
-/// this query any more, and a caller cannot ask for one.
+// Builds the bounded listing query; `limit` includes the lookahead row.
 fn list_sql(
     binder: &mut Binder,
     filter: &SnapshotListFilter,
@@ -248,11 +212,8 @@ fn list_sql(
     if let Some(cursor) = &filter.cursor {
         let cursor_id = binder.add(Value::Text(cursor.snapshot_id.to_string()));
         let cursor_ms = binder.add(Value::I64(cursor.created_at_unix_ms));
-        // 🔴 Spelled exactly as `listSnapshotsSQL` does: the keyset
-        // comparison swaps its operands so the two halves of the tuple sort
-        // in opposite directions in one comparison, and both ids compare as
-        // text — see that file's own comment on why the ORDER BY below may
-        // still use the native column and stay consistent with this.
+        // Compare the descending timestamp and ascending text ID tuple exactly
+        // as the matching ORDER BY requires.
         sql.push_str(&format!(
             "\n   AND (s.created_at_ms, s.id::text) < ({cursor_ms}::bigint, {cursor_id}::text)"
         ));
@@ -264,10 +225,7 @@ fn list_sql(
     sql
 }
 
-/// 🔴 No branch for `published`/`origin_node_id`, and there must never be
-/// one — see rule 5 of the origin-pinning block in
-/// `0001_initial_schema.sql`: filtering a listing on them would tell a user a
-/// snapshot does not exist when it can only be started on one machine.
+// Never filter on publication pin fields; pinned snapshots still exist.
 fn append_filters(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFilter) {
     if let Some(sources) = &filter.sources {
         if !sources.is_empty() {

@@ -1,52 +1,8 @@
-//! `PostgresPausedSandboxRegistry`: the paused registry backend that
-//! connects directly to PostgreSQL from `aenv-api`, folding
-//! `services/scheduler/internal/registry/` (4,191 lines) plus the
-//! heartbeat-lease-renewal half of `internal/reconcile.go` into this
-//! process. Stage C of the phase-4 scheduler fold
-//! (`docs/proposals/_sd-phase4-stageC-paused-registry.md`).
-//!
-//! # Module map
-//!
-//! - [`schema`][]: `paused_sandboxes` DDL bootstrap (`migrate.go`).
-//! - [`sql`][]: every SQL statement, ported verbatim from `store_postgres.go`.
-//! - [`row`][]: row decoding shared by every reader.
-//! - [`reads`][]: `get`/`get_many` (trait) + the internal full-column reads
-//!   [`reconcile`]/[`reclaim`] use.
-//! - [`writes`][]: the fencing write path (`begin_pause` through `remove`).
-//! - [`lease`][]: `renew_lease` (trait) + the two heartbeat-driven,
-//!   internal-only siblings Fix A/Fix B need.
-//! - [`reclaim`][]: `reclaim_expired_holdings`/`release_node_holdings` (trait)
-//!   + the `DiscardBreaker`.
-//! - [`grace`][]: the restart-grace redesign for N replicas -- **read this
-//!   module's doc before touching [`reconcile`] or [`reclaim_task`]**.
-//! - [`reconcile`][]: the reconcile leader loop (D4's monitoring fix + grace
-//!   entry). D2 Fix A no longer lives here -- see [`replica_renewal`] and
-//!   [`reconcile`]'s own module doc's "B1" section for why.
-//! - [`replica_renewal`][]: **B1**'s per-replica, unelected Fix A -- read
-//!   this module's doc for why Fix A cannot be leader-elected under N
-//!   `aenv-api` replicas.
-//! - [`reclaim_task`][]: the reclaim leader loop.
-//!
-//! # D1: which parts of this backend need leader election, and why only
-//! these two
-//!
-//! Every method in [`writes`]/[`reads`]/[`lease`] (the whole
-//! [`PausedSandboxRegistry`] trait impl below) is safe to call from every
-//! `aenv-api` replica concurrently, unelected -- each is a single
-//! generation/execution_id-CAS'd statement, and PostgreSQL's own row locking
-//! serialises the rest. So is [`replica_renewal`] (B1) -- see its own module
-//! doc. See the Stage C report's D1 section for the per-statement review
-//! this claim rests on.
-//!
-//! [`spawn_background_tasks`] starts the two things that genuinely do need
-//! cluster-wide leadership: the reconcile loop
-//! (`AdvisoryLockKey::PausedRegistryReconcile`, [`reconcile`]) and the
-//! reclaim loop (`AdvisoryLockKey::PausedRegistryReclaim`,
-//! [`reclaim_task`]). Neither requires a heartbeat roster source any more
-//! (M1) -- [`replica_renewal`]'s per-replica loop is spawned alongside them
-//! only when [`crate::node_registry::registry::NodeRegistry`] is available,
-//! and is simply skipped (not required) when it is not, which is exactly
-//! the pre-split single process's own shape: see [`spawn_background_tasks`]'s own doc.
+//! PostgreSQL paused-sandbox registry.
+//! CRUD and lease operations are safe on every replica through row locks and
+//! generation/execution fencing. Reconcile and reclaim alone are singleton
+//! tasks; heartbeat-derived renewal runs independently on each replica.
+//! Restart-grace state is persisted so both singleton leaders observe it.
 
 #[cfg(test)]
 mod contract;
@@ -82,12 +38,7 @@ use super::{
     RegistryResult, ReleasedHoldings, ResumeClaim,
 };
 
-/// [`PostgresPausedRegistryFactory`] over one shared `[pg]` pool.
-///
-/// 🔴 The only thing on this side of the boundary that a caller has to name
-/// to select the `postgres` backend. `build_paused_registry` keeps the arm,
-/// the refusal message and the `aenv-api` roster guard; this keeps the
-/// pool, the schema bootstrap and B2(1)'s synchronous restart-grace entry.
+/// PostgreSQL paused-registry factory over a shared pool.
 pub struct PgPausedRegistryFactory {
     pool: PgPool,
 }
@@ -120,13 +71,7 @@ async fn build_registry(
         .await
         .context("bootstrap the paused_sandboxes schema")?;
 
-    // 🔴 B2(1): a synchronous, best-effort attempt to enter restart grace
-    // *before* this returns and the caller opens for traffic -- see
-    // `grace::attempt_initial_entry`'s own doc for why this closes (most of)
-    // the window between this process serving its first request and the
-    // reconcile leader's own background loop landing its first `enter`. Never
-    // fails this call: a database that cannot be reached for this attempt will
-    // be retried by the background reconcile loop regardless.
+    // Best-effort grace entry narrows the window before the reconcile loop starts.
     attempt_initial_grace_entry(&pool, cluster_id, lease_ttl.as_secs_f64()).await;
 
     Ok(Arc::new(PostgresPausedSandboxRegistry::new(
@@ -134,12 +79,7 @@ async fn build_registry(
     )))
 }
 
-/// A direct PostgreSQL-backed [`PausedSandboxRegistry`]. One shared `[pg]`
-/// pool (built once per `aenv-api` process by
-/// `src/bin/aenv-api.rs::build_pg_pool`, the same pool Stage B's catalog
-/// backend uses) covers both the per-request CRUD paths in this struct's
-/// trait impl and the two background leader tasks
-/// [`spawn_background_tasks`] starts.
+/// PostgreSQL-backed [`PausedSandboxRegistry`] sharing the process pool.
 pub struct PostgresPausedSandboxRegistry {
     pool: PgPool,
     cluster_id: Uuid,
@@ -267,56 +207,17 @@ impl PausedSandboxRegistry for PostgresPausedSandboxRegistry {
     }
 }
 
-/// This backend's background tasks, split by whether shutdown has to
-/// release an advisory lock ([`SingletonTaskHandle::shutdown`], `async`) or
-/// can simply be aborted (a plain [`tokio::task::JoinHandle`]) -- see
-/// [`spawn_background_tasks`]'s own doc for which is which and why.
+/// Background tasks grouped by shutdown mechanism.
 pub struct BackgroundTasks {
-    /// The reconcile and reclaim leader loops. Belongs in the same
-    /// `pg_singleton_tasks` bucket every other PostgreSQL-elected background
-    /// task in this process shuts down through
-    /// (`src/bin/aenv-api.rs::Assembly::pg_singleton_tasks`).
+    /// Advisory-lock singleton tasks requiring async shutdown.
     pub singleton: Vec<SingletonTaskHandle>,
-    /// B1's per-replica renewal loop, present only when a
-    /// [`NodeRegistry`] was supplied. Belongs in `Assembly::upkeep`
-    /// alongside `spawn_paused_record_upkeep`'s own tasks -- see
-    /// [`replica_renewal::spawn`]'s own doc for why a plain abort is safe
-    /// here.
+    /// Per-replica tasks safe to abort.
     pub plain: Vec<tokio::task::JoinHandle<()>>,
 }
 
-/// Starts this backend's background tasks: the reconcile leader loop, the
-/// reclaim leader loop, and (M1) B1's per-replica renewal loop when a
-/// heartbeat roster source is available.
+/// Starts reconcile and reclaim singletons plus optional per-replica renewal.
 ///
-/// # M1: `node_registry` is optional
-///
-/// D2 Fix A (now [`replica_renewal`]) only does anything under a real
-/// [`NodeRegistry::rosters_in_cluster`] answer -- without one, there is
-/// nothing for it to renew from, so [`replica_renewal::spawn`] is simply not
-/// started. This is **not** the same gap Fix A originally closed: under the
-/// split node/api identity model, a missing roster really would leave
-/// `running` rows with no renewal path at all, and
-/// `crate::orchestrator::paused_registry::build_paused_registry` still
-/// refuses to select this backend without one (see that function's own
-/// doc) — `aenv-api` always builds one now, so this case is no longer
-/// reachable from production, only from a test calling this function
-/// directly. The case this function *does* have
-/// to accept a missing roster for is the pre-split single process, which never builds a
-/// [`crate::node_registry::registry::AtomicNodeRegistry`] at all: there,
-/// this process's own identity coincides with `origin_node_id` for
-/// everything it runs, so the ordinary `renew_lease` trait method (driven by
-/// `spawn_paused_record_upkeep` in `src/bin/aenv-api.rs`) already renews those
-/// rows under matching identity -- the pre-split single process never needed Fix A in the
-/// first place. See [`replica_renewal`]'s own module doc for the full
-/// argument.
-///
-/// The reconcile and reclaim leader loops are started unconditionally
-/// either way: grace entry ([`grace::enter`]) and D4's metrics
-/// ([`reconcile::compute_reconcile`]) are both roster-independent, and a
-/// cluster running the pre-split single process still needs restart-grace protection against
-/// the same fleet-wide-coverage-gap scenario a `aenv-api` deployment does
-/// (see [`grace`]'s own module doc).
+/// Renewal is omitted when no heartbeat roster source is available.
 pub fn spawn_background_tasks(
     pool: PgPool,
     cluster_id: Uuid,
@@ -359,46 +260,21 @@ pub fn spawn_background_tasks(
     BackgroundTasks { singleton, plain }
 }
 
-/// B2(1): delegates to [`grace::attempt_initial_entry`] -- see that
-/// function's own doc. Exposed at this module's boundary so
-/// `crate::orchestrator::paused_registry::build_paused_registry` (the
-/// parent module) can call it without reaching into [`grace`] directly.
+/// Attempts the synchronous best-effort restart-grace entry.
 pub async fn attempt_initial_grace_entry(pool: &PgPool, cluster_id: Uuid, ttl_secs: f64) {
     grace::attempt_initial_entry(pool, cluster_id, ttl_secs).await
 }
 
-/// [`spawn_paused_registry_background_tasks`]'s result -- split by shutdown
-/// mechanism, mirroring `postgres::BackgroundTasks` (which this simply
-/// forwards): `singleton` needs `SingletonTaskHandle::shutdown()`'s async
-/// advisory-lock release and belongs in `Assembly::pg_singleton_tasks`
-/// (`src/bin/aenv-api.rs`); `plain` is safe to `.abort()` and belongs in
-/// `Assembly::upkeep` alongside `spawn_paused_record_upkeep`'s own tasks.
+/// Background tasks grouped by shutdown mechanism.
 #[derive(Default)]
 pub struct PausedRegistryBackgroundTasks {
     pub singleton: Vec<SingletonTaskHandle>,
     pub plain: Vec<tokio::task::JoinHandle<()>>,
 }
 
-/// Starts the `postgres` backend's background tasks (reconcile leader loop,
-/// reclaim leader loop, and -- M1 -- B1's per-replica renewal loop when a
-/// roster source is available; see `postgres::spawn_background_tasks`'s own
-/// doc), if and only if `config.backend == Postgres`. Every other backend
-/// returns everything empty.
+/// Starts PostgreSQL paused-registry tasks only when that backend is selected.
 ///
-/// Kept separate from [`build_paused_registry`] deliberately, mirroring
-/// `src/bin/aenv-api.rs`'s own `build_pg_pool` + `spawn_pg_singleton_tasks`
-/// split: the registry itself has to exist before `ApiImpl`/`Orchestrator`
-/// can be constructed, but the resulting task handles belong in the buckets
-/// every other PostgreSQL-backed background task in this process already
-/// shuts down through.
-///
-/// 🔴 Call this only after a preceding [`build_paused_registry`] call with
-/// the same `config`/`pg_pool` has already succeeded (it performed the
-/// "postgres requires a pool" validation this function relies on without
-/// repeating). `node_registry` may legitimately be `None` here even when
-/// `config.backend == Postgres` (M1: the pre-split single process) -- see
-/// `postgres::spawn_background_tasks`'s own doc for what that does and does
-/// not skip.
+/// The matching registry must already have been built successfully.
 pub fn spawn_paused_registry_background_tasks(
     config: &PausedRegistryConfig,
     identity: &NodeIdentity,

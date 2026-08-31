@@ -1,14 +1,4 @@
-//! Behavioural contract tests against a real PostgreSQL database -- the
-//! Rust equivalent of `services/scheduler/internal/registry/contract_*.go`
-//! (`contract_test.go`/`contract_claim_test.go`/`contract_lease_test.go`,
-//! 44 `TestContract*` functions total), covering the state machine end to
-//! end rather than the SQL text in isolation.
-//!
-//! Not a 1:1 port of every one of Go's 44 -- this suite prioritises the
-//! transitions D1-D4 in the task brief actually turn on: every state-machine
-//! edge, D2 Fix A/Fix B in their final (not "pre-fix") form, and D3's
-//! claimant/holder split in `mark_running`. See the Stage C report's own
-//! coverage-mapping section for what is and is not mirrored here.
+//! PostgreSQL paused-registry state-machine contract tests.
 
 #![cfg(test)]
 
@@ -65,18 +55,6 @@ mod pg {
         crate::snapshot::SnapshotId::generate()
     }
 
-    /// Brings a brand-new sandbox straight to `running` via branch ② of
-    /// `mark_running` (a local wake with no claim ever taken): `begin_pause`
-    /// then `mark_running` under the *same* execution id, `node_id ==
-    /// holder_node_id == node_id`.
-    ///
-    /// 🔴 `mark_running` never creates a row (Go's own doc, ported
-    /// verbatim) -- every test that needs a `running` row must create it
-    /// via `begin_pause` first. This is the minimal path when the test does
-    /// not care about `snapshot_id` (which stays `NULL`, since neither
-    /// `begin_pause` nor `mark_running` ever sets it); tests that do care
-    /// (reclaim, claim_for_resume) use [`bring_to_running_with_snapshot`]
-    /// instead.
     async fn bring_to_running(
         registry: &PostgresPausedSandboxRegistry,
         sandbox_id: SandboxId,
@@ -100,10 +78,6 @@ mod pg {
         );
     }
 
-    /// Like [`bring_to_running`], but goes through `complete_pause` first so
-    /// the row carries a real `snapshot_id` -- required by
-    /// `reclaim_expired_holdings`'s `running` arm and by anything that
-    /// later calls `claim_for_resume` on the row.
     async fn bring_to_running_with_snapshot(
         registry: &PostgresPausedSandboxRegistry,
         sandbox_id: SandboxId,
@@ -137,9 +111,6 @@ mod pg {
         assert_eq!(outcome, MarkRunningOutcome::Adopted);
     }
 
-    // ---------------------------------------------------------------------
-    // begin_pause / complete_pause / mark_local_only
-    // ---------------------------------------------------------------------
 
     #[tokio::test]
     async fn begin_pause_then_complete_pause_lands_on_paused_with_a_snapshot() {
@@ -202,8 +173,6 @@ mod pg {
         assert!(row.snapshot_id.is_none());
     }
 
-    /// `completePauseSQL`'s generation CAS: a stale generation is refused, not
-    /// silently ignored.
     #[tokio::test]
     async fn complete_pause_with_a_stale_generation_is_a_generation_conflict() {
         let pool = isolated_schema_pool_or_skip!(
@@ -229,8 +198,6 @@ mod pg {
         ));
     }
 
-    /// begin_pause's own fencing: a pause sent under an incarnation the row no
-    /// longer names is refused as `ExecutionFenced`, never silently upserted.
     #[tokio::test]
     async fn begin_pause_under_a_superseded_incarnation_is_execution_fenced() {
         let pool = isolated_schema_pool_or_skip!(
@@ -245,17 +212,12 @@ mod pg {
             .begin_pause(&entry(sandbox_id, cluster_id, "node-a", first_execution))
             .await
             .unwrap();
-        // Bring the row to `running` under a *new* incarnation the way a
-        // cross-node resume would -- the row now names `second_execution`, not
-        // `first_execution`.
         let second_execution = ExecutionId::new();
         registry
             .mark_running(&sandbox_id, "node-a", "node-a", second_execution, None)
             .await
             .unwrap();
 
-        // A pause sent under the now-superseded first incarnation must be
-        // refused, not accepted and left overwriting the live row's identity.
         let err = registry
             .begin_pause(&entry(sandbox_id, cluster_id, "node-a", first_execution))
             .await
@@ -263,26 +225,12 @@ mod pg {
         assert!(matches!(err, PausedRegistryError::ExecutionFenced { .. }));
     }
 
-    /// **H2(b)**: the two refusals this backend can give a caller mean
-    /// opposite things -- `GenerationConflict` says "your view of the row is
-    /// stale, re-read and try again"; `ExecutionFenced` says "the run you
-    /// are writing on behalf of is over, stop retrying for good". Every
-    /// other test in this file only asserts the variant it *expects*; this
-    /// one also asserts the *other* variant did not come back instead, for
-    /// both scenarios. Mirrors Go's `TestTwoRefusalsAreToldApart`: "a build
-    /// that wrapped one in the other would look correct in every test that
-    /// asserts 'the write was refused', and would send a node into a
-    /// re-read loop that walks straight around the fence."
     #[tokio::test]
     async fn two_refusals_are_told_apart() {
         let pool = isolated_schema_pool_or_skip!("two_refusals_are_told_apart");
         let cluster_id = Uuid::new_v4();
         let registry = registry(pool, cluster_id).await;
 
-        // Scenario 1: a stale generation on `complete_pause` -- the row is
-        // still under the *same* incarnation, just a different generation
-        // than the caller last observed. Must be `GenerationConflict`, never
-        // `ExecutionFenced`.
         let sandbox_a = SandboxId::new();
         let execution_a = ExecutionId::new();
         registry
@@ -307,9 +255,6 @@ mod pg {
              fresh re-read and retry is exactly right"
         );
 
-        // Scenario 2: a pause sent under an incarnation the row has already
-        // moved past (a cross-node resume happened since). Must be
-        // `ExecutionFenced`, never `GenerationConflict`.
         let sandbox_b = SandboxId::new();
         let first_execution = ExecutionId::new();
         registry
@@ -336,9 +281,6 @@ mod pg {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // claim_for_resume
-    // ---------------------------------------------------------------------
 
     #[tokio::test]
     async fn claiming_an_untracked_sandbox_reports_not_found() {
@@ -390,10 +332,6 @@ mod pg {
         assert_eq!(claimed.execution_id, Some(claim_execution));
     }
 
-    /// The `previous_state` must never be read off the post-claim row (always
-    /// `Resuming`) -- this pins the same regression the trait doc on
-    /// `ResumeClaim` names by history: reading it off the wrong place silently
-    /// reports every ordinary resume as a takeover.
     #[tokio::test]
     async fn claiming_a_lapsed_local_only_sandbox_reports_local_only_as_the_previous_state_not_resuming(
     ) {
@@ -401,7 +339,7 @@ mod pg {
             "claiming_a_lapsed_local_only_sandbox_reports_local_only_as_the_previous_state_not_resuming"
         );
         let cluster_id = Uuid::new_v4();
-        // A very short lease TTL so this test does not need a long sleep.
+        // Short lease keeps the test fast.
         let pool_clone = pool.clone();
         super::super::schema::migrate(&pool_clone).await.unwrap();
         let registry = PostgresPausedSandboxRegistry::new(
@@ -410,11 +348,7 @@ mod pg {
             Duration::from_millis(50),
         );
 
-        // 🔴 The lapsed-lease claim arm is withheld during a cluster's restart
-        // grace window (see `super::super::grace`'s own doc) -- this test is
-        // about the ordinary, long-past-grace case, so mark this cluster
-        // already serving directly rather than actually waiting out a grace
-        // period.
+        // Seed an expired restart-grace window so the lapsed-lease arm is reachable.
         sqlx::query(
             "INSERT INTO paused_registry_grace (cluster_id, grace_until, downtime_secs, leases_extended)
              VALUES ($1, now() - interval '1 second', 0, 0)",
@@ -424,13 +358,7 @@ mod pg {
         .await
         .expect("seeding the grace row should succeed");
 
-        // A realistic path to a `local_only` row that still carries a
-        // *durable* snapshot from an earlier successful pause: pause once,
-        // complete it durably, resume it, then pause it again -- this
-        // second upload is the one that fails and lands on `local_only`,
-        // while the row still carries the first pause's snapshot_id
-        // (neither `begin_pause`'s upsert nor `mark_local_only` ever
-        // touches that column).
+        // Preserve a durable snapshot while the second pause becomes `local_only`.
         let sandbox_id = SandboxId::new();
         bring_to_running_with_snapshot(&registry, sandbox_id, cluster_id, "node-a", None).await;
         let running = registry.get(&sandbox_id).await.unwrap().unwrap();
@@ -489,10 +417,6 @@ mod pg {
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
-        // 🔴 The core claim under test: a lapsed lease on a `running` row must
-        // never be treated as evidence the node is dead -- only
-        // `release_node_holdings`/`reclaim_expired_holdings` may take a live row
-        // away from its holder.
         let claim = registry
             .claim_for_resume(&sandbox_id, "node-b", ExecutionId::new())
             .await
@@ -508,15 +432,6 @@ mod pg {
         assert_eq!(reason, ConflictReason::LiveElsewhere);
     }
 
-    /// **H2(d)**: `ResumeClaim::NotReady` had never once been constructed or
-    /// asserted on anywhere in this suite before this test -- an entire
-    /// result variant with zero coverage. A `publishing` row whose lease has
-    /// *not* yet lapsed is claimable by nobody (only its origin node can
-    /// serve it while the upload is still in flight): calls
-    /// `writes::claim_for_resume` directly with `durable_only: false` so the
-    /// outcome is decided purely by the row's own state/lease, independent
-    /// of this cluster's restart-grace phase (`super::grace`), which this
-    /// test is not about.
     #[tokio::test]
     async fn claiming_a_fresh_publishing_sandbox_reports_not_ready() {
         let pool =
@@ -531,10 +446,6 @@ mod pg {
             .await
             .unwrap();
 
-        // The row is `publishing` with a fresh (default 90s) lease -- not
-        // claimable by a degraded takeover, and never claimable outright
-        // (publishing/local_only never are -- only a lapsed lease makes them
-        // eligible, and only when `durable_only` is false).
         let claim = super::super::writes::claim_for_resume(
             &registry,
             false,
@@ -551,13 +462,7 @@ mod pg {
         assert_eq!(origin_node_id, "node-a");
     }
 
-    // ---------------------------------------------------------------------
-    // mark_running -- D3's claimant/holder split
-    // ---------------------------------------------------------------------
 
-    /// Branch ①: a cross-node resume claimed on `node-b`, running physically on
-    /// `node-b` too (the ordinary shape when the api replica's own identity and
-    /// the real machine coincide, e.g. the pre-split single process).
     #[tokio::test]
     async fn mark_running_adopts_a_freshly_claimed_sandbox() {
         let pool = isolated_schema_pool_or_skip!("mark_running_adopts_a_freshly_claimed_sandbox");
@@ -592,11 +497,6 @@ mod pg {
         assert!(row.claimed_by_node_id.is_none());
     }
 
-    /// 🔴 D3's actual split, proved end to end: `node_id` (the claimant) is the
-    /// CAS guard and `holder_node_id` differs from it -- an api replica marking
-    /// running a sandbox a *different* machine actually holds. This is the
-    /// exact shape a0487f0 broke (quoting the holder at the guard) and D3
-    /// exists to keep separate.
     #[tokio::test]
     async fn mark_running_writes_the_holder_into_origin_node_id_while_guarding_on_the_claimant() {
         let pool = isolated_schema_pool_or_skip!(
@@ -616,8 +516,6 @@ mod pg {
             .await
             .unwrap();
         let claim_execution = ExecutionId::new();
-        // "api-replica-7" claims on behalf of the resume; "real-machine-3" is
-        // the actual VM host reported by the backend.
         registry
             .claim_for_resume(&sandbox_id, "api-replica-7", claim_execution)
             .await
@@ -636,12 +534,8 @@ mod pg {
         assert_eq!(outcome, MarkRunningOutcome::Adopted);
 
         let row = registry.get(&sandbox_id).await.unwrap().unwrap();
-        // The holder was written into origin_node_id...
         assert_eq!(row.origin_node_id, "real-machine-3");
 
-        // ...and branch ③'s retry check reads the holder, not the claimant: a
-        // second, idempotent mark_running call using the SAME claimant identity
-        // must still succeed even though origin_node_id no longer equals it.
         let retried = registry
             .mark_running(
                 &sandbox_id,
@@ -660,8 +554,6 @@ mod pg {
         );
     }
 
-    /// Branch ②: a sandbox parked on this node's own disk, woken with no claim
-    /// ever taken -- `node_id == holder_node_id`, both the origin.
     #[tokio::test]
     async fn mark_running_wakes_a_locally_parked_sandbox_with_no_prior_claim() {
         let pool = isolated_schema_pool_or_skip!(
@@ -726,7 +618,6 @@ mod pg {
             .await
             .unwrap();
 
-        // node-c tries to mark it running -- it never held the claim.
         let outcome = registry
             .mark_running(&sandbox_id, "node-c", "node-c", ExecutionId::new(), None)
             .await
@@ -734,9 +625,6 @@ mod pg {
         assert_eq!(outcome, MarkRunningOutcome::HeldElsewhere);
     }
 
-    /// A `running` row's own incarnation being superseded (e.g. a very late,
-    /// stale `mark_running` retry racing a fresh resume) is `ExecutionFenced`,
-    /// never silently applied.
     #[tokio::test]
     async fn mark_running_a_stale_incarnation_on_a_running_row_is_execution_fenced() {
         let pool = isolated_schema_pool_or_skip!(
@@ -757,9 +645,6 @@ mod pg {
         )
         .await;
 
-        // A stale retry (or a late message from a superseded incarnation)
-        // quoting a *different* execution id than the one currently on the
-        // row must be fenced, not silently applied.
         let stale_retry = registry
             .mark_running(&sandbox_id, "node-a", "node-a", ExecutionId::new(), None)
             .await
@@ -770,17 +655,6 @@ mod pg {
         ));
     }
 
-    /// **H2(c)**: the one cell of `mark_running`'s outcome table this suite
-    /// had zero coverage for -- a `running` row held by a *different* node
-    /// entirely (not a stale retry of the same incarnation, which is
-    /// `ExecutionFenced` above, and not a `resuming` claim someone else
-    /// holds, which `mark_running_a_claim_another_node_holds_reports_held_
-    /// elsewhere` already covers). This is
-    /// `writes.rs::mark_running`'s `(entry.state == Running &&
-    /// entry.origin_node_id == holder)` branch's *false* half: without it,
-    /// a build that swapped the two outcomes for this specific cell (`Held
-    /// Elsewhere` versus `ExecutionFenced`) would pass every other test in
-    /// this file.
     #[tokio::test]
     async fn mark_running_a_running_row_held_by_a_different_node_reports_held_elsewhere() {
         let pool = isolated_schema_pool_or_skip!(
@@ -801,25 +675,17 @@ mod pg {
         )
         .await;
 
-        // node-c never held any claim on this sandbox and is not its
-        // current holder -- this must read as the healthy "somebody else
-        // has it" case, not as this node's own incarnation having gone
-        // stale.
         let outcome = registry
             .mark_running(&sandbox_id, "node-c", "node-c", ExecutionId::new(), None)
             .await
             .unwrap();
         assert_eq!(outcome, MarkRunningOutcome::HeldElsewhere);
 
-        // And the row itself must be untouched -- node-a still holds it.
         let row = registry.get(&sandbox_id).await.unwrap().unwrap();
         assert_eq!(row.state, PausedRegistryState::Running);
         assert_eq!(row.origin_node_id, "node-a");
     }
 
-    // ---------------------------------------------------------------------
-    // renew_sandbox_deadline
-    // ---------------------------------------------------------------------
 
     #[tokio::test]
     async fn renew_sandbox_deadline_updates_only_the_deadline() {
@@ -900,9 +766,6 @@ mod pg {
         assert_eq!(outcome, DeadlineRenewalOutcome::NotTracked);
     }
 
-    // ---------------------------------------------------------------------
-    // renew_lease -- the caller's own identity, not a caller-asserted one
-    // ---------------------------------------------------------------------
 
     #[tokio::test]
     async fn renew_lease_only_renews_rows_the_caller_actually_holds() {
@@ -932,8 +795,6 @@ mod pg {
         )
         .await;
 
-        // node-a asserts it holds both -- the SQL predicate, not the caller's
-        // own claim, decides which one actually renews.
         let renewed = registry
             .renew_lease(
                 "node-a",
@@ -956,12 +817,6 @@ mod pg {
         );
     }
 
-    /// D2 Fix A's own precondition, pinned here rather than only in
-    /// `postgres::lease`'s doc: `renew_lease` (the per-replica identity-based
-    /// call) never renews a `Running` row when the caller's identity is not the
-    /// row's `origin_node_id` -- exactly the api-pod-vs-real-machine mismatch
-    /// Fix A exists to work around via a *different* path
-    /// (`renew_live_leases`/the reconcile loop), not this one.
     #[tokio::test]
     async fn renew_lease_under_an_api_pod_identity_never_renews_a_running_row_it_does_not_hold() {
         let pool = isolated_schema_pool_or_skip!(
@@ -971,7 +826,6 @@ mod pg {
         let registry = registry(pool, cluster_id).await;
 
         let sandbox_id = SandboxId::new();
-        // origin_node_id is the *real machine*, never an api pod's own identity.
         bring_to_running(
             &registry,
             sandbox_id,
@@ -998,9 +852,6 @@ mod pg {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // remove / release_claim / release_node_holdings
-    // ---------------------------------------------------------------------
 
     #[tokio::test]
     async fn remove_deletes_a_matching_generation_and_reports_no_match_otherwise() {
@@ -1029,14 +880,7 @@ mod pg {
         assert!(registry.get(&sandbox_id).await.unwrap().is_none());
     }
 
-    // ---------------------------------------------------------------------
-    // list_all
-    // ---------------------------------------------------------------------
 
-    /// `ListRegistrySandboxes`'s own read carries what [`PausedSandboxEntry`]
-    /// deliberately does not: `lease_expires_at`/`sandbox_expires_at`/
-    /// `execution_id`, scoped to this registry's own cluster, alongside a
-    /// database clock reading a real transaction was read against.
     #[tokio::test]
     async fn list_all_carries_lease_and_execution_columns_scoped_to_the_cluster() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1052,9 +896,6 @@ mod pg {
         bring_to_running_with_snapshot(&reg, sandbox_id, cluster_id, "node-a", Some(expires_at))
             .await;
 
-        // A row in a different cluster must never appear in this cluster's
-        // listing -- the same isolation `get`/`get_many` already enforce via
-        // their own `cluster_id` bind.
         let other_sandbox = SandboxId::new();
         bring_to_running_with_snapshot(&other_reg, other_sandbox, other_cluster_id, "node-z", None)
             .await;
@@ -1086,9 +927,6 @@ mod pg {
             "mark_running's own expires_at must have been stored"
         );
 
-        // The database clock the rows were read against must be a real,
-        // recent reading -- not a zero value, and not this process's own
-        // clock read at a different instant than the query.
         assert!(
             listing.now >= before && listing.now <= after,
             "list_all's `now` ({}) must fall between this test's own before/after readings \
@@ -1130,10 +968,6 @@ mod pg {
         assert!(row.claimed_by_node_id.is_none());
     }
 
-    /// `release_node_holdings` only reaches `Resuming` rows through the
-    /// `claimed_by_node_id` identity match under the split node/api model (see
-    /// `reclaim.rs`'s own doc): `node_id` here has to be the claimant identity,
-    /// not a real machine.
     #[tokio::test]
     async fn release_node_holdings_frees_a_resuming_claim_this_replica_never_finished() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1168,14 +1002,7 @@ mod pg {
         assert_eq!(row.state, PausedRegistryState::Paused);
     }
 
-    // ---------------------------------------------------------------------
-    // D2 Fix B: reclaim_expired_holdings' split running/resuming statements
-    // ---------------------------------------------------------------------
 
-    /// 🔴 The exact scenario Fix B closes: a first-ever cross-node resume whose
-    /// claiming replica died before `mark_running` landed. `sandbox_expires_at`
-    /// was never written (`claim_for_resume` never sets it), so the row must
-    /// still be reclaimable on a lapsed lease alone.
     #[tokio::test]
     async fn a_resuming_row_with_a_lapsed_lease_and_no_deadline_is_reclaimed() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1201,7 +1028,6 @@ mod pg {
             .await
             .unwrap();
 
-        // Confirm the precondition Fix B is about: sandbox_expires_at is NULL.
         let stuck = registry.get(&sandbox_id).await.unwrap().unwrap();
         assert_eq!(stuck.state, PausedRegistryState::Resuming);
 
@@ -1217,9 +1043,6 @@ mod pg {
         assert_eq!(row.state, PausedRegistryState::Paused);
     }
 
-    /// The `running` sibling: a lapsed lease alone is never enough -- the
-    /// deadline must also have passed, or a partitioned-but-alive node's
-    /// sandbox would be duplicated.
     #[tokio::test]
     async fn a_running_row_with_only_a_lapsed_lease_and_no_passed_deadline_is_not_reclaimed() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1231,9 +1054,6 @@ mod pg {
         super::super::schema::migrate(&pool).await.unwrap();
 
         let sandbox_id = SandboxId::new();
-        // A deadline far in the future -- the sandbox has plenty of time left,
-        // it just has not renewed its lease (e.g. the reconcile loop has not
-        // ticked yet).
         let far_future = SystemTime::now() + Duration::from_secs(3600);
         bring_to_running_with_snapshot(
             &registry,
@@ -1255,8 +1075,6 @@ mod pg {
         assert_eq!(row.state, PausedRegistryState::Running);
     }
 
-    /// A `running` row with both conditions -- lapsed lease *and* a passed
-    /// deadline -- is the ordinary reclaim case, unaffected by Fix B's split.
     #[tokio::test]
     async fn a_running_row_with_a_lapsed_lease_and_a_passed_deadline_is_reclaimed() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1298,19 +1116,6 @@ mod pg {
         assert_eq!(row.state, PausedRegistryState::Paused);
     }
 
-    /// **H2(a)**, half one: Go's `TestContractAResumingClaimIsReleasedEven
-    /// WithAFarFutureInheritedDeadline` -- the resuming SQL arm's own
-    /// omission of `sandbox_expires_at` is proved with a row that actually
-    /// *carries* a non-null, far-future deadline (inherited from a previous
-    /// `running` incarnation -- `begin_pause`/`complete_pause`/
-    /// `claim_for_resume` none of them touch that column, so it survives an
-    /// ordinary pause/resume cycle untouched), not merely a row where the
-    /// column happens to be `NULL`
-    /// (`a_resuming_row_with_a_lapsed_lease_and_no_deadline_is_reclaimed`,
-    /// above). Without this test, a "fix" that re-merged the two reclaim
-    /// statements behind a `COALESCE(sandbox_expires_at, 'epoch')` guard
-    /// would still pass every other test in this file while leaving a
-    /// resuming row with a real future deadline permanently stuck.
     #[tokio::test]
     async fn a_resuming_row_with_an_inherited_far_future_deadline_is_still_reclaimed_on_lease_alone(
     ) {
@@ -1332,8 +1137,6 @@ mod pg {
             .execution_id
             .expect("a running row always carries an incarnation");
 
-        // An ordinary pause -- sandbox_expires_at is not in either
-        // statement's SET list, so it carries over untouched.
         let began = registry
             .begin_pause(&entry(sandbox_id, cluster_id, "node-a", running_execution))
             .await
@@ -1343,8 +1146,6 @@ mod pg {
             .await
             .unwrap();
 
-        // A cross-node resume claim -- `claim_for_resume` does not touch
-        // sandbox_expires_at either.
         registry
             .claim_for_resume(&sandbox_id, "node-b", ExecutionId::new())
             .await
@@ -1364,11 +1165,6 @@ mod pg {
         assert_eq!(row.state, PausedRegistryState::Paused);
     }
 
-    /// **H2(a)**, half two: Go's `TestContractAFreshResumeClaimSurvivesRe
-    /// claimWhileItsLeaseIsStillLive`. Without this test, a "fix" that made
-    /// reclaim release *every* `resuming` row unconditionally (ignoring the
-    /// lease entirely) would still pass every other reclaim test in this
-    /// file -- they all reclaim only after sleeping past a short lease.
     #[tokio::test]
     async fn a_freshly_claimed_resuming_row_with_a_live_lease_survives_a_reclaim_pass() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1392,7 +1188,6 @@ mod pg {
             .await
             .unwrap();
 
-        // No sleep -- the (default, 90s) lease is still live.
         let outcome = registry.reclaim_expired_holdings().await.unwrap();
         assert_eq!(
             outcome.released, 0,
@@ -1402,12 +1197,6 @@ mod pg {
         assert_eq!(row.state, PausedRegistryState::Resuming);
     }
 
-    /// **H2(d)**: `ReleasedHoldings::discarded` had only ever been asserted
-    /// `== 0` in this file -- the non-zero path had never actually run. A
-    /// `running` row with no durable snapshot behind it (a pause that never
-    /// got as far as `complete_pause`) whose lease *and* deadline have both
-    /// passed is gone for good, not merely parked -- `RECLAIM_DISCARDED_SQL`
-    /// deletes it outright rather than releasing it to `paused`.
     #[tokio::test]
     async fn a_running_row_with_no_snapshot_and_a_passed_deadline_is_discarded() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1424,7 +1213,6 @@ mod pg {
             .begin_pause(&entry(sandbox_id, cluster_id, "node-a", execution_id))
             .await
             .unwrap();
-        // No `complete_pause` -- snapshot_id stays NULL.
         let past_deadline = SystemTime::now() - Duration::from_secs(10);
         let outcome = registry
             .mark_running(
@@ -1459,15 +1247,7 @@ mod pg {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // D1: two replicas racing the same sandbox
-    // ---------------------------------------------------------------------
 
-    /// Direct proof of the D1 claim underlying every fencing statement in this
-    /// backend: two "replicas" (two independent registry handles on the same
-    /// pool) racing `claim_for_resume` on the same `paused` row must have
-    /// exactly one winner, decided by PostgreSQL's own row lock -- not by any
-    /// coordination this Rust code performs.
     #[tokio::test]
     async fn two_replicas_racing_claim_for_resume_on_the_same_row_produce_exactly_one_winner() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1504,15 +1284,7 @@ mod pg {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // B1: replica_renewal's per-replica coverage
-    // ---------------------------------------------------------------------
 
-    /// A [`NodeRegistry`] that answers `rosters_in_cluster` with exactly one
-    /// fixed, always-fresh [`Roster`] -- everything else is unreachable from
-    /// [`super::super::replica_renewal::renew_once`], the only method this
-    /// test exercises. Simulates one `aenv-api` replica whose heartbeat
-    /// connections happen to cover exactly one node.
     struct SingleRosterRegistry(crate::node_registry::types::Roster);
 
     impl NodeRegistry for SingleRosterRegistry {
@@ -1617,19 +1389,6 @@ mod pg {
             .expect("the row should exist")
     }
 
-    /// **B1's own regression pin**: two replicas, each holding only *part*
-    /// of the cluster's heartbeat roster (as `AtomicNodeRegistry` actually
-    /// is -- per-process, unsynchronised), each independently renew only the
-    /// `running` row their own roster names -- and the **union** of the two
-    /// covers every row. Neither replica's pass alone would have.
-    ///
-    /// Before B1, this exact renewal only ran on whichever replica held the
-    /// reconcile leader lock, using *that* replica's own roster alone -- a
-    /// `running` row whose node's heartbeat was pinned to any other replica
-    /// had no renewal path here at all. This test's own "before" half (the
-    /// mid-test assertion that node-b's lease is *still* expired after only
-    /// replica 1's pass) is the direct evidence that coverage really is
-    /// partial per replica, not an artifact of this test's own setup.
     #[tokio::test]
     async fn two_replicas_each_holding_part_of_the_roster_together_renew_every_running_row() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1661,8 +1420,6 @@ mod pg {
         )
         .await;
 
-        // Let both leases lapse -- the ordinary steady-state condition
-        // Fix A's renewal exists to prevent from mattering.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let expired_a = raw_lease_expires_at(&pool, sandbox_a).await;
         let expired_b = raw_lease_expires_at(&pool, sandbox_b).await;
@@ -1693,7 +1450,6 @@ mod pg {
         let replica_1 = SingleRosterRegistry(roster_1);
         let replica_2 = SingleRosterRegistry(roster_2);
 
-        // Replica 1's pass, alone: only node-a's row is in its roster.
         let (parked_1, live_1) = super::super::replica_renewal::renew_once(&registry, &replica_1)
             .await
             .expect("replica 1's renewal pass should succeed");
@@ -1704,15 +1460,12 @@ mod pg {
             renewed_a > now,
             "sandbox_a must have been renewed by replica 1's own pass"
         );
-        // 🔴 The coverage-is-partial claim: replica 1's pass, which never
-        // saw node-b at all, must not have touched sandbox_b's row.
         let still_expired_b = raw_lease_expires_at(&pool, sandbox_b).await;
         assert!(
             still_expired_b < now,
             "sandbox_b must still be expired -- replica 1's roster never mentioned it"
         );
 
-        // Replica 2's pass, independently: only node-b's row is in its roster.
         let (parked_2, live_2) = super::super::replica_renewal::renew_once(&registry, &replica_2)
             .await
             .expect("replica 2's renewal pass should succeed");
@@ -1724,8 +1477,6 @@ mod pg {
             "sandbox_b must have been renewed by replica 2's own, independent pass"
         );
 
-        // The union: both rows are now healthy, even though neither replica
-        // ever saw the other's node.
         assert!(registry.get(&sandbox_a).await.unwrap().is_some());
         assert!(registry.get(&sandbox_b).await.unwrap().is_some());
     }

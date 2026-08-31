@@ -1,8 +1,4 @@
-//! A per-process PostgreSQL connection pool for the control plane (`aenv-api`).
-//!
-//! `aenv-node` must never build one of these, and cannot: it does not link this
-//! crate. It also refuses to start with `[pg].dsn` configured at all — see
-//! `refuse_configured_pg_dsn` in `crates/aenv-node/src/bin/aenv-node.rs`.
+//! Per-process PostgreSQL pool for control-plane services only.
 
 use std::time::Duration;
 
@@ -12,46 +8,25 @@ use tracing::info;
 
 use crate::cfg::PgConfig;
 
-/// Per-replica pool cap used when `[pg].max_connections` is unset.
+/// Default per-replica pool cap.
 ///
-/// 🔴 `aenv-api` runs more than one replica, and every replica builds its
-/// own pool independently — there is no cluster-wide coordination over how
-/// many connections exist, only over how many *this process* opens. The
-/// cluster-wide total this deployment produces is therefore
-/// `replica_count * max_connections`, not this number alone, and it has to
-/// stay comfortably under PostgreSQL's own `max_connections` (default 100)
-/// with room for every replica plus whatever else already connects — the
-/// Go scheduler's registry pool, migrations, `psql`, and so on. 8 mirrors
-/// `services/scheduler/internal/registry/store_postgres.go`'s
-/// `defaultStoreMaxConnections`, chosen there for a single-instance service;
-/// it is more conservative here on purpose because this process is not
-/// single-instance.
+/// Deployment capacity is `replicas * max_connections`.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 8;
 
-/// How long [`connect`] waits for the first connection, and how long every
-/// later `pool.acquire()` waits under saturation, when `[pg]` does not set
-/// `connect_timeout_secs`.
+/// Default connection and acquire timeout.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Resolved, ready-to-connect pool settings for one process's `[pg]` pool.
-///
-/// Built from [`crate::cfg::PgConfig`] by [`PgPoolSettings::from_config`]
-/// rather than used directly, so every caller applies the same defaults —
-/// `[pg]` is deserialized straight from TOML and leaves every field `None`
-/// where the deployment did not set one.
+/// Resolved settings for one process's PostgreSQL pool.
 #[derive(Debug, Clone)]
 pub struct PgPoolSettings {
-    /// A libpq-style connection URL. Never logged or included in an error
-    /// message verbatim — see [`redact_dsn`].
+    /// Connection URL; never log it without [`redact_dsn`].
     pub dsn: String,
     pub max_connections: u32,
     pub connect_timeout: Duration,
 }
 
 impl PgPoolSettings {
-    /// `Ok(None)` when PostgreSQL is not configured for this process (no
-    /// `[pg]` section, or a `dsn` that is absent or blank) — a legitimate,
-    /// common state today, since nothing yet consumes this pool.
+    /// Returns `None` when the `[pg]` section or DSN is absent or blank.
     pub fn from_config(pg: Option<&PgConfig>) -> Result<Option<Self>> {
         let Some(pg) = pg else {
             return Ok(None);
@@ -70,13 +45,7 @@ impl PgPoolSettings {
     }
 }
 
-/// Builds a pool and validates it can actually reach PostgreSQL before
-/// returning, so a misconfigured or unreachable database is a startup
-/// failure with an actionable message rather than a surprise on the first
-/// request that needs one.
-///
-/// Uses `sqlx::PgPoolOptions::connect` (not `connect_lazy`), which opens and
-/// tests at least one real connection as part of this call.
+/// Connects eagerly and fails startup when PostgreSQL is unreachable.
 pub async fn connect(settings: &PgPoolSettings) -> Result<PgPool> {
     let redacted = redact_dsn(&settings.dsn);
     let pool = PgPoolOptions::new()
@@ -105,10 +74,9 @@ pub async fn connect(settings: &PgPoolSettings) -> Result<PgPool> {
     Ok(pool)
 }
 
-/// `host:port/dbname` with the userinfo (username and password) stripped, for
-/// safe use in logs and error messages. Falls back to a fixed placeholder
-/// when `dsn` does not parse as a URL, rather than risking a credential
-/// leaking through an un-parsed fallback.
+/// Removes userinfo from a DSN for safe diagnostics.
+///
+/// Unparseable input returns a fixed placeholder rather than leaking text.
 pub fn redact_dsn(dsn: &str) -> String {
     match url::Url::parse(dsn) {
         Ok(url) => {
@@ -184,8 +152,6 @@ mod tests {
         assert_eq!(settings.connect_timeout, Duration::from_secs(1));
     }
 
-    /// The one property that actually matters for this helper: whatever goes
-    /// in, the password never comes out.
     #[test]
     fn redact_dsn_never_reproduces_the_password() {
         let redacted = redact_dsn("postgres://api_user:hunter2@db.internal:5432/agentenv");
@@ -199,8 +165,6 @@ mod tests {
         assert_eq!(redact_dsn("not a url at all"), "<unparsable dsn>");
     }
 
-    /// Against a real server: `connect` succeeds and the returned pool
-    /// actually works.
     #[tokio::test]
     async fn connect_reaches_a_real_server() {
         let Some(dsn) = crate::pg::harness::dsn_for("connect_reaches_a_real_server") else {
@@ -219,15 +183,9 @@ mod tests {
         assert_eq!(answer, 1);
     }
 
-    /// The startup failure this whole helper exists for: a DSN that cannot
-    /// be reached has to fail fast (bounded by `connect_timeout`, not
-    /// sqlx's own 30-second default) and say something a human can act on.
     #[tokio::test]
     async fn connect_to_an_unreachable_host_fails_fast_and_actionably() {
-        // 203.0.113.0/24 is TEST-NET-3 (RFC 5737): reserved for documentation,
-        // guaranteed to route nowhere, so this fails on a timeout rather than
-        // an immediate "connection refused" that would race the timeout logic
-        // this test means to cover.
+        // TEST-NET-3 forces a timeout rather than connection refusal.
         let settings = PgPoolSettings {
             dsn: "postgres://user:pw@203.0.113.1:5432/agentenv".to_string(),
             max_connections: 2,

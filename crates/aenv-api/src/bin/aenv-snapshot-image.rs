@@ -4,13 +4,6 @@
 //! non-zero with a credential-free context chain. It never starts
 //! node-runtime machinery (KVM, ublk, network); registry authentication
 //! stays with the Docker config that `regctl` reads itself.
-//!
-//! 🔴 In `aenv-api` and not `aenv-node`, because the snapshot catalog is
-//! PostgreSQL and `[pg]` is this half's alone. It used to read the
-//! object-storage catalog directly from a node; object storage stopped holding
-//! catalog rows at the Stage B cutover, so that read would now answer "not
-//! found" for every snapshot published since — indistinguishable from a wrong
-//! snapshot id.
 
 use std::path::PathBuf;
 
@@ -59,11 +52,6 @@ async fn main() -> anyhow::Result<()> {
         None => ConfigManager::init_global()
             .context("load AgentENV config (AENV_CONFIG_PATH or the default config path)")?,
     };
-    // 🔴 The snapshot catalog is PostgreSQL, so this tool needs `[pg]` — the
-    // same section `aenv-api` itself reads, and the reason this binary lives in
-    // that crate. Nothing here migrates the schema: the tool is read-only, and
-    // a schema this cluster's api replicas have not already created is a
-    // cluster with no snapshots to export.
     let settings = pg_settings(config_manager.config())?;
     let pool = pg::connect(&settings)
         .await
@@ -89,19 +77,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The `[pg]` settings this tool cannot run without, or the refusal that says
-/// how to supply them.
-///
-/// 🔴 Extracted from `main` so the refusal is reachable from a test without a
-/// database. What it must not say is `AENV_PG_DSN`: there is no such
-/// environment variable and there cannot be one — `AppConfig::pg` is an
-/// `Option<PgConfig>`, and confique reaches a field from the environment only
-/// through `#[config(nested)]`, which may not be optional (see `src/cfg.rs`'s
-/// `[pg]` module doc). An operator sent to set it would export a name nothing
-/// reads and see the same refusal again. The wording therefore matches
-/// `build_pg_pool`'s (`crates/aenv-api/src/bin/aenv-api.rs`): the setting is
-/// `[pg].dsn`, it is TOML-file-only, and it arrives through
-/// `AENV_CONFIG_PATH` or an `AENV_CONFIG_OVERLAY_PATH` overlay.
 fn pg_settings(config: &AppConfig) -> anyhow::Result<PgPoolSettings> {
     PgPoolSettings::from_config(config.pg.as_ref())?.context(
         "[pg] is not configured, and the snapshot catalog is PostgreSQL: this tool reads one \
@@ -120,18 +95,6 @@ mod tests {
 
     use super::{pg_settings, AppConfig, Cli};
 
-    /// 🔴 The refusal must not send an operator to an environment variable
-    /// that does not exist.
-    ///
-    /// `AENV_PG_DSN` was named here for as long as this tool has existed, and
-    /// nothing reads it: `[pg]` is `Option<PgConfig>` in `AppConfig`, and
-    /// confique descends into a struct only through `#[config(nested)]`, which
-    /// may not be optional — so no field under `[pg]` can carry an `env =`
-    /// binding. An operator who followed the old message would export the
-    /// name, restart, and get the identical error with nothing to show for it.
-    ///
-    /// `AppConfig::default()` carries no `[pg]`, which is what makes this
-    /// refusal reachable without a database.
     #[test]
     fn the_missing_pg_refusal_names_no_environment_variable_that_does_not_exist() {
         let config = AppConfig::default();
@@ -148,9 +111,6 @@ mod tests {
             !err.contains("AENV_PG_DSN"),
             "there is no such environment variable: {err}"
         );
-        // And it still says what to do instead — the same three facts
-        // `build_pg_pool`'s message carries, so an operator reading either one
-        // is told the same thing.
         assert!(err.contains("[pg].dsn"), "{err}");
         assert!(err.contains("TOML-file-only"), "{err}");
         assert!(err.contains("AENV_CONFIG_OVERLAY_PATH"), "{err}");

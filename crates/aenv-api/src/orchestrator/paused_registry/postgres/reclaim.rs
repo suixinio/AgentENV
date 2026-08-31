@@ -1,15 +1,6 @@
-//! `ReclaimExpiredHoldings` (`store_postgres.go`'s
-//! `reclaimExpiredHoldings` + `DiscardBreaker`, `grace.go:411-513`) and
-//! `ReleaseNodeHoldings` (`releaseHoldingsReleasedSQL`/
-//! `releaseHoldingsDiscardedSQL`, `store_postgres.go:1798-1814`).
-//!
-//! 🔴 **D2 Fix B lives here**: [`super::sql::RECLAIM_RELEASED_RUNNING_SQL`]
-//! and [`super::sql::RECLAIM_RELEASED_RESUMING_SQL`] are two independent
-//! statements, run as two independent `UPDATE`s in the same transaction --
-//! never folded into one `state IN ('running', 'resuming')` statement. See
-//! their own doc comments in `sql.rs` for why re-merging them reopens the
-//! stuck-forever `resuming` deadlock, worse under N `aenv-api` replicas
-//! than under Go's single instance.
+//! Reclaims expired holdings and releases a dead node's rows.
+//! Running and resuming releases stay separate statements in one transaction;
+//! the discard breaker rolls back the entire transaction when it trips.
 
 use anyhow::anyhow;
 use sqlx::PgPool;
@@ -23,8 +14,7 @@ fn backend_err(operation: &'static str, err: sqlx::Error) -> PausedRegistryError
     PausedRegistryError::backend(operation, err)
 }
 
-/// `DiscardBreaker` (`grace.go:411-513`), ported. Both arms are ORed --
-/// the stricter wins.
+/// Limits destructive reclaim by both row count and ratio.
 #[derive(Debug, Clone, Copy)]
 pub struct DiscardBreaker {
     pub max_rows: i64,
@@ -32,11 +22,6 @@ pub struct DiscardBreaker {
     pub min_ratio_rows: i64,
 }
 
-/// `defaultDiscardMaxRows`/`defaultDiscardMaxRatio`/`defaultDiscardMinRatioRows`
-/// (`grace.go:430-434`), verbatim. Not exposed as a config knob here, same as
-/// Go: `MinRatioRows` was never configurable on the Go side either
-/// (`services/shared/config/config.go` exposes `DiscardMaxRows`/
-/// `DiscardMaxRatio` only).
 impl Default for DiscardBreaker {
     fn default() -> Self {
         Self {
@@ -48,8 +33,7 @@ impl Default for DiscardBreaker {
 }
 
 impl DiscardBreaker {
-    /// `DiscardBreaker.Allow` (`grace.go:465-513`), ported verbatim.
-    /// `candidates == 0` always allows -- nothing to trip a breaker over.
+    /// Allows a discard pass only when neither breaker threshold is exceeded.
     pub fn allow(&self, candidates: i64, total: i64) -> Result<(), String> {
         if candidates == 0 {
             return Ok(());
@@ -89,11 +73,9 @@ impl DiscardBreaker {
     }
 }
 
-/// `ReclaimExpiredHoldings` (`store_postgres.go`'s `reclaimExpiredHoldings`),
-/// ported: releases both live states unconditionally, then gates the
-/// discard DELETE on the breaker -- **the whole transaction, releases
-/// included, is abandoned if the breaker trips**, exactly mirroring Go's own
-/// comment on that point.
+/// Releases expired rows, then discards unrecoverable rows if the breaker allows.
+///
+/// A tripped breaker rolls back releases and discards together.
 pub async fn reclaim_expired_holdings(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -132,9 +114,7 @@ pub async fn reclaim_expired_holdings(
         .map_err(|e| backend_err("reclaim_expired_holdings", e))?;
 
     if let Err(reason) = breaker.allow(candidates, total) {
-        // 🔴 The whole transaction is abandoned, releases included -- `tx`
-        // drops here without `commit()`, which rolls back both UPDATEs
-        // above along with the DELETE that never ran.
+        // Dropping the uncommitted transaction rolls back both release updates.
         error!(
             candidates,
             total,
@@ -176,19 +156,7 @@ pub async fn reclaim_expired_holdings(
     Ok(outcome)
 }
 
-/// `ReleaseNodeHoldings` (`store_postgres.go:1798-1814`), ported: the third
-/// seizure path, releasing whatever `node_id`'s previous process on this
-/// same machine was holding when it died.
-///
-/// 🔴 For a `Running` row this only ever matches when `node_id` equals the
-/// row's `origin_node_id` -- which, under the split node/api identity model,
-/// `aenv-api`'s own identity never is (`origin_node_id` names the real
-/// machine; an api replica's identity is a Pod name). It remains fully
-/// effective for `Resuming` rows this same api replica claimed and never
-/// finished resuming -- see the Stage C report's D1 section for why this is
-/// not a gap this port needs to close: Fix B's lease-based reclaim is the
-/// primary safety net for that state, this is a faster, identity-based
-/// shortcut on top of it.
+/// Releases or discards rows still held by `node_id`.
 pub async fn release_node_holdings(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -259,8 +227,6 @@ mod tests {
         assert!(breaker.allow(20, 100).is_err());
     }
 
-    /// `MinRatioRows` exists so a small cluster's ordinary reclamation (two
-    /// sandboxes out of eight, 25%) does not trip a 10% ratio limit.
     #[test]
     fn min_ratio_rows_protects_a_small_cluster() {
         let breaker = DiscardBreaker {

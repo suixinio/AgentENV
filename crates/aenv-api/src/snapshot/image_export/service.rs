@@ -46,11 +46,6 @@ fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
 }
 
 /// Orchestrates committed-snapshot rootfs image export.
-///
-/// Depends on the catalog alone: this tool reads one row and then reaches the
-/// layers through `ManagedLayerLocator`, so it has no business holding a whole
-/// repository. Being able to say that is the point of the catalog/artifact
-/// split.
 pub struct SnapshotImageService {
     catalog: Arc<dyn SnapshotCatalog>,
     layers: ManagedLayerLocator,
@@ -58,20 +53,7 @@ pub struct SnapshotImageService {
 }
 
 impl SnapshotImageService {
-    /// Builds the service from the global config and an already-connected
-    /// `[pg]` pool, intentionally skipping the node-runtime resolver, artifact
-    /// cache, layer store, and P2P machinery.
-    ///
-    /// 🔴 The catalog is PostgreSQL and nothing else. This tool used to build
-    /// the object-storage catalog straight out of `snapshot.repository_backend`
-    /// and read a row from it; object storage stopped receiving catalog rows at
-    /// the Stage B cutover, so that read answered "not found" for every
-    /// snapshot published since — an answer an operator cannot tell apart from
-    /// a wrong snapshot id. It reads the real catalog now, which is why this
-    /// binary moved into `aenv-api`: that is the half that holds the pool.
-    ///
-    /// `repository_backend` still decides where the *bytes* are, and that is
-    /// all it decides here.
+    /// Builds a PostgreSQL-catalog service while repository config selects byte storage.
     pub async fn from_global_config(
         pool: &sqlx::PgPool,
         regctl_binary: impl Into<PathBuf>,
@@ -461,8 +443,6 @@ mod tests {
             .await
     }
 
-    /// One row, by id, and nothing else — the only catalog surface this tool
-    /// touches (`catalog.get`).
     struct SeededCatalog(SnapshotRecord);
 
     #[async_trait::async_trait]

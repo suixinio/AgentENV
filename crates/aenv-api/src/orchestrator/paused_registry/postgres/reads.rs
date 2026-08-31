@@ -1,15 +1,5 @@
-//! `Get`/`GetMany` (`store_postgres.go:251-267`, `:317-330`), ported.
-//!
-//! 🔴 §7 point 1 of the plan doc ("两套并行的读模型"): Go keeps two
-//! independent column lists (`entryColumns` for the write path, `selectColumns`
-//! for the read-only `postgres.go`/`registry.go` surface) that can drift
-//! apart -- `postgres.go`'s own comment names the failure mode ("adding a
-//! column to one and not the other does not fail: it makes that column read
-//! as empty"). This port has exactly one column list
-//! ([`super::sql::ENTRY_COLUMNS`]) and one row type
-//! ([`super::row::EntryRow`]/[`super::row::RegistryRow`]): every reader in
-//! this backend, trait-facing or internal, is built from the same query
-//! shape, so there is nothing left to drift.
+//! Paused-registry reads share [`super::sql::ENTRY_COLUMNS`] and one row
+//! decoder so trait and internal query shapes cannot drift.
 
 use std::collections::{HashMap, HashSet};
 
@@ -36,17 +26,8 @@ pub async fn get(
     get_via_conn(&registry.pool, registry.cluster_id, sandbox_id).await
 }
 
-/// [`get`]'s own query, over an arbitrary executor rather than
-/// `registry.pool` specifically -- **B5**'s own reason to exist: a caller
-/// that just wrote a conditional `UPDATE` and needs to classify why it
-/// matched zero rows must read the row it is classifying on the *same*
-/// connection/transaction as the write, or the read can land on a
-/// different physical connection and see a version of the row the write
-/// never observed (see `writes.rs`'s `mark_running`/`renew_sandbox_deadline`
-/// for the two internal callers this exists for). Takes anything
-/// implementing [`sqlx::Executor`] for `Postgres` -- `&PgPool` (this
-/// function's own use above), `&mut PgConnection`, or `&mut Transaction<'_,
-/// Postgres>` via `&mut *tx` all satisfy it.
+/// Reads on the caller's executor so zero-row write outcomes can be classified
+/// against the same connection or transaction.
 pub async fn get_via_conn<'e, E>(
     executor: E,
     cluster_id: Uuid,
@@ -70,10 +51,7 @@ pub async fn get_many(
     sandbox_ids: &[SandboxId],
 ) -> RegistryResult<PausedRegistryRows> {
     if sandbox_ids.is_empty() {
-        // 🔴 Asked nothing, covers nothing. The caller compares `covered`
-        // against the ids it passed, so an empty request is satisfied by an
-        // empty coverage list -- not by a claim to have answered for ids that
-        // were never in the batch.
+        // An empty request covers no IDs.
         return Ok(PausedRegistryRows::default());
     }
 
@@ -85,16 +63,8 @@ pub async fn get_many(
         .await
         .map_err(|e| backend_err("get_many", e))?;
 
-    // 🔴 One row this crate cannot decode must not fail the whole batch,
-    // and must not be reported as an absence either. `get_many` exists so a
-    // reconciliation pass can compare a node's whole roster against the
-    // registry in one round trip (the trait's own doc); a `?` here turns one
-    // unreadable row into "every sandbox on this node looks untracked", while
-    // silently dropping it turns that one row into "this sandbox is gone" --
-    // and the caller destroys a paused record or a live VM on exactly that
-    // answer. Both are wrong in the destructive direction, so the row is
-    // dropped from `entries` *and* withheld from `covered`: the batch keeps
-    // answering for every other id and declines to answer for this one.
+    // Undecodable rows are omitted from entries and coverage so destructive
+    // callers cannot mistake them for absent sandboxes.
     let (rows, skipped) = collect_entries(sandbox_ids, rows);
     if skipped > 0 {
         warn!(
@@ -108,20 +78,8 @@ pub async fn get_many(
     Ok(rows)
 }
 
-/// The pure decode-and-account loop [`get_many`] runs -- pulled out so it is
-/// testable without a database (see `#[cfg(test)] mod tests` below).
-///
-/// `covered` is built from `requested` rather than from the rows that came
-/// back, because absence is a real answer here: an id the cluster holds no row
-/// for is answered for, and the caller is entitled to act on it. What removes
-/// an id from `covered` is a row that exists and could not be read.
-///
-/// 🔴 A row whose own `sandbox_id` column will not parse cannot be
-/// attributed to any requested id, so there is no single id to withhold. The
-/// batch then covers nothing: with an unattributable row in the result set,
-/// *any* of the requested ids could be the one whose row was unreadable, and
-/// "some absence in here is a lie" is not a state a destructive caller can
-/// safely act on for the rest.
+// Coverage includes real absences but excludes undecodable rows. If a bad row
+// cannot be attributed to an ID, cover nothing.
 fn collect_entries(requested: &[SandboxId], rows: Vec<EntryRow>) -> (PausedRegistryRows, u32) {
     let mut entries = HashMap::with_capacity(rows.len());
     let mut undecodable: HashSet<SandboxId> = HashSet::new();
@@ -165,22 +123,7 @@ fn collect_entries(requested: &[SandboxId], rows: Vec<EntryRow>) -> (PausedRegis
     (PausedRegistryRows { entries, covered }, skipped)
 }
 
-/// Every row in `cluster_id` -- the internal listing
-/// [`super::reconcile::compute_reconcile`] compares against the heartbeat
-/// roster. No pagination: `RunRegistryReconcile`'s own Go equivalent
-/// (`PostgresReader::List`) has none either, and a cluster large enough for
-/// that to matter is a scaling question for a later stage, not a
-/// correctness one for this one.
-///
-/// 🔴 Skip-and-count, and unlike [`get_many`] that is the whole fix here rather
-/// than half of one. One row this build could not decode used to fail the whole
-/// `Vec::collect`, which failed every tick's reconcile pass forever (the bad row
-/// never goes away on its own), which stops Fix A's lease renewal for the
-/// *entire* cluster -- precisely the "running row lease freeze" failure mode
-/// this backend already exists to avoid (see B1's own doc). A skipped row is
-/// counted and named at `warn` instead, and needs no coverage list on top
-/// because this listing's only consumer counts rows rather than acting on their
-/// absence -- see [`skip_bad_registry_rows`].
+/// Lists decodable registry rows for reconciliation, warning on skipped rows.
 pub async fn list_registry_rows(
     registry: &PostgresPausedSandboxRegistry,
 ) -> RegistryResult<Vec<RegistryRow>> {
@@ -206,13 +149,8 @@ pub async fn list_registry_rows(
     Ok(out)
 }
 
-/// The pure skip-and-count loop [`list_registry_rows`] runs.
-///
-/// Still a plain skip-and-count, unlike [`collect_entries`]: this listing's
-/// consumer is [`super::reconcile::compute_reconcile`], which counts metrics
-/// over the rows it is given and never acts on a row's *absence*. A skipped row
-/// costs this pass its contribution to those counters and nothing else, so
-/// there is no absence for a coverage list to protect here.
+// Reconciliation only aggregates returned rows, so skipped rows need no
+// destructive-read coverage accounting.
 fn skip_bad_registry_rows(rows: Vec<EntryRow>) -> (Vec<RegistryRow>, u32) {
     let mut out = Vec::with_capacity(rows.len());
     let mut skipped = 0u32;
@@ -234,24 +172,9 @@ fn skip_bad_registry_rows(rows: Vec<EntryRow>) -> (Vec<RegistryRow>, u32) {
     (out, skipped)
 }
 
-/// `ListRegistrySandboxes`' own read -- every row in `cluster_id`, plus the
-/// database clock they were read against, in one read-only transaction.
-/// Ports Go's `PostgresReader.List` (`postgres.go:135-183`).
+/// Lists rows and the database time from one read-only transaction.
 ///
-/// The two come from the same transaction deliberately, mirroring Go's own
-/// comment on that method: `now()` is fixed at the transaction's start
-/// regardless of isolation level, so reading it over a second round trip
-/// would risk pairing a row set against a clock reading taken at a
-/// different instant -- and every lease judgement downstream
-/// (`LeaseExpiresAtUnixMs`/`SandboxExpiresAtUnixMs` against
-/// `DatabaseNowUnixMs` on the wire) depends on that not happening. Rolled
-/// back rather than committed when it succeeds, same as Go's `defer
-/// tx.Rollback(ctx)`: read-only, so there is nothing to keep.
-///
-/// No pagination, matching [`list_registry_rows`]'s own reasoning (and
-/// Go's `PostgresReader.List` having none either): filtering and paging are
-/// `list_registry_sandboxes`'s job (`src/node_registry/grpc_service.rs`),
-/// not this read's.
+/// The shared transaction keeps lease comparisons on a single clock instant.
 pub async fn list_all(
     registry: &PostgresPausedSandboxRegistry,
 ) -> RegistryResult<PausedRegistryListing> {
@@ -272,9 +195,6 @@ pub async fn list_all(
         .await
         .map_err(|e| backend_err("list_all", e))?;
 
-    // Read-only: nothing to keep, so a rollback (matching Go's own
-    // `defer tx.Rollback(ctx)`) is exactly as correct as a commit here and
-    // costs nothing to prefer -- there is no write on this path to lose.
     tx.rollback()
         .await
         .map_err(|e| backend_err("list_all", e))?;
@@ -294,12 +214,6 @@ pub async fn list_all(
     })
 }
 
-/// The pure skip-and-count loop [`list_all`] runs: one row this build cannot
-/// decode must not take an admin/debug listing of every other row down with it.
-///
-/// No coverage list, for [`skip_bad_registry_rows`]'s reason -- this feeds
-/// `ListRegistrySandboxes`, a read-only listing whose callers report what they
-/// were shown rather than destroying what they were not.
 fn skip_bad_list_entries(rows: Vec<EntryRow>) -> (Vec<PausedRegistryListEntry>, u32) {
     let mut out = Vec::with_capacity(rows.len());
     let mut skipped = 0u32;
@@ -329,13 +243,6 @@ mod tests {
     use crate::orchestrator::store::SandboxMetadata;
     use crate::types::ExecutionId;
 
-    /// A minimal, decodable [`EntryRow`] -- every field a real row would
-    /// carry for a `paused` sandbox, so `decode_entry`/`decode_registry_row`
-    /// both succeed on it. Metadata comes from `SandboxMetadata::default()`
-    /// (the same technique `postgres::contract`'s own `entry()` helper
-    /// uses) rather than a hand-written JSON literal, so this stays correct
-    /// across `SandboxMetadata`'s own field changes instead of drifting into
-    /// a shape the real decoder no longer accepts.
     fn good_row(sandbox_id: Uuid, cluster_id: Uuid) -> EntryRow {
         let id = SandboxId::parse_str(&sandbox_id.to_string()).unwrap();
         let metadata = SandboxMetadata {
@@ -361,12 +268,6 @@ mod tests {
         }
     }
 
-    /// A row that fails to decode, however far its own state gets it: an
-    /// unrecognised `state` string, which no CHECK constraint short of a
-    /// direct hand-corruption (or a build mismatch reading a differently
-    /// migrated table) should ever actually produce -- but exactly the
-    /// shape [`collect_entries`]/[`skip_bad_registry_rows`] exist to
-    /// survive rather than propagate.
     fn unreadable_row(sandbox_id: Uuid, cluster_id: Uuid) -> EntryRow {
         let mut row = good_row(sandbox_id, cluster_id);
         row.state = "not_a_real_state".to_string();
@@ -377,7 +278,6 @@ mod tests {
         SandboxId::parse_str(&raw.to_string()).unwrap()
     }
 
-    /// One bad row must not take the good one down with it.
     #[test]
     fn collect_entries_keeps_the_good_row_and_counts_the_bad_one() {
         let cluster_id = Uuid::new_v4();
@@ -398,10 +298,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The A1 claim itself: an unreadable row is withheld from `covered`, so
-    /// a caller that destroys on absence cannot read it as "this sandbox is
-    /// gone". Without this the row simply vanishes from the map and
-    /// `reap_superseded_running_sandboxes` tears down a live VM.
     #[test]
     fn collect_entries_withholds_coverage_for_a_row_it_cannot_decode() {
         let cluster_id = Uuid::new_v4();
@@ -425,9 +321,6 @@ mod tests {
         );
     }
 
-    /// An id the cluster holds no row for is still *answered for*: absence is a
-    /// real result, and reconciliation is entitled to act on it. Only a row
-    /// that exists and cannot be read costs coverage.
     #[test]
     fn collect_entries_covers_an_id_with_no_row_at_all() {
         let cluster_id = Uuid::new_v4();
@@ -445,10 +338,6 @@ mod tests {
         );
     }
 
-    /// 🔴 A row whose own id column will not parse cannot be attributed to a
-    /// requested id, so no single id can be withheld -- and any of them could
-    /// be the one. The batch then covers nothing rather than covering the rest
-    /// on a guess.
     #[test]
     fn collect_entries_covers_nothing_when_a_bad_row_cannot_be_attributed() {
         let cluster_id = Uuid::new_v4();
@@ -470,9 +359,6 @@ mod tests {
         );
     }
 
-    /// A batch with nothing wrong in it must report zero skipped and full
-    /// coverage -- this fix must not turn a clean batch into a partially
-    /// reported one.
     #[test]
     fn collect_entries_reports_nothing_skipped_when_every_row_decodes() {
         let cluster_id = Uuid::new_v4();
@@ -487,10 +373,6 @@ mod tests {
         assert!(rows.covers(&requested));
     }
 
-    /// The identical claim for [`list_registry_rows`]'s own loop -- the one
-    /// that, before this fix, could stop Fix A's cluster-wide lease renewal
-    /// forever on a single bad row (see this module's own doc on
-    /// `list_registry_rows`).
     #[test]
     fn skip_bad_registry_rows_keeps_the_good_row_and_counts_the_bad_one() {
         let cluster_id = Uuid::new_v4();
@@ -507,9 +389,6 @@ mod tests {
         assert_eq!(out[0].sandbox_id.to_string(), good_id.to_string());
     }
 
-    /// The identical claim for [`list_all`]'s own loop -- `ListRegistrySandboxes`
-    /// is an admin/debug listing of the whole table, and one row this build
-    /// cannot decode must not blank out every other sandbox in the answer.
     #[test]
     fn skip_bad_list_entries_keeps_the_good_row_and_counts_the_bad_one() {
         let cluster_id = Uuid::new_v4();
@@ -526,8 +405,6 @@ mod tests {
         assert_eq!(out[0].sandbox_id.to_string(), good_id.to_string());
     }
 
-    /// A clean batch must report zero skipped -- mirrors
-    /// `collect_entries_reports_nothing_skipped_when_every_row_decodes`.
     #[test]
     fn skip_bad_list_entries_reports_nothing_skipped_when_every_row_decodes() {
         let cluster_id = Uuid::new_v4();
@@ -541,12 +418,6 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// [`decode_list_entry`] must carry the lease/execution-id columns
-    /// [`decode_entry`] leaves out -- the whole reason this listing exists
-    /// as its own decode rather than reusing that one. A row with every one
-    /// of those columns populated must come back with all of them, not
-    /// silently dropped the way the trait-facing `PausedSandboxEntry` drops
-    /// them.
     #[test]
     fn decode_list_entry_carries_the_lease_and_execution_columns() {
         let cluster_id = Uuid::new_v4();

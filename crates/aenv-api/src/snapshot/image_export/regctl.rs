@@ -280,10 +280,7 @@ pub mod fixture {
     use crate::digest;
     use crate::snapshot::{ExternalLayer, ManagedLayer, OverlaybdLayerRef};
 
-    /// 把仓内 fixture 链进 `dir`，而不是在这里现写一个可执行文件：写文件的线程
-    /// 持有写 fd 期间，同进程任何线程的 fork 都会复制到这个 fd，紧随其后的
-    /// execve 就被内核以 ETXTBSY 拒绝。symlink 不碰目标 inode，窗口不存在。
-    /// 链接（而非直接返回 fixture 路径）是因为脚本靠 `$0` 定位 `{dir}/state`。
+    /// Symlinks the fixture to avoid ETXTBSY and preserve its `$0`-relative state path.
     pub fn install_fake_regctl(dir: &Path) -> PathBuf {
         let binary = dir.join("regctl");
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/regctl.sh");

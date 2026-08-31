@@ -1,30 +1,7 @@
-//! Test support: a real, ephemeral PostgreSQL server, and a policy about what
-//! happens when one cannot be started.
-//!
-//! Mirrors `src/orchestrator/store/redis/harness.rs` deliberately, down to
-//! the skip/required policy: a real server, spawned once per test binary and
-//! shared by every test in it, never a fake — the whole point of testing
-//! [`crate::pg::election`] is the actual concurrency behaviour of
-//! `pg_try_advisory_lock`/`pg_advisory_unlock` across real sessions, which a
-//! fake would only agree with this code's own beliefs about.
-//!
-//! * `AENV_PG_TEST_REQUIRED=1` turns "no usable `initdb`/`postgres`" into a
-//!   **failure**, not a skip.
-//! * Without it, a skip prints a line beginning `SKIPPED[postgres]` to
-//!   stderr — greppable, the same convention the Redis harness uses, so a
-//!   skip that silently becomes permanent is something a make target can
-//!   still catch.
-//!
-//! 🔴 The Redis side has since hoisted its *process bootstrap* — free port,
-//! spawn under `PR_SET_PDEATHSIG`, readiness probe, the
-//! `AENV_REDIS_TEST_REQUIRED` predicate — into `aenv-core`'s
-//! `src/redis_test_server.rs`, shared by its three harnesses. That does not
-//! generalise to here and is not meant to: this one spawns a different server
-//! with `initdb` first, lives in a different crate, and hands out schemas
-//! rather than logical databases. What the Redis extraction kept separate is
-//! the same thing this file keeps separate — each subsystem's own server
-//! process and its own namespace allocator, so one suite's reset cannot reach
-//! into another's live state.
+//! Real ephemeral PostgreSQL test server shared by one test binary.
+//! `AENV_PG_TEST_REQUIRED=1` turns unavailable binaries into failure;
+//! otherwise tests emit a greppable `SKIPPED[postgres]` line.
+//! DDL tests receive isolated schemas while election tests receive fresh pools.
 
 use std::io;
 use std::net::TcpListener;
@@ -42,19 +19,12 @@ struct PgTestServer {
 }
 
 impl PgTestServer {
-    /// `postgres://postgres@127.0.0.1:<port>/postgres`. Trust auth, no
-    /// password — this cluster exists only for the lifetime of this test
-    /// binary, on a random localhost port, with unix sockets disabled.
     fn url(&self) -> String {
         format!("postgres://postgres@127.0.0.1:{}/postgres", self.port)
     }
 }
 
-/// Finds a PostgreSQL server-side binary (`initdb`, `postgres`): an explicit
-/// override environment variable first, then `PATH`, then Debian/Ubuntu's
-/// versioned `/usr/lib/postgresql/<version>/bin/` layout — `apt install
-/// postgresql` puts binaries there and nowhere on `PATH` except the
-/// `pg_wrapper`-based client tools.
+// Finds server binaries from an override, `PATH`, or Debian's versioned layout.
 fn find_bin(name: &str, env_override: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var(env_override) {
         let path = PathBuf::from(path);
@@ -71,8 +41,6 @@ fn find_bin(name: &str, env_override: &str) -> Option<PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .collect();
-    // Best-effort newest-first; any version with both binaries works equally
-    // well for these tests.
     versions.sort();
     versions.reverse();
     versions
@@ -136,9 +104,7 @@ fn spawn_server() -> io::Result<(Child, u16, TempDir)> {
             .arg(port.to_string())
             .arg("-c")
             .arg("listen_addresses=127.0.0.1")
-            // Disables the unix socket entirely rather than pointing it at a
-            // tempdir, whose path can exceed the kernel's ~100-byte socket
-            // path limit; every test connects over TCP anyway.
+            // Disable unix sockets to avoid temporary-path length limits.
             .arg("-c")
             .arg("unix_socket_directories=")
             .arg("-c")
@@ -256,25 +222,19 @@ fn server() -> Option<&'static PgTestServer> {
         .as_ref()
 }
 
-/// Whether a missing PostgreSQL is a failure rather than a skip.
 fn pg_required() -> bool {
     std::env::var("AENV_PG_TEST_REQUIRED")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
-/// A fresh advisory lock key for one test. Starts well above every real
-/// [`super::AdvisoryLockKey`] variant and every digit of the Go
-/// `schemaLockKey`'s magnitude, so a test can never collide with a real key
-/// or with another test racing it on the same shared server.
+/// Returns a collision-free advisory lock key for one test.
 pub fn next_test_lock_key() -> i64 {
     static NEXT: AtomicI64 = AtomicI64::new(1_000_000);
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// The shared ephemeral test server's connection URL, or `None` when this
-/// machine has no usable `initdb`/`postgres` and the run has not demanded
-/// one.
+/// Returns the shared test server DSN, or skips when PostgreSQL is optional.
 pub fn dsn_for(test: &str) -> Option<String> {
     let Some(server) = server() else {
         if pg_required() {
@@ -283,17 +243,13 @@ pub fn dsn_for(test: &str) -> Option<String> {
                  Install postgresql (initdb/postgres), or point INITDB_BIN/POSTGRES_BIN at them."
             );
         }
-        // 🔴 Loud, greppable and on stderr — mirrors SKIPPED[redis].
         eprintln!("SKIPPED[postgres]: {test} (no postgres server available)");
         return None;
     };
     Some(server.url())
 }
 
-/// A fresh pool over the shared ephemeral test server, or `None` under the
-/// same conditions as [`dsn_for`]. Always a brand-new `PgPool`, never a
-/// shared/cloned one — two calls simulate two independent replicas each
-/// dialing the same database, which is what election tests need.
+/// Returns a fresh pool over the shared test server.
 pub async fn pool_for(test: &str) -> Option<sqlx::PgPool> {
     let dsn = dsn_for(test)?;
     let pool = sqlx::postgres::PgPoolOptions::new()
@@ -304,7 +260,7 @@ pub async fn pool_for(test: &str) -> Option<sqlx::PgPool> {
     Some(pool)
 }
 
-/// Binds a pool, or returns from the test having said so out loud.
+/// Binds a pool or returns from the skipped test.
 macro_rules! pool_or_skip {
     ($test:literal) => {
         match crate::pg::harness::pool_for($test).await {
@@ -316,29 +272,9 @@ macro_rules! pool_or_skip {
 
 pub(crate) use pool_or_skip;
 
-/// A pool scoped to a fresh, uniquely-named PostgreSQL schema on the shared
-/// ephemeral test server, or `None` under the same conditions as
-/// [`dsn_for`].
+/// Returns a pool scoped to a unique schema.
 ///
-/// 🔴 Exists because [`pool_for`] is not enough for anything that runs real
-/// DDL. The ephemeral server is one Postgres instance shared by every test in
-/// this binary (see this module's own doc comment), all connecting to the
-/// same literal `postgres` database — [`pool_for`] gives election tests their
-/// own *pool*, but every pool still points at the same physical tables. Two
-/// `#[tokio::test]` functions run concurrently by default, and a migration
-/// test that creates `snapshots`/`aliases`/etc. races every other migration
-/// test doing the same in the same schema — including one that drops them
-/// (`the_documented_rollback_command_actually_rolls_back`), which is a
-/// `relation "..." does not exist` away from failing a sibling test that
-/// merely happened to run at the wrong moment. A private schema per test,
-/// selected via `search_path` on every connection the pool hands out, gives
-/// each test its own copy of every table name with no coordination between
-/// tests required.
-///
-/// Every connection this pool ever opens carries the schema via
-/// `after_connect`, not a per-transaction `SET LOCAL` — the schema has to
-/// survive for the whole test, across however many connections the pool
-/// borrows out over that time, not just one transaction.
+/// `after_connect` applies the schema to every connection for the test lifetime.
 pub async fn isolated_schema_pool(test: &str) -> Option<sqlx::PgPool> {
     let dsn = dsn_for(test)?;
 
@@ -349,9 +285,7 @@ pub async fn isolated_schema_pool(test: &str) -> Option<sqlx::PgPool> {
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
 
-    // A throwaway single-connection pool just to create the schema — the
-    // real pool below assumes it already exists by the time its first
-    // `after_connect` hook runs.
+    // Create the schema before the real pool's first `after_connect`.
     let bootstrap = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&dsn)
@@ -384,8 +318,7 @@ pub async fn isolated_schema_pool(test: &str) -> Option<sqlx::PgPool> {
     Some(pool)
 }
 
-/// Binds a schema-scoped pool, or returns from the test having said so out
-/// loud. See [`isolated_schema_pool`].
+/// Binds an isolated-schema pool or returns from the skipped test.
 macro_rules! isolated_schema_pool_or_skip {
     ($test:literal) => {
         match crate::pg::harness::isolated_schema_pool($test).await {

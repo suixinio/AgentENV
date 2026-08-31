@@ -1,11 +1,4 @@
-//! `aenv-core`'s repository backends, plus the PostgreSQL catalog.
-//!
-//! The shared assembly (`build_snapshot_backend`, `build_catalog_only_storage`)
-//! is `aenv-core`'s and is re-exported here unchanged; what this crate adds is
-//! the catalog that answers over `[pg]` — the only snapshot catalog there is —
-//! and the two bridges the binary calls into it (`migrate_catalog_schema`,
-//! `spawn_catalog_build_reaper`), plus `pg_snapshot_catalog`, which builds what
-//! the shared assembly takes.
+//! Shared snapshot backends with the PostgreSQL catalog added.
 
 pub use aenv_core::snapshot::repository::backends::*;
 
@@ -13,10 +6,6 @@ pub mod postgres;
 
 pub use postgres::{migrate_catalog_schema, pg_snapshot_catalog, spawn_catalog_build_reaper};
 
-/// The production construction of the snapshot catalog, against a real
-/// database. Named `pg::` (not `mod tests`) so `make test-with-postgres` — a
-/// name filter, not a feature check — actually selects it; see Stage B's own
-/// proposal doc §7 step 12 on this exact trap.
 #[cfg(test)]
 mod pg {
     use super::*;
@@ -36,8 +25,6 @@ mod pg {
         }
     }
 
-    /// The catalog `pg_snapshot_catalog` hands the shared assembly is live: a
-    /// row written through it reads back through it, over the same pool.
     #[tokio::test]
     async fn the_catalog_handed_to_the_assembly_is_wired_to_the_pool() {
         let pool = isolated_schema_pool_or_skip!(
@@ -60,12 +47,6 @@ mod pg {
         assert_eq!(found.id, id);
     }
 
-    /// 🔴 The whole assembly, end to end, over a real database: the byte half
-    /// `build_catalog_only_storage` builds carries no catalog, and
-    /// `build_snapshot_backend` is what puts this one in front of it. A
-    /// regression that dropped the catalog on the floor would leave the
-    /// repository answering out of `NoSnapshotCatalog` — which refuses — and
-    /// this is the only test that would notice.
     #[tokio::test]
     async fn the_assembled_repository_reads_through_postgresql() {
         let pool =
@@ -106,17 +87,6 @@ mod pg {
         assert_eq!(found.id, id);
     }
 
-    /// 🔴 P1's production path: `config.snapshot.catalog.max_concurrent_builds`
-    /// has to reach the `PostgresSnapshotCatalog` [`pg_snapshot_catalog`]
-    /// constructs, not just the test-only constructor in `postgres::mod::pg`.
-    /// A ceiling of `1` set on the `AppConfig` passed in here must refuse a
-    /// second *different* template's build the same way
-    /// `the_cluster_wide_build_ceiling_refuses_once_it_is_reached` proves the
-    /// underlying store does — this test is the only one that goes through
-    /// `pg_snapshot_catalog` to get there, so a regression that stops the
-    /// config value from being read (for instance, `pg_snapshot_catalog` going
-    /// back to `PostgresSnapshotCatalog::new` without the
-    /// `with_max_concurrent_builds` call) fails only here.
     #[tokio::test]
     async fn max_concurrent_builds_from_config_reaches_admission() {
         let pool =

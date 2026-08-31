@@ -2,24 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use overlaybd::config::{
     lexically_normalize_path, load_image_config as load_overlaybd_image_config,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use tracing::warn;
 
-use crate::local_store::{LocalKvBatchOp, LocalKvStore, LocalStoreDurability};
+use crate::image::commit_index::{self, CommitIndex};
 
-const SCHEMA_VERSION: u32 = 1;
-const SCHEMA_VERSION_KEY: &[u8] = b"schema/version";
-const HARD_COMMIT_OBJECT_PREFIX: &[u8] = b"object/hard-commit/";
-const HOLD_RECORD_PREFIX: &[u8] = b"hold/";
-const CONFIG_TO_HARD_PREFIX: &[u8] = b"ref/config-to-hard/";
-const HOLD_TO_HARD_PREFIX: &[u8] = b"ref/hold-to-hard/";
-const HARD_TO_HOLD_PREFIX: &[u8] = b"ref/hard-to-hold/";
-const CONFIG_LAST_USED_PREFIX: &[u8] = b"config-last-used/";
 const IMAGE_CONFIG_SUFFIX: &str = "-image.json";
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
@@ -71,9 +65,23 @@ pub struct CacheOwnedImageConfigFacts {
     pub upper_file: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
+/// The image cache's reference graph, rebuilt from the cache directories
+/// rather than stored.
+///
+/// Config references and hard-commit facts come from `configs/` and
+/// `indexes/`; holds exist only for the lifetime of the process that took
+/// them, which is why a deleting pass needs [`ReclaimAuthority`].
+#[derive(Clone, Debug, Default)]
 pub struct ImageCacheMetadataStore {
-    store: LocalKvStore,
+    state: Arc<RwLock<CacheGraph>>,
+}
+
+#[derive(Debug, Default)]
+struct CacheGraph {
+    config_refs: BTreeMap<ImageCacheConfigId, BTreeSet<HardCommitId>>,
+    hard_commits: BTreeMap<HardCommitId, HardCommitObjectRecord>,
+    holds: BTreeMap<ImageCacheHoldOwner, BTreeSet<HardCommitId>>,
+    last_used: BTreeMap<ImageCacheConfigId, u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -149,18 +157,6 @@ pub struct HardCommitObjectRecord {
     pub size: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ConfigReferenceRecord {
-    config_id: ImageCacheConfigId,
-    digest: HardCommitId,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct ConfigLastUsedRecord {
-    config_id: ImageCacheConfigId,
-    last_used: u64,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CapacityEvictionPlan {
     pub candidates: Vec<CapacityEvictionCandidate>,
@@ -173,19 +169,6 @@ pub struct CapacityEvictionCandidate {
     pub last_used: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct HoldRecord {
-    namespace: String,
-    key: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct HoldHardCommitReferenceRecord {
-    namespace: String,
-    key: String,
-    digest: HardCommitId,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedHardCommitRef {
     digest: HardCommitId,
@@ -193,20 +176,28 @@ struct ParsedHardCommitRef {
     size: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ParsedConfig {
+    hard_refs: Vec<ParsedHardCommitRef>,
+    /// Seeds LRU recency for a config this process has not resolved yet.
+    modified_secs: u64,
+}
+
+/// Proof that paused holds have been re-derived, which a deleting pass needs
+/// because holds do not survive the process that took them.
+///
+/// [`ImageCacheMetadataStore::grant_reclaim_authority`] is the only source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReclaimAuthority(());
+
 impl ImageCacheMetadataStore {
-    pub async fn open(path: impl Into<PathBuf>, durability: LocalStoreDurability) -> Result<Self> {
-        let store = LocalKvStore::open(path, durability).await?;
-        let metadata = Self { store };
-        metadata.ensure_schema_version().await?;
-        Ok(metadata)
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// Boundedly stops background store work before process shutdown.
-    pub async fn close(
-        &self,
-        timeout: std::time::Duration,
-    ) -> crate::local_store::LocalKvCloseOutcome {
-        self.store.close(timeout).await
+    /// Records that paused holds have been re-derived, unblocking deleting passes.
+    pub async fn grant_reclaim_authority(&self) -> ReclaimAuthority {
+        ReclaimAuthority(())
     }
 
     pub async fn record_hard_commit_object(
@@ -215,49 +206,27 @@ impl ImageCacheMetadataStore {
         file: Option<PathBuf>,
         size: Option<u64>,
     ) -> Result<()> {
-        self.store
-            .put(
-                hard_commit_object_key(&digest),
-                serde_json::to_vec(&HardCommitObjectRecord {
-                    digest: digest.clone(),
-                    file,
-                    size,
-                })
-                .context("serialize hard commit object record")?,
-            )
-            .await
-            .with_context(|| format!("record hard commit object {digest}"))
+        self.state.write().await.hard_commits.insert(
+            digest.clone(),
+            HardCommitObjectRecord { digest, file, size },
+        );
+        Ok(())
     }
 
     pub async fn record_config_refs_from_config_path(&self, config_path: &Path) -> Result<()> {
         let config_id = ImageCacheConfigId::from_config_path(config_path)?;
         let hard_refs = load_cache_owned_hard_commit_refs(config_path)?;
-        let new_refs = hard_refs
-            .iter()
-            .map(|reference| reference.digest.clone())
-            .collect::<BTreeSet<_>>();
-        let existing = self.config_refs_set(&config_id).await?;
-        let mut ops = config_ref_replacement_ops(&config_id, &existing, &new_refs)?;
-        for reference in &hard_refs {
-            ops.push(hard_commit_object_put_op(
-                &reference.digest,
-                Some(reference.file.clone()),
-                Some(reference.size),
-            )?);
-        }
+        let mut state = self.state.write().await;
+        state.apply_config(&config_id, &hard_refs);
         // This path runs on every resolve (cache hit via record_source_image
         // config root and miss via publish), so it doubles as the LRU "touch".
         // `rebuild_from_configs` does not call it, so reconciles never reset it.
-        if new_refs.is_empty() {
-            ops.push(LocalKvBatchOp::delete(config_last_used_key(&config_id)));
+        if hard_refs.is_empty() {
+            state.last_used.remove(&config_id);
         } else {
-            ops.push(config_last_used_put_op(&config_id, unix_now_secs())?);
+            state.last_used.insert(config_id, unix_now_secs());
         }
-
-        self.store
-            .write_batch(ops)
-            .await
-            .with_context(|| format!("record image cache refs for config {config_id}"))
+        Ok(())
     }
 
     /// Cache-owned `file=` lowers inside the commit store; remote-recoverable
@@ -275,47 +244,26 @@ impl ImageCacheMetadataStore {
     }
 
     pub async fn remove_hard_commit_object(&self, digest: &HardCommitId) -> Result<()> {
-        self.store
-            .delete(hard_commit_object_key(digest))
-            .await
-            .with_context(|| format!("remove hard commit object {digest}"))
+        self.state.write().await.hard_commits.remove(digest);
+        Ok(())
     }
 
     pub async fn get_hard_commit_object(
         &self,
         digest: &HardCommitId,
     ) -> Result<Option<HardCommitObjectRecord>> {
-        let key = hard_commit_object_key(digest);
-        let Some(value) = self.store.get(key.clone()).await? else {
-            return Ok(None);
-        };
-        Ok(Some(decode_json(
-            &key,
-            &value,
-            "hard commit object record",
-        )?))
-    }
-
-    async fn scan_decode<T>(&self, prefix: &[u8], record_type: &'static str) -> Result<Vec<T>>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
-        let mut records = Vec::new();
-        for (key, value) in self.store.scan_prefix(prefix.to_vec()).await? {
-            records.push(decode_json(&key, &value, record_type)?);
-        }
-        Ok(records)
+        Ok(self.state.read().await.hard_commits.get(digest).cloned())
     }
 
     pub async fn list_hard_commit_objects(&self) -> Result<Vec<HardCommitObjectRecord>> {
-        let mut records = self
-            .scan_decode::<HardCommitObjectRecord>(
-                HARD_COMMIT_OBJECT_PREFIX,
-                "hard commit object record",
-            )
-            .await?;
-        records.sort_by(|left, right| left.digest.cmp(&right.digest));
-        Ok(records)
+        Ok(self
+            .state
+            .read()
+            .await
+            .hard_commits
+            .values()
+            .cloned()
+            .collect())
     }
 
     pub async fn create_or_replace_hold(
@@ -323,39 +271,32 @@ impl ImageCacheMetadataStore {
         owner: &ImageCacheHoldOwner,
         refs: &BTreeSet<HardCommitId>,
     ) -> Result<()> {
-        let existing = self.hold_refs_set(owner).await?;
-        let mut ops = hold_ref_replacement_ops(owner, &existing, refs)?;
-        ops.push(hold_record_put_op(owner)?);
-
-        self.store
-            .write_batch(ops)
+        self.state
+            .write()
             .await
-            .with_context(|| format!("replace image cache hold {owner}"))
+            .holds
+            .insert(owner.clone(), refs.clone());
+        Ok(())
     }
 
     pub async fn release_hold(&self, owner: &ImageCacheHoldOwner) -> Result<()> {
-        let existing = self.hold_refs_set(owner).await?;
-        let ops = hold_ref_removal_ops(owner, &existing);
-        self.store
-            .write_batch(ops)
-            .await
-            .with_context(|| format!("release image cache hold {owner}"))
+        self.state.write().await.holds.remove(owner);
+        Ok(())
     }
 
     pub async fn list_hold_owners_in_namespaces(
         &self,
         namespaces: &[&str],
     ) -> Result<Vec<ImageCacheHoldOwner>> {
-        let mut owners = Vec::new();
-        for record in self
-            .scan_decode::<HoldRecord>(HOLD_RECORD_PREFIX, "hold record")
-            .await?
-        {
-            if namespaces.contains(&record.namespace.as_str()) {
-                owners.push(ImageCacheHoldOwner::new(record.namespace, record.key)?);
-            }
-        }
-        Ok(owners)
+        Ok(self
+            .state
+            .read()
+            .await
+            .holds
+            .keys()
+            .filter(|owner| namespaces.contains(&owner.namespace()))
+            .cloned()
+            .collect())
     }
 
     /// Startup cleanup for transient namespaces. Do not pass durable namespaces.
@@ -363,19 +304,15 @@ impl ImageCacheMetadataStore {
         &self,
         namespaces: &[&str],
     ) -> Result<Vec<ImageCacheHoldOwner>> {
-        let owners = self.list_hold_owners_in_namespaces(namespaces).await?;
-        let mut ops = Vec::new();
+        let mut state = self.state.write().await;
+        let owners: Vec<ImageCacheHoldOwner> = state
+            .holds
+            .keys()
+            .filter(|owner| namespaces.contains(&owner.namespace()))
+            .cloned()
+            .collect();
         for owner in &owners {
-            ops.extend(hold_ref_removal_ops(
-                owner,
-                &self.hold_refs_set(owner).await?,
-            ));
-        }
-        if !ops.is_empty() {
-            self.store
-                .write_batch(ops)
-                .await
-                .context("release stale image cache holds at startup")?;
+            state.holds.remove(owner);
         }
         Ok(owners)
     }
@@ -384,29 +321,28 @@ impl ImageCacheMetadataStore {
         &self,
         digest: &HardCommitId,
     ) -> Result<Vec<ImageCacheHoldOwner>> {
-        let prefix = hard_to_hold_prefix_for_digest(digest);
-        let mut owners = BTreeSet::new();
-        for record in self
-            .scan_decode::<HoldHardCommitReferenceRecord>(&prefix, "hard-to-hold reference")
-            .await?
-        {
-            owners.insert(ImageCacheHoldOwner::new(record.namespace, record.key)?);
-        }
-        Ok(owners.into_iter().collect())
+        Ok(self
+            .state
+            .read()
+            .await
+            .holds
+            .iter()
+            .filter(|(_, refs)| refs.contains(digest))
+            .map(|(owner, _)| owner.clone())
+            .collect())
     }
 
     pub async fn hard_commit_config_referrer_map(
         &self,
     ) -> Result<BTreeMap<HardCommitId, Vec<ImageCacheConfigId>>> {
         let mut referrers = BTreeMap::<HardCommitId, Vec<ImageCacheConfigId>>::new();
-        for (config_id, refs) in self.config_ref_map().await? {
+        for (config_id, refs) in &self.state.read().await.config_refs {
             for digest in refs {
-                referrers.entry(digest).or_default().push(config_id.clone());
+                referrers
+                    .entry(digest.clone())
+                    .or_default()
+                    .push(config_id.clone());
             }
-        }
-        for configs in referrers.values_mut() {
-            configs.sort();
-            configs.dedup();
         }
         Ok(referrers)
     }
@@ -415,179 +351,83 @@ impl ImageCacheMetadataStore {
         &self,
         digest: &HardCommitId,
     ) -> Result<Vec<ImageCacheConfigId>> {
-        let mut referrers = BTreeSet::new();
-        for (config_id, refs) in self.config_ref_map().await? {
-            if refs.contains(digest) {
-                referrers.insert(config_id);
-            }
-        }
-        Ok(referrers.into_iter().collect())
+        Ok(self
+            .state
+            .read()
+            .await
+            .config_refs
+            .iter()
+            .filter(|(_, refs)| refs.contains(digest))
+            .map(|(config_id, _)| config_id.clone())
+            .collect())
     }
 
     pub async fn remove_config_refs(&self, config_id: &ImageCacheConfigId) -> Result<()> {
-        let existing = self.config_refs_set(config_id).await?;
-        self.store
-            .write_batch(config_ref_removal_ops(config_id, &existing))
-            .await
-            .with_context(|| format!("remove image cache refs for config {config_id}"))
+        let mut state = self.state.write().await;
+        state.config_refs.remove(config_id);
+        state.last_used.remove(config_id);
+        Ok(())
     }
 
-    pub async fn rebuild_from_configs(&self, configs_dir: &Path) -> Result<()> {
+    /// Rebuilds the config-derived half of the graph from the cache directories.
+    ///
+    /// Configs no longer on disk lose their references; hard-commit facts are
+    /// only added, so a commit this process recorded but has not yet published
+    /// a config for stays accounted for. Holds are untouched, and recency this
+    /// process already observed wins over the on-disk seed.
+    pub async fn rebuild_from_configs(
+        &self,
+        configs_dir: &Path,
+        index_dir: &Path,
+        commit_store: &Path,
+    ) -> Result<()> {
         let parsed = parse_configs_dir(configs_dir).await.with_context(|| {
             format!(
                 "rebuild image cache metadata from {}",
                 configs_dir.display()
             )
         })?;
-        let existing = self.config_ref_map().await?;
-        let existing_last_used = self.config_last_used_map().await?;
-        let now = unix_now_secs();
-        let mut ops = Vec::new();
+        let indexed = scan_indexed_hard_commits(index_dir, commit_store).await?;
+        let mut config_refs = BTreeMap::new();
+        let mut last_used = BTreeMap::new();
 
-        for stale_config in existing.keys().filter(|id| !parsed.contains_key(*id)) {
-            ops.extend(config_ref_removal_ops(
-                stale_config,
-                existing.get(stale_config).expect("iterated existing key"),
-            ));
-        }
-
-        for (config_id, hard_refs) in &parsed {
-            let new_refs = hard_refs
+        let mut state = self.state.write().await;
+        state.hard_commits.extend(indexed);
+        for (config_id, config) in parsed {
+            for reference in &config.hard_refs {
+                state.hard_commits.insert(
+                    reference.digest.clone(),
+                    HardCommitObjectRecord {
+                        digest: reference.digest.clone(),
+                        file: Some(reference.file.clone()),
+                        size: Some(reference.size),
+                    },
+                );
+            }
+            let refs = config
+                .hard_refs
                 .iter()
                 .map(|reference| reference.digest.clone())
                 .collect::<BTreeSet<_>>();
-            let old_refs = existing.get(config_id).cloned().unwrap_or_default();
-            ops.extend(config_ref_replacement_ops(config_id, &old_refs, &new_refs)?);
-            for reference in hard_refs {
-                ops.push(hard_commit_object_put_op(
-                    &reference.digest,
-                    Some(reference.file.clone()),
-                    Some(reference.size),
-                )?);
+            if refs.is_empty() {
+                continue;
             }
-            // Rebuilds preserve recency; new configs get a baseline touch.
-            if new_refs.is_empty() {
-                ops.push(LocalKvBatchOp::delete(config_last_used_key(config_id)));
-            } else if !existing_last_used.contains_key(config_id) {
-                ops.push(config_last_used_put_op(config_id, now)?);
-            }
+            let recency = state
+                .last_used
+                .get(&config_id)
+                .copied()
+                .unwrap_or(config.modified_secs);
+            last_used.insert(config_id.clone(), recency);
+            config_refs.insert(config_id, refs);
         }
 
-        self.store.write_batch(ops).await.with_context(|| {
-            format!(
-                "write image cache metadata rebuild from {}",
-                configs_dir.display()
-            )
-        })
-    }
-
-    async fn ensure_schema_version(&self) -> Result<()> {
-        match self.store.get(SCHEMA_VERSION_KEY).await? {
-            Some(bytes) => {
-                match serde_json::from_slice::<u32>(&bytes) {
-                    Ok(version) if version == SCHEMA_VERSION => Ok(()),
-                    Ok(version) => {
-                        self.reset_schema_version(&format!(
-                            "unsupported image cache metadata schema version {version}; expected {SCHEMA_VERSION}"
-                        ))
-                        .await
-                    }
-                    Err(error) => {
-                        self.reset_schema_version(&format!(
-                            "invalid image cache metadata schema version: {error}"
-                        ))
-                        .await
-                    }
-                }
-            }
-            None => self.write_schema_version().await,
-        }
-    }
-
-    async fn write_schema_version(&self) -> Result<()> {
-        self.store
-            .put(
-                SCHEMA_VERSION_KEY,
-                serde_json::to_vec(&SCHEMA_VERSION)
-                    .context("serialize image cache metadata schema version")?,
-            )
-            .await
-            .context("write image cache metadata schema version")
-    }
-
-    async fn reset_schema_version(&self, reason: &str) -> Result<()> {
-        let mut ops = self
-            .store
-            .entries()
-            .await
-            .with_context(|| format!("scan image cache metadata before reset: {reason}"))?
-            .into_iter()
-            .map(|(key, _)| LocalKvBatchOp::delete(key))
-            .collect::<Vec<_>>();
-        warn!(
-            reason,
-            entries = ops.len(),
-            "wiping image-cache metadata store due to schema version mismatch"
-        );
-        ops.push(schema_version_put_op()?);
-        self.store
-            .write_batch(ops)
-            .await
-            .with_context(|| format!("reset image cache metadata store: {reason}"))
-    }
-
-    async fn config_refs_set(
-        &self,
-        config_id: &ImageCacheConfigId,
-    ) -> Result<BTreeSet<HardCommitId>> {
-        let prefix = config_to_hard_prefix_for_config(config_id);
-        let mut refs = BTreeSet::new();
-        for record in self
-            .scan_decode::<ConfigReferenceRecord>(&prefix, "config-to-hard reference")
-            .await?
-        {
-            refs.insert(record.digest);
-        }
-        Ok(refs)
-    }
-
-    async fn config_ref_map(&self) -> Result<BTreeMap<ImageCacheConfigId, BTreeSet<HardCommitId>>> {
-        let mut refs = BTreeMap::<ImageCacheConfigId, BTreeSet<HardCommitId>>::new();
-        for record in self
-            .scan_decode::<ConfigReferenceRecord>(CONFIG_TO_HARD_PREFIX, "config-to-hard reference")
-            .await?
-        {
-            refs.entry(record.config_id)
-                .or_default()
-                .insert(record.digest);
-        }
-        Ok(refs)
-    }
-
-    async fn config_last_used_map(&self) -> Result<BTreeMap<ImageCacheConfigId, u64>> {
-        let mut last_used = BTreeMap::new();
-        for record in self
-            .scan_decode::<ConfigLastUsedRecord>(CONFIG_LAST_USED_PREFIX, "config last-used record")
-            .await?
-        {
-            last_used.insert(record.config_id, record.last_used);
-        }
-        Ok(last_used)
+        state.config_refs = config_refs;
+        state.last_used = last_used;
+        Ok(())
     }
 
     pub async fn config_last_used(&self, config_id: &ImageCacheConfigId) -> Result<Option<u64>> {
-        let key = config_last_used_key(config_id);
-        let Some(value) = self.store.get(key.clone()).await? else {
-            return Ok(None);
-        };
-        let record: ConfigLastUsedRecord = decode_json(&key, &value, "config last-used record")?;
-        if &record.config_id != config_id {
-            bail!(
-                "config last-used key mismatch: requested {config_id}, record has {}",
-                record.config_id
-            );
-        }
-        Ok(Some(record.last_used))
+        Ok(self.state.read().await.last_used.get(config_id).copied())
     }
 
     /// LRU source-config eviction plan. The freed estimate ignores holds, so any
@@ -598,13 +438,15 @@ impl ImageCacheMetadataStore {
         low_watermark_bytes: u64,
         evictable_before: u64,
     ) -> Result<CapacityEvictionPlan> {
-        let config_refs = self.config_ref_map().await?;
-        let sizes: BTreeMap<HardCommitId, u64> = self
-            .list_hard_commit_objects()
-            .await?
-            .into_iter()
-            .map(|record| (record.digest, record.size.unwrap_or(0)))
+        let state = self.state.read().await;
+        let config_refs = state.config_refs.clone();
+        let sizes: BTreeMap<HardCommitId, u64> = state
+            .hard_commits
+            .values()
+            .map(|record| (record.digest.clone(), record.size.unwrap_or(0)))
             .collect();
+        let last_used = state.last_used.clone();
+        drop(state);
         let total_bytes: u64 = sizes.values().copied().sum();
         if total_bytes <= high_watermark_bytes {
             return Ok(CapacityEvictionPlan {
@@ -623,7 +465,6 @@ impl ImageCacheMetadataStore {
             }
         }
 
-        let last_used = self.config_last_used_map().await?;
         let mut evictable: Vec<(u64, ImageCacheConfigId)> = config_refs
             .keys()
             .filter_map(|config_id| {
@@ -669,107 +510,96 @@ impl ImageCacheMetadataStore {
             total_bytes,
         })
     }
+}
 
-    async fn hold_refs_set(&self, owner: &ImageCacheHoldOwner) -> Result<BTreeSet<HardCommitId>> {
-        let prefix = hold_to_hard_prefix_for_owner(owner);
-        let mut refs = BTreeSet::new();
-        for record in self
-            .scan_decode::<HoldHardCommitReferenceRecord>(&prefix, "hold-to-hard reference")
-            .await?
-        {
-            refs.insert(record.digest);
+impl CacheGraph {
+    fn apply_config(&mut self, config_id: &ImageCacheConfigId, refs: &[ParsedHardCommitRef]) {
+        for reference in refs {
+            self.hard_commits.insert(
+                reference.digest.clone(),
+                HardCommitObjectRecord {
+                    digest: reference.digest.clone(),
+                    file: Some(reference.file.clone()),
+                    size: Some(reference.size),
+                },
+            );
         }
-        Ok(refs)
+        let digests = refs
+            .iter()
+            .map(|reference| reference.digest.clone())
+            .collect::<BTreeSet<_>>();
+        if digests.is_empty() {
+            self.config_refs.remove(config_id);
+        } else {
+            self.config_refs.insert(config_id.clone(), digests);
+        }
     }
 }
 
-fn push_mirrored_delete(ops: &mut Vec<LocalKvBatchOp>, forward: Vec<u8>, reverse: Vec<u8>) {
-    ops.push(LocalKvBatchOp::delete(forward));
-    ops.push(LocalKvBatchOp::delete(reverse));
-}
+/// Hard-commit facts for every commit this node's conversion indexes name,
+/// keeping commits that no published config references yet accountable.
+async fn scan_indexed_hard_commits(
+    index_dir: &Path,
+    commit_store: &Path,
+) -> Result<BTreeMap<HardCommitId, HardCommitObjectRecord>> {
+    let mut found = BTreeMap::new();
+    let mut digest_dirs = match tokio::fs::read_dir(index_dir).await {
+        Ok(dirs) => dirs,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read index dir {}", index_dir.display()))
+        }
+    };
 
-fn put_json_op<T: Serialize>(
-    key: Vec<u8>,
-    record: &T,
-    context: &'static str,
-) -> Result<LocalKvBatchOp> {
-    Ok(LocalKvBatchOp::put(
-        key,
-        serde_json::to_vec(record).context(context)?,
-    ))
-}
-
-fn push_mirrored_put_json<T: Serialize>(
-    ops: &mut Vec<LocalKvBatchOp>,
-    forward: Vec<u8>,
-    reverse: Vec<u8>,
-    record: &T,
-    context: &'static str,
-) -> Result<()> {
-    let value = serde_json::to_vec(record).context(context)?;
-    ops.push(LocalKvBatchOp::put(forward, value.clone()));
-    ops.push(LocalKvBatchOp::put(reverse, value));
-    Ok(())
-}
-
-fn config_ref_replacement_ops(
-    config_id: &ImageCacheConfigId,
-    existing: &BTreeSet<HardCommitId>,
-    refs: &BTreeSet<HardCommitId>,
-) -> Result<Vec<LocalKvBatchOp>> {
-    let mut ops = Vec::new();
-    for digest in existing.difference(refs) {
-        ops.push(LocalKvBatchOp::delete(config_to_hard_key(
-            config_id, digest,
-        )));
+    while let Some(digest_dir) = digest_dirs
+        .next_entry()
+        .await
+        .with_context(|| format!("scan index dir {}", index_dir.display()))?
+    {
+        if !digest_dir.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let mut index_files = tokio::fs::read_dir(digest_dir.path())
+            .await
+            .with_context(|| format!("read index dir {}", digest_dir.path().display()))?;
+        while let Some(index_file) = index_files
+            .next_entry()
+            .await
+            .with_context(|| format!("scan index dir {}", digest_dir.path().display()))?
+        {
+            let index = match CommitIndex::read(&index_file.path()).await {
+                Ok(Some(index)) => index,
+                Ok(None) => continue,
+                Err(error) => {
+                    warn!(
+                        index = %index_file.path().display(),
+                        error = %error,
+                        "skipping unreadable conversion index while rebuilding image cache metadata"
+                    );
+                    continue;
+                }
+            };
+            let Ok(digest) = HardCommitId::new(index.commit_digest.clone()) else {
+                continue;
+            };
+            let file = commit_index::commit_file(commit_store, &index.commit_digest);
+            if !tokio::fs::metadata(&file)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
+            {
+                continue;
+            }
+            found.insert(
+                digest.clone(),
+                HardCommitObjectRecord {
+                    digest,
+                    file: Some(file),
+                    size: Some(index.size),
+                },
+            );
+        }
     }
-    for digest in refs.difference(existing) {
-        ops.push(put_json_op(
-            config_to_hard_key(config_id, digest),
-            &ConfigReferenceRecord {
-                config_id: config_id.clone(),
-                digest: digest.clone(),
-            },
-            "serialize image cache reference",
-        )?);
-    }
-    Ok(ops)
-}
-
-fn config_ref_removal_ops(
-    config_id: &ImageCacheConfigId,
-    existing: &BTreeSet<HardCommitId>,
-) -> Vec<LocalKvBatchOp> {
-    let mut ops = Vec::new();
-    for digest in existing {
-        ops.push(LocalKvBatchOp::delete(config_to_hard_key(
-            config_id, digest,
-        )));
-    }
-    ops.push(LocalKvBatchOp::delete(config_last_used_key(config_id)));
-    ops
-}
-
-fn config_last_used_put_op(
-    config_id: &ImageCacheConfigId,
-    last_used: u64,
-) -> Result<LocalKvBatchOp> {
-    put_json_op(
-        config_last_used_key(config_id),
-        &ConfigLastUsedRecord {
-            config_id: config_id.clone(),
-            last_used,
-        },
-        "serialize config last-used record",
-    )
-}
-
-fn schema_version_put_op() -> Result<LocalKvBatchOp> {
-    put_json_op(
-        SCHEMA_VERSION_KEY.to_vec(),
-        &SCHEMA_VERSION,
-        "serialize image cache metadata schema version",
-    )
+    Ok(found)
 }
 
 pub fn unix_now_secs() -> u64 {
@@ -857,88 +687,9 @@ fn canonicalize_nearest_existing_parent(path: &Path) -> PathBuf {
     }
 }
 
-fn hard_commit_object_put_op(
-    digest: &HardCommitId,
-    file: Option<PathBuf>,
-    size: Option<u64>,
-) -> Result<LocalKvBatchOp> {
-    put_json_op(
-        hard_commit_object_key(digest),
-        &HardCommitObjectRecord {
-            digest: digest.clone(),
-            file,
-            size,
-        },
-        "serialize hard commit object record",
-    )
-}
-
-fn hold_record_put_op(owner: &ImageCacheHoldOwner) -> Result<LocalKvBatchOp> {
-    put_json_op(
-        hold_record_key(owner),
-        &HoldRecord {
-            namespace: owner.namespace().to_string(),
-            key: owner.key().to_string(),
-        },
-        "serialize image cache hold record",
-    )
-}
-
-fn hold_ref_replacement_ops(
-    owner: &ImageCacheHoldOwner,
-    existing: &BTreeSet<HardCommitId>,
-    refs: &BTreeSet<HardCommitId>,
-) -> Result<Vec<LocalKvBatchOp>> {
-    let mut ops = Vec::new();
-    for digest in existing.difference(refs) {
-        push_mirrored_delete(
-            &mut ops,
-            hold_to_hard_key(owner, digest),
-            hard_to_hold_key(digest, owner),
-        );
-    }
-    for digest in refs.difference(existing) {
-        push_mirrored_put_json(
-            &mut ops,
-            hold_to_hard_key(owner, digest),
-            hard_to_hold_key(digest, owner),
-            &hold_hard_reference_record(owner, digest),
-            "serialize image cache hold reference",
-        )?;
-    }
-    Ok(ops)
-}
-
-fn hold_ref_removal_ops(
-    owner: &ImageCacheHoldOwner,
-    existing: &BTreeSet<HardCommitId>,
-) -> Vec<LocalKvBatchOp> {
-    let mut ops = Vec::new();
-    for digest in existing {
-        push_mirrored_delete(
-            &mut ops,
-            hold_to_hard_key(owner, digest),
-            hard_to_hold_key(digest, owner),
-        );
-    }
-    ops.push(LocalKvBatchOp::delete(hold_record_key(owner)));
-    ops
-}
-
-fn hold_hard_reference_record(
-    owner: &ImageCacheHoldOwner,
-    digest: &HardCommitId,
-) -> HoldHardCommitReferenceRecord {
-    HoldHardCommitReferenceRecord {
-        namespace: owner.namespace().to_string(),
-        key: owner.key().to_string(),
-        digest: digest.clone(),
-    }
-}
-
 async fn parse_configs_dir(
     configs_dir: &Path,
-) -> Result<BTreeMap<ImageCacheConfigId, Vec<ParsedHardCommitRef>>> {
+) -> Result<BTreeMap<ImageCacheConfigId, ParsedConfig>> {
     let mut paths = Vec::new();
     let mut entries = match tokio::fs::read_dir(configs_dir).await {
         Ok(entries) => entries,
@@ -965,18 +716,33 @@ async fn parse_configs_dir(
             .await
             .with_context(|| format!("stat image config {}", path.display()))?;
         if metadata.is_file() {
-            paths.push(path);
+            paths.push((path, modified_unix_secs(&metadata)));
         }
     }
     paths.sort();
 
     let mut parsed = BTreeMap::new();
-    for path in paths {
+    for (path, modified_secs) in paths {
         let config_id = ImageCacheConfigId::from_config_path(&path)?;
-        let refs = load_cache_owned_hard_commit_refs(&path)?;
-        parsed.insert(config_id, refs);
+        let hard_refs = load_cache_owned_hard_commit_refs(&path)?;
+        parsed.insert(
+            config_id,
+            ParsedConfig {
+                hard_refs,
+                modified_secs,
+            },
+        );
     }
     Ok(parsed)
+}
+
+fn modified_unix_secs(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_else(unix_now_secs)
 }
 
 fn load_cache_owned_hard_commit_refs(image_config_path: &Path) -> Result<Vec<ParsedHardCommitRef>> {
@@ -1047,113 +813,24 @@ fn is_regular_config_filename(filename: &str) -> bool {
     filename.ends_with(IMAGE_CONFIG_SUFFIX)
 }
 
-fn config_last_used_key(config_id: &ImageCacheConfigId) -> Vec<u8> {
-    key_with_components(CONFIG_LAST_USED_PREFIX, [config_id.as_str()])
-}
-
-fn hold_record_key(owner: &ImageCacheHoldOwner) -> Vec<u8> {
-    key_with_components(HOLD_RECORD_PREFIX, [owner.namespace(), owner.key()])
-}
-
-fn hard_commit_object_key(digest: &HardCommitId) -> Vec<u8> {
-    key_with_components(HARD_COMMIT_OBJECT_PREFIX, [digest.as_str()])
-}
-
-fn config_to_hard_key(config_id: &ImageCacheConfigId, digest: &HardCommitId) -> Vec<u8> {
-    key_with_components(CONFIG_TO_HARD_PREFIX, [config_id.as_str(), digest.as_str()])
-}
-
-fn config_to_hard_prefix_for_config(config_id: &ImageCacheConfigId) -> Vec<u8> {
-    let mut prefix = key_with_components(CONFIG_TO_HARD_PREFIX, [config_id.as_str()]);
-    prefix.push(b'/');
-    prefix
-}
-
-fn hold_to_hard_key(owner: &ImageCacheHoldOwner, digest: &HardCommitId) -> Vec<u8> {
-    key_with_components(
-        HOLD_TO_HARD_PREFIX,
-        [
-            owner.namespace().to_string(),
-            owner.key().to_string(),
-            digest.as_str().to_string(),
-        ],
-    )
-}
-
-fn hard_to_hold_key(digest: &HardCommitId, owner: &ImageCacheHoldOwner) -> Vec<u8> {
-    key_with_components(
-        HARD_TO_HOLD_PREFIX,
-        [
-            digest.as_str().to_string(),
-            owner.namespace().to_string(),
-            owner.key().to_string(),
-        ],
-    )
-}
-
-fn hold_to_hard_prefix_for_owner(owner: &ImageCacheHoldOwner) -> Vec<u8> {
-    let mut prefix = key_with_components(HOLD_TO_HARD_PREFIX, [owner.namespace(), owner.key()]);
-    prefix.push(b'/');
-    prefix
-}
-
-fn hard_to_hold_prefix_for_digest(digest: &HardCommitId) -> Vec<u8> {
-    let mut prefix = key_with_components(HARD_TO_HOLD_PREFIX, [digest.as_str()]);
-    prefix.push(b'/');
-    prefix
-}
-
-fn key_with_components<S>(prefix: &'static [u8], components: impl IntoIterator<Item = S>) -> Vec<u8>
-where
-    S: AsRef<str>,
-{
-    let mut key = prefix.to_vec();
-    let mut first = true;
-    for component in components {
-        if !first {
-            key.push(b'/');
-        }
-        first = false;
-        key.extend_from_slice(hex_encode(component.as_ref().as_bytes()).as_bytes());
-    }
-    key
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
-fn decode_json<T>(key: &[u8], value: &[u8], record_type: &str) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    serde_json::from_slice(value).with_context(|| {
-        format!(
-            "parse image cache metadata {record_type} at key {}",
-            String::from_utf8_lossy(key)
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use tempfile::TempDir;
 
-    async fn test_store(temp: &TempDir) -> ImageCacheMetadataStore {
-        ImageCacheMetadataStore::open(
-            temp.path().join("metadata.db"),
-            LocalStoreDurability::Memory,
-        )
-        .await
-        .expect("open metadata store")
+    fn test_store() -> ImageCacheMetadataStore {
+        ImageCacheMetadataStore::new()
+    }
+
+    async fn rebuild(store: &ImageCacheMetadataStore, temp: &TempDir) -> Result<()> {
+        store
+            .rebuild_from_configs(
+                &temp.path().join("configs"),
+                &temp.path().join("indexes"),
+                &temp.path().join("commits"),
+            )
+            .await
     }
 
     fn config_id(name: &str) -> ImageCacheConfigId {
@@ -1201,8 +878,7 @@ mod tests {
 
     #[tokio::test]
     async fn hold_ref_lifecycle_replaces_stale_refs_then_clears_on_release() {
-        let temp = TempDir::new().expect("tempdir");
-        let store = test_store(&temp).await;
+        let store = test_store();
         let owner = hold_owner("test", "owner-1");
         let digest1 = hard("sha256:one");
         let digest2 = hard("sha256:two");
@@ -1259,7 +935,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_from_configs_records_only_hard_commit_refs() {
         let temp = TempDir::new().expect("tempdir");
-        let store = test_store(&temp).await;
+        let store = test_store();
         let configs = temp.path().join("configs");
         let config = configs.join("mixed-image.json");
 
@@ -1290,10 +966,7 @@ mod tests {
             "https://registry.example/v2/repo/blobs",
         );
 
-        store
-            .rebuild_from_configs(&configs)
-            .await
-            .expect("rebuild metadata");
+        rebuild(&store, &temp).await.expect("rebuild metadata");
 
         let config = config_id("mixed-image.json");
         assert_eq!(
@@ -1319,7 +992,7 @@ mod tests {
     #[tokio::test]
     async fn rebuild_from_configs_fails_closed_on_malformed_config() {
         let temp = TempDir::new().expect("tempdir");
-        let store = test_store(&temp).await;
+        let store = test_store();
         let configs = temp.path().join("configs");
         let existing_config = config_id("existing-image.json");
         let existing_digest = hard("sha256:existing");
@@ -1343,8 +1016,7 @@ mod tests {
             "",
         );
 
-        let err = store
-            .rebuild_from_configs(&configs)
+        let err = rebuild(&store, &temp)
             .await
             .expect_err("malformed config should fail rebuild");
 
@@ -1368,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn plan_capacity_eviction_frees_shared_commit_only_when_all_referrers_evicted() {
         let temp = TempDir::new().expect("tempdir");
-        let store = test_store(&temp).await;
+        let store = test_store();
         let a = config_id("a-image.json");
         let b = config_id("b-image.json");
         // Both reference the shared base; a also has an exclusive layer.

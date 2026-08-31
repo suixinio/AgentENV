@@ -7,7 +7,6 @@ mod store;
 #[cfg(test)]
 mod orchestrator_gc_tests;
 
-pub use service::close_shared_metadata_stores;
 pub use store::{
     local_image_services_from_app_config, local_image_services_from_global_config,
     CachedImageConfig, OverlaybdLayerLocation, OverlaybdLayerStore, SourceImageStore,

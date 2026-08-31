@@ -118,10 +118,6 @@ impl ProcessRuntime for NodeRuntime {
                 );
             }
         }
-
-        // Stop background store work while other shared-store clones remain live.
-        info!(target: "agentenv", "closing image cache metadata store");
-        aenv_node::image::close_image_cache_stores(NODE_RUNTIME_SHUTDOWN_STEP_TIMEOUT).await;
     }
 }
 
@@ -136,8 +132,8 @@ struct NodeCore {
     runtime: NodeRuntime,
 }
 
-// Bound Tokio's blocking pool after graceful store shutdown; plain runtime
-// drop can wait forever for RocksDB `spawn_blocking` work.
+// Bound the wait on Tokio's blocking pool: a plain runtime drop waits forever
+// for whatever blocking work is still in flight.
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -458,12 +454,6 @@ mod tests {
             panic!("{name} has no closing brace");
         };
 
-        let shutdown = body("async fn shutdown(self: Box<Self>)");
-        assert!(
-            shutdown.contains("close_image_cache_stores"),
-            "NodeRuntime::shutdown no longer closes the image cache metadata store's RocksDB \
-             handle before process exit"
-        );
         let main = body("fn main() -> anyhow::Result<()>");
         assert!(
             main.contains("shutdown_timeout"),

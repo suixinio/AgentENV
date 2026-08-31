@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use serde_json::Value;
@@ -22,7 +22,7 @@ use super::gc::{
 use super::graph::{
     non_empty, path_is_inside, stable_path_identity, unix_now_secs, CapacityEvictionCandidate,
     HardCommitId, HardCommitObjectRecord, ImageCacheConfigId, ImageCacheHoldOwner,
-    ImageCacheMetadataStore,
+    ImageCacheMetadataStore, ReclaimAuthority,
 };
 use super::source_config::{
     read_source_image_metadata, source_image_config_filename, source_image_config_is_usable,
@@ -36,11 +36,10 @@ use crate::image::commit_index::{self, CommitIndex};
 use crate::image::local_layer::LocalLayer;
 use crate::image::oci_image::{ImageConversion, LayerConversionKey};
 use crate::image::ImageResolutionMetadata;
-use crate::local_store::LocalStoreDurability;
 
 const IMAGE_CACHE_CONFIG_DIR: &str = "configs";
 const IMAGE_CACHE_INDEX_DIR: &str = "indexes";
-const IMAGE_CACHE_METADATA_DIR: &str = "metadata";
+const LEGACY_IMAGE_CACHE_METADATA_DIR: &str = "metadata";
 const IMAGE_CACHE_STAGING_DIR: &str = "staging";
 const RUNTIME_HOLD_NAMESPACE: &str = "runtime";
 const PAUSED_HOLD_NAMESPACE: &str = "paused";
@@ -73,53 +72,21 @@ impl HoldNamespace {
 
 /// Process-wide image-cache services keyed by cache root.
 ///
-/// Entries live for the process lifetime so shutdown can reach every opened
-/// metadata store through [`close_shared_metadata_stores`].
+/// Entries live for the process lifetime so every caller resolving the same
+/// cache root shares one metadata graph and one set of holds.
 fn shared_registry() -> &'static StdMutex<BTreeMap<PathBuf, Arc<ImageCacheService>>> {
     static SHARED: OnceLock<StdMutex<BTreeMap<PathBuf, Arc<ImageCacheService>>>> = OnceLock::new();
     SHARED.get_or_init(|| StdMutex::new(BTreeMap::new()))
-}
-
-/// Best-effort bounded shutdown for every opened image-cache metadata store.
-pub async fn close_shared_metadata_stores(timeout: Duration) {
-    // Do not hold the synchronous registry lock across store shutdown awaits.
-    let snapshot: Vec<Arc<ImageCacheService>> = {
-        let services = shared_registry()
-            .lock()
-            .expect("image cache service registry lock poisoned");
-        services.values().cloned().collect()
-    };
-
-    for service in snapshot {
-        let Some(store) = service.metadata_store.get() else {
-            continue;
-        };
-        match store.close(timeout).await {
-            crate::local_store::LocalKvCloseOutcome::Closed => {
-                info!(
-                    store = %service.metadata_store_path.display(),
-                    "closed image cache metadata store"
-                );
-            }
-            crate::local_store::LocalKvCloseOutcome::TimedOut => {
-                warn!(
-                    store = %service.metadata_store_path.display(),
-                    timeout_secs = timeout.as_secs(),
-                    "image cache metadata store did not finish closing within timeout; \
-                     background RocksDB compaction/flush may still be running"
-                );
-            }
-        }
-    }
 }
 
 pub struct ImageCacheService {
     commit_store: PathBuf,
     index_dir: PathBuf,
     config_dir: PathBuf,
-    metadata_store_path: PathBuf,
+    legacy_metadata_store_path: PathBuf,
     staging_dir: PathBuf,
     metadata_store: OnceCell<ImageCacheMetadataStore>,
+    reclaim_authority: OnceLock<ReclaimAuthority>,
     source_images: Arc<SourceImageCache>,
 }
 
@@ -158,10 +125,11 @@ impl ImageCacheService {
         Self {
             index_dir: root_dir.join(IMAGE_CACHE_INDEX_DIR),
             config_dir: root_dir.join(IMAGE_CACHE_CONFIG_DIR),
-            metadata_store_path: root_dir.join(IMAGE_CACHE_METADATA_DIR),
+            legacy_metadata_store_path: root_dir.join(LEGACY_IMAGE_CACHE_METADATA_DIR),
             staging_dir: root_dir.join(IMAGE_CACHE_STAGING_DIR),
             commit_store,
             metadata_store: OnceCell::new(),
+            reclaim_authority: OnceLock::new(),
             source_images: Arc::new(SourceImageCache::default()),
         }
     }
@@ -205,7 +173,6 @@ impl ImageCacheService {
             ("overlaybd commit cache", self.commit_store.as_path()),
             ("image cache index", self.index_dir.as_path()),
             ("image cache config", self.config_dir.as_path()),
-            ("image cache metadata", self.metadata_store_path.as_path()),
             ("image cache staging", self.staging_dir.as_path()),
         ] {
             tokio::fs::create_dir_all(path)
@@ -271,7 +238,7 @@ impl ImageCacheService {
     async fn rebuild_metadata_from_configs(&self) -> Result<()> {
         self.metadata_store()
             .await?
-            .rebuild_from_configs(&self.config_dir)
+            .rebuild_from_configs(&self.config_dir, &self.index_dir, &self.commit_store)
             .await
     }
 
@@ -484,6 +451,10 @@ impl ImageCacheService {
 
     /// Startup reconcile: drop transient runtime/operation holds, then release
     /// holds in `namespace` whose owner is no longer live.
+    ///
+    /// Reconciling [`HoldNamespace::Paused`] is what authorizes deleting
+    /// maintenance passes, because paused holds exist only once this process
+    /// has re-derived them from the paused sandboxes it restored.
     pub async fn reconcile_namespace(
         &self,
         namespace: HoldNamespace,
@@ -499,6 +470,10 @@ impl ImageCacheService {
                 }
             }
         }
+        if namespace == HoldNamespace::Paused {
+            let authority = self.metadata_store().await?.grant_reclaim_authority().await;
+            let _ = self.reclaim_authority.set(authority);
+        }
         Ok(())
     }
 
@@ -511,15 +486,21 @@ impl ImageCacheService {
         watermark: Option<(u64, u64)>,
         min_age: Duration,
     ) -> Result<ImageCacheGcSummary> {
+        let Some(&authority) = self.reclaim_authority.get() else {
+            bail!(
+                "image cache maintenance ran before paused holds were re-derived; \
+                 reconcile the paused namespace first"
+            );
+        };
         let reconciled = if let Some((high, low)) = watermark {
-            self.evict_source_configs_over_capacity(high, low, min_age)
+            self.evict_source_configs_over_capacity(high, low, min_age, authority)
                 .await?;
             true
         } else {
             false
         };
         let live_refs = self.live_refs_from_running(running).await?;
-        let report = self.run_gc(live_refs, !reconciled).await?;
+        let report = self.run_gc(live_refs, !reconciled, authority).await?;
         Ok(ImageCacheGcSummary::from_report(&report))
     }
 
@@ -618,11 +599,16 @@ impl ImageCacheService {
 
     async fn metadata_store(&self) -> Result<&ImageCacheMetadataStore> {
         self.metadata_store
-            .get_or_try_init(|| {
-                ImageCacheMetadataStore::open(
-                    self.metadata_store_path.clone(),
-                    LocalStoreDurability::Sync,
-                )
+            .get_or_try_init(|| async {
+                let legacy = &self.legacy_metadata_store_path;
+                if aenv_core::record_dir::discard_unreadable_store(legacy).await {
+                    warn!(
+                        store = %legacy.display(),
+                        "discarded an image cache metadata store this build cannot read; the \
+                         graph is rebuilt from the cache directories instead"
+                    );
+                }
+                Ok(ImageCacheMetadataStore::new())
             })
             .await
     }
@@ -693,10 +679,20 @@ impl ImageCacheService {
     /// runtime refs the caller already computed. Optionally rebuilds the
     /// config-derived metadata first (skip it when capacity eviction already
     /// reconciled it this pass).
+    #[cfg(test)]
+    async fn test_reclaim_authority(&self) -> ReclaimAuthority {
+        self.metadata_store()
+            .await
+            .expect("metadata store")
+            .grant_reclaim_authority()
+            .await
+    }
+
     async fn run_gc(
         self: &Arc<Self>,
         live_refs: ImageCacheLiveRuntimeRefs,
         rebuild_metadata: bool,
+        _authority: ReclaimAuthority,
     ) -> Result<ImageCacheGcReport> {
         if rebuild_metadata {
             self.rebuild_metadata_from_configs().await?;
@@ -859,6 +855,7 @@ impl ImageCacheService {
         high_watermark_bytes: u64,
         low_watermark_bytes: u64,
         min_age: Duration,
+        _authority: ReclaimAuthority,
     ) -> Result<()> {
         self.rebuild_metadata_from_configs().await?;
         let now = unix_now_secs();
@@ -1461,7 +1458,11 @@ mod tests {
         assert_eq!(std::fs::read(&cached).expect("read cached commit"), payload);
 
         let report = service
-            .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+            .run_gc(
+                ImageCacheLiveRuntimeRefs::new(),
+                true,
+                service.test_reclaim_authority().await,
+            )
             .await
             .expect("run gc");
         assert_eq!(report.collected, 1);
@@ -1660,6 +1661,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn maintenance_refuses_until_the_paused_namespace_is_reconciled() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        service.ensure_layout().await.expect("layout");
+
+        let error = service
+            .run_maintenance(Vec::new(), None, Duration::from_secs(0))
+            .await
+            .expect_err("maintenance must not delete before paused holds exist");
+        assert!(
+            error.to_string().contains("paused holds"),
+            "unexpected error: {error:#}"
+        );
+
+        service
+            .reconcile_namespace(HoldNamespace::Paused, &[])
+            .await
+            .expect("reconcile paused");
+        service
+            .run_maintenance(Vec::new(), None, Duration::from_secs(0))
+            .await
+            .expect("maintenance runs once paused holds are re-derived");
+    }
+
+    #[tokio::test]
     async fn run_gc_collects_free_candidate_and_skips_roots_holds_and_live_refs() {
         let temp = TempDir::new().expect("tempdir");
         let service = Arc::new(test_service(&temp));
@@ -1712,6 +1738,7 @@ mod tests {
                     vec![live_owner.clone()],
                 )]),
                 true,
+                service.test_reclaim_authority().await,
             )
             .await
             .expect("run gc");
@@ -1809,7 +1836,11 @@ mod tests {
         }
 
         let report = service
-            .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+            .run_gc(
+                ImageCacheLiveRuntimeRefs::new(),
+                true,
+                service.test_reclaim_authority().await,
+            )
             .await
             .expect("run gc");
 
@@ -1954,7 +1985,11 @@ mod tests {
         );
 
         let report = service
-            .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+            .run_gc(
+                ImageCacheLiveRuntimeRefs::new(),
+                true,
+                service.test_reclaim_authority().await,
+            )
             .await
             .expect("run gc");
         assert_eq!(report.collected, 0);
@@ -1995,7 +2030,12 @@ mod tests {
         // High/low watermark 0 selects every config; eviction un-roots it by
         // removing the source config file so the hard-commit GC can reclaim it.
         service
-            .evict_source_configs_over_capacity(0, 0, Duration::from_secs(0))
+            .evict_source_configs_over_capacity(
+                0,
+                0,
+                Duration::from_secs(0),
+                service.test_reclaim_authority().await,
+            )
             .await
             .expect("eviction");
         assert!(!config_path.exists());

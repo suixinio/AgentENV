@@ -9,6 +9,7 @@ use anyhow::Result;
 use serde_json::json;
 use tempfile::TempDir;
 
+use super::service::HoldNamespace;
 use super::test_support::{test_local_image_services_from_service, ImageCacheService};
 use crate::cfg::ResolvedImageCacheConfig;
 use crate::image::RecordingRuntimeImageRefs;
@@ -122,6 +123,10 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
     std::fs::remove_file(&source_config).expect("evict source config");
 
     orchestrator.pause_sandbox(created.id).await?;
+    // What `Orchestrator::new` does before it starts maintenance.
+    image_cache
+        .reconcile_namespace(HoldNamespace::Paused, &[created.id.to_string()])
+        .await?;
     let running: Vec<(String, Vec<PathBuf>)> = orchestrator
         .collect_running_artifacts()
         .await

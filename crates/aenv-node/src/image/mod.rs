@@ -18,8 +18,3 @@ pub use resolver::ImageResolver;
 pub fn local_runtime_image_refs() -> std::sync::Arc<dyn RuntimeImageRefs> {
     cache::local_image_services_from_global_config().runtime_refs
 }
-
-/// Best-effort bounded shutdown for every local image-cache metadata store.
-pub async fn close_image_cache_stores(timeout: std::time::Duration) {
-    cache::close_shared_metadata_stores(timeout).await;
-}

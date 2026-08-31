@@ -741,11 +741,7 @@ mod tests {
         path
     }
 
-    /// 把可执行文件的落盘交给子进程：本进程若持有它的写 fd，同进程任何线程在
-    /// 这期间 fork 都会复制到这个 fd，紧随其后的 execve 会被内核以 ETXTBSY
-    /// 拒绝。子进程的 fd 表不共享给我们的线程，窗口不存在。
-    /// `rm -f` 先行则是另一个方向：覆盖一个仍在被执行的文件同样是 ETXTBSY，
-    /// 换掉 inode 就绕开了它。
+    /// 由子进程替换 inode，避免并发 fork/exec 继承写 fd 导致 ETXTBSY。
     fn write_executable(path: &Path, contents: &str) {
         use std::io::Write as _;
 

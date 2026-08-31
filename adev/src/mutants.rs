@@ -31,9 +31,6 @@ pub fn run(args: MutantsArgs) -> Result<()> {
     ensure_tool::ensure_cargo_tool("mutants", "cargo-mutants")?;
 
     // Check platform
-    // 🔴 All three halves of the split, not just the shared one: `aenv-node`
-    // links ublk and overlaybd, `aenv-api` links the same `nix`/`kube` stack
-    // through `aenv-core`, and none of the three builds off Linux.
     if matches!(
         args.package.as_str(),
         "aenv-core" | "aenv-node" | "aenv-api"

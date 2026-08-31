@@ -1,26 +1,5 @@
-//! What the placement shadow scorer costs, at three cluster sizes.
-//!
-//! The shadow scorer runs on every `Schedule` and on every paused-sandbox
-//! restore that reaches the strategy — the hot path of sandbox creation.
-//! It is allowed to cost something; it is not allowed to cost something
-//! surprising, and "surprising" here has a specific shape: an `O(N)`
-//! sequence of `metrics::counter!` macro calls, each of which takes the
-//! Prometheus recorder's `RwLock`. That mistake is invisible to every
-//! correctness test in the tree and would only show up as placement
-//! latency under a wide fleet.
-//!
-//! So this measures the *whole selection*, twice:
-//!
-//! - `baseline` reconstructs the pre-shadow body out of the same public
-//!   pieces it always used: one registry read per node, `filter_unschedulable`,
-//!   `RoundRobinStrategy::select`. There is no production switch that turns
-//!   the shadow off — deliberately, see `placement`'s module doc — so the
-//!   comparison has to be built rather than toggled.
-//! - `with_shadow` calls `select_node`, which is the same body plus the
-//!   scorer.
-//!
-//! The difference between the two, at N = 2 / 100 / 1000, is the scorer's
-//! cost.
+//! Measures whole placement selection with and without shadow scoring at
+//! 2, 100, and 1000 nodes.
 //!
 //! Run with: `cargo bench -p agentenv-benchmarks --bench placement_shadow`
 
@@ -44,9 +23,6 @@ const MEASUREMENT_TIME: Duration = Duration::from_secs(1);
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Cluster sizes: two (what a small deployment actually runs), a hundred,
-/// and a thousand — the last one being where an accidental per-candidate
-/// metric call would be unmistakable.
 const CLUSTER_SIZES: [usize; 3] = [2, 100, 1000];
 
 fn registry_with(node_count: usize) -> AtomicNodeRegistry {
@@ -69,8 +45,6 @@ fn registry_with(node_count: usize) -> AtomicNodeRegistry {
                     service_instance_id: format!("{node_id}-instance"),
                     snapshot: Some(NodeSnapshot {
                         status: NodeStatus::Ready as i32,
-                        // Spread the load so the scorer has a real ordering
-                        // to compute rather than a field of ties.
                         allocated_cpu: (index % 8) as u32,
                         allocated_memory_bytes: (index as u64 % 8) * GIB,
                         cpu_count: 8,
@@ -96,7 +70,6 @@ fn hint() -> ScheduleRequestHint {
     }
 }
 
-/// The selection as it was before the scorer existed.
 fn baseline_select(
     registry: &AtomicNodeRegistry,
     strategy: &RoundRobinStrategy,

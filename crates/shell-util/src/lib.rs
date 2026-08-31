@@ -2,11 +2,6 @@ use std::path::{Component, Path, PathBuf};
 
 /// Lexically normalizes a path: drops `.` components and resolves `..` against
 /// the components already accumulated, without touching the filesystem.
-///
-/// 🔴 Lives here, not in `overlaybd`, because both the storage layer and the
-/// configuration layer normalize the paths they hand each other, and the
-/// configuration layer must not depend on the storage crate. `overlaybd::config`
-/// re-exports this, so its callers are unaffected.
 pub fn lexically_normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {

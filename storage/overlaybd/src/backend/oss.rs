@@ -113,11 +113,6 @@ impl OssBackend {
     }
 
     /// Upload `body` to an `oss://` / `s3://` URL.
-    ///
-    /// Retained deliberately, not live: the `upload_path` wrapper that fed it
-    /// from a staging file went with `ImageService::export_upper_as_oss_sealed`.
-    /// The only remaining exercise is `tests/oss_backend_minio.rs`, which is
-    /// `#[ignore = "requires docker"]`, so nothing covers this in a normal run.
     pub async fn upload_bytes(&self, url: impl AsRef<str>, body: Vec<u8>) -> Result<()> {
         let location = ParsedOssUrl::parse(
             url.as_ref(),

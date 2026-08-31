@@ -94,18 +94,7 @@ pub struct BuildStatusReason {
 }
 
 impl Client {
-    /// 🔴 Follows the cursor, because a missing `limit` stopped meaning "all of
-    /// them".
-    ///
-    /// It used to be one request: the server read a missing `limit` as no limit
-    /// and answered with every template. The catalog move gives that request a
-    /// hundred-row page and a token instead — deliberately, so one request
-    /// cannot pull ten thousand rows into memory, and so an unbounded request
-    /// means the same thing whichever store answers it. A client that did not
-    /// follow the token would silently show the newest hundred and call it the
-    /// list, which is the shape of failure a listing command must not have.
-    ///
-    /// Same loop as `list_snapshots`, for the same reason.
+    /// Returns all templates by following pagination cursors.
     pub fn list_templates(&self) -> Result<Vec<Template>> {
         let mut templates = Vec::new();
         let mut next_token: Option<String> = None;

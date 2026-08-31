@@ -505,9 +505,6 @@ fn resolve_path_field(base_dir: &Path, value: &mut String) {
     *value = lexically_normalize_path(&resolved).display().to_string();
 }
 
-/// Re-exported so `overlaybd::config::lexically_normalize_path` keeps working.
-/// The definition moved to `shell-util` because `crate::cfg` normalizes the
-/// same paths and must not depend on this crate.
 pub use shell_util::lexically_normalize_path;
 
 /// Chunk knobs that are honored in every `DownloadConfig` context, including

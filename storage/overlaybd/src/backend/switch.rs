@@ -27,14 +27,6 @@ async fn try_open_zfile(
 
 /// Open `source` as a lower layer, transparently unwrapping a zfile header
 /// (`verify` is enabled for remote sources and disabled for local ones).
-///
-/// This used to hand back a `SwitchFile` that could later be re-pointed at a
-/// locally downloaded copy through `set_switch_file`; no production code ever
-/// switched one, so the wrapper — whose whole `VirtualFile` impl forwarded to
-/// the single file opened here — is gone and that file is returned directly.
-///
-/// Tar detection was never done here: all four callers apply
-/// `super::tar::new_tar_file_adaptor` to `source` themselves before calling.
 pub async fn new_switch_file(
     source: Arc<dyn VirtualFile>,
     local: bool,
@@ -169,8 +161,6 @@ mod tests {
             read_all(opened.as_ref()).await.expect("read switch source"),
             source_data
         );
-        // A source without a zfile header is handed back untouched: no
-        // wrapper stands between the caller and the file it passed in.
         assert!(Arc::ptr_eq(&source, &opened));
     }
 

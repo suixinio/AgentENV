@@ -183,13 +183,7 @@ impl ImageFile {
     }
 
     /// Export the writable upper layer as a standalone sealed layer.
-    ///
-    /// Retained deliberately, not live: its last caller was
-    /// `ImageService::export_upper_as_oss_sealed`, deleted along with the OSS
-    /// staging wrapper that was its only user. The pause path uses
-    /// `close_seal` + `restack` instead. The `LSMTFile::export_upper_as_sealed`
-    /// this delegates to *is* live — three `lsmt/file/tests.rs` tests drive it
-    /// directly.
+    /// Deliberately retained without a production caller for direct layer export.
     pub async fn export_upper_as_sealed(&self, args: CommitArgs) -> Result<()> {
         let state = self.state.read().await;
         state

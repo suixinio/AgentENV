@@ -128,13 +128,8 @@ pub fn setup_tracing(dst: Option<PathBuf>, level: LevelFilter) -> Result<()> {
     // take ownership of `log::` operations
     LogTracer::init().context("add log to tracing")?;
 
-    // Kept in step with `aenv_core::logging::DEFAULT_FILTER`. These are target
-    // prefixes matched with `starts_with`, and a target defaults to
-    // `module_path!()`: `uvm_ublk=` is what lights up this crate *and*
-    // `uvm_ublk_daemon`, which is the process that actually calls this. The
-    // `aenv_*` entries are inert here — no half of the server is in this
-    // binary's dependency graph — and are carried anyway so that the two
-    // strings stay greppable as one thing when a crate is next renamed.
+    // Keep aligned with `aenv_core::logging::DEFAULT_FILTER`; targets match
+    // module-path prefixes, and `uvm_ublk` also enables `uvm_ublk_daemon`.
     let default_filter = format!(
         "aenv_core=info,aenv_node=info,aenv_api=info,agentenv=info,envd=info,uvm_ublk={}",
         level.to_string().to_ascii_lowercase()

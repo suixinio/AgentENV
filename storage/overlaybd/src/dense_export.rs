@@ -108,11 +108,6 @@ mod tests {
             "dense output should skip the large sparse hole, got {dense_size}"
         );
 
-        // `write_dense_layer_to` commits at concurrency 1, so the dense output
-        // is one deterministic byte stream. That is the property the deleted
-        // `describe_dense_layer` helper leaned on when it hashed the stream
-        // instead of the file, so assert it against the file directly: a second
-        // export of the same sparse layer must hash identically.
         let repeat_path = temp.path().join("dense-repeat.commit");
         let repeat_file: Arc<dyn VirtualFile> = Arc::new(
             LocalFile::new(&repeat_path, shared_transient_io_ring())

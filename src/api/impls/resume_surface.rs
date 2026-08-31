@@ -1362,12 +1362,4 @@ mod tests {
              life would be evicted again immediately"
         );
     }
-
-    // Endpoint scheme normalisation used to be tested here via a local
-    // `qualified_endpoint` duplicate, then via `SchedulerEndpointSource`'s own
-    // qualification once that duplicate was deleted. Neither applies any more:
-    // this module dials nothing, so it has no endpoint to normalise. Scheme
-    // handling is `crate::scheduler_endpoint::qualified`'s alone, tested there
-    // by `a_scheme_is_added_only_when_one_is_missing`, for the two consumers
-    // that still dial (`aenv-node`'s heartbeat reporter and P2P discovery).
 }

@@ -312,12 +312,9 @@ impl FirecrackerCommonConfig {
     }
 }
 
-/// Creates the directory one sandbox's Firecracker runs in.
+/// Creates and owner-stamps a sandbox Firecracker work directory.
 ///
-/// 🔴 The only place a `agentenv-fc-*` directory is made, and therefore the
-/// only place the startup sweep's owner stamp can be written. `node_reclaim`
-/// reads that stamp to tell a leftover from a sandbox belonging to a server
-/// that is still running; a directory without one is never reclaimed.
+/// Unstamped directories are never reclaimed.
 pub fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<TempDir> {
     let dir = match work_dir {
         Some(parent) => {
@@ -334,11 +331,7 @@ pub fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<TempDir> {
             .context("create firecracker sandbox work directory")?,
     };
 
-    // 🔴 Warned about rather than fatal. A sandbox that runs perfectly well
-    // must not be refused because a startup sweep it will probably never meet
-    // would have liked a marker; the cost of the missing stamp is that a later
-    // sweep declines to reclaim this directory, which is the safe direction and
-    // is counted in `agentenv_node_reclaim_failed_total`.
+    // Stamp failure must leak safely rather than fail sandbox creation.
     if let Err(error) = crate::node_reclaim::stamp_work_dir(dir.path()) {
         tracing::warn!(
             target: "agentenv",

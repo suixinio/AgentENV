@@ -151,20 +151,9 @@ impl TemplateBuilder {
         Ok(record)
     }
 
-    /// Builds the `TemplateBuildContext` a caller will drive and stage
-    /// itself, without executing or publishing it.
+    /// Prepares, but does not execute or publish, a node-side build context.
     ///
-    /// 🔴 For `NodeSandboxService::build_template`: `execute_and_publish`
-    /// above also commits and advertises the built snapshot, and on the
-    /// api/node split those two steps run in different processes — the node
-    /// stages, the API half commits (`SnapshotManager::stage` +
-    /// `adopt_staged`, not `publish`). This method stops exactly where the
-    /// two diverge, and reuses `prepare_fresh_context` /
-    /// `prepare_snapshot_base_context` unchanged rather than restating the
-    /// validation they perform (the build id must differ from its base, a
-    /// snapshot base's virtualization mode must match this node's, resources
-    /// may not change under a snapshot base) a second time for the remote
-    /// caller.
+    /// The caller owns commit and advertisement of the staged result.
     pub fn prepare_remote_context(
         &self,
         spec: &TemplateBuildSpec,

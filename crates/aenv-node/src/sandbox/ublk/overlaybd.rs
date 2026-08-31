@@ -96,19 +96,9 @@ fn default_runtime_upper_mode() -> UpperMode {
     UpperMode::LogStructured
 }
 
-/// Converts the configuration layer's upper-mode vocabulary into the storage
-/// engine's.
+/// Exhaustively converts the core configuration enum to the storage enum.
 ///
-/// 🔴 The two enums are deliberately separate: `crate::cfg` is read by every
-/// role, including the one that links no storage engine, so it cannot name
-/// `overlaybd`'s type. This is the single boundary that turns one into the
-/// other, and it is exhaustive by construction — adding a variant on either
-/// side fails to compile until it is added here too.
-/// 🔴 A free function and not a `From` impl: both types are foreign to this
-/// crate now (`RuntimeUpperMode` is `aenv-core`'s, `UpperMode` is
-/// `overlaybd`'s), which the orphan rule refuses. The exhaustiveness argument
-/// above is unchanged — the `match` still fails to compile until a new variant
-/// on either side is handled here.
+/// A free function is required because both enum types are foreign.
 pub fn upper_mode_for(mode: crate::cfg::RuntimeUpperMode) -> UpperMode {
     match mode {
         crate::cfg::RuntimeUpperMode::Sparse => UpperMode::Sparse,
@@ -202,16 +192,6 @@ pub async fn compact_layers(
 mod tests {
     use super::*;
 
-    /// 🔴 The one thing splitting `UpperMode` into a configuration mirror can
-    /// silently get wrong.
-    ///
-    /// Before the split there was no conversion at all — `crate::cfg` named
-    /// the storage crate's enum directly, so a wrong mapping was not
-    /// expressible. Now it is, and only the `sparse` arm happens to be covered
-    /// by an existing assertion (`sandbox_config_binds_overlaybd_to_user_image`);
-    /// mutating either of the other two arms left the whole unit suite green.
-    /// This asserts both halves of the boundary: the accepted TOML spellings,
-    /// and the arm-for-arm translation.
     #[test]
     fn runtime_upper_mode_mirrors_the_storage_enum() {
         for (spelling, configured, expected) in [

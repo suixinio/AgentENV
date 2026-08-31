@@ -1,17 +1,4 @@
-//! Driving a sandbox on "another machine" — a node service in this process,
-//! reached over a real socket.
-//!
-//! 🔴 In `aenv-node` even though the code under test (`aenv_core::node_client`)
-//! is the deciding half's. "Another machine" here is a real
-//! `NodeSandboxService` on a real socket, and that service is this crate's —
-//! a test in `aenv-core` could not link it. Everything below still exercises
-//! `aenv-core`'s client; this crate only supplies the other end of the wire.
-//!
-//! 🔴 Over a socket rather than by calling the trait directly. Everything this
-//! module is for lives in the gap between an in-process handle and a wire: a
-//! reply that lost a field, a node that answered about the wrong run, a call
-//! that never came back. None of those exist if the two halves are the same
-//! object.
+//! Node-client behavior exercised over a real gRPC socket.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -50,9 +37,6 @@ use crate::node_client::placement::{
 };
 use crate::node_client::wire;
 
-// ---------------------------------------------------------------------------
-// A node in this process, on a real socket
-// ---------------------------------------------------------------------------
 
 struct RunningNode {
     endpoint: NodeEndpoint,
@@ -70,12 +54,7 @@ async fn serve<S>(service: S, orchestration: Option<Arc<dyn SandboxOrchestration
 where
     S: NodeSandboxService,
 {
-    // 🔴 Bound here and handed over, rather than bound-probed-and-released.
-    // Two reasons, and the second is why it is worth the extra line: there is
-    // no window in which another test in this binary can take the port, and
-    // the listener is accepting before this function returns — so the loop
-    // that used to wait for the bind, and could time out while a test looked
-    // like a wire failure, is gone.
+    // Hand the bound listener directly to the server to avoid a port-reuse race.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a port");
@@ -94,10 +73,7 @@ where
             .await;
     });
 
-    // 🔴 Still waited for, and for a narrower reason than before: the socket is
-    // bound, but the accept loop is in a task that may not have been polled.
-    // A connect that raced it comes back as "connection refused", which is
-    // indistinguishable from the failure half of these tests are about.
+    // Wait until the spawned accept loop has been polled.
     for _ in 0..200 {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             break;
@@ -112,15 +88,10 @@ where
     }
 }
 
-/// A node backed by the real service, over a real orchestrator with mock
-/// sandboxes.
 async fn real_node() -> RunningNode {
     real_node_with_factory(MockBackendFactory::new()).await
 }
 
-/// Like [`real_node`], but with a caller-supplied backend factory — so a test
-/// can hold the `MockBehavior` and read back what the *runtime* actually
-/// received, not only what the node's own metadata store echoes.
 async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
@@ -141,21 +112,6 @@ async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
     serve(service, Some(orchestration)).await
 }
 
-/// A node wired to resolve OCI images itself, via a fake `regctl` that
-/// records every reference it is asked to resolve into `{regctl_dir}/argv`
-/// and answers with a registry 404 — a *user* error, so `ImageResolver`
-/// refuses in one round trip rather than retrying (see
-/// `tests/fixtures/regctl-recorder.sh`).
-///
-/// # 🔴 This is the only fixture in this file that exercises
-/// `NodeSandboxService::with_template_build`
-///
-/// Every other real-node fixture here builds the service through `new`
-/// alone, deliberately — see the note on `NodeSandboxService::template_build`
-/// — because the RPCs those fixtures exercise never touch image resolution.
-/// This one does: it is the fixture for `create`'s `Source::Image` arm and
-/// `RemoteSandboxBackendFactory::build_from_image_ref`, and neither reaches
-/// any further than `Unimplemented` without a wired `ImageResolver`.
 async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) {
     crate::logging::init_for_tests();
 
@@ -213,8 +169,6 @@ async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) 
     (node, regctl_dir)
 }
 
-/// A catalog and resolver that answer with one mock snapshot, so a create can
-/// get as far as starting a sandbox.
 fn resolvable_snapshot_manager() -> SnapshotManager {
     struct OneSnapshot;
 
@@ -233,9 +187,6 @@ fn resolvable_snapshot_manager() -> SnapshotManager {
             Ok((id_or_alias != "no-such-snapshot")
                 .then(|| SnapshotRecord::mock_ready(CommittedSnapshot::mock())))
         }
-        /// These tests resolve one snapshot by id to get a sandbox started;
-        /// nothing lists, and a row appearing in a listing would be a row this
-        /// double never had.
         async fn list_page(
             &self,
             _filter: SnapshotListFilter,
@@ -282,9 +233,6 @@ fn resolvable_snapshot_manager() -> SnapshotManager {
     )
 }
 
-// ---------------------------------------------------------------------------
-// A node that answers whatever a test told it to
-// ---------------------------------------------------------------------------
 
 #[derive(Default)]
 struct ScriptedNode {
@@ -314,10 +262,6 @@ impl ScriptedNode {
     }
 }
 
-/// 🔴 A newtype rather than `impl NodeSandboxService for Arc<ScriptedNode>`.
-/// The trait is `aenv-core`'s (tonic generates it there, next to the proto),
-/// and `Arc` is `std`'s, so the orphan rule refuses that impl from this crate.
-/// A local wrapper is the smallest thing that is local.
 #[derive(Clone)]
 struct ScriptedNodeService(Arc<ScriptedNode>);
 
@@ -415,11 +359,6 @@ impl NodeSandboxService for ScriptedNodeService {
         }
     }
 
-    /// 🔴 `NOT_FOUND` when nothing was scripted, not `unimplemented`. A
-    /// scripted node runs what a test told it to run and nothing else, and
-    /// "this node is running nothing under that id" is the honest answer for a
-    /// node that was told nothing — it is also the answer the attach path has
-    /// to keep working through.
     async fn describe(
         &self,
         request: Request<pb::SandboxDescribeRequest>,
@@ -445,12 +384,7 @@ impl NodeSandboxService for ScriptedNodeService {
         }))
     }
 
-    // 🔴 Not scripted like the calls above: nothing in this module drives
-    // `BuildTemplate` through a `ScriptedNode` — the node-side behavior is
-    // covered directly in `src/node_server/tests.rs`, against the real
-    // `NodeSandboxService`, and this fake exists to test `RemoteSandboxStub`
-    // against the *other* RPCs. Unimplemented rather than unreachable so a
-    // future test that does script this call fails loudly instead of hanging.
+    // Unscripted so accidental use fails loudly.
     async fn build_template(
         &self,
         _request: Request<pb::TemplateBuildRequest>,
@@ -475,15 +409,7 @@ fn launch_config() -> SandboxLaunchConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
-/// A sandbox built here, started there, and visible in that node's own listing
-/// of what it is running.
-///
-/// 🔴 End to end over a socket: factory → stub → gRPC → the real node service →
-/// an orchestrator with mock sandboxes.
 #[tokio::test]
 async fn a_sandbox_built_here_starts_on_the_node() {
     let node = real_node().await;
@@ -498,9 +424,6 @@ async fn a_sandbox_built_here_starts_on_the_node() {
         Err(err) => panic!("building a stub should not fail: {err:#}"),
     };
 
-    // 🔴 Nothing has happened yet. `build` is synchronous and may not touch a
-    // network, so a stub that had already placed the sandbox would mean the
-    // seam does not actually hold.
     assert!(backend.host_interaction_ip().is_none());
     assert!(
         backend.holding_node_id().is_none(),
@@ -509,10 +432,6 @@ async fn a_sandbox_built_here_starts_on_the_node() {
 
     backend.start().await.expect("start on the node");
     assert_eq!(backend.execution_id(), execution_id);
-    // 🔴 The one fact `mark_running`'s fix depends on: once placed, this
-    // backend must answer with the real node — not `None`, which the paused
-    // sandbox registry's write path would silently read as "this process is
-    // the machine", the exact bug this backend exists to not reproduce.
     assert_eq!(backend.holding_node_id(), Some("node-under-test"));
 
     let live = node
@@ -531,21 +450,6 @@ async fn a_sandbox_built_here_starts_on_the_node() {
     );
 }
 
-/// A custom extension params update sent through the stub lands in the real
-/// node's own record of the sandbox — not merely in whatever this half
-/// believes happened.
-///
-/// # 🔴 Why the real node and not a script
-///
-/// `custom_extension_params_update_is_a_real_round_trip` proves the stub
-/// sends a real RPC and surfaces a real failure. This proves the other half
-/// of the old lie: with a real `NodeSandboxService` behind the wire — the
-/// same one `aenv-node` runs — the value the stub sent is the value the
-/// node's own orchestrator now has on file for this sandbox, read back
-/// through the node's own `get_sandbox`, which is the node-local analogue of
-/// what a `GET` on the API half would answer. `None` and `Some(..)` in
-/// succession is the contrasting pair: a build that only ever wrote the
-/// first value, or only ever cleared it, fails one direction of this.
 #[tokio::test]
 async fn custom_extension_params_update_lands_in_the_real_node() {
     let behavior = Arc::new(MockBehavior::new());
@@ -618,12 +522,6 @@ async fn custom_extension_params_update_lands_in_the_real_node() {
     );
 }
 
-/// 🔴 A node that answers about a different run fails the start, and the
-/// sandbox it did start is torn down.
-///
-/// The caller has already written the incarnation into its own record, so
-/// adopting the node's would leave two records of one sandbox naming two
-/// different runs — and fencing compares exactly that value.
 #[tokio::test]
 async fn a_node_that_started_another_run_fails_the_start_and_is_told_to_stop() {
     let (script, node) = scripted_node().await;
@@ -654,19 +552,6 @@ async fn a_node_that_started_another_run_fails_the_start_and_is_told_to_stop() {
     );
 }
 
-/// 🔴 The api half sends the same bytes whether or not it resolved the
-/// snapshot first.
-///
-/// `aenv-api` used to reach `SnapshotRuntimeResolver::resolve` before every
-/// warm create — downloading `vm_state.bin` onto its own disk, materializing
-/// two overlaybd `image.json` files and leasing them — and then throw all of
-/// it away here, because a `SnapshotSource` carries the catalog row and
-/// nothing else. `build_from_snapshot_record` is that create without the
-/// download, and the *only* thing that makes it safe to switch a live
-/// deployment onto it is that the node cannot tell the difference.
-///
-/// So this compares the encoded request, not a field of it: a divergence in
-/// any field, including one added later, changes these bytes.
 #[tokio::test]
 async fn a_create_from_an_unresolved_record_is_the_same_bytes_as_one_from_a_resolved_snapshot() {
     use prost::Message;
@@ -723,7 +608,6 @@ async fn a_create_from_an_unresolved_record_is_the_same_bytes_as_one_from_a_reso
     );
 }
 
-/// The create carries the incarnation the factory was built for.
 #[tokio::test]
 async fn the_create_names_the_run_the_caller_minted() {
     let (script, node) = scripted_node().await;
@@ -750,9 +634,6 @@ async fn the_create_names_the_run_the_caller_minted() {
     assert_eq!(creates.len(), 1);
     assert_eq!(creates[0].sandbox_id, sandbox_id.to_string());
     assert_eq!(creates[0].execution_id, execution_id.to_string());
-    // 🔴 The factory attaches no ownership marker: it is a mechanism the
-    // control plane drives, not the thing that holds the control plane's
-    // record.
     assert!(creates[0].control_plane_config.is_empty());
 
     assert_eq!(
@@ -760,28 +641,10 @@ async fn the_create_names_the_run_the_caller_minted() {
         Some(std::net::Ipv4Addr::new(10, 1, 2, 3))
     );
     assert_eq!(backend.runtime_info().rootfs_virtual_size, Some(8192));
-    // See the table at the top of `stub.rs`: the deciding half pins no local
-    // artifacts, because it has none.
     assert!(backend.runtime_info().runtime_artifacts.is_empty());
     assert!(backend.startup_artifacts().is_empty());
 }
 
-/// 🔴 The API half tells the node, in as many words, that it keeps this
-/// sandbox's deadline itself.
-///
-/// This is the half of the fix that lives on the sending side, and it is worth
-/// a test of its own because the failure it prevents is a *silence*: the field
-/// used to be a `uint64` left at its zero value, the node read that zero as
-/// "the caller named no deadline, use yours", and its
-/// `default_sandbox_timeout_secs` paused a VM this half went on reporting as
-/// running. Nothing logged a disagreement, because neither half knew there was
-/// one.
-///
-/// The two values it must not send are built here as well. Both are what a
-/// plausible edit produces — `node_kept_default` is literally the old
-/// behaviour, and a `node_kept_timeout_ms` is what "just send the timeout"
-/// produces — and neither is distinguishable from the right answer by anything
-/// else in this crate.
 #[tokio::test]
 async fn the_create_tells_the_node_that_this_half_keeps_the_deadline() {
     use pb::sandbox_create_request::Expiry;
@@ -810,8 +673,6 @@ async fn the_create_tells_the_node_that_this_half_keeps_the_deadline() {
         "the node was not told that this half keeps the sandbox's deadline"
     );
 
-    // 🔴 The three answers this field has, and the two that are wrong here.
-    // `None` is the one that used to be sent, by way of a zero.
     assert_ne!(
         creates[0].expiry,
         Some(Expiry::NodeKeptDefault(pb::NodeDefaultExpiry {})),
@@ -827,24 +688,6 @@ async fn the_create_tells_the_node_that_this_half_keeps_the_deadline() {
     );
 }
 
-/// A custom extension params update is a real round trip now, not a
-/// fire-and-forget task: the node sees exactly the value that was sent, and a
-/// node refusal comes back to the caller as an error rather than a log line
-/// nobody but that Pod can read.
-///
-/// # 🔴 Why this test exists
-///
-/// `RemoteSandboxStub::update_custom_extension_params` used to spawn a task
-/// and return before the RPC was even sent — a caller could not tell success
-/// from failure, both looked exactly like `()`, and the only trace of a
-/// refusal was an `error!` line on a different process. The faces here, all
-/// in one round:
-///
-/// * two different values sent in succession each reach the node as
-///   themselves — not as each other and not as a stale copy of the first —
-///   proving the wire payload tracks the call rather than something fixed;
-/// * a node refusal is returned to the caller as `Err` and carries the
-///   node's own message, rather than being swallowed.
 #[tokio::test]
 async fn custom_extension_params_update_is_a_real_round_trip() {
     let (script, node) = scripted_node().await;
@@ -911,11 +754,6 @@ async fn custom_extension_params_update_is_a_real_round_trip() {
     );
 }
 
-/// 🔴 A node that cannot be reached is an error, never "the sandbox is gone".
-///
-/// `stop` is where the temptation is strongest — both endings have nothing left
-/// to do — and taking the first for the second is how a cluster stops
-/// accounting for a VM that is still running.
 #[tokio::test]
 async fn an_unreachable_node_does_not_mean_the_sandbox_stopped() {
     let (script, node) = scripted_node().await;
@@ -941,8 +779,6 @@ async fn an_unreachable_node_does_not_mean_the_sandbox_stopped() {
         "the failure lost what the node said: {err:#}"
     );
 
-    // 🔴 The control probe: a node that says it does not have the sandbox *is*
-    // an answer, and it makes `stop` idempotent as the trait requires.
     *script.delete.lock().expect("lock") = Some(Err(Status::not_found("no such sandbox here")));
     backend
         .stop()
@@ -950,36 +786,12 @@ async fn an_unreachable_node_does_not_mean_the_sandbox_stopped() {
         .expect("a node that says the sandbox is not there has answered");
 }
 
-// ---------------------------------------------------------------------------
-// A stale node address: retried once against a freshly resolved one, and
-// never against an answer the node actually sent
-// ---------------------------------------------------------------------------
 
-/// A placement source that hands out one address for the *initial* placement
-/// and a different one — for the same node id — once asked to re-resolve.
-///
-/// Models the split the stale-node-address retry depends on: a scheduler's
-/// per-sandbox binding cache (`place_existing`) can go on naming a node's old
-/// address long after `resolve_node` — backed by node discovery rather than
-/// that cache — already knows the new one.
 struct ReplacementNodePlacement {
     node_id: String,
     initial: NodeEndpoint,
     resolved: NodeEndpoint,
     resolve_calls: std::sync::atomic::AtomicUsize,
-    /// How many calls to `resolve_node` answer with `resolved` before every
-    /// call after that refuses instead.
-    ///
-    /// 🔴 Load-bearing for
-    /// `a_forks_children_carry_the_connection_the_retry_actually_used`, and
-    /// only for that test: every remote call retries once on its own, so a
-    /// fork child built from a stale, pre-retry connection would silently
-    /// self-heal on its *own* first call — the very next `resolve_node` —
-    /// and the bug that test exists to catch would go unnoticed. Setting
-    /// this to `1` removes that safety net: a second re-resolve, which only
-    /// happens if the child was handed the connection the retry had already
-    /// abandoned, fails instead of quietly succeeding. Every other test
-    /// leaves this at `usize::MAX`, where the cap never bites.
     resolve_budget: usize,
 }
 
@@ -1020,9 +832,6 @@ impl NodePlacement for ReplacementNodePlacement {
         Ok(self.resolved.clone())
     }
 
-    /// Unused by every test this double serves: they all exercise the stale
-    /// *connection* retry, never a dial that fails outright, so `attach`'s
-    /// membership check is never reached.
     async fn node_membership(&self, _node_id: &str) -> anyhow::Result<NodeMembership> {
         Ok(NodeMembership::Present)
     }
@@ -1037,16 +846,6 @@ impl NodePlacement for ReplacementNodePlacement {
     }
 }
 
-/// A stale node address — a connection that once worked and now cannot be
-/// reached at all — is retried exactly once against a freshly resolved
-/// address, and the retry reaches the node the fresh address actually names.
-///
-/// 🔴 Deleting the retry turns this red outright. Wiring the re-resolve to
-/// `place_existing` instead of `resolve_node` — exactly the stale binding
-/// cache this exists to route around — also turns it red: `place_existing`
-/// here answers with `initial` again, the same dead address, so the retried
-/// call would fail exactly like the first one instead of reaching
-/// `script_b`.
 #[tokio::test]
 async fn a_stale_node_address_is_retried_once_against_a_freshly_resolved_one() {
     let (script_a, node_a) = scripted_node().await;
@@ -1107,14 +906,6 @@ async fn a_stale_node_address_is_retried_once_against_a_freshly_resolved_one() {
     assert!(script_a.seen_delete.lock().expect("lock").is_empty());
 }
 
-/// A fork's child stubs carry the connection the retry actually used, not the
-/// one it had already abandoned by the time the fork succeeded.
-///
-/// 🔴 Reading `node`/`client` from a value captured *before* the retried
-/// `fork` call — instead of from `self.placed` afterward — turns this red:
-/// every child would be built from the dead node's connection, and operating
-/// on one would fail exactly like the parent's first attempt did, rather than
-/// reaching the node the fork was actually run on.
 #[tokio::test]
 async fn a_forks_children_carry_the_connection_the_retry_actually_used() {
     let (script_a, node_a) = scripted_node().await;
@@ -1188,18 +979,6 @@ async fn a_forks_children_carry_the_connection_the_retry_actually_used() {
     assert!(script_a.seen_delete.lock().expect("lock").is_empty());
 }
 
-/// The control face: a status the node *sent* — even the identically-coded
-/// `Unavailable` a transport failure also produces — is never retried against
-/// a different address. Only a connection that never reached the node at all
-/// is.
-///
-/// 🔴 This is the half `an_unreachable_node_does_not_mean_the_sandbox_stopped`
-/// cannot cover on its own: that test's node answers the same canned status on
-/// every call, so a build that wrongly retried an application-level
-/// `Unavailable` would still surface the same message text and pass it.
-/// Pointing the re-resolve target at a second node that would visibly answer
-/// instead — and asserting it is never touched — is what catches that
-/// mutation.
 #[tokio::test]
 async fn a_status_the_node_sent_is_not_retried_against_a_different_address() {
     let (script, node) = scripted_node().await;
@@ -1251,16 +1030,6 @@ async fn a_status_the_node_sent_is_not_retried_against_a_different_address() {
     );
 }
 
-/// The re-resolve-and-retry path is bounded: a re-resolve that would take
-/// longer than `STALE_PLACEMENT_RETRY_BUDGET` does not turn a fast failure
-/// into a slow one. The original transport failure is surfaced once the
-/// budget elapses, not once the slow re-resolve eventually finishes.
-///
-/// 🔴 Deleting the `tokio::time::timeout` wrapper around the retry — while
-/// leaving everything else intact — turns this red: without it, this test
-/// hangs for the placement's full multi-second `resolve_node` delay instead
-/// of returning within the budget, and the elapsed-time assertion below
-/// catches that directly rather than via a flaky sleep-and-hope race.
 #[tokio::test]
 async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
     struct SlowReresolve {
@@ -1297,8 +1066,6 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
             .await;
             Ok(self.initial.clone())
         }
-        /// Unused: this test is about the reconnect retry budget, never
-        /// reached from `attach`'s dial-failure path.
         async fn node_membership(&self, _node_id: &str) -> anyhow::Result<NodeMembership> {
             Ok(NodeMembership::Present)
         }
@@ -1364,54 +1131,10 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// A black-holed address: bounded by `STUB_CONNECT_TIMEOUT`, not by the
-// kernel's own SYN-retry ceiling
-// ---------------------------------------------------------------------------
+// Black-hole endpoint used to exercise the explicit stub connect timeout.
 
-/// A private, non-routable address whose SYN is never answered — chosen
-/// empirically for this suite rather than assumed.
-///
-/// 🔴 Not `127.0.0.1:1` (or any other closed local port): that fails with an
-/// instant RST regardless of any `connect_timeout`, which is exactly why it
-/// tests nothing about this fix — see
-/// `a_node_nobody_answers_does_not_hang_the_remote_build` in
-/// `src/api/impls/template.rs`, which uses exactly that address to test a
-/// *different* thing (a refused connection must not hang a build lease),
-/// and its own doc comment says so.
-///
-/// 🔴 Also not an RFC 5737 documentation address (`192.0.2.0/24` and
-/// friends), despite those being the standard textbook choice for "an
-/// address nothing will ever answer": verified directly against this
-/// repository's own dev sandbox before writing this test, a raw
-/// `TcpStream::connect` to `192.0.2.1` returns *successfully* in well under
-/// a millisecond — some outbound network layer between this container and
-/// the internet answers on behalf of the whole public documentation range,
-/// which would make a test built on it pass by accident regardless of
-/// whether `STUB_CONNECT_TIMEOUT` does anything at all. A private,
-/// unassigned address such as this one is not proxied the same way: a raw
-/// socket connect to it was confirmed to block with no answer at all (not
-/// even an ICMP unreachable) for as long as it was given, which is the
-/// actual shape of failure a deleted Kubernetes pod's address produces on a
-/// real cluster.
 const BLACK_HOLE_ENDPOINT: &str = "http://10.255.255.1:1";
 
-/// The bug this whole change fixes, isolated to the one function it lives
-/// in: dialing an address whose SYN is never answered used to be gated only
-/// by the kernel's own SYN-retry ceiling (`net.ipv4.tcp_syn_retries`,
-/// exponential backoff capped around two minutes at Linux's default) — which
-/// is what a real cluster incident measured at ~71 seconds before this fix.
-/// `RemoteSandboxStub::connect` now carries `STUB_CONNECT_TIMEOUT`; this
-/// asserts the dial gives up at that bound instead.
-///
-/// 🔴 Deleting `.connect_timeout(STUB_CONNECT_TIMEOUT)` from
-/// `RemoteSandboxStub::connect` turns this red: without it, the dial this
-/// test makes does not return within the outer `tokio::time::timeout`
-/// below, and the test fails on that outer bound rather than on the
-/// elapsed-time assertion — deliberately, so a regression here fails this
-/// suite in 20 seconds instead of hanging it for the kernel's own ceiling.
-/// Confirmed by temporarily reverting that one line and re-running this test
-/// alone: the outer 20s timeout fired every time.
 #[tokio::test]
 async fn a_black_holed_dial_gives_up_at_the_connect_timeout_not_the_kernels_syn_ceiling() {
     let started = std::time::Instant::now();
@@ -1438,13 +1161,6 @@ async fn a_black_holed_dial_gives_up_at_the_connect_timeout_not_the_kernels_syn_
     );
 }
 
-/// The two timing constants are sized together, not independently: see
-/// `STUB_CONNECT_TIMEOUT`'s doc in `stub.rs` for why the reconnect inside
-/// `STALE_PLACEMENT_RETRY_BUDGET` has to leave room, in the same budget, for
-/// the `resolve_node` RPC and the retried call that follow it. Mirrors the
-/// style of `RedisStoreConfig::validate`'s paired-field checks
-/// (`src/orchestrator/store/redis/config.rs`), as a plain assertion rather
-/// than a new validation system for two `const`s.
 #[test]
 fn stub_connect_timeout_leaves_headroom_in_the_retry_budget() {
     assert!(
@@ -1458,7 +1174,6 @@ fn stub_connect_timeout_leaves_headroom_in_the_retry_budget() {
     );
 }
 
-/// A pause comes back as a reference to bytes on the node, not as a handle.
 #[tokio::test]
 async fn a_pause_comes_back_as_a_reference_to_the_nodes_bytes() {
     let (script, node) = scripted_node().await;
@@ -1490,9 +1205,6 @@ async fn a_pause_comes_back_as_a_reference_to_the_nodes_bytes() {
     backend.start().await.expect("start");
 
     let capture = backend.pause(None, false).await.expect("pause");
-    // 🔴 Always absent, and not because the node had nothing: by the time this
-    // reply exists the bytes are already durable there, so what a caller needs
-    // is the staged row and not a handle owning a directory on another disk.
     assert!(capture.publishable.is_none());
 
     let encoded = capture.state.encode().expect("encode");
@@ -1511,13 +1223,6 @@ async fn a_pause_comes_back_as_a_reference_to_the_nodes_bytes() {
     );
 }
 
-/// A pause the node reported as successful but answered without state is
-/// terminal.
-///
-/// 🔴 Terminal rather than recoverable: a successful pause means the VM is
-/// already stopped, so a reply with nothing to reopen it is a sandbox that is
-/// down and cannot come back. Calling that recoverable would have the caller
-/// mark it running again.
 #[tokio::test]
 async fn a_pause_with_nothing_to_reopen_is_terminal() {
     let (script, node) = scripted_node().await;
@@ -1549,8 +1254,6 @@ async fn a_pause_with_nothing_to_reopen_is_terminal() {
     assert!(err.is_terminal(), "{err}");
 }
 
-/// A capture failure keeps the classification the node gave it, and gains a
-/// terminal one when it gave none.
 #[tokio::test]
 async fn a_capture_failure_keeps_its_classification_across_the_wire() {
     for (terminal, expected) in [(false, false), (true, true)] {
@@ -1579,9 +1282,6 @@ async fn a_capture_failure_keeps_its_classification_across_the_wire() {
         assert_eq!(err.is_terminal(), expected, "{err}");
     }
 
-    // 🔴 And the direction that matters: a failure with no classification is
-    // read as terminal, because "I do not know whether the runtime was mutated"
-    // and "it was not" are not the same answer.
     let (script, node) = scripted_node().await;
     let execution_id = ExecutionId::new();
     *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
@@ -1605,7 +1305,6 @@ async fn a_capture_failure_keeps_its_classification_across_the_wire() {
         .is_terminal());
 }
 
-/// A row a node might hand back, staged on the node under test.
 fn staged_snapshot() -> StagedSnapshot {
     StagedSnapshot {
         commit: SnapshotCommit {
@@ -1621,7 +1320,6 @@ fn staged_snapshot() -> StagedSnapshot {
     }
 }
 
-/// A checkpoint comes back as the staged snapshot itself, ready to commit.
 #[tokio::test]
 async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
     let (script, node) = scripted_node().await;
@@ -1657,11 +1355,6 @@ async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
     assert_eq!(decoded.id(), staged.id());
 }
 
-/// A fork answered with the wrong number of results is a terminal failure.
-///
-/// 🔴 The caller pairs results with the children it asked for by position and
-/// writes a record for each; a short list would give some child another child's
-/// record.
 #[tokio::test]
 async fn a_fork_answered_with_the_wrong_shape_is_refused() {
     let (script, node) = scripted_node().await;
@@ -1696,8 +1389,6 @@ async fn a_fork_answered_with_the_wrong_shape_is_refused() {
     assert!(err.is_terminal(), "{err}");
 }
 
-/// A fork keeps each child's outcome with the child it belongs to, failures
-/// included.
 #[tokio::test]
 async fn a_fork_keeps_each_childs_outcome_with_that_child() {
     let (script, node) = scripted_node().await;
@@ -1757,11 +1448,6 @@ async fn a_fork_keeps_each_childs_outcome_with_that_child() {
     assert_eq!(child.execution_id(), specs[0].execution_id);
 }
 
-/// 🔴 A cold create is refused here rather than approximated.
-///
-/// `build` is handed a spec whose image config and drives have already been
-/// resolved into paths on the local disk, and the reference a node would need
-/// to resolve them itself is no longer in it.
 #[tokio::test]
 async fn a_cold_create_is_refused_with_the_reason() {
     let (_script, node) = scripted_node().await;
@@ -1784,29 +1470,6 @@ async fn a_cold_create_is_refused_with_the_reason() {
     assert!(err.to_string().contains("image reference"), "{err:#}");
 }
 
-/// The counterpart of the refusal just above, for the method that exists
-/// precisely because that one refuses: `build_from_image_ref` is handed a
-/// reference — not a path — and this pins that the reference *is* what
-/// crosses the wire, and that the node resolves it with its own
-/// `ImageResolver` rather than trusting a value this process never had.
-///
-/// # 🔴 Why the fake `regctl`'s argv is the only evidence that matters
-///
-/// This process never calls `regctl` at all — `real_node_with_image_resolution`
-/// wires the fake into the *node's* `deps_path`, not this process's. So the
-/// fake recording exactly the reference this test sent is proof of two
-/// things at once: that `RemoteSandboxBackendFactory::build_from_image_ref`
-/// shipped `spec.image_ref` unresolved (a resolved reference would have shown
-/// up as a local overlaybd config path, and there would have been no regctl
-/// call here to record at all), and that `NodeSandboxService::create`'s
-/// `Source::Image` arm is the one that called it, on the node.
-///
-/// A real image resolve is out of scope here — it needs a real manifest, real
-/// blobs and real overlaybd conversion — so the fake answers every lookup
-/// with a registry 404 and the create fails there. That failure is itself
-/// checked: `start` must fail with the *node's* resolve error, not with
-/// `Unimplemented` — the answer this call used to give unconditionally, and
-/// would still give if `create`'s `Source::Image` arm regressed to refusing.
 #[tokio::test]
 async fn an_unresolved_image_reference_ships_to_the_node_which_resolves_it_itself() {
     const IMAGE: &str = "registry.invalid/agentenv/cold-start:pinned";
@@ -1860,11 +1523,6 @@ async fn an_unresolved_image_reference_ships_to_the_node_which_resolves_it_itsel
     );
 }
 
-/// A paused state with no machine attached to it is refused.
-///
-/// 🔴 The path inside is on one particular disk. A record that carried it and
-/// not the machine would be a resume sent wherever placement happened to
-/// point, failing there in a way that looks like the bytes are corrupt.
 #[tokio::test]
 async fn a_paused_state_without_a_node_is_refused() {
     let (_script, node) = scripted_node().await;
@@ -1893,31 +1551,11 @@ async fn a_paused_state_without_a_node_is_refused() {
         .expect("a paused state that says where its bytes are");
 }
 
-/// 🔴 The remote factory must not send a blank ownership marker.
-///
-/// `RemoteSandboxBackendFactory` used to send `control_plane_config:
-/// Vec::new()` on every create. A grep for who sets the marker therefore came
-/// back with tests and nothing else, which read exactly like a defect — and
-/// would have been one the moment anything drove this factory for real: every
-/// sandbox it created would be one the control plane does not recognise as its
-/// own, invisible to `ListSandboxes` and to the reconciliation that runs off
-/// it. It was not one at the time only because `aenv-api` refused to
-/// assemble, so nothing constructed this factory outside these tests.
-///
-/// Both halves of that have since been settled: `aenv-api` assembles (it is
-/// its own binary now, in `crates/aenv-api`), and the marker arrives from the
-/// caller. What is left is the assertion that mattered, kept on its own.
-///
-/// 🔴 This used to `include_str!` the api binary to decide which of two
-/// branches to assert. That branch is dead — the binary lives in another crate
-/// and assembles — and reaching across the crate boundary with a relative path
-/// to read it would be a coupling with nothing left to check.
 #[test]
 fn the_remote_factory_sends_no_blank_ownership_marker() {
     const BLANK_MARKER: &str = "control_plane_config: Vec::new()";
 
-    // 🔴 A relative path into `aenv-core`: the file under scan is that
-    // crate's, and there is no other way to read its source text.
+    // The scanned factory source lives in `aenv-core`.
     let factory = include_str!("../../../src/node_client/factory.rs");
 
     assert!(
@@ -1931,23 +1569,11 @@ fn the_remote_factory_sends_no_blank_ownership_marker() {
     );
 }
 
-/// The marker the orchestrator put on the launch config is the marker the node
-/// stores and hands back.
-///
-/// 🔴 End to end over a socket, and over the *real* node service, because every
-/// place this could be lost is between the two: the factory could drop it, the
-/// proto could carry it in a field nothing reads, the node could parse it
-/// instead of storing it. A test that called the trait directly would prove
-/// none of that.
 #[tokio::test]
 async fn the_marker_the_orchestrator_stamped_is_the_marker_on_the_wire() {
     let node = real_node().await;
     let factory = RemoteSandboxBackendFactory::new(node.placement());
 
-    // 🔴 The factory answers `true` to this, which is what makes the
-    // orchestrator above it fill the field the rest of this test follows. If
-    // it ever answered `false`, every assertion below would still hold — on a
-    // launch config a test wrote by hand — while production sent nothing.
     assert!(
         factory.stamps_control_plane_ownership(),
         "a factory whose sandboxes run elsewhere has to ask for the marker"
@@ -1990,14 +1616,6 @@ async fn the_marker_the_orchestrator_stamped_is_the_marker_on_the_wire() {
     );
 }
 
-/// 🔴 The control probe, and the one that says what an unmarked sandbox is
-/// *for*: it is left alone, not killed.
-///
-/// A create that reached a node without a marker is a sandbox no control plane
-/// claims. The direction that costs nothing is to leave it out of the listing
-/// the reconciliation reads; the direction that ends a user's session is to
-/// treat it as an orphan. Same node, same service, same call as the test above
-/// — one field different.
 #[tokio::test]
 async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
     let node = real_node().await;
@@ -2023,8 +1641,6 @@ async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
         .await
         .expect("the node can list what it is running");
 
-    // 🔴 The sandbox is running. Without this the two emptiness assertions
-    // below would be satisfied by a create that never happened.
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].sandbox_id, sandbox_id);
     assert!(
@@ -2037,14 +1653,6 @@ async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
     );
 }
 
-/// The node service, stood up the way a binary stands it up.
-///
-/// 🔴 Through `node_server::serve_on` rather than through this file's own
-/// `serve` helper, because that is the function `assemble_node` calls and it
-/// is the one nothing had ever run: the harness above builds its own tonic
-/// server so it can serve scripted services, so it proves the *service*
-/// works and says nothing about the entry point. This also exercises the
-/// shutdown channel, which is what `main` sends on SIGTERM.
 #[tokio::test]
 async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     crate::logging::init_for_tests();
@@ -2109,9 +1717,6 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].sandbox_id, sandbox_id);
 
-    // 🔴 And it stops when told. `main` sends on this channel from the
-    // graceful-shutdown closure; a surface that ignored it would keep the port
-    // bound and hold the process open past the Pod's termination grace.
     drop(stop);
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), serving)
         .await
@@ -2124,23 +1729,7 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Reopening a capture the node is holding
-// ---------------------------------------------------------------------------
 
-/// A paused sandbox comes back on the machine whose disk its capture is on, and
-/// under the run the resume claimed.
-///
-/// 🔴 End to end over a socket and over the *real* node service, because every
-/// place this could go wrong is between the two halves: the factory could send
-/// the wrong incarnation, the proto could carry the fence in a field nothing
-/// reads, the node could mint its own run. A test that called the trait
-/// directly would prove none of it.
-///
-/// The refusal comes first and the success second, on purpose. The refusal's
-/// evidence is that the node is running nothing — and "running nothing" is what
-/// a node that never started anything also looks like, so the second half is
-/// what gives the first half its resolution.
 #[tokio::test]
 async fn a_paused_sandbox_is_reopened_on_the_machine_that_holds_its_capture() {
     let node = real_node().await;
@@ -2181,10 +1770,6 @@ async fn a_paused_sandbox_is_reopened_on_the_machine_that_holds_its_capture() {
         )
     };
 
-    // 🔴 A capture the placement answer does not match is refused here rather
-    // than sent. Sent, it would come back `NotFound` from a machine that has
-    // simply never seen this sandbox — which reads exactly like "the only copy
-    // is gone".
     let elsewhere = capture_on("node-that-holds-nothing");
     let mut wrong = factory
         .build_from_paused_state(sandbox_id, resumed_execution_id, &elsewhere, None)
@@ -2206,7 +1791,6 @@ async fn a_paused_sandbox_is_reopened_on_the_machine_that_holds_its_capture() {
         "a refused resume started something anyway"
     );
 
-    // 🔴 The same call, one value different: the machine the capture is on.
     let here = capture_on("node-under-test");
     let mut backend = factory
         .build_from_paused_state(sandbox_id, resumed_execution_id, &here, None)
@@ -2229,16 +1813,6 @@ async fn a_paused_sandbox_is_reopened_on_the_machine_that_holds_its_capture() {
     );
 }
 
-/// The resume says which run it is reopening and which run it is starting, in
-/// that order, in those fields.
-///
-/// 🔴 A test rather than a reading of the proto. Field names are not covered by
-/// this project's mutation testing — a `.proto` is generated code by the time
-/// anything mutates — so a swap of these two would type-check, compile, and
-/// resume a sandbox under the run it had just been paused under while fencing
-/// against the run that has not happened yet. The control face is the swap
-/// itself: the two values are different, and each is asserted absent from the
-/// other's field.
 #[tokio::test]
 async fn the_resume_names_the_run_it_reopens_and_the_run_it_starts() {
     let (script, node) = scripted_node().await;
@@ -2287,17 +1861,13 @@ async fn the_resume_names_the_run_it_reopens_and_the_run_it_starts() {
         resumed_execution_id.to_string(),
         "the node was told to start a run other than the one the claim allocated"
     );
-    // 🔴 The swap, ruled out from both directions.
     assert_ne!(seen[0].execution_id, resumed_execution_id.to_string());
     assert_ne!(
         seen[0].resumed_execution_id,
         paused_execution_id.to_string()
     );
-    // 🔴 Zero, meaning "keep what it was paused with". A deadline is the
-    // orchestrator's to decide and it does not reach a backend.
     assert_eq!(seen[0].timeout_ms, 0);
 
-    // And what the node reported is what this half now holds.
     assert_eq!(
         backend.host_interaction_ip(),
         Some(std::net::Ipv4Addr::new(10, 4, 5, 6))
@@ -2305,13 +1875,6 @@ async fn the_resume_names_the_run_it_reopens_and_the_run_it_starts() {
     assert_eq!(backend.runtime_info().rootfs_virtual_size, Some(4096));
 }
 
-/// 🔴 A node that could not be reached is not a capture that is gone.
-///
-/// One call shape, one value different — what the node answered — and the two
-/// answers license opposite moves: `NotFound` says the only copy of this
-/// sandbox is not on that machine, which is grounds for rebuilding it from a
-/// published snapshot or giving it up, and `Unavailable` says a machine is
-/// down, which is grounds for nothing at all.
 #[tokio::test]
 async fn a_node_that_could_not_be_reached_is_not_a_capture_that_is_gone() {
     let paused_execution_id = ExecutionId::new();
@@ -2373,12 +1936,6 @@ async fn a_node_that_could_not_be_reached_is_not_a_capture_that_is_gone() {
     );
 }
 
-/// A node that reported a resume and said nothing about the run it started is a
-/// failure, not a success with fields missing.
-///
-/// 🔴 The sandbox is up over there either way. What this half loses is the
-/// ability to fence anything it sends next, so accepting the reply would leave
-/// it addressing a VM it cannot name.
 #[tokio::test]
 async fn a_resume_that_named_no_run_is_a_failure() {
     let (script, node) = scripted_node().await;
@@ -2403,7 +1960,6 @@ async fn a_resume_that_named_no_run_is_a_failure() {
         .expect_err("a reply with no run in it must not look like a success");
     assert!(format!("{err:#}").contains("said nothing"), "{err:#}");
 
-    // 🔴 The control face: the same reply carrying the run does start.
     let (script, node) = scripted_node().await;
     *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
         started: Some(pb::SandboxCreateResponse {
@@ -2419,13 +1975,6 @@ async fn a_resume_that_named_no_run_is_a_failure() {
     backend.start().await.expect("a reply that named the run");
 }
 
-/// A node that brought the sandbox back under some other run fails the start,
-/// and — unlike a create — the sandbox is *not* torn down.
-///
-/// 🔴 The asymmetry is the point. A create that went wrong can be undone
-/// because the sandbox did not exist before the call; this one did, its capture
-/// has just been consumed by whatever the node started, and a teardown would
-/// destroy the user's only copy of their work over a protocol disagreement.
 #[tokio::test]
 async fn a_node_that_reopened_another_run_fails_the_start_and_is_not_told_to_delete() {
     let (script, node) = scripted_node().await;
@@ -2458,11 +2007,6 @@ async fn a_node_that_reopened_another_run_fails_the_start_and_is_not_told_to_del
         "a resume that disagreed about the run tore the user's sandbox down"
     );
 
-    // 🔴 The control face for the emptiness above: the same node, the same
-    // scripted delete, and a resume that *did* agree about the run — stopped,
-    // it produces exactly the delete the run above did not. Without this half
-    // an empty log would be evidence about the harness rather than about the
-    // resume.
     *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
         started: Some(pb::SandboxCreateResponse {
             sandbox_id: sandbox_id.to_string(),
@@ -2480,12 +2024,6 @@ async fn a_node_that_reopened_another_run_fails_the_start_and_is_not_told_to_del
     assert_eq!(deletes[0].execution_id, claimed.to_string());
 }
 
-/// A paused state that does not say which run it captured is refused.
-///
-/// 🔴 It is the fence a resume carries. Without it the call says only *which
-/// sandbox*, and a node still holding a stale paused record — one whose sandbox
-/// was resumed elsewhere and paused there — would reopen the run the user
-/// abandoned two runs ago while their newer work sat on another disk.
 #[tokio::test]
 async fn a_paused_state_that_does_not_say_which_run_it_captured_is_refused() {
     let (_script, node) = scripted_node().await;
@@ -2519,8 +2057,6 @@ async fn a_paused_state_that_does_not_say_which_run_it_captured_is_refused() {
         .expect_err("a paused state naming something that is not a run");
     assert!(err.to_string().contains("the-last-one"), "{err:#}");
 
-    // 🔴 The control face: the same document with a real incarnation decodes,
-    // and decodes to *that* incarnation.
     let decoded = factory
         .decode_paused_state(
             std::path::PathBuf::from("/ignored"),
@@ -2541,13 +2077,6 @@ async fn a_paused_state_that_does_not_say_which_run_it_captured_is_refused() {
     );
 }
 
-/// A resume that would run under the incarnation the sandbox was paused under
-/// is refused before anything is sent.
-///
-/// 🔴 A resume starts a new run. One that reused the paused run's identity
-/// would leave every command written before the pause indistinguishable from
-/// one written after it, which is the whole thing the incarnation on every call
-/// exists to tell apart.
 #[tokio::test]
 async fn a_resume_that_would_reuse_the_paused_run_is_refused() {
     let (_script, node) = scripted_node().await;
@@ -2567,15 +2096,11 @@ async fn a_resume_that_would_reuse_the_paused_run_is_refused() {
         .expect("a resume into the run it is replacing");
     assert!(err.to_string().contains("starts a new one"), "{err:#}");
 
-    // 🔴 The control face: a different run builds, so this is not a method that
-    // refuses everything.
     factory
         .build_from_paused_state(sandbox_id, ExecutionId::new(), &state, None)
         .expect("a resume under a run of its own");
 }
 
-/// A paused state some other factory produced is refused rather than sent
-/// wherever placement points.
 #[tokio::test]
 async fn a_paused_state_this_factory_did_not_produce_is_refused() {
     let (_script, node) = scripted_node().await;
@@ -2593,7 +2118,6 @@ async fn a_paused_state_this_factory_did_not_produce_is_refused() {
         .expect("a local paused state was accepted by the remote factory");
     assert!(err.to_string().contains("which machine"), "{err:#}");
 
-    // 🔴 The control face: one this factory did produce builds.
     factory
         .build_from_paused_state(
             sandbox_id,
@@ -2609,12 +2133,7 @@ async fn a_paused_state_this_factory_did_not_produce_is_refused() {
         .expect("a paused state from this factory");
 }
 
-// ---------------------------------------------------------------------------
-// Pause, and what must not follow it
-// ---------------------------------------------------------------------------
 
-/// Scripts a create and a pause on a node, and returns a stub that has done
-/// both.
 async fn paused_stub(
     script: &Arc<ScriptedNode>,
     node: &RunningNode,
@@ -2641,19 +2160,6 @@ async fn paused_stub(
     (backend, execution_id)
 }
 
-/// 🔴 Stopping a sandbox that has just been paused does not delete it.
-///
-/// `Orchestrator::pause_sandbox` calls `stop` on the backend right after a
-/// successful pause, "to free up resources". Locally that tears down a VM
-/// process and leaves the capture on disk. Over this wire the only teardown is
-/// `Delete`, which takes the paused record and its artifacts with it — so a
-/// `stop` sent as a `Delete` erases the capture the pause has just promised the
-/// user, and the sandbox then comes back `NotFound` from the one machine that
-/// had it.
-///
-/// The control face is the same `stop` on a stub that was never paused, which
-/// *must* delete: without it this test passes on a `stop` that does nothing at
-/// all, which is how a cluster stops accounting for VMs that are still running.
 #[tokio::test]
 async fn stopping_a_sandbox_that_was_just_paused_does_not_delete_its_capture() {
     let (script, node) = scripted_node().await;
@@ -2676,28 +2182,12 @@ async fn stopping_a_sandbox_that_was_just_paused_does_not_delete_its_capture() {
     assert_eq!(deletes[0].execution_id, execution_id.to_string());
 }
 
-/// The pause this half sends asks for exactly what its caller promised to
-/// commit, and brings the row back only when it did.
-///
-/// 🔴 Both values of the flag, in one test, because a `publish` flag is one bit
-/// and nothing in this project's mutation testing covers a `.proto` field.
-/// "The request said false" on its own is a fact about a constant; the pair —
-/// the flag on the wire tracking the argument, and the row coming back only on
-/// the arm that asked for it — is a fact about behaviour.
-///
-/// 🔴 The staged row on the `true` arm is what stops this passing on a build
-/// that sets the flag and drops the reply. That drop is not a cosmetic
-/// failure: the node has written a whole snapshot into durable storage by the
-/// time it answers, and a caller that discards the row leaves those bytes with
-/// nothing to announce them and no way to find them again.
 #[tokio::test]
 async fn a_pause_asks_for_a_row_only_when_its_caller_will_commit_one() {
     let (script, node) = scripted_node().await;
 
     let staged = staged_snapshot();
-    // 🔴 After `paused_stub`, which writes its own pause script on the way to
-    // starting the sandbox. Setting it first would be overwritten and this test
-    // would assert against a reply with no row in it.
+    // Script after `paused_stub`, whose setup writes its own pause reply.
     let (mut backend, _) = paused_stub(&script, &node).await;
     *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
         paused_state: Some(pb::PausedState {
@@ -2758,12 +2248,6 @@ async fn a_pause_asks_for_a_row_only_when_its_caller_will_commit_one() {
     );
 }
 
-/// The whole published pause, across both halves: this half asks, the real node
-/// service stages, and the row that comes back is the one the node wrote.
-///
-/// 🔴 The scripted test above proves the stub reads a reply. This one proves
-/// there is a reply to read: it drives the request through the real service,
-/// whose refusal of this exact flag is what the split shipped with.
 #[tokio::test]
 async fn a_published_pause_crosses_both_halves() {
     let real = real_node().await;
@@ -2789,32 +2273,12 @@ async fn a_published_pause_crosses_both_halves() {
         "the pause this half sends did not pause anything"
     );
 
-    // 🔴 `real_node` gives the service a snapshot manager that refuses to
-    // stage, which is the honest default for a harness that writes no bytes. So
-    // the assertion this arm can make is the one that matters for the split:
-    // the flag is no longer refused at the door, and the sandbox was paused
-    // either way. Whether a row comes back when staging works is
-    // `a_published_pause_stages_the_bytes_here_and_leaves_the_row_to_the_caller`.
     assert!(
         capture.publishable.is_none(),
         "a node whose repository refuses to stage handed back a row anyway"
     );
 }
 
-/// The whole of it: a sandbox started from here, paused from here, and reopened
-/// from here on the machine that held its bytes.
-///
-/// 🔴 Nothing else in this file crosses both halves. The pause tests script the
-/// node's reply, and the resume tests pause the sandbox through the node's own
-/// orchestrator; either passes on a build whose `Pause` writes a record no
-/// `Resume` can find. This one takes the paused state the pause reply produced,
-/// puts it through the round trip a record makes it take, and hands the result
-/// back to the factory.
-///
-/// The control face is the machine: the same encoded state with a different
-/// origin node is refused rather than sent, and the refusal happens with the
-/// node still holding the capture — so "the resume worked" is about the machine
-/// that has the bytes and not about any machine.
 #[tokio::test]
 async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
     let node = real_node().await;
@@ -2830,9 +2294,6 @@ async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
     backend.start().await.expect("start on the node");
 
     let capture = backend.pause(None, false).await.expect("pause on the node");
-    // 🔴 The stop the orchestrator sends after every successful pause. It is
-    // here rather than left out because leaving it out is what made this round
-    // trip look like it worked.
     backend.stop().await.expect("stop after the pause");
     assert!(
         orchestration
@@ -2843,7 +2304,6 @@ async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
         "the paused sandbox is still running"
     );
 
-    // Through the encoding a record forces on it, and back.
     let encoded = capture.state.encode().expect("encode");
     assert_eq!(encoded["origin_node_id"], "node-under-test");
     assert_eq!(
@@ -2855,7 +2315,6 @@ async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
         .decode_paused_state(std::path::PathBuf::from("/ignored"), encoded.clone())
         .expect("decode");
 
-    // 🔴 The control face: the same capture, one value different — the machine.
     let mut elsewhere = encoded.clone();
     elsewhere["origin_node_id"] = serde_json::json!("node-that-holds-nothing");
     let elsewhere = factory
@@ -2894,35 +2353,9 @@ async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Two replicas over one ledger
-// ---------------------------------------------------------------------------
-//
-// 🔴 What this section is for, stated once.
-//
-// `Orchestrator` keeps its live backends in a process-local map. That map is
-// the whole truth when there is one process, and `aenv-api` is deployed as
-// two replicas behind a Service with **no session affinity** — so the replica a
-// request lands on is not usually the replica that started the sandbox.
-//
-// The pause path read "no handle here" as "the sandbox is gone" and deleted the
-// shared record. On a cluster that meant: the user's pause answered 404, the VM
-// went on running on its node, and the only thing that could still name it had
-// just been erased. Two of those filled half a machine, and no API call could
-// reach either.
-//
-// Everything below is written as two faces that differ in exactly one value —
-// which replica the call lands on, whether the machine can be reached, whether
-// the factory's sandboxes are on other machines — because the failure is a
-// *silence* and an assertion with one face passes on a build that does nothing
-// at all.
+// Exercises multiple API replicas sharing one ledger while node handles remain
+// process-local.
 
-/// One `InMemoryMetadataStore` behind more than one orchestrator.
-///
-/// 🔴 Every method forwards, including the ones with defaults. A newtype that
-/// let a default stand would be a second store implementation wearing the first
-/// one's name, and the whole point here is that two replicas read and write the
-/// *same* records.
 #[derive(Clone)]
 struct SharedLedger(Arc<InMemoryMetadataStore>);
 
@@ -3069,15 +2502,9 @@ impl crate::orchestrator::MetadataStore for SharedLedger {
 type ApiReplica =
     Arc<Orchestrator<SharedLedger, RemoteSandboxBackendFactory, DisabledSandboxPersister>>;
 
-/// One replica of the deciding half: the cluster ledger, and a factory whose
-/// sandboxes are on `node`.
 async fn api_replica(node: &RunningNode, ledger: &SharedLedger) -> ApiReplica {
     Orchestrator::new(
-        // 🔴 `MayGenerate` rather than `MustBeConfigured`, and it changes
-        // nothing this file is about: the policy is read once, to decide
-        // whether the process may invent its own envd access-token seed, and a
-        // test config has none to find. Everything that makes this a replica of
-        // the deciding half is the store and the factory below.
+        // Test replicas may generate an otherwise irrelevant access-token seed.
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         ledger.clone(),
         RemoteSandboxBackendFactory::new(node.placement()),
@@ -3088,7 +2515,6 @@ async fn api_replica(node: &RunningNode, ledger: &SharedLedger) -> ApiReplica {
     .expect("a replica of the deciding half")
 }
 
-/// A machine-local half: its sandboxes are in its own process.
 async fn local_half(
 ) -> Arc<Orchestrator<InMemoryMetadataStore, MockBackendFactory, DisabledSandboxPersister>> {
     Orchestrator::new(
@@ -3122,7 +2548,6 @@ fn cluster_create_request() -> crate::orchestrator::CreateSandboxRequest {
     }
 }
 
-/// The ids the node is running right now.
 async fn running_on(node: &RunningNode) -> Vec<crate::types::SandboxId> {
     let mut ids: Vec<_> = node
         .orchestration
@@ -3138,7 +2563,6 @@ async fn running_on(node: &RunningNode) -> Vec<crate::types::SandboxId> {
     ids
 }
 
-/// Waits until nothing is listening on the node's address any more.
 async fn wait_until_unreachable(endpoint: &str) {
     let addr = endpoint
         .trim_start_matches("http://")
@@ -3153,13 +2577,6 @@ async fn wait_until_unreachable(endpoint: &str) {
     panic!("the node kept answering after it was told to stop");
 }
 
-/// A pause pauses the same VM whichever replica it lands on.
-///
-/// 🔴 Two faces differing in exactly one value: which of two replicas of one
-/// deciding half the call was made on. Both must succeed **and** both VMs must
-/// actually stop on the node — a build where the second face merely returned a
-/// different error, or returned `Ok` without asking anyone, passes neither
-/// half of that.
 #[tokio::test]
 async fn a_pause_pauses_the_same_vm_whichever_replica_it_lands_on() {
     let node = real_node().await;
@@ -3192,16 +2609,11 @@ async fn a_pause_pauses_the_same_vm_whichever_replica_it_lands_on() {
         .await
         .expect("the replica that started the sandbox pauses it");
 
-    // Face 2: the same call, on the replica that did not. The one value that
-    // differs between the two.
     Arc::clone(&landed_elsewhere)
         .pause_sandbox(stray.id)
         .await
         .expect("a replica that did not start the sandbox pauses it");
 
-    // 🔴 Both VMs are actually down on the machine that was running them.
-    // Without this the test passes on a pause that answered `Ok` and told
-    // nobody, which is the other half of the same bug.
     assert_eq!(
         running_on(&node).await,
         Vec::<crate::types::SandboxId>::new(),
@@ -3231,14 +2643,6 @@ async fn a_pause_pauses_the_same_vm_whichever_replica_it_lands_on() {
     }
 }
 
-/// A missing handle takes the shared record with it **only** when there is
-/// nothing anywhere to address.
-///
-/// 🔴 The second face is the one that gives the first its resolution. "The
-/// record is still there" is satisfied by a build whose clean-up code never
-/// runs at all, so the same test drives a case where a record genuinely *is*
-/// removed. The single value that differs is whether the factory's sandboxes
-/// live on other machines.
 #[tokio::test]
 async fn a_missing_handle_removes_the_record_only_when_nothing_can_be_addressed() {
     let node = real_node().await;
@@ -3293,12 +2697,6 @@ async fn a_missing_handle_removes_the_record_only_when_nothing_can_be_addressed(
     );
 }
 
-/// A pause that cannot reach the machine leaves the sandbox exactly as it was.
-///
-/// 🔴 "I could not find out" is neither of the other two answers, and folding
-/// it into "the sandbox is gone" is what turned a network hiccup into a deleted
-/// record. The control face is the same call, on the same replica, against the
-/// same sandbox — with the machine up.
 #[tokio::test]
 async fn a_pause_that_cannot_reach_the_machine_leaves_the_record_alone() {
     let node = real_node().await;
@@ -3335,9 +2733,6 @@ async fn a_pause_that_cannot_reach_the_machine_leaves_the_record_alone() {
         "the failure did not say the machine was unreachable: {err}"
     );
 
-    // 🔴 The record is untouched, and it is back in the state it started in —
-    // not left parked in `Pausing`, which is a sandbox no later call can act
-    // on.
     let record = ledger
         .0
         .get(&unreachable.id)
@@ -3346,7 +2741,6 @@ async fn a_pause_that_cannot_reach_the_machine_leaves_the_record_alone() {
         .expect("🔴 an unreachable machine caused the shared record to be deleted");
     assert_eq!(record.state, crate::orchestrator::SandboxState::Running);
 
-    // The control's record, for contrast, moved.
     assert_eq!(
         ledger
             .0
@@ -3359,15 +2753,6 @@ async fn a_pause_that_cannot_reach_the_machine_leaves_the_record_alone() {
     );
 }
 
-/// A delete on a replica that did not start the sandbox reaches the machine.
-///
-/// 🔴 This is the other half of the same fault, and it failed the opposite way
-/// round: the delete found no handle, skipped the teardown entirely, removed
-/// the record and answered 204. The VM stayed up with nothing left to name it.
-///
-/// The second face is a delete that could not reach the machine, which must
-/// keep the record — and which is what stops the first face from passing on a
-/// build that deletes records unconditionally.
 #[tokio::test]
 async fn a_delete_on_a_replica_that_did_not_start_the_sandbox_reaches_the_machine() {
     let node = real_node().await;
@@ -3426,17 +2811,6 @@ async fn a_delete_on_a_replica_that_did_not_start_the_sandbox_reaches_the_machin
     assert_eq!(record.state, crate::orchestrator::SandboxState::Running);
 }
 
-/// A replica going away does not pause the cluster's sandboxes.
-///
-/// 🔴 The shutdown path preserves everything in the record store by pausing it,
-/// which is what a machine that is about to stop running VMs owes them. A
-/// deciding half's record store is the *cluster's* ledger and it runs no VMs at
-/// all, so the same loop there pauses every running sandbox in the cluster once
-/// per replica rolled.
-///
-/// The control face is a half whose sandboxes really are its own: its shutdown
-/// must still pause them, or this test passes on a build that has simply
-/// stopped preserving anything.
 #[tokio::test]
 async fn a_replica_going_away_leaves_the_clusters_sandboxes_running() {
     let node = real_node().await;
@@ -3491,17 +2865,6 @@ async fn a_replica_going_away_leaves_the_clusters_sandboxes_running() {
     );
 }
 
-/// An egress policy set on a replica that did not start the sandbox reaches the
-/// machine.
-///
-/// 🔴 This path failed less loudly than pause and delete — it answered
-/// `SandboxOperationConflict`, a 409 telling the user something else was busy
-/// with their sandbox when nothing was — but it failed for exactly the same
-/// reason, on whichever replica the request happened to land.
-///
-/// The control face is a half whose sandboxes really are in its own process:
-/// there a missing handle *is* a conflict, and it must still be reported as
-/// one.
 #[tokio::test]
 async fn an_egress_policy_set_on_a_replica_that_did_not_start_the_sandbox_reaches_the_machine() {
     let node = real_node().await;
@@ -3524,8 +2887,6 @@ async fn an_egress_policy_set_on_a_replica_that_did_not_start_the_sandbox_reache
         .await
         .expect("a replica that did not start the sandbox sets its egress policy");
 
-    // 🔴 On the machine, not merely in the ledger. A build that recorded the
-    // policy and told nobody satisfies every assertion that stops at the store.
     assert_eq!(
         on_the_node
             .get_sandbox(&sandbox.id)
@@ -3562,11 +2923,6 @@ async fn an_egress_policy_set_on_a_replica_that_did_not_start_the_sandbox_reache
     );
 }
 
-// ---------------------------------------------------------------------------
-// Fork, driven by the deciding half
-// ---------------------------------------------------------------------------
-
-/// Where this replica would send traffic for a sandbox.
 async fn routed_to(
     replica: &ApiReplica,
     sandbox_id: crate::types::SandboxId,
@@ -3581,27 +2937,6 @@ async fn routed_to(
     }
 }
 
-/// A fork driven by the API half makes every child routable, at the address the
-/// child's own VM answers on.
-///
-/// # 🔴 This is the shape the bug had in production
-///
-/// `aenv-api` forks by asking a node, and the node's answer is the only thing
-/// this half ever learns about where a child is. The node used to answer with
-/// an empty address, so `proxy_target_from_sandbox` refused every child with
-/// *missing host interaction IP after start* — deterministically, on children
-/// whose VMs were up and healthy on the node, which were then torn down again.
-///
-/// The faces, against one node in one round:
-///
-/// * Every child both **starts** and is **routable**. A build that starts the
-///   children and cannot route them fails the second half, which is exactly
-///   what the bug did.
-/// * The three addresses — two children and their source — are all different.
-///   That is what says each was read from that child's own handle on the node,
-///   rather than being a constant or a copy of the source's.
-/// * The node itself agrees all three are running, so nothing here is satisfied
-///   by a route to a VM that is not there.
 #[tokio::test]
 async fn a_fork_driven_by_the_deciding_half_routes_each_child_to_its_own_vm() {
     let node = real_node().await;
@@ -3653,15 +2988,6 @@ async fn a_fork_driven_by_the_deciding_half_routes_each_child_to_its_own_vm() {
     );
 }
 
-/// A child the node reported no address for arrives here with none.
-///
-/// 🔴 Two halves one wire value apart, in one answer to one fork: the first
-/// child comes back with an address and a rootfs size, the second with the
-/// blanks proto3 cannot tell from "unset". The first has to arrive as facts.
-/// The second has to arrive as *nothing at all* — never as a default, never as
-/// its sibling's — because that `None` is what makes the orchestrator above
-/// refuse the child loudly instead of publishing a route to an address nothing
-/// is listening on.
 #[tokio::test]
 async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
     let (script, node) = scripted_node().await;
@@ -3755,17 +3081,6 @@ async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Attaching to a sandbox this process did not start
-// ---------------------------------------------------------------------------
-
-/// A backend for a sandbox this replica did not start, built exactly the way
-/// `Orchestrator::absent_handle` builds one.
-///
-/// 🔴 The factory call and the `start` that follows are that method's two
-/// lines. The orchestrator does not hand back the backend it adopts, and
-/// repeating the two calls here is closer to the path under test than adding an
-/// accessor to production code for a test to read.
 async fn adopted(
     node: &RunningNode,
     sandbox: &crate::orchestrator::SandboxMetadata,
@@ -3782,37 +3097,6 @@ async fn adopted(
     backend
 }
 
-/// A replica that did not start a sandbox says the same address for it as the
-/// replica that did.
-///
-/// # 🔴 The gap this closes
-///
-/// `aenv-api` runs several replicas behind a Service with no session
-/// affinity, so a call about a sandbox usually lands on a replica that did not
-/// start it. That replica adopts the sandbox — and the adopted stub used to be
-/// placed with its address and rootfs size left as `None`, on the reasoning
-/// that this half never made the call that would have reported them.
-///
-/// `None` is not a neutral value here. It is what a node reports for a sandbox
-/// that has no address, and the orchestrator above turns that into
-/// *sandbox missing host interaction IP after start* and tears the sandbox
-/// down — which is exactly the production failure `1d5cd05` fixed for fork
-/// children. The blank did not read as "nobody asked"; it read as a verdict
-/// about a healthy sandbox.
-///
-/// # 🔴 The faces, one node and one round
-///
-/// * **the replica that started it against the one that did not.** Both must
-///   answer, and both must answer the *same* address — it is one sandbox. A
-///   build where the second answers `None` fails, and so does one where the
-///   first stopped answering.
-/// * **three addresses, all different.** A source and its two fork children
-///   each get their own network slot on the node. A constant, or a value copied
-///   from a sibling, fails all three equalities at once.
-/// * **two of the three carry no ownership marker.** A fork child driven by
-///   this half reaches the node unmarked, and `ListSandboxes` leaves an
-///   unmarked sandbox out entirely. The adopting replica answers for all three,
-///   which is what says these facts did not come from that listing.
 #[tokio::test]
 async fn a_replica_that_did_not_start_a_sandbox_says_the_same_address_as_the_one_that_did() {
     let node = real_node().await;
@@ -3882,23 +3166,6 @@ async fn a_replica_that_did_not_start_a_sandbox_says_the_same_address_as_the_one
     );
 }
 
-/// A machine that could not be asked and a machine that is not running the
-/// sandbox are two different answers.
-///
-/// # 🔴 One value apart, and it is the status
-///
-/// Both faces reach the machine and both get a reply. In the first the machine
-/// says it is running nothing under that id — an answer, and the one a delete
-/// exists to act on: its whole job is to reconcile a record against a machine
-/// that no longer has the sandbox, so failing there would leave such a record
-/// undeletable. In the second the machine could not tell, and that is a
-/// failure. Folding the second into the first is how a replica concludes a
-/// running sandbox has no address because a node was busy — and, one caller up,
-/// how a delete decides a VM is gone because nobody could answer.
-///
-/// 🔴 Deliberately not written as "shut the socket down": a dead socket fails
-/// in `connect`, a round trip before the branch under test, so a build that
-/// folded every status into "no such sandbox" would pass it.
 #[tokio::test]
 async fn a_machine_that_could_not_be_asked_is_not_one_that_is_not_running_it() {
     let (script, node) = scripted_node().await;
@@ -3949,15 +3216,6 @@ async fn a_machine_that_could_not_be_asked_is_not_one_that_is_not_running_it() {
     );
 }
 
-/// An address the node did not read off a live handle is refused rather than
-/// recorded.
-///
-/// 🔴 Two faces one bit apart, in the same reply shape: the node reports an
-/// address and a rootfs size, and says whether it read them from the sandbox's
-/// live handle or from its record. Its record holds neither field, so a `false`
-/// there means both values are blanks wearing the shape of facts. The bit has
-/// to be what decides: a build that took the values regardless would pass the
-/// second face here and quietly record a busy sandbox's blanks as its address.
 #[tokio::test]
 async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded() {
     let (script, node) = scripted_node().await;
@@ -4012,78 +3270,28 @@ async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded(
     );
 }
 
-// ---------------------------------------------------------------------------
-// The window between a create and the cluster hearing about it
-// ---------------------------------------------------------------------------
-//
-// 🔴 What this section is for, stated once.
-//
-// A binding is the cluster's answer to *which machine is this sandbox on*.
-// Nothing in this process used to write one. The gateway did — it read the node
-// off the create it had just routed — and it stopped being able to the day
-// user-facing REST began going to the API half, which is the deployment this
-// module exists for. Its own comment says so and names this half as the owner
-// of the write it gave up (`services/gateway/internal/rest_upstream.go`).
-//
-// The only thing left that wrote a binding was the node's heartbeat roster, one
-// interval behind. While a sandbox is running that is invisible: the replica
-// holding the handle never asks anyone where the sandbox is. A pause drops the
-// handle, and from that instant every call has to ask — so a sandbox created and
-// paused inside one heartbeat interval could be neither deleted nor resumed, and
-// both answered 500 until a heartbeat landed.
-//
-// Every test below is written as faces differing in one value — whether the
-// write happened, whether a heartbeat has landed, which machine the cluster
-// names — because the failure is an *absence*, and an assertion with one face
-// passes on a build that never asks anybody anything.
+// Exercises the interval between sandbox creation and the cluster learning its
+// node binding.
 
-/// What a placement source answers when asked where a sandbox is.
 #[derive(Clone)]
 enum LookupAnswer {
-    /// The binding store decides. A bound sandbox resolves to the node; an
-    /// unbound one is `Ok(None)`, which is the scheduler's `NOT_FOUND`.
     FromBindings,
-    /// The cluster names some other machine as the holder — a binding, a
-    /// heartbeat roster, or a registry row in `running`/`resuming` that points
-    /// somewhere else.
     Holder(NodeEndpoint),
-    /// The placement source could not be consulted at all.
     Unavailable,
 }
 
-/// A stand-in for the cluster scheduler's placement surface.
-///
-/// 🔴 It has a binding store, and the store starts *empty* — which is the whole
-/// point. `FixedNodePlacement` answers every question about every sandbox
-/// without being told anything, so it can express neither the window this
-/// section is about nor the write that closes it.
 struct ClusterPlacement {
     node: NodeEndpoint,
     bindings: Mutex<std::collections::HashSet<crate::types::SandboxId>>,
-    /// Whether `record_placement` writes a binding. Off is the world before
-    /// this change: the call existed on the wire and nothing in `src/` made it.
     records: bool,
-    /// Whether `record_placement` refuses. A cluster can say no, and a create
-    /// must not fail because it did.
     record_fails: bool,
     lookup: LookupAnswer,
-    /// What `resolve_node` answers, whatever it is asked about. `None` refuses.
     resolves: Option<NodeEndpoint>,
     recorded: Mutex<Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint)>>,
     resolve_calls: Mutex<usize>,
-    /// What `node_membership` answers, whatever node it is asked about.
-    /// `Present` by default: a node this test never told to leave the cluster
-    /// has not left it.
     membership: Mutex<MembershipAnswer>,
 }
 
-/// What `ClusterPlacement::node_membership` answers.
-///
-/// 🔴 A separate type from `NodeMembership` rather than a reuse of it: this
-/// one needs a third face — the placement source could not be asked at all —
-/// that the production type deliberately has no variant for (it lives in
-/// `Err` there instead, the same way `LookupAnswer::Unavailable` stands in for
-/// `place_existing`'s `Err`).
 #[derive(Clone, Copy)]
 enum MembershipAnswer {
     Present,
@@ -4092,7 +3300,6 @@ enum MembershipAnswer {
 }
 
 impl ClusterPlacement {
-    /// A cluster this half tells where sandboxes went.
     fn recording(node: NodeEndpoint) -> Arc<Self> {
         Arc::new(Self {
             bindings: Mutex::new(Default::default()),
@@ -4107,8 +3314,6 @@ impl ClusterPlacement {
         })
     }
 
-    /// The same cluster, told nothing. This is the shape of the deployment the
-    /// bug was reproduced on.
     fn silent(node: NodeEndpoint) -> Arc<Self> {
         let mut placement = Arc::try_unwrap(Self::recording(node))
             .ok()
@@ -4141,9 +3346,6 @@ impl ClusterPlacement {
         Arc::new(placement)
     }
 
-    /// The node's heartbeat roster landing: every sandbox it holds becomes
-    /// bound. This is the repair path the cluster has always had, and the one
-    /// interval of it is what the field reproduction measured.
     fn heartbeat(&self, ids: &[crate::types::SandboxId]) {
         let mut bindings = self.bindings.lock().expect("lock");
         for id in ids {
@@ -4163,8 +3365,6 @@ impl ClusterPlacement {
         *self.resolve_calls.lock().expect("lock")
     }
 
-    /// Tells this placement what to answer the next time it is asked whether
-    /// its one node is still part of the cluster.
     fn set_membership(&self, answer: MembershipAnswer) {
         *self.membership.lock().expect("lock") = answer;
     }
@@ -4235,7 +3435,6 @@ impl NodePlacement for ClusterPlacement {
     }
 }
 
-/// One replica of the deciding half, over a placement source a test controls.
 async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger) -> ApiReplica {
     Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
@@ -4248,22 +3447,6 @@ async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger)
     .expect("a replica of the deciding half")
 }
 
-/// A create tells the cluster which machine the sandbox went to, with the
-/// address the cluster names that machine by.
-///
-/// 🔴 The address is the load-bearing half and it is asserted against its own
-/// control. A `NodeEndpoint` carries two: the one this process dials, which is
-/// the node service's port, and the one the placement source named, which is
-/// where user traffic goes. The scheduler compares the address on a
-/// `RecordAssignment` byte-for-byte against its discovery entry
-/// (`AtomicNodeRegistry.Contains`) and refuses anything else — so a write that
-/// carried the dialled address would be rejected on every single create, and
-/// rejected as *an unknown node*, which reads like a discovery fault. The two
-/// addresses differ here on purpose, and both are asserted.
-///
-/// 🔴 Two sandboxes, so the incarnation is a control rather than a constant: a
-/// build that recorded a fixed value, an empty string, or the first sandbox's
-/// run for both would agree with itself and fail this.
 #[tokio::test]
 async fn a_create_tells_the_cluster_which_machine_the_sandbox_is_on() {
     let node = real_node().await;
@@ -4322,13 +3505,6 @@ async fn a_create_tells_the_cluster_which_machine_the_sandbox_is_on() {
     }
 }
 
-/// A cluster that refuses the assignment does not cost the user their sandbox.
-///
-/// 🔴 The two faces differ in exactly one value — whether the placement source
-/// accepts the write — and both must produce a running sandbox. The refusal is
-/// *reached* in the first face, which is what stops this passing on a build that
-/// simply stopped making the call: an untried write and a rejected one both
-/// leave the binding absent, and only the attempt count tells them apart.
 #[tokio::test]
 async fn a_create_survives_a_cluster_that_refuses_the_assignment() {
     let node = real_node().await;
@@ -4379,18 +3555,9 @@ async fn a_create_survives_a_cluster_that_refuses_the_assignment() {
         "an accepted write recorded nothing"
     );
 
-    // 🔴 And both VMs are up on the machine. Without this the test passes on a
-    // build where `start` returned `Ok` without creating anything.
     assert_eq!(running_on(&node).await.len(), 2, "a create started no VM");
 }
 
-/// A resume tells the cluster the sandbox is live again, under the run it woke
-/// it as.
-///
-/// 🔴 The control is the paused run, which is in scope and is the value a build
-/// that recorded the wrong incarnation would most plausibly record: it is the
-/// one the resume request carries as its fence. Recording it would point the
-/// gateway's fencing at a run that is over.
 #[tokio::test]
 async fn a_resume_tells_the_cluster_the_sandbox_is_live_again() {
     let node = real_node().await;
@@ -4438,18 +3605,6 @@ async fn a_resume_tells_the_cluster_the_sandbox_is_live_again() {
     );
 }
 
-/// A sandbox created and paused inside one heartbeat interval can still be
-/// deleted.
-///
-/// This is the reproduction, with the heartbeat made explicit instead of waited
-/// for. On the cluster it read: a delete 0.2 seconds after a pause answered 500,
-/// and the same delete on the same sandbox a minute later answered 204.
-///
-/// 🔴 Three faces over one value — what the cluster has been told. The second is
-/// the world before this change and must still fail, or the first passes on a
-/// build that has stopped consulting placement at all; the third is the same
-/// world one heartbeat later and must succeed, which is what proves the second
-/// face failed over the *absence* rather than over the sandbox.
 #[tokio::test]
 async fn a_sandbox_can_be_deleted_before_the_cluster_has_heard_of_it() {
     let node = real_node().await;
@@ -4547,30 +3702,6 @@ async fn a_sandbox_can_be_deleted_before_the_cluster_has_heard_of_it() {
     );
 }
 
-/// A delete forgets a running sandbox's record once the node holding it has
-/// left the cluster — and refuses, exactly as before this change, for as long
-/// as the cluster still lists it.
-///
-/// # 🔴 Three faces over one value: what the placement source says about the
-/// node's own membership once a delete's dial to it fails
-///
-/// * **Face 1 — still listed.** A node whose registry entry is merely stale
-///   is not a node that is gone: it may yet report back on its own, and a
-///   single failed dial is not proof otherwise. This is today's behaviour —
-///   the world before this test's fix — and it is the regression guard: a
-///   build that started forgetting on *any* dial failure, not only a
-///   confirmed-gone one, passes every other face here and fails this one.
-/// * **Face 2 — evicted.** The node's own record is gone from the registry:
-///   explicitly unregistered, or dropped once discovery stopped listing it.
-///   Nothing on it is coming back to report anything, so the sandbox's record
-///   may be forgotten even though the machine itself was never reached again.
-/// * **Face 3 — unanswerable.** The membership question itself could not be
-///   asked. This must land exactly on face 1's answer: not knowing whether a
-///   node is gone is never licence to conclude that it is.
-///
-/// The node is shut down once, before any of the three deletes: every face is
-/// about what the *placement source* says, not about a dial that might
-/// happen to succeed.
 #[tokio::test]
 async fn a_delete_forgets_a_sandbox_only_once_its_node_has_left_the_cluster() {
     let node = real_node().await;
@@ -4664,20 +3795,6 @@ async fn a_delete_forgets_a_sandbox_only_once_its_node_has_left_the_cluster() {
     );
 }
 
-/// A capture is reopened on the machine holding it when the cluster has no
-/// record of the sandbox — and on no other machine, for any other answer.
-///
-/// 🔴 This is the fencing argument, asserted. The fallback is entered on
-/// *absence* only, and the three faces that must still refuse are the three
-/// shapes of "not absence": the cluster names another holder, the cluster could
-/// not be consulted, and the fallback itself answered about another machine.
-/// Each refusal is checked against the node running nothing afterwards, and each
-/// wrong answer carries the *real* node's address — so a build that dropped the
-/// identity check would not merely fail to refuse, it would succeed, and these
-/// assertions would go red rather than staying silent.
-///
-/// The three refusals come before the success on purpose: "the node is running
-/// nothing" is also what a build that can reopen nothing at all looks like.
 #[tokio::test]
 async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record() {
     let node = real_node().await;
@@ -4782,11 +3899,6 @@ async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record
     assert_eq!(live[0].sandbox_id, sandbox_id);
     assert_eq!(live[0].execution_id, Some(resumed_execution_id));
 
-    // 🔴 And the fallback belongs to the resume alone. The same placement
-    // source, the same missing binding, and an attach — which holds a sandbox
-    // id and nothing that names a machine — must refuse rather than reach for
-    // it. The resolve count is the evidence, and it is meaningful because the
-    // face above pushed it to one in this same round.
     let attaching = setup_attach(Arc::clone(&absent), sandbox_id, resumed_execution_id).await;
     assert!(
         attaching.is_err(),
@@ -4799,8 +3911,6 @@ async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record
     );
 }
 
-/// Starts an attaching stub — what a delete, a pause or a snapshot builds when
-/// the handle is not in this process — and reports what `start` said.
 async fn setup_attach(
     placement: Arc<ClusterPlacement>,
     sandbox_id: crate::types::SandboxId,

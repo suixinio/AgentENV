@@ -370,10 +370,7 @@ fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> 
         .collect()
 }
 
-/// Offers a freshly committed snapshot's local artifacts over P2P.
-///
-/// 🔴 Only ever constructed by the half that holds the bytes. See
-/// [`SnapshotArtifactAdvertiser`]'s own doc.
+/// Advertises locally committed snapshot artifacts over P2P.
 pub struct P2pSnapshotAdvertiser {
     transport: Arc<dyn P2pTransport>,
 }
@@ -394,7 +391,6 @@ impl SnapshotArtifactAdvertiser for P2pSnapshotAdvertiser {
             return;
         };
 
-        // Prepare the manifest and VM state.
         let manifest_bytes = serde_json::to_vec(manifest).expect("manifest should serialize");
         let mut artifacts = vec![
             SnapshotP2pArtifact::fixed(
@@ -409,7 +405,6 @@ impl SnapshotArtifactAdvertiser for P2pSnapshotAdvertiser {
             ),
         ];
 
-        // Collect any overlaybd layers referenced by this snapshot's runtime images.
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.rootfs.image_config_path,
@@ -437,7 +432,7 @@ impl SnapshotArtifactAdvertiser for P2pSnapshotAdvertiser {
             ));
         }
 
-        // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
+        // Publish concurrently and log individual failures.
         stream::iter(artifacts)
             .for_each_concurrent(SNAPSHOT_P2P_PUBLISH_CONCURRENCY, |artifact| async move {
                 if let Err(error) = artifact.publish(transport).await {
@@ -455,10 +450,6 @@ impl SnapshotArtifactAdvertiser for P2pSnapshotAdvertiser {
 
 #[cfg(test)]
 mod advertisement_tests {
-    //! 🔴 These live here and not beside `SnapshotManager` because what they
-    //! assert is the *advertisement*, and the advertisement is this module's:
-    //! it reads overlaybd layer files off this machine's disk and offers them
-    //! to peers. The manager only decides whether there is anything to offer.
     use std::sync::Arc;
 
     use tempfile::TempDir;
@@ -475,19 +466,6 @@ mod advertisement_tests {
     };
     use crate::tests::snapshot_manager::{capture_of, staged_elsewhere};
 
-    /// An adopted staging holds no local bytes and offers nothing to P2P; a local
-    /// one holds them and does.
-    ///
-    /// 🔴 Two assertions per half, and the pair is deliberate. The P2P lookups
-    /// alone are not enough: "nothing was advertised" is the same observation
-    /// whether the staging had nothing to offer or had a manifest and failed to
-    /// read the files it names, so a build that handed an adopted staging some
-    /// other snapshot's manifest would still look right from there. The handle
-    /// is asked directly for the fact itself.
-    ///
-    /// 🔴 And the local publish in the same round is what stops the negative
-    /// halves passing on a build where staging or advertising stopped working
-    /// altogether — a different and much worse bug than the one this pins.
     #[tokio::test]
     async fn only_bytes_this_process_holds_are_advertised() {
         let tempdir = TempDir::new().expect("tempdir should exist");
@@ -498,8 +476,7 @@ mod advertisement_tests {
         })
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
-        // The POSIX byte half under a catalog these tests can publish through:
-        // a node's own repository refuses every catalog call by construction.
+        // Wrap node byte storage with a test catalog that can publish rows.
         let repository = InMemorySnapshotCatalog::in_front_of(&repository);
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(

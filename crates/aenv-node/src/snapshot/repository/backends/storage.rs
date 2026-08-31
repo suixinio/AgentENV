@@ -1,29 +1,14 @@
-//! The byte half: turning a configured repository backend into something a VM
-//! can actually mmap.
+//! Node-only snapshot byte storage and runtime materialization.
 //!
-//! # 🔴 This module is the compile-time gate
-//!
-//! Everything here reaches the node-local overlaybd layer store
-//! (`crate::image::cache`), the node-local artifact cache
-//! (`crate::snapshot::artifact_cache`) and, through the two backends'
-//! importing halves, overlaybd itself. A process that boots no microVMs must
-//! not link any of it.
-//!
-//! That used to be a runtime gate — `build_storage_for_role` took the
-//! now-deleted `ServerRole` and returned early when it said this process runs
-//! no sandbox runtime, and a source-scanning test asserted it was the only
-//! call site. The gate is now the crate boundary: this module lives
-//! in `aenv-node`, `aenv-api` does not depend on it, and
-//! `make check-crate-boundaries` is what fails when that stops being true.
-//! See `build_catalog_only_storage` for the half `aenv-api` builds instead.
+//! This module links overlaybd layers, artifact caches, and importing backends.
+//! Catalog-only processes must use `build_catalog_only_storage` instead; the
+//! crate boundary and `make check-crate-boundaries` enforce that split.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-/// 🔴 Re-exported here rather than from `backends` itself: both are the byte
-/// half. `backends` is shared, this module is not.
 pub use super::oss::OssBackend;
 pub use super::posixfs::{PosixFsBackend, PosixFsBackendConfig};
 use super::{snapshot_image_storage_policy, RoleStorage};
@@ -34,7 +19,7 @@ use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::SnapshotRepository;
 
-/// Both storage halves, for the binary that has somewhere to run a sandbox.
+/// Builds node storage with its runtime resolver.
 pub fn build_node_storage(
     config: &AppConfig,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
@@ -109,37 +94,6 @@ mod tests {
     use crate::snapshot::types::SnapshotId;
     use crate::snapshot::RepositoryError;
 
-    /// 🔴 The step's own acceptance criterion: the half that runs no sandboxes
-    /// assembles the byte half's *lifecycle* and none of its
-    /// *materialization*.
-    ///
-    /// Two claims, and the second is why the first is safe:
-    ///
-    /// 1. no [`SnapshotRuntimeResolver`] is built at all, so nothing on this
-    ///    process holds an overlaybd layer store, a shared artifact cache, or
-    ///    a runtime cache root on api's behalf; and
-    /// 2. `delete` still works over what *is* built — the row goes, and the
-    ///    committed bytes go with it. That half must stay on api: a snapshot's
-    ///    origin node can be gone, and a delete that had to be dispatched
-    ///    there would leave the row removed and the bytes orphaned.
-    ///
-    /// The bytes are staged through the *node*-assembled repository, because
-    /// that is where staging happens and because this half now refuses it —
-    /// see the third claim below.
-    ///
-    /// 🔴 One catalog, shared by both halves, and supplied by the test. Neither
-    /// assembly carries one: the snapshot catalog is PostgreSQL and both of
-    /// these byte halves are built over `NoSnapshotCatalog`. In a real cluster
-    /// the shared catalog is the `[pg]` pool `aenv-api` puts in front of its own
-    /// byte half; here it is `InMemorySnapshotCatalog`, and it has to be shared
-    /// or the delete below would be deleting out of a catalog the publish never
-    /// reached.
-    ///
-    /// 3. `publish` through the api-assembled repository is refused rather
-    ///    than silently doing nothing. `aenv-api` never stages: every capture
-    ///    that reaches it arrived already staged by the node holding the bytes
-    ///    (`SnapshotManager::adopt_staged`). The importing half is what needs
-    ///    to read overlaybd layer files, so it is the half api does not build.
     #[tokio::test]
     async fn an_api_role_assembles_no_runtime_resolver_and_still_deletes() {
         let dir = tempfile::TempDir::new().expect("tempdir");

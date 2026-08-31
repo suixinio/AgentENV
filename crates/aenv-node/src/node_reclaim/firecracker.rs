@@ -1,10 +1,5 @@
-//! Firecracker VMMs a previous process on this machine left running.
-//!
-//! Split into a pure half and a syscall half on purpose. [`plan`] reads `/proc`
-//! and decides, per process, what should happen to it and why; [`apply`] does
-//! the signalling. Everything that can be wrong about *who gets killed* lives in
-//! the pure half, where a test can put a hostile `/proc` in front of it and read
-//! the decision back without a single real process being at risk.
+//! Plans Firecracker reclamation from `/proc` before applying any signals.
+//! Ownership and signal blast radius are decided in the pure planning half.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -16,72 +11,38 @@ use tracing::{debug, info, warn};
 
 use super::{owner, ReclaimCounts, ReclaimPaths};
 
-/// The `comm` of the process this sweep is looking for.
-///
-/// `/proc/<pid>/comm` is world-readable and never longer than 15 bytes, which
-/// `firecracker` fits inside. It is the cheap filter; it decides only whether a
-/// process is a *candidate*, never whether it is ours.
+// Candidate filter only; ownership is established from work directory and stamp.
 const FIRECRACKER_COMM: &str = "firecracker";
 
-/// The prefix `create_firecracker_work_dir` gives every sandbox work directory.
-///
-/// 🔴 Load-bearing, not cosmetic. See [`is_sandbox_work_dir`].
+/// Prefix shared with sandbox work-directory creation.
 pub const WORK_DIR_PREFIX: &str = "agentenv-fc-";
 
-/// What the sweep concluded about one candidate process.
+/// Ownership classification for a candidate Firecracker process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ownership {
-    /// Started by a previous AgentENV process on this machine, and that
-    /// process is gone: it is Firecracker, its working directory is a sandbox
-    /// work directory under this deployment's own work base, and the owner
-    /// stamp in that directory names a process that is no longer running.
-    ///
-    /// 🔴 "And that process is gone" is the half that used to be assumed. See
-    /// [`super::owner`].
+    /// Firecracker under this work base whose stamped server is gone.
     Ours,
-    /// Someone else's. A Firecracker, but running somewhere this deployment
-    /// never puts one.
+    /// Firecracker outside this deployment's work base.
     Foreign,
-    /// 🔴 Started by an AgentENV server that is **still running**, named by the
-    /// owner stamp in its work directory.
-    ///
-    /// Ours in the sense [`Ownership::Ours`] means it — it is a Firecracker in
-    /// one of this deployment's work directories — and emphatically not ours to
-    /// kill. This is the answer that separates "a leftover" from "a live
-    /// sandbox on a machine we are sharing", which is a distinction the two
-    /// host-wide premise checks in [`super::premise_holds`] can only make when
-    /// they happen to be right. See [`super::owner`].
+    /// Firecracker whose stamped server is still running.
     LiveOwner(i32),
-    /// It went away while it was being read. Not an answer about ownership,
-    /// and not a failure — it is the state the sweep was trying to reach.
+    /// Process disappeared while being inspected.
     Vanished,
-    /// 🔴 Could not be determined.
-    ///
-    /// Kept apart from [`Ownership::Foreign`] deliberately, even though both
-    /// lead to the same action — none. They must not lead to the same *reading*:
-    /// a sweep whose `/proc` access broke under some future kernel or seccomp
-    /// profile would otherwise report the same clean "nothing of mine here" as a
-    /// sweep on a genuinely clean host, forever.
+    /// Ownership could not be determined; never safe to reclaim.
     Undetermined(&'static str),
 }
 
-/// What [`apply`] should do about one process.
+/// Signal action for a candidate already classified as owned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Signal the whole process group. Firecracker is spawned with
-    /// `process_group(0)` (`sandbox::firecracker::instance`), so a VMM we
-    /// started leads its own group and taking the group takes any helper it
-    /// spawned with it.
+    /// Signal a Firecracker-led process group.
     KillGroup(i32),
-    /// Signal just this process. What is done when the group cannot be
-    /// established, or when signalling the group would mean signalling
-    /// something other than that one VMM's group.
+    /// Signal only the candidate process.
     KillProcess(i32),
-    /// Leave it alone.
     Nothing,
 }
 
-/// One `/proc` entry, the conclusion drawn about it, and what follows.
+/// Planned ownership and action for one process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessPlan {
     pub pid: i32,
@@ -89,24 +50,11 @@ pub struct ProcessPlan {
     pub action: Action,
 }
 
-/// 🔴 Process group ids that must never be turned into `kill(-pgid, …)`.
-///
-/// `kill(-0, sig)` signals **the caller's own process group** and
-/// `kill(-1, sig)` signals **every process the caller is permitted to signal**
-/// — which, in a privileged container on a node, is the machine: this server,
-/// the ublk daemon, every other VM on the host, and the kubelet's view of all
-/// of it. Neither is a hypothetical: `pgid` is parsed out of a `/proc` file, and
-/// a field that shifts, a truncated read, or a process exiting mid-parse all
-/// produce a `0` that looks like an ordinary number.
-///
-/// The caller's own group is refused separately, in [`plan_for_owned`], because
-/// its value is not a constant.
+// Never negate these values: `kill(-0, …)` targets this process group and
+// `kill(-1, …)` targets every permitted process.
 const NEVER_A_GROUP_TARGET: [i32; 2] = [0, 1];
 
-/// Reads `paths.proc_dir` and decides what should happen to each process there.
-///
-/// Pure with respect to the system: it reads, it does not signal. Every
-/// judgement about who may be killed is made here.
+/// Purely plans reclamation without sending signals.
 pub fn plan(paths: &ReclaimPaths) -> Vec<ProcessPlan> {
     let work_base = resolve(&paths.work_base);
     let own_pid = i32::try_from(std::process::id()).unwrap_or(-1);
@@ -115,9 +63,7 @@ pub fn plan(paths: &ReclaimPaths) -> Vec<ProcessPlan> {
     let entries = match std::fs::read_dir(&paths.proc_dir) {
         Ok(entries) => entries,
         Err(error) => {
-            // Not a per-candidate failure — there were no candidates. It is
-            // still worth saying out loud, because on a node this means the
-            // sweep did nothing at all.
+            // A failed `/proc` listing means the sweep examined nothing.
             warn!(
                 target: "agentenv",
                 proc_dir = %paths.proc_dir.display(),
@@ -140,10 +86,7 @@ pub fn plan(paths: &ReclaimPaths) -> Vec<ProcessPlan> {
         if pid <= 0 {
             continue;
         }
-        // 🔴 Cheap paranoia with a real payoff: this process is not a
-        // Firecracker and so cannot reach the branches below, but the cost of
-        // being wrong about that once is the node killing itself during
-        // startup.
+        // Never classify this process as a reclaim candidate.
         if pid == own_pid {
             continue;
         }
@@ -166,11 +109,7 @@ pub fn plan(paths: &ReclaimPaths) -> Vec<ProcessPlan> {
     plans
 }
 
-/// Whether this `/proc` entry is a Firecracker at all.
-///
-/// Deliberately silent about everything it rejects. A host runs hundreds of
-/// processes that are none of this sweep's business, and turning each one into
-/// an examined candidate would bury the handful that are.
+// Candidate selection is intentionally silent for unrelated host processes.
 fn is_candidate(process_dir: &Path) -> bool {
     std::fs::read_to_string(process_dir.join("comm"))
         .map(|comm| comm.trim() == FIRECRACKER_COMM)
@@ -191,12 +130,7 @@ fn plan_for_candidate(
             if !is_sandbox_work_dir(&cwd, work_base) {
                 Ownership::Foreign
             } else if work_dir_unlinked {
-                // 🔴 The one place a missing stamp still means "leftover", and
-                // it is not a guess: the directory this VMM needs has been
-                // unlinked, so it cannot be serving anybody. Leaving it alone
-                // would leak it permanently — its stamp is gone with the
-                // directory, so no later sweep could conclude anything about it
-                // either.
+                // An unlinked work directory cannot provide a stamp or serve a live VMM.
                 Ownership::Ours
             } else {
                 match owner::owner_of(&cwd, proc_dir) {
@@ -206,8 +140,7 @@ fn plan_for_candidate(
                 }
             }
         }
-        // The process exited between the directory listing and this read. That
-        // is not something that could not be determined; it is the outcome.
+        // Disappearance is the intended outcome, not an ownership failure.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ownership::Vanished,
         Err(error) => {
             warn!(
@@ -232,34 +165,17 @@ fn plan_for_candidate(
     }
 }
 
-/// How to signal a process already established as ours.
-///
-/// 🔴 Every branch that is not `KillGroup` is a refusal, and each one exists
-/// because turning it into a group kill would signal something other than that
-/// one VMM.
-///
-/// 🔴 The order matters, and two of the refusals only bite where the last one
-/// does not. `pgid != pid` already covers most of the ground — a group whose
-/// leader is not this process is somebody else's — so the two guards above it
-/// are reached exactly when the leader *is* this process and the group is
-/// still not safe: `pgid == pid == 1` (`kill(-1)` is every process on the
-/// machine) and `pgid == pid == own_pgid` (this server's own group). Those two
-/// cases are where the catastrophic mistakes live, so they are tested directly
-/// against this function rather than through `plan`, where the `pgid != pid`
-/// arm would answer first and the guards would look redundant.
+// Fall back to signalling only the process whenever group blast radius is unsafe.
 fn plan_for_owned(pid: i32, process_dir: &Path, own_pgid: i32) -> Action {
     let Some(pgid) = read_pgid(process_dir) else {
-        // Ownership is settled; only the blast radius is not. Signal the one
-        // process that was identified.
+        // Ownership is known, but group ownership is not.
         return Action::KillProcess(pid);
     };
     if NEVER_A_GROUP_TARGET.contains(&pgid) {
         return Action::KillProcess(pid);
     }
     if pgid == own_pgid {
-        // This server's own group. A Firecracker in our work directory that
-        // shares our process group did not come from `process_group(0)`, and
-        // signalling the group would kill this process on the way past.
+        // Never signal this server's own process group.
         warn!(
             target: "agentenv",
             pid,
@@ -269,25 +185,13 @@ fn plan_for_owned(pid: i32, process_dir: &Path, own_pgid: i32) -> Action {
         return Action::KillProcess(pid);
     }
     if pgid != pid {
-        // Not a group leader, so the group is somebody else's and contains
-        // more than this VMM.
+        // A non-leader does not own its process group.
         return Action::KillProcess(pid);
     }
     Action::KillGroup(pgid)
 }
 
-/// Whether `cwd` is one of this deployment's sandbox work directories.
-///
-/// 🔴 Two conditions, and dropping either one is a real fault rather than a
-/// looser check:
-///
-/// * **the parent must be the configured work base** — without it the sweep
-///   kills every Firecracker on the machine, including another tenant's.
-/// * **the directory name must carry the `agentenv-fc-` prefix** — without it
-///   the sweep kills every process whose working directory sits directly under
-///   the work base, and `[firecracker].work_dir` is *optional*: unset, the work
-///   base is the **system temp directory**, and "its cwd is `/tmp`" is true of a
-///   great many processes that have nothing to do with this.
+// Require both the configured parent and sandbox work-directory prefix.
 fn is_sandbox_work_dir(cwd: &Path, work_base: &Path) -> bool {
     cwd.parent() == Some(work_base)
         && cwd
@@ -296,30 +200,15 @@ fn is_sandbox_work_dir(cwd: &Path, work_base: &Path) -> bool {
             .is_some_and(|name| name.starts_with(WORK_DIR_PREFIX))
 }
 
-/// The process group id from `/proc/<pid>/stat`, or `None` when it cannot be
-/// read out.
-///
-/// The field is the fifth, and the first two cannot be split on whitespace:
-/// `comm` is bracketed and may itself contain spaces and brackets, so the parse
-/// starts after the **last** `)`. Getting that wrong shifts every field by one
-/// and yields a plausible-looking number, which is why
-/// [`NEVER_A_GROUP_TARGET`] exists downstream of it.
+// Parse pgrp after the final `)` because `/proc/<pid>/stat` comm may contain spaces.
 fn read_pgid(process_dir: &Path) -> Option<i32> {
     let stat = std::fs::read_to_string(process_dir.join("stat")).ok()?;
     let after_comm = &stat[stat.rfind(')')? + 1..];
-    // After the closing bracket: state, ppid, pgrp, …
+    // Fields after comm: state, ppid, pgrp.
     after_comm.split_whitespace().nth(2)?.parse().ok()
 }
 
-/// `/proc/<pid>/cwd` for a process whose working directory has been unlinked
-/// reads back as `"<path> (deleted)"`. It is still that path, and the process
-/// is still ours.
-///
-/// 🔴 Returns whether the marker was there, because that is load-bearing in two
-/// places rather than cosmetic in one: a Firecracker whose work directory has
-/// been unlinked has no owner stamp left to read, and a second copy of this
-/// server whose binary was replaced on disk reads back this way from
-/// `/proc/<pid>/exe`.
+/// Strips Linux's ` (deleted)` suffix and reports whether it was present.
 pub fn strip_deleted_marker(path: &Path) -> (PathBuf, bool) {
     match path
         .to_str()
@@ -330,16 +219,12 @@ pub fn strip_deleted_marker(path: &Path) -> (PathBuf, bool) {
     }
 }
 
-/// Resolves symlinks where possible and falls back to the path as written.
-///
-/// The fallback matters: a work base that does not exist yet, or a working
-/// directory already unlinked, cannot be canonicalised, and treating that as
-/// "could not tell" would make an ordinary cold start look like a broken sweep.
+// Canonicalize when possible; vanished paths must retain their lexical identity.
 fn resolve(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Carries out a plan and waits for what it signalled to actually be gone.
+/// Applies a plan and waits for signalled processes to exit.
 pub async fn reclaim(paths: &ReclaimPaths, exit_wait: Duration) -> ReclaimCounts {
     let plans = plan(paths);
     let mut counts = ReclaimCounts::default();
@@ -374,9 +259,7 @@ pub async fn reclaim(paths: &ReclaimPaths, exit_wait: Duration) -> ReclaimCounts
                 }
             }
             (Ownership::Ours, Action::Nothing) => {
-                // Unreachable by construction, and counted rather than ignored
-                // so that a future edit which makes it reachable shows up as a
-                // number instead of as silence.
+                // Preserve a visible failure if planning ever makes this reachable.
                 counts.failed += 1;
             }
             (Ownership::Foreign, _) => {
@@ -384,12 +267,7 @@ pub async fn reclaim(paths: &ReclaimPaths, exit_wait: Duration) -> ReclaimCounts
                 counts.left_alone += 1;
             }
             (Ownership::LiveOwner(owner_pid), _) => {
-                // 🔴 `info`, not `debug`, and not silent. This is a sandbox
-                // belonging to a server that is up while this one is starting,
-                // which means the premise the sweep rests on is false and the
-                // two host-wide checks above did not catch it. Reclaiming this
-                // host is not what should happen next, and an operator has to
-                // be able to see that it did not.
+                // A live stamped owner disproves the host-wide ownership premise.
                 info!(
                     target: "agentenv",
                     pid = plan.pid,
@@ -410,12 +288,7 @@ pub async fn reclaim(paths: &ReclaimPaths, exit_wait: Duration) -> ReclaimCounts
     counts
 }
 
-/// Waits for signalled processes to leave `/proc`, and reports how many did
-/// not.
-///
-/// 🔴 The work directory sweep runs after this returns, and deleting the files
-/// under a VMM that is still running leaves it running and broken. A VMM that
-/// outlives its `SIGKILL` is counted as a failure so the two are told apart.
+// Failure to exit vetoes the subsequent work-directory sweep.
 async fn wait_for_exit(proc_dir: &Path, pids: &[i32], exit_wait: Duration) -> u64 {
     if pids.is_empty() {
         return 0;
@@ -450,7 +323,6 @@ mod tests {
 
     use tempfile::TempDir;
 
-    /// A `/proc` a test can write.
     struct FakeProc {
         root: TempDir,
     }
@@ -466,7 +338,6 @@ mod tests {
             self.root.path().to_path_buf()
         }
 
-        /// A process with a `comm`, a `cwd` symlink and a `stat` line.
         fn process(&self, pid: i32, comm: &str, cwd: Option<&Path>, pgid: i32) -> &Self {
             let dir = self.root.path().join(pid.to_string());
             std::fs::create_dir_all(&dir).unwrap();
@@ -484,8 +355,6 @@ mod tests {
             self
         }
 
-        /// A process whose `cwd` is a dangling symlink, which is what a
-        /// process that exited mid-sweep looks like.
         fn vanished_process(&self, pid: i32, comm: &str) -> &Self {
             let dir = self.root.path().join(pid.to_string());
             std::fs::create_dir_all(&dir).unwrap();
@@ -513,10 +382,6 @@ mod tests {
             std::fs::canonicalize(self.work.path()).unwrap()
         }
 
-        /// A sandbox work directory of ours, created for real so `cwd` can
-        /// point at it.
-        /// A work directory left behind by a server that has exited, which is
-        /// what every leftover in this suite is.
         fn sandbox_work_dir(&self, name: &str) -> PathBuf {
             let dir = self.work_base().join(name);
             std::fs::create_dir_all(&dir).unwrap();
@@ -524,9 +389,6 @@ mod tests {
             dir
         }
 
-        /// A work directory whose server process is *still running*, laid out
-        /// in this fixture's forged `/proc` so the stamp can be checked against
-        /// it.
         fn work_dir_of_a_live_server(&self, name: &str, server_pid: i32) -> PathBuf {
             let dir = self.work_base().join(name);
             std::fs::create_dir_all(&dir).unwrap();
@@ -561,17 +423,6 @@ mod tests {
         }
     }
 
-    // ── The refusals ────────────────────────────────────────────────────────
-
-    /// 🔴 T-NR-46. **The refusal this module was missing.**
-    ///
-    /// Two Firecrackers, side by side in the same work base, indistinguishable
-    /// in every way the old sweep could see: same name, same parent directory,
-    /// same prefix. The only difference is that one's work directory names a
-    /// server process that is in this host's `/proc` and the other's does not.
-    ///
-    /// One is a leftover and one is a running user's sandbox, and before the
-    /// owner stamp both were `Ours` and both were killed.
     #[test]
     fn a_firecracker_whose_server_is_still_running_is_not_a_leftover() {
         const SERVER: i32 = 7200;
@@ -608,12 +459,6 @@ mod tests {
         );
     }
 
-    /// 🔴 T-NR-47. A work directory that is there but says nothing about who
-    /// made it is "cannot tell", and "cannot tell" does not kill.
-    ///
-    /// Distinct from T-NR-11, where the directory has been *unlinked* — there
-    /// the VMM's files are gone, it cannot be serving anyone, and no later
-    /// sweep could ever conclude anything about it either.
     #[test]
     fn a_firecracker_whose_work_directory_carries_no_stamp_is_left_alone() {
         let fixture = Fixture::new();
@@ -637,18 +482,6 @@ mod tests {
         assert_eq!(plans[1].action, Action::KillGroup(4202));
     }
 
-    /// 🔴 T-NR-1. **The refusal, and the reason this module can exist at all.**
-    ///
-    /// A node is a machine, and a machine may be running Firecrackers that are
-    /// nothing to do with this deployment — another tenant's, a developer's,
-    /// the previous generation of this software installed elsewhere. The sweep
-    /// kills by *name and place*, and only the place tells them apart.
-    ///
-    /// Both faces in one test, because a sweep that refuses everything also
-    /// passes a test that only checks that a stranger's VMM survives — and a
-    /// sweep that refuses everything is a node that starts with the last
-    /// process's VMs still holding its memory, its ublk devices and its network
-    /// slots.
     #[test]
     fn a_firecracker_outside_our_work_base_is_left_alone_and_ours_is_not() {
         let fixture = Fixture::new();
@@ -677,12 +510,6 @@ mod tests {
         assert_eq!(plans[1].action, Action::Nothing);
     }
 
-    /// 🔴 T-NR-2. The second half of the ownership test, and the one that
-    /// matters most when `[firecracker].work_dir` is unset.
-    ///
-    /// Unset, the work base is the **system temp directory**. Matching on the
-    /// parent alone would then make every process whose working directory is
-    /// `/tmp` a leftover Firecracker of ours.
     #[test]
     fn a_process_directly_under_the_work_base_is_not_ours_without_the_prefix() {
         let fixture = Fixture::new();
@@ -705,11 +532,6 @@ mod tests {
         assert_eq!(plans[1].ownership, Ownership::Ours);
     }
 
-    /// 🔴 T-NR-3. A nested directory under a work directory is not a work
-    /// directory.
-    ///
-    /// Guards the same mistake `role_gate::node_detail_id` guards: writing the
-    /// match as a prefix test rather than as an exact parent.
     #[test]
     fn only_the_work_directory_itself_counts_never_something_inside_it() {
         let fixture = Fixture::new();
@@ -734,9 +556,6 @@ mod tests {
             );
         }
 
-        // 🔴 And the control: the work directory itself, in the same fixture,
-        // is ours. Without it a `plan` that answered `Foreign` for everything —
-        // a sweep that reclaims nothing anywhere — passes the loop above.
         let itself = fixture.sandbox_work_dir("agentenv-fc-A2");
         fixture
             .proc
@@ -744,14 +563,6 @@ mod tests {
         assert_eq!(fixture.plan()[2].ownership, Ownership::Ours);
     }
 
-    /// 🔴 T-NR-4. **`kill(-0)` is "my own process group" and `kill(-1)` is "the
-    /// machine".**
-    ///
-    /// `pgid` comes out of a `/proc` file. A truncated read, a field that moves
-    /// in a future kernel, or a process exiting mid-parse all produce a number,
-    /// and `0` is the number they produce. Turning it into `kill(-pgid,
-    /// SIGKILL)` as root on a node kills this server, the ublk daemon and every
-    /// VM on the host — during startup, before anything is watching.
     #[test]
     fn a_process_group_of_zero_or_one_is_never_signalled_as_a_group() {
         let fixture = Fixture::new();
@@ -779,8 +590,6 @@ mod tests {
         assert_eq!(plans[2].action, Action::KillGroup(7003));
     }
 
-    /// A `/proc`-shaped directory carrying just a `stat` line, for driving
-    /// [`plan_for_owned`] directly.
     fn stat_dir(pid: i32, pgid: i32) -> TempDir {
         let dir = TempDir::new().unwrap();
         std::fs::write(
@@ -791,17 +600,6 @@ mod tests {
         dir
     }
 
-    /// 🔴 T-NR-4b. **`kill(-1)` is every process on the machine.**
-    ///
-    /// Driven straight at [`plan_for_owned`], because that is the only place
-    /// the guard is reachable: through `plan`, a process whose group id is 1
-    /// almost always fails `pgid == pid` first and is signalled alone anyway,
-    /// so a test at that level passes with the guard deleted. The one arrangement
-    /// where the guard is what stands between here and `kill(-1, SIGKILL)` is a
-    /// group leader whose id is 1 — which is exactly what a shifted `stat` field
-    /// or a truncated read produces.
-    ///
-    /// Found by mutation: deleting the guard left every `plan`-level test green.
     #[test]
     fn a_group_leader_with_id_one_is_never_signalled_as_a_group() {
         let dir = stat_dir(1, 1);
@@ -827,11 +625,6 @@ mod tests {
         );
     }
 
-    /// 🔴 T-NR-5b. The sweep never signals its own group, in the one
-    /// arrangement where saying so costs something.
-    ///
-    /// Same story as above: reached only when the leader of our own group is
-    /// the candidate, which `pgid != pid` cannot catch.
     #[test]
     fn the_leader_of_our_own_group_is_never_signalled_as_a_group() {
         let own_pgid = 31337;
@@ -849,8 +642,6 @@ mod tests {
         );
     }
 
-    /// T-NR-6b. An unreadable `stat` settles nothing about the group, so only
-    /// the one process that was identified is signalled.
     #[test]
     fn an_unreadable_stat_narrows_the_signal_to_one_process() {
         let empty = TempDir::new().unwrap();
@@ -860,7 +651,6 @@ mod tests {
         );
     }
 
-    /// 🔴 T-NR-5. The sweep never signals the group it is a member of.
     #[test]
     fn our_own_process_group_is_never_signalled_as_a_group() {
         let fixture = Fixture::new();
@@ -880,8 +670,6 @@ mod tests {
         );
     }
 
-    /// T-NR-6. A Firecracker of ours that does not lead its own group is
-    /// signalled alone: the group is somebody else's and holds more than it.
     #[test]
     fn a_process_that_does_not_lead_its_group_is_signalled_alone() {
         let fixture = Fixture::new();
@@ -893,15 +681,6 @@ mod tests {
         assert_eq!(plans[0].action, Action::KillProcess(9001));
     }
 
-    // ── The three-state answer ──────────────────────────────────────────────
-
-    /// 🔴 T-NR-7. "Gone", "not mine" and "cannot tell" are three answers.
-    ///
-    /// All three lead to the same action — none — which is exactly why they
-    /// have to stay distinguishable in the record. Collapsed into two, a sweep
-    /// that lost its `/proc` access reports the same clean zero as a sweep on a
-    /// clean host, and does so for as long as nobody restarts a node expecting
-    /// to see something reclaimed.
     #[tokio::test]
     async fn absence_not_mine_and_cannot_tell_are_told_apart() {
         let fixture = Fixture::new();
@@ -940,14 +719,6 @@ mod tests {
         );
     }
 
-    /// 🔴 T-NR-8. A candidate that cannot be classified is a failure, not a
-    /// stranger.
-    ///
-    /// Driven through a `cwd` symlink that exists and points nowhere useful is
-    /// not enough — that reads back fine. The reachable version of "cannot
-    /// tell" is a `read_link` that fails for a reason other than absence, which
-    /// is produced here by making `cwd` a regular file: `EINVAL`, not
-    /// `NotFound`.
     #[tokio::test]
     async fn a_candidate_that_cannot_be_classified_is_counted_as_a_failure() {
         let fixture = Fixture::new();
@@ -977,10 +748,6 @@ mod tests {
         );
     }
 
-    // ── Details that are easy to get wrong ──────────────────────────────────
-
-    /// T-NR-9. A work directory that has already been unlinked still belongs to
-    /// us.
     #[test]
     fn a_deleted_working_directory_is_still_ours() {
         let fixture = Fixture::new();
@@ -1000,8 +767,6 @@ mod tests {
         assert_eq!(fixture.plan()[0].ownership, Ownership::Ours);
     }
 
-    /// T-NR-10. `stat`'s fifth field survives a `comm` with spaces and
-    /// brackets in it.
     #[test]
     fn the_process_group_is_parsed_from_after_the_last_bracket() {
         let temp = TempDir::new().unwrap();
@@ -1020,8 +785,6 @@ mod tests {
         );
     }
 
-    /// T-NR-11. `/proc` that cannot be read produces no plans and no
-    /// invented failures.
     #[test]
     fn an_unreadable_proc_yields_no_plans() {
         let fixture = Fixture::new();
@@ -1032,13 +795,6 @@ mod tests {
         assert!(plan(&paths).is_empty());
     }
 
-    /// 🔴 T-NR-12. The reclaim actually signals, and the counters say which
-    /// way each decision went.
-    ///
-    /// Runs against a real child process this test starts, so the syscall half
-    /// is exercised rather than asserted about. The child is `sleep`, put in
-    /// its own process group, with a `/proc` entry forged for it that says its
-    /// working directory is one of ours.
     #[tokio::test]
     async fn a_process_the_plan_names_is_actually_killed() {
         use std::os::unix::process::CommandExt;
@@ -1062,9 +818,6 @@ mod tests {
         let plans = fixture.plan();
         assert_eq!(plans[0].action, Action::KillGroup(pid));
 
-        // The forged `/proc` is what the plan reads; the wait afterwards has to
-        // watch the real one, so point the reclaim at `/proc` for that half by
-        // deleting the forged entry once the signal has been sent.
         let counts = reclaim(&fixture.paths(), Duration::from_millis(200)).await;
         assert_eq!(counts.reclaimed, 1);
 
@@ -1073,28 +826,9 @@ mod tests {
             !status.success(),
             "the child must have been killed rather than have exited on its own"
         );
-        // 🔴 The forged entry is still on disk, so `wait_for_exit` timed out and
-        // said so. That is the honest reading: this fake `/proc` cannot show a
-        // process leaving. The real one can, and
-        // `a_clean_host_reclaims_nothing_and_fails_at_nothing` covers the empty
-        // case.
         assert_eq!(counts.failed, 1);
     }
 
-    /// 🔴 T-NR-57. The signal goes to the **group**, not to the one process the
-    /// plan names.
-    ///
-    /// `Action::KillGroup(pgid)` is carried out as `kill(-pgid)`, and the sign
-    /// is the whole of it. Without it the leader dies and everything else in
-    /// its group is orphaned and left running — still holding the work
-    /// directory the file sweep is about to delete, which is precisely the
-    /// "VMM running with its files gone" that the ordering in `sweep` exists to
-    /// prevent. Nothing in the counters can tell the two apart: one process was
-    /// signalled either way, and `reclaimed` reads `1` either way.
-    ///
-    /// So the blast radius is read directly: a shell that puts itself in its
-    /// own group and leaves a second process in it, which is the smallest thing
-    /// that can distinguish `kill(-pgid)` from `kill(pgid)`.
     #[tokio::test]
     async fn the_whole_group_goes_not_just_the_process_the_plan_names() {
         use std::io::BufRead;
@@ -1150,8 +884,6 @@ mod tests {
             "the group leader must have been killed rather than have exited on its own"
         );
 
-        // 🔴 The assertion this test exists for. Read before the cleanup, so a
-        // failing run does not leave a `sleep 60` behind on the machine.
         let follower_gone = left_the_host(follower);
         if !follower_gone {
             let _ = kill(Pid::from_raw(follower), Signal::SIGKILL);
@@ -1162,14 +894,6 @@ mod tests {
         );
     }
 
-    /// 🔴 T-NR-58. A leftover the sweep may not signal as a group is still
-    /// killed, and still counted as reclaimed.
-    ///
-    /// Every guard in `plan_for_owned` narrows a group kill to one process, and
-    /// four tests above assert that it decides to. None of them reaches the
-    /// branch that carries it out — a `KillProcess` that signalled nothing, or
-    /// that counted what it signalled as anything other than a reclaim, would
-    /// leave all four green.
     #[tokio::test]
     async fn a_leftover_that_may_not_be_signalled_as_a_group_is_still_killed() {
         let fixture = Fixture::new();
@@ -1200,16 +924,6 @@ mod tests {
         assert_eq!(counts.failed, 1);
     }
 
-    /// 🔴 T-NR-59. The wait ends when the process leaves, and not before.
-    ///
-    /// This is the last thing between a `SIGKILL` and the work-directory sweep,
-    /// and both ways of getting it wrong are silent. A deadline that has
-    /// already passed when the loop starts returns on the first look and
-    /// reports every process it signalled as a failure — which vetoes the file
-    /// sweep on every node, forever, on hosts where nothing was ever wrong. A
-    /// deadline that is never reached holds startup open instead. So both
-    /// halves assert a value **and** a duration; the value alone cannot tell
-    /// "it waited and the process left" from "it gave up immediately".
     #[tokio::test]
     async fn the_wait_ends_when_the_process_leaves_and_not_before() {
         let proc = FakeProc::new();
@@ -1250,12 +964,7 @@ mod tests {
         );
     }
 
-    /// Whether `pid` is gone from this host's real `/proc`, waiting a bounded
-    /// moment for it to get there.
-    ///
-    /// A zombie counts as gone: the process is dead and only its exit status is
-    /// still on the host, and whether anything reaps it is not this module's
-    /// business.
+    // Treat zombies as gone; only an unreaped exit status remains.
     fn left_the_host(pid: i32) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

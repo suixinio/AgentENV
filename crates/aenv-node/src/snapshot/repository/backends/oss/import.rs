@@ -1,8 +1,4 @@
-//! Importing a snapshot's bytes into an OSS store.
-//!
-//! 🔴 The overlaybd half of [`super::artifacts`]. Everything here reads
-//! overlaybd layer files off local disk, which is why it is separated from the
-//! delete path that the catalog-owning half also needs.
+//! Imports node-local snapshot bytes into OSS.
 
 //! The OSS artifact store: snapshot bytes, and nothing else.
 //!

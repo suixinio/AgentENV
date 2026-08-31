@@ -1,33 +1,8 @@
-//! The gRPC surface one node serves to the API half of the split control plane.
+//! Node gRPC surface used by the API half to execute sandbox operations.
 //!
-//! # Transport
-//!
-//! tonic, over the proto in `services/api/proto/node.proto`. Nothing new was
-//! built for it: the crate already generates a gRPC client and server from
-//! `scheduler.proto` through the same `build.rs`, and the calls this service
-//! carries are the same shape as that one's — a command, a wait, a result.
-//!
-//! # 🔴 What this service is for, and what it is not for
-//!
-//! It exists so that a process with no `/dev/kvm` can run sandboxes on a
-//! machine that has one. It is *not* a remote form of
-//! [`SandboxBackend`][crate::sandbox::SandboxBackend]: three of that trait's
-//! return types own live local state, two of them keep a temporary directory
-//! alive, and a fourth is a list of paths on one particular disk. What crosses
-//! this wire is identifiers and facts, and where the local trait hands back
-//! something holding bytes, this one hands back where the bytes already are.
-//!
-//! # 🔴 Served by `aenv-node`, and by nothing else
-//!
-//! `assemble_node` binds [`serve_on`] on `[cluster].node_service_addr`.
-//! the pre-split single process deliberately does not: it is the rollback target and is defined
-//! as the process that ran before the split, which listened on one port.
-//!
-//! 🔴 That has a consequence for the shadow phase, and it is not a small one.
-//! §11.2's 3a keeps the DaemonSet on the pre-split single process while the API half drives it
-//! through this service — and a the pre-split single process node does not serve this service.
-//! So the API half can decide, and can serve the wake-up surface, but has no
-//! machine it can drive until the DaemonSet moves to `aenv-node`.
+//! Only identifiers and durable facts cross this boundary; VM handles,
+//! temporary-directory guards, and node-local paths remain on the node.
+//! `aenv-node` serves this surface on its dedicated node-service listener.
 
 mod convert;
 mod ownership;
@@ -50,39 +25,15 @@ use crate::template::TemplateBuilder;
 
 pub use service::NodeSandboxService;
 
-/// How often this server pings an otherwise-quiet HTTP/2 connection, and how
-/// long it waits for the reply before dropping it.
-///
-/// 🔴 Exists for one RPC on this service — `BuildTemplate` — which can sit
-/// with nothing on the wire for most of ten minutes while a build sandbox
-/// runs. Every other call here is a handful of round trips and would never
-/// notice this setting either way, so applying it to the whole server rather
-/// than one route costs those calls nothing: see
-/// `src/node_client/build.rs`'s matching client-side constants for the other
-/// half of the argument.
+// Keep quiet long-running template-build RPCs alive; clients use matching bounds.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Reachable from `crate::node_client`'s tests, which drive a create through
-/// the wire and then ask this side whether the sandbox came out owned.
-///
-/// 🔴 Test-only, because the production consumer is `service.rs` next door and
-/// a crate-wide export would invite a second one — and "who counts as the
-/// control plane's" having two callers is how the answer comes to differ
-/// between them.
+/// Test-only ownership predicate shared with node-client wire tests.
 #[cfg(test)]
 pub use ownership::owned_by_control_plane;
 
-/// Builds the tonic server for one node's orchestrator.
-///
-/// 🔴 Always wired for `BuildTemplate`: every `aenv-node` process has its
-/// own `ImageResolver` and `TemplateBuilder` regardless of whether a template
-/// build ever reaches it (`assemble_node_core` builds both unconditionally,
-/// the same as the pre-split single process always has), so there is no configuration under
-/// which this server should answer `Unimplemented` for it. See
-/// `NodeSandboxService::with_template_build`'s doc for why the *type* still
-/// allows a service with neither wired — that is for this function's own
-/// tests, not for production.
+/// Builds the node gRPC server with template-building support.
 pub fn server(
     orchestration: Arc<dyn SandboxOrchestration>,
     snapshots: Arc<SnapshotManager>,
@@ -96,21 +47,9 @@ pub fn server(
     )
 }
 
-/// Serves the node service on a listener somebody else bound, until `shutdown`
-/// resolves.
+/// Serves on a caller-bound listener until shutdown.
 ///
-/// 🔴 A separate listener from the HTTP one, rather than a route on it. The two
-/// have different audiences — this one is spoken to only by the API half, and
-/// the HTTP port is spoken to by users and by the gateway — and a deployment
-/// has to be able to expose them differently.
-///
-/// 🔴 The listener is bound by the caller, and there is deliberately no
-/// variant that takes an address and binds here. Binding inside this future
-/// means an assembly that spawns it learns nothing: the port being taken shows
-/// up as a task that ended, and the process goes on running with a surface the
-/// API half cannot reach — which from the outside is indistinguishable from an
-/// API half that has nothing to say. Bound by the assembly, that is a process
-/// that does not start.
+/// Binding remains with process assembly so a port conflict prevents startup.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_on(
     listener: tokio::net::TcpListener,

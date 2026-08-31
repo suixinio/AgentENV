@@ -1,13 +1,5 @@
-//! The one orchestrator test that needs this machine's *real* layer cache.
-//!
-//! # 🔴 Here rather than in `aenv-core`'s orchestrator suite
-//!
-//! Every other test in that suite drives the orchestrator against a recording
-//! `RuntimeImageRefs` double. This one is about the cache itself: a paused
-//! sandbox whose *source* image config has been evicted must still keep its
-//! *runtime* config pinned, so garbage collection does not take the commit the
-//! sandbox will resume from. Proving that needs `ImageCacheService`, which is
-//! `aenv-node`'s, so the test lives on this side of the split with it.
+//! Verifies paused sandboxes keep runtime image commits pinned in the real
+//! node-local layer cache.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -32,9 +24,6 @@ fn setup() {
     crate::logging::init_for_tests();
 }
 
-/// A copy of `aenv-core`'s own `create_request` helper, kept minimal: this
-/// test only ever asks for a snapshot-sourced sandbox with an explicit
-/// timeout.
 fn create_request(
     timeout_secs: Option<u64>,
     _user_metadata: &[(&str, &str)],

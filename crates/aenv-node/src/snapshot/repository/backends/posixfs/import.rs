@@ -1,8 +1,4 @@
-//! Importing a snapshot's bytes into a POSIX-filesystem store.
-//!
-//! 🔴 The overlaybd half of [`super::artifacts`]. Everything here reads
-//! overlaybd layer files off local disk, which is why it is separated from the
-//! delete path that the catalog-owning half also needs.
+//! Imports node-local snapshot bytes into a POSIX store.
 
 use async_trait::async_trait;
 use overlaybd::config::load_image_config as load_overlaybd_image_config;

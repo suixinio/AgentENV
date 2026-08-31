@@ -1,22 +1,7 @@
-//! The node service: what one node accepts from the API half of the split.
+//! Node-side implementation of the control-plane gRPC contract.
 //!
-//! # 🔴 What is not here
-//!
-//! `SandboxBackend` is the node's own interface to one sandbox and it does not
-//! appear on this surface. Three of its methods return values that own live
-//! local state — a paused capture, a captured snapshot, and the set of local
-//! image artifacts a running sandbox has open — and two of those keep a
-//! temporary directory alive for as long as the value does. None of them can
-//! cross a process boundary, so what crosses instead is *where the bytes are*.
-//!
-//! # 🔴 What "not found" means here
-//!
-//! Nothing on this service ever answers a question it could not look at. A
-//! store read that failed, a handle that could not be reached, a resolver that
-//! could not reach a registry: each of those is an error, never an empty
-//! answer. The caller reconciles a cluster against these replies and tears
-//! sandboxes down on the strength of them, and "I could not look" and "there is
-//! nothing there" have to stay two different answers all the way up.
+//! Only identifiers and durable facts cross the boundary. Lookup failures are
+//! errors, never absence, because reconciliation may delete on `NotFound`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,49 +29,19 @@ use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 use super::convert;
 use super::ownership::owned_by_control_plane;
 
-/// Serves [`pb::node_sandbox_service_server::NodeSandboxService`] out of one
-/// node's orchestrator.
+/// Serves node sandbox RPCs from one orchestrator.
 pub struct NodeSandboxService {
     orchestration: Arc<dyn SandboxOrchestration>,
-    /// Used to turn a snapshot id from the wire into something this machine can
-    /// boot.
-    ///
-    /// 🔴 The API half sends an id, not a resolved snapshot. Resolving one
-    /// opens local artifacts and yields local paths, and both belong to the
-    /// machine that will run the VM — so the API decides *which* snapshot and
-    /// the node decides what that means on its disk.
+    // Snapshot resolution remains node-local because it opens local artifacts.
     snapshots: Arc<SnapshotManager>,
     node_id: String,
-    /// What `build_template` needs beyond the above, plus the `ImageResolver`
-    /// `create` reads for a `Source::Image` request — or `None` on a service
-    /// nobody wired for either.
-    ///
-    /// 🔴 A builder step (`with_template_build`) rather than two more
-    /// constructor parameters, and deliberately so: every test in this module
-    /// but the ones that specifically exercise a build or an image-source
-    /// create constructs a service through `new(...)` alone, and required
-    /// extra arguments would be pure churn for all of them. Production always
-    /// calls `with_template_build` — see `node_server::server`.
-    ///
-    /// 🔴 `create`'s `Source::Image` arm reuses `image_resolver` rather than
-    /// getting its own copy. Resolving an OCI image reference into local
-    /// overlaybd is one capability regardless of which RPC needed it, and a
-    /// node wired for one has always been wired for the other —
-    /// `assemble_node_core` builds this `ImageResolver` unconditionally, the
-    /// same as `template_builder`.
+    // Optional only for narrow tests; production wires template builds and images.
     template_build: Option<TemplateBuildWiring>,
 }
 
-/// What [`NodeSandboxService::build_template`] needs beyond the orchestrator
-/// and the snapshot manager every other call already has — also read by
-/// `create`'s `Source::Image` arm for `image_resolver` alone. See the note on
-/// `template_build`.
+// Image and template-build capabilities shared by their RPC handlers.
 struct TemplateBuildWiring {
-    /// Resolves an image reference into local overlaybd, node-side — the
-    /// piece `aenv-api` cannot do for itself: see the note on
-    /// `TemplateBuildImageBase` and `ImageSource` in `node.proto`.
     image_resolver: Arc<ImageResolver>,
-    /// Drives `TemplateBuildRunner` and validates the build's `TemplateBuildContext`.
     template_builder: Arc<TemplateBuilder>,
 }
 
@@ -104,13 +59,7 @@ impl NodeSandboxService {
         }
     }
 
-    /// Wires this service to serve `BuildTemplate`.
-    ///
-    /// 🔴 Not called by most of this file's own tests, and that is the
-    /// point — see the note on `template_build`'s field. A service nobody
-    /// called this on answers `build_template` with `Unimplemented` rather
-    /// than panicking on a `None`, which is why that path is a refusal and
-    /// not an `.unwrap()`.
+    /// Enables template-build and image-source RPCs.
     pub fn with_template_build(
         mut self,
         image_resolver: Arc<ImageResolver>,
@@ -123,20 +72,7 @@ impl NodeSandboxService {
         self
     }
 
-    /// Refuses a call addressed to a run this node is not the one running.
-    ///
-    /// # 🔴 Three answers, and only one of them is a refusal
-    ///
-    /// - the incarnations match: proceed;
-    /// - they differ: the caller is acting on a run that has been superseded —
-    ///   most likely resumed on another machine — and applying its command
-    ///   would tear down or mutate a run it has never seen;
-    /// - this node has no record of the sandbox at all: `NotFound`, which the
-    ///   caller resolves by looking again rather than by concluding anything.
-    ///
-    /// The incarnation is read from the live handle when there is one and from
-    /// the record otherwise, because a paused sandbox has a record and no
-    /// handle and is still perfectly deletable.
+    // Refuse a superseded execution ID; preserve not-found as a distinct result.
     async fn fenced(&self, sandbox_id: SandboxId, claimed: ExecutionId) -> Result<(), Status> {
         if let Some(live) = self.orchestration.live_execution_id(&sandbox_id).await {
             return if live == claimed {
@@ -146,9 +82,7 @@ impl NodeSandboxService {
             };
         }
 
-        // 🔴 An error from the record store is propagated, not read as absence.
-        // "I could not reach the records" and "this node has never heard of
-        // that sandbox" lead the caller to opposite conclusions.
+        // Store errors are not absence and must propagate.
         let record = self
             .orchestration
             .get_sandbox(&sandbox_id)
@@ -163,34 +97,9 @@ impl NodeSandboxService {
         }
     }
 
-    /// Writes one capture's bytes into the snapshot repository and encodes the
-    /// row the caller will announce.
-    ///
-    /// # 🔴 It returns a message, not a `Status`, because its two callers do
-    /// opposite things with the failure
-    ///
-    /// Staging runs *after* the operation that produced the capture has already
-    /// settled — a checkpoint has put the sandbox back to `Running`, a pause has
-    /// persisted it and stopped it — so nothing that fails here has touched the
-    /// runtime. But the two callers are not in the same position afterwards.
-    ///
-    /// A checkpoint's whole product is the staged row: with nothing to return
-    /// it fails the call, non-terminally, and the sandbox goes on running. A
-    /// pause has already produced the thing the user asked for, and failing the
-    /// call would hand the caller a classification that is false either way —
-    /// "recoverable" tells it to put back a sandbox this node has stopped, and
-    /// "terminal" tells it to destroy a pause that worked. So the pause
-    /// succeeds and reports the loss in `staging_error`.
-    ///
-    /// Returning the message leaves that choice with the caller instead of
-    /// making it here twice.
-    ///
-    /// 🔴 The publish metadata is built from *this node's* record and not from
-    /// anything on the wire. Every field of it but the alias is a fact about
-    /// this machine — the kernel it booted, the Firecracker it ran, the images
-    /// it resolved — and this node's record is the one that saw the capture
-    /// happen. The alias is the single field staging never reads, so it stays
-    /// the committer's to apply.
+    // Stages durable bytes and returns the row the caller must announce.
+    // Checkpoint propagates staging failure; pause records it after runtime state
+    // has already settled. Publish metadata always comes from this node's record.
     async fn stage_for_caller(
         &self,
         sandbox_id: SandboxId,
@@ -205,15 +114,10 @@ impl NodeSandboxService {
             )
             .await
             .map_err(|err| format!("stage sandbox {sandbox_id}'s capture: {err}"))?
-            // 🔴 Drops the local half here, which releases the capture's
-            // temporary directory. Nothing below reads a file: the local half's
-            // one consumer is the P2P advertisement, and that belongs to the
-            // process that commits, which is not this one.
+            // Drop only the temporary local half after durable staging.
             .into_staged();
 
-        // 🔴 The bytes are staged by now and this reply was the only thing that
-        // would have told anyone about them. Reported like any other staging
-        // failure: what is lost is the snapshot, never the sandbox.
+        // Encoding failure loses the announcement, never the sandbox.
         let value = crate::proto::node::encode_value(&staged).map_err(|err| {
             format!(
                 "encode the staged snapshot for sandbox {sandbox_id}: {err} (its bytes are staged \
@@ -221,13 +125,7 @@ impl NodeSandboxService {
             )
         })?;
 
-        // 🔴 An `info!` and not a `debug!`, and it names the id. These bytes
-        // are durable from this instant and nothing on this node will ever
-        // mention them again: a caller that dies before committing leaves them
-        // with no row, and no read path resolves an unannounced snapshot, so
-        // nothing finds them. This line is the only record that they exist, and
-        // an operator reconciling `snapshots/` against the catalog has nothing
-        // else to reconcile it *from*.
+        // This is the only durable log linking unannounced bytes to their ID.
         info!(
             %sandbox_id,
             snapshot_id = %staged.commit.id,
@@ -237,20 +135,6 @@ impl NodeSandboxService {
         Ok(pb::StagedSnapshot { value: Some(value) })
     }
 
-    /// [`NodeSandboxService::build_template`]'s body, once wiring has been
-    /// confirmed present.
-    ///
-    /// # 🔴 What this mirrors, and what it does not
-    ///
-    /// The "resolve the base, execute, stage" shape is exactly
-    /// `run_the_build` -> `TemplateBuilder::execute_and_publish`'s local path
-    /// in `src/api/impls/template.rs`, moved here because resolving an image
-    /// needs `regctl` and `aenv-api` has none. It stops one step short of
-    /// that path, at `SnapshotManager::stage` rather than `publish`: a build
-    /// run for `aenv-api` has no catalog row of its own to write into —
-    /// only the caller's `try_start_build` row does, and only the caller can
-    /// write it. What crosses back is therefore a `StagedSnapshot` for the
-    /// caller to commit, exactly like `stage_for_caller` above.
     async fn build_template_impl(
         &self,
         wiring: &TemplateBuildWiring,
@@ -296,14 +180,7 @@ impl NodeSandboxService {
                 if base_ref.is_empty() {
                     return Err(Status::invalid_argument("base_snapshot_ref is required"));
                 }
-                // 🔴 `base_snapshot_resolved` is **required** — same contract
-                // as `SnapshotSource.resolved_record` in `create` below; see
-                // that field's doc in node.proto. Absent is refused rather
-                // than resolved here: this node's `SnapshotRepository` carries
-                // `NoSnapshotCatalog`, which refuses every catalog call, so
-                // the fallback that used to sit in this arm could only ever
-                // produce a confusing `Internal` naming a catalog this binary
-                // does not have.
+                // The node has no catalog; callers must supply the resolved record.
                 let record: SnapshotRecord = convert::serialized(
                     request.base_snapshot_resolved.as_ref(),
                     "base_snapshot_resolved",
@@ -343,12 +220,7 @@ impl NodeSandboxService {
             .prepare_remote_context(&spec, build_snapshot_id.clone(), base_snapshot.as_ref())
             .map_err(prepare_context_status)?;
 
-        // 🔴 Synchronous and blocking, matching `execute_and_publish`'s own
-        // call to it exactly — see that function in `src/template/builder.rs`.
-        // `execute` spawns its own OS thread and joins it, so this does hold
-        // the async task (and the worker thread under it) for as long as the
-        // build sandbox runs; nothing about the split changes that trade-off,
-        // and `TemplateBuildRunner::execute`'s own code is untouched here.
+        // Execution is synchronous and internally joins its worker thread.
         let build_execution = TemplateBuildRunner::new()
             .execute(&context)
             .map_err(|err| execute_status(&err))?;
@@ -360,13 +232,7 @@ impl NodeSandboxService {
             build_execution,
         );
 
-        // 🔴 `stage`, not `stage_captured`: this build produced a manifest
-        // directly, not a `CapturedSandboxSnapshot` — see `SnapshotManager::stage`'s
-        // own doc, "for artifacts that were built rather than captured".
-        // `execution_id: None`, matching the local publish path
-        // (`TemplateBuilder::execute_and_publish` calls `publish` ->
-        // `stage(metadata, manifest, None)`): a template build fences on
-        // nothing, because there is no sandbox run for a later caller to name.
+        // Built artifacts use `stage`; there is no sandbox execution to fence.
         let staged = self
             .snapshots
             .stage(metadata, manifest)
@@ -374,12 +240,7 @@ impl NodeSandboxService {
             .map_err(|err| {
                 Status::internal(format!("stage template build {build_snapshot_id}: {err:#}"))
             })?
-            // 🔴 Drops the local half here, same as `stage_for_caller` above:
-            // by the time `stage` returns, `import_built_artifacts` has
-            // already copied the build's artifacts into this node's durable
-            // repository storage, so `context`'s temporary workspace (which
-            // goes out of scope at the end of this function) has nothing left
-            // that matters.
+            // Durable import completed before the temporary build context is dropped.
             .into_staged();
 
         let value = crate::proto::node::encode_value(&staged).map_err(|err| {
@@ -397,46 +258,18 @@ impl NodeSandboxService {
         Ok(pb::StagedSnapshot { value: Some(value) })
     }
 
-    /// The live facts for everything this node is running, or `None` when the
-    /// read did not work.
-    ///
-    /// The two facts a record cannot supply — the address the sandbox reaches
-    /// the host on, and the size the rootfs turned out to be — are only
-    /// knowable from the live handle, and this is the one call that reaches
-    /// one.
-    ///
-    /// It costs a scan of everything running on this node. That is a real cost
-    /// and it is the right trade here: the calls it is inside have just booted
-    /// virtual machines, and the alternative is a second accessor on the
-    /// orchestration surface that exists to serve two fields.
-    ///
-    /// 🔴 `.ok()` and not `?`: an operation that *succeeded* must not be
-    /// reported as a failure because the follow-up read did not work. The
-    /// sandbox is running either way, and a caller told it failed would leak
-    /// it.
+    // Best-effort follow-up facts must not turn a successful start into failure.
     async fn live_facts(&self) -> Option<Vec<LiveSandbox>> {
         self.orchestration.list_live_sandboxes().await.ok()
     }
 
-    /// One sandbox's live facts out of a scan.
     fn facts_for(live: Option<&Vec<LiveSandbox>>, sandbox_id: SandboxId) -> Option<&LiveSandbox> {
         live?
             .iter()
             .find(|candidate| candidate.sandbox_id == sandbox_id)
     }
 
-    /// What a caller learns about a sandbox this node has just brought up.
-    ///
-    /// 🔴 One renderer for `create`, `resume` **and** each of `fork`'s
-    /// children, because the three answer the same question — *what is running
-    /// now, and under which run* — and a second copy of it is a second place
-    /// for a field to be forgotten. `fork` had that second copy, and it had
-    /// forgotten both of the fields only the live handle can supply: it sent
-    /// an empty address and a zero rootfs size for children whose VMs were up
-    /// and addressable. The API half reads the address to publish the child's
-    /// proxy route, so every fork it drove failed with *missing host
-    /// interaction IP after start* — deterministically, on a child that was
-    /// running fine.
+    // Shared renderer for create, resume, and fork start responses.
     fn started_sandbox(
         metadata: &SandboxMetadata,
         facts: Option<&LiveSandbox>,
@@ -458,38 +291,23 @@ impl NodeSandboxService {
             }),
             started_at_ms: convert::unix_millis(Some(metadata.created_at)),
             expires_at_ms: convert::unix_millis(metadata.expires_at),
-            // 🔴 Left unset here rather than encoded: `started_sandbox` is
-            // also `fork`'s renderer, and a fork child's context and image
-            // configs are already known to the caller from the parent it
-            // forked — nothing here needs patching. `create` is the one
-            // caller that sets these two fields itself, after this call
-            // returns; see there.
+            // Create fills these fields; fork already knows them from its parent.
             context: None,
             image_configs: None,
         }
     }
 
-    /// [`started_sandbox`](Self::started_sandbox) for a single sandbox, with
-    /// the scan it needs.
     async fn running_sandbox(&self, metadata: &SandboxMetadata) -> pb::SandboxCreateResponse {
         let live = self.live_facts().await;
         Self::started_sandbox(metadata, Self::facts_for(live.as_ref(), metadata.id))
     }
 
-    /// `create`'s `Source::Image` arm: resolves the reference and its
-    /// attached drives node-side, into the same `SandboxLaunchSource::Image`
-    /// a local cold create already builds from a `regctl`-resolved path. See
-    /// the note on `ImageSource` in `node.proto` for why the reference
-    /// crosses this call unresolved rather than already turned into one.
+    // Resolves image and attached-drive references on this node.
     async fn resolve_image_source(
         &self,
         image: pb::ImageSource,
     ) -> Result<SandboxLaunchSource, Status> {
         let Some(wiring) = self.template_build.as_ref() else {
-            // 🔴 Mirrors `build_template`'s own refusal when nobody called
-            // `with_template_build`: production always does (see
-            // `node_server::server`), so this is a test-fixture-only path in
-            // practice, not a production one.
             return Err(Status::unimplemented(
                 "this node was not wired to resolve images \
                  (NodeSandboxService::with_template_build was not called), so a cold create from \
@@ -576,13 +394,7 @@ impl NodeSandboxService {
     }
 }
 
-/// Re-stamps a status raised before the backend was reached as one that did not
-/// touch the sandbox.
-///
-/// 🔴 The code and message are kept exactly as they were — a `NotFound` stays a
-/// `NotFound` — and only the classification is added. Without it the caller,
-/// which treats an unclassified capture failure as terminal, tears down a
-/// sandbox over a fence check that never reached the runtime.
+// Preserves status code/message while marking that runtime state was untouched.
 fn untouched(status: Status) -> Status {
     crate::proto::node::capture_failure_status(
         status.code(),
@@ -592,16 +404,8 @@ fn untouched(status: Status) -> Status {
     )
 }
 
-/// What a caller must do about a pause that did not produce a capture.
-///
-/// # 🔴 Terminal is the default and each exception is named
-///
-/// "Terminal" tells the caller the live runtime was mutated past safe resume
-/// and has to be torn down; "recoverable" tells it the sandbox is still there
-/// and should go back to running. Guessing either way is expensive, so the only
-/// answers that claim the sandbox survived are the ones this node can prove:
-/// the orchestrator's own capture classification, and the errors raised before
-/// the backend was ever asked to pause.
+// Capture failures default terminal; only proven pre-runtime or recoverable
+// failures may tell the caller the sandbox survived.
 fn capture_op_failure_status(
     sandbox_id: SandboxId,
     operation: SandboxOperation,
@@ -609,22 +413,8 @@ fn capture_op_failure_status(
 ) -> Status {
     let status = orchestrator_status(err);
     let terminal = match err {
-        // The backend answered, and its answer already says which of the two
-        // this is — the orchestrator acted on the same flag when it decided
-        // whether to put the sandbox back or tear it down.
-        //
-        // 🔴 The operation is matched, not ignored. A sandbox can only be
-        // inside one lifecycle operation at a time, so a `SandboxOperationFailed`
-        // naming a *different* one than the call being served is not this
-        // call's capture answering: it is some other failure arriving through
-        // the same shape, and reading its classification would be reading a
-        // verdict about a runtime this call never touched. That falls through
-        // to the fail-closed default below.
-        //
-        // 🔴 `unwrap_or(true)` and not `false`: a source that is not a capture
-        // error is a failure this node cannot account for, and the fail-closed
-        // reading of "I do not know what happened to the runtime" is that it
-        // did not survive.
+        // Use a matching capture operation's explicit classification; unknown
+        // sources and mismatched operations remain terminal.
         OrchestratorError::SandboxOperationFailed {
             operation: failed,
             source,
@@ -633,9 +423,7 @@ fn capture_op_failure_status(
             .downcast_ref::<SandboxCaptureError>()
             .map(SandboxCaptureError::is_terminal)
             .unwrap_or(true),
-        // Refused before the runtime was touched: the wrong state, another
-        // operation holding the sandbox, a node that is draining, a request
-        // that does not parse.
+        // Refused before touching runtime state.
         OrchestratorError::InvalidSandboxState { .. }
         | OrchestratorError::SandboxOperationConflict { .. }
         | OrchestratorError::SandboxLifetimeExceeded { .. }
@@ -643,13 +431,9 @@ fn capture_op_failure_status(
         | OrchestratorError::ShuttingDown
         | OrchestratorError::NotAcceptingNewWork
         | OrchestratorError::VirtualizationModeMismatch { .. } => false,
-        // 🔴 Allocating the artifact directory happens before the backend is
-        // asked for anything, and its failure puts the sandbox straight back to
-        // running. A capture never reaches the persister at all.
+        // Artifact allocation failure occurs before backend capture.
         OrchestratorError::SandboxPersistenceFailed(_) => false,
-        // 🔴 Including `SandboxNotFound`, which on this path means the pause
-        // found no sandbox to pause and removed the record — so the caller's
-        // record of it is the last one standing and must go too.
+        // NotFound here means no sandbox remained to pause.
         _ => true,
     };
     crate::proto::node::capture_failure_status(
@@ -666,13 +450,7 @@ fn superseded(sandbox_id: SandboxId, claimed: ExecutionId, actual: ExecutionId) 
     ))
 }
 
-/// Maps an orchestrator failure onto a gRPC status.
-///
-/// 🔴 `SandboxNotFound` becomes `NotFound` and everything else stays a failure.
-/// The temptation is to flatten "it was not there" and "something went wrong"
-/// into one unhappy path, and the caller's next move differs between them:
-/// after `NotFound` it may decide the sandbox is gone, and after anything else
-/// it may not.
+// Preserves NotFound because callers distinguish absence from node failure.
 fn orchestrator_status(err: &OrchestratorError) -> Status {
     match err {
         OrchestratorError::SandboxNotFound(sandbox_id) => {
@@ -691,26 +469,7 @@ fn orchestrator_status(err: &OrchestratorError) -> Status {
     }
 }
 
-/// Resolves a template build's image base, node-side.
-///
-/// 🔴 Mirrors `resolve_template_rootfs_image` in
-/// `src/api/impls/template.rs` rather than sharing code with it: that
-/// function speaks `models::Error`, an HTTP type this gRPC surface has no
-/// business depending on, and the part that is not the four-line translation
-/// of an `ImageResolutionError` into a status — `ImageResolver::resolve`
-/// itself — is already shared, being the one and only implementation either
-/// caller drives.
-/// Whether `record` is the snapshot `id_or_alias` names — by id or by the
-/// record's own current alias, since a caller may name either one.
-///
-/// 🔴 What stands between `BuildTemplate`'s `base_snapshot_resolved` and
-/// silently building on top of the wrong snapshot: unlike `Create`'s
-/// `resolved_record` (checked against `snapshot_id` alone, because
-/// `SnapshotSource.snapshot_id` is always an id), `base_snapshot_ref` is
-/// documented to accept either an id or an alias — see its own doc in
-/// node.proto — so the cross-check has to accept whichever one a caller
-/// actually sent, or a legitimate alias-named build would be refused as a
-/// mismatch.
+// Accept either the snapshot ID or its current alias.
 fn record_names(record: &SnapshotRecord, id_or_alias: &str) -> bool {
     record.id.to_string() == id_or_alias
         || record
@@ -734,10 +493,6 @@ async fn resolve_build_image(
     })
 }
 
-/// Applies a resolved image base to a `TemplateBuildSpec`, matching the
-/// `raw_config` -> `ImageConfigs` and `base_context` -> `CommandContext`
-/// translation `resolve_template_rootfs_image`'s caller performs today in
-/// `src/api/impls/template.rs`'s `run_the_build`.
 fn apply_image_base(
     spec: TemplateBuildSpec,
     resolved: crate::image::ResolvedBlockImage,
@@ -758,25 +513,9 @@ fn apply_image_base(
         .with_base_context(base_context)
 }
 
-/// Splits a finished build into the two things `SnapshotManager::stage` wants
-/// — the metadata describing it, and the manifest naming its artifacts — and
-/// derives `resources.disk_size_mib` from the manifest the way
-/// `TemplateBuilder::execute_and_publish` does for the local build path.
+/// Splits completed template-build output into publish metadata and a manifest.
 ///
-/// 🔴 Pure and free of `self` on purpose: `TemplateBuildRunner::execute`
-/// (which produces the `TemplateBuildExecution` this consumes) boots a real
-/// Firecracker VM and cannot run inside `cargo test --lib`, but everything
-/// downstream of it — this function, `SnapshotManager::stage`, encoding for
-/// the wire, and `commit_staged` on the other end — is ordinary Rust that
-/// can. See `a_built_templates_metadata_survives_stage_encode_decode_and_commit`
-/// in `tests.rs`, which drives exactly that: a hand-built
-/// `TemplateBuildExecution` through this function and a real
-/// (PosixFs-backed) `SnapshotManager`.
-///
-/// 🔴 `alias: None`, deliberately — see `TemplateBuildRequest`'s doc in
-/// `node.proto`. Staging never reads it: the caller's `adopt_staged`
-/// overwrites `staged.commit.alias` unconditionally once this row is
-/// committed, so a value written here would never be read back.
+/// Alias remains caller-owned and is applied when the staged row is committed.
 pub fn template_build_publish_metadata(
     build_snapshot_id: SnapshotId,
     resources: crate::types::SandboxResources,
@@ -852,16 +591,8 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
     ) -> Result<Response<pb::SandboxCreateResponse>, Status> {
         let request = request.into_inner();
         let sandbox_id = convert::sandbox_id(&request.sandbox_id)?;
-        // 🔴 Everything that can be refused without touching the machine is
-        // refused first. Resolving a snapshot reaches a registry and opens
-        // local artifacts, and doing that before noticing the request was
-        // malformed spends a network round trip to arrive at the same answer.
+        // Reject malformed scalar fields before any registry or local-artifact work.
         let timeout_action = convert::timeout_action(request.timeout_action)?;
-        // 🔴 Read here, with the rest of the "can be refused without touching
-        // the machine" group, and not down at the launch. A create whose sender
-        // did not say who keeps the deadline is refused before a snapshot is
-        // resolved, so the refusal costs a registry round trip less than the
-        // silent mis-reading it replaced.
         let expiry = convert::create_expiry(request.expiry)?;
         let network_policy: SandboxNetworkPolicy =
             convert::serialized(request.network_policy.as_ref(), "network_policy")?
@@ -876,17 +607,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 if snapshot.snapshot_id.is_empty() {
                     return Err(Status::invalid_argument("snapshot.snapshot_id is required"));
                 }
-                // 🔴 `resolved_record` is **required** — see
-                // `SnapshotSource.resolved_record`'s own doc in node.proto
-                // and Q3 in `_sd-phase4-open-questions-resolved.md`. The API
-                // half read this row to route the create at all and forwards
-                // it; this node's `SnapshotRepository` carries
-                // `NoSnapshotCatalog` (`src/snapshot/repository/no_catalog.rs`),
-                // which *refuses* every catalog call rather than reporting
-                // absence, so the `load_runnable` fallback that used to sit
-                // in this arm could only ever turn a missing field into an
-                // `Internal` about a catalog this binary does not have.
-                // Refusing the message outright says what is actually wrong.
+                // Nodes have no catalog; callers must supply the resolved record.
                 let record: SnapshotRecord =
                     convert::serialized(snapshot.resolved_record.as_ref(), "resolved_record")?
                         .ok_or_else(|| {
@@ -929,13 +650,9 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             network_policy,
             secure: request.secure,
             custom_extension_params,
-            // 🔴 The one place a marker is ever set. Everything else that can
-            // create a sandbox on this node leaves it `None`.
+            // Ownership markers are set only at create.
             control_plane_config: convert::control_plane_config(&request.control_plane_config),
-            // 🔴 Empty means "you choose". A caller that sent one is an
-            // orchestrator that already recorded it, and running the sandbox
-            // under a different one would leave its record naming a run that
-            // is not the one that is up.
+            // Empty lets the orchestrator mint; nonempty adopts the caller's claim.
             execution_id: convert::optional_execution_id(&request.execution_id)?,
         };
 
@@ -947,11 +664,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .map_err(|err| orchestrator_status(&err))?;
 
         let mut response = self.running_sandbox(&metadata).await;
-        // 🔴 Sent unconditionally rather than only for a `Source::Image`
-        // create: this process's own record of the sandbox is the same
-        // `metadata` either way, and a `Source::Snapshot` caller that already
-        // knew both values reads back exactly what it sent. See the note on
-        // these two fields in `node.proto`.
+        // Always return the node's resolved context and image configuration.
         response.context = Some(
             crate::proto::node::encode_value(&metadata.context)
                 .map_err(|err| Status::internal(format!("encode resolved context: {err}")))?,
@@ -979,72 +692,22 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         Ok(Response::new(pb::SandboxDeleteResponse {}))
     }
 
-    /// Pauses the sandbox and says where the capture it produced now sits.
+    /// Pauses locally and returns the node-owned capture location.
     ///
-    /// # 🔴 What travels back is a location, not a capture
-    ///
-    /// The bytes are written to this node's disk and stay there. What the
-    /// caller receives is the pair its own factory will hand back the day it
-    /// wants the sandbox reopened — the directory they went into and this
-    /// node's own encoding of its backend state — plus, from the reply's
-    /// envelope, which machine said it. Nothing here owns anything the caller
-    /// has to release.
-    ///
-    /// # 🔴 Every failure carries a classification, including the ones that
-    /// are not capture failures
-    ///
-    /// The caller reads an unclassified failure as *terminal* by design, and
-    /// terminal on this path means "tear the sandbox down". So a refusal that
-    /// left the sandbox untouched — the wrong state, a node that is draining, a
-    /// request that never reached the backend — must say so explicitly, or a
-    /// caller doing exactly what it was told to do will delete a running
-    /// sandbox because its pause arrived at an awkward moment. See
-    /// [`capture_op_failure_status`].
-    ///
-    /// # 🔴 What `publish` changes, and what it does not
-    ///
-    /// Without it the pause is this node's business: the bytes stay here, the
-    /// caller gets a path and a handle, and the sandbox is reopenable on this
-    /// machine and nowhere else. With it the capture is *also* staged into the
-    /// snapshot repository and the row comes back for the caller to commit, so
-    /// the sandbox survives losing this machine.
-    ///
-    /// It does not change the pause. Staging happens after the sandbox is
-    /// paused, persisted and stopped, and a staging that fails leaves all three
-    /// of those standing — so the reply says so and the sandbox stays paused
-    /// here rather than being torn down for a failure that never touched it.
-    ///
-    /// 🔴 An absent `staged` in a reply that was *asked* to publish is not a
-    /// silent gap and never becomes one: the pause path only reaches this call
-    /// without a capture when the pause did not happen on this call — the
-    /// sandbox was already paused, or this call joined one in flight — and in
-    /// both the capture belongs to the pause that produced it and is gone. Any
-    /// other reason fails the call.
-    ///
-    /// 🔴 This node's own publisher is not consulted on this arm. In
-    /// `aenv-node` it is `DisabledPausedSandboxRegistry` and would drop the
-    /// capture; either way it would be a second process writing a row for a
-    /// pause the caller already owns.
+    /// Optional publication stages a row for the caller without changing pause success.
     async fn pause(
         &self,
         request: Request<pb::SandboxPauseRequest>,
     ) -> Result<Response<pb::SandboxPauseResponse>, Status> {
         let request = request.into_inner();
-        // 🔴 Classified, like every other refusal on this call. A request that
-        // does not parse never reached the runtime, and the caller reads an
-        // unclassified capture failure as terminal — so leaving these two bare
-        // would have a malformed request tear down the sandbox it named.
+        // Parse and fence failures are classified as runtime-untouched.
         let sandbox_id = convert::sandbox_id(&request.sandbox_id).map_err(untouched)?;
         let execution_id = convert::execution_id(&request.execution_id).map_err(untouched)?;
         self.fenced(sandbox_id, execution_id)
             .await
             .map_err(untouched)?;
 
-        // 🔴 Two entry points and not one with a flag, because they differ in
-        // who the capture is offered to and not merely in what comes back.
-        // The unpublished arm is left byte-for-byte the call it has always
-        // been: `pause_sandbox`, which offers the capture to this process's own
-        // publisher exactly as a machine-local role does.
+        // Published and local pauses intentionally use distinct orchestration entry points.
         let (metadata, staged, staging_error) = if request.publish {
             let outcome = Arc::clone(&self.orchestration)
                 .pause_sandbox_for_publication(sandbox_id)
@@ -1053,15 +716,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                     capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err)
                 })?;
             let (staged, staging_error) = match outcome.publishable {
-                // 🔴 A staging that fails does not fail the pause, and this is
-                // the only place on this service where a failure is reported
-                // inside a success. The sandbox is paused, persisted and
-                // stopped by now; the two answers a failed pause can carry are
-                // "put it back to running" and "tear it down", and both are
-                // lies about a sandbox that is sitting here paused and
-                // perfectly reopenable. What is lost is the cluster's copy, so
-                // that is what the reply says was lost. See
-                // `SandboxPauseResponse.staging_error`.
+                // Staging failure is reported inside a successful, locally resumable pause.
                 Some(publishable) => match self
                     .stage_for_caller(sandbox_id, &outcome.metadata, publishable)
                     .await
@@ -1077,8 +732,6 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                         (None, err)
                     }
                 },
-                // The pause was idempotent: nothing happened on this call, so
-                // there is no capture of it. See the note on the flag above.
                 None => {
                     debug!(
                         %sandbox_id,
@@ -1098,17 +751,9 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             (metadata, None, String::new())
         };
 
-        // 🔴 The handle the pause produced, from the record the pause wrote. A
-        // reply without it is not a pause with nothing to say: it is a stopped
-        // VM the caller has no way of reopening, and the caller has to be told
-        // that rather than handed a `paused_state` it will store and later find
-        // empty.
+        // A successful pause must return the handle needed to reopen it.
         let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
-            // 🔴 Not terminal. The sandbox *is* paused on this node and a later
-            // `Resume` addressed here will reopen it from this node's own
-            // record; what failed is this reply's ability to describe it. Of
-            // the two wrong readings available, "put it back to running" costs
-            // a reconciliation and "tear it down" costs the user's only copy.
+            // Missing reply state is nonterminal because the node record remains resumable.
             crate::proto::node::capture_failure_status(
                 tonic::Code::Internal,
                 format!(
@@ -1140,20 +785,14 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 })
             })?;
 
-        // 🔴 A failed read fails the call rather than answering with an empty
-        // path. The caller stores this and never asks again, so a blank written
-        // into its record because a disk hiccuped is a permanent lie about
-        // where the user's sandbox lives.
+        // Never persist a fabricated empty artifact location after a failed read.
         let artifact_root = self
             .orchestration
             .paused_artifact_root(&sandbox_id)
             .await
             .map_err(|err| capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err))?;
         if artifact_root.is_none() {
-            // Not a failure: a node whose persister allocates nothing captured
-            // into temporaries it manages itself, and there is no directory to
-            // name. Worth saying out loud because the caller's record of this
-            // sandbox will carry no location.
+            // Some persisters manage temporary capture storage without a named root.
             warn!(
                 %sandbox_id,
                 "paused a sandbox this node kept no artifact directory for"
@@ -1167,53 +806,20 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                     .unwrap_or_default(),
                 state: Some(state),
             }),
-            // 🔴 Absent unless `publish` was asked for, and then absent for
-            // exactly two reasons — the idempotent pause above, and a staging
-            // that failed. `staging_error` is what tells them apart.
             staged,
             staging_error,
         }))
     }
 
-    /// Captures a snapshot of a running sandbox and writes its bytes, leaving
-    /// the row for the caller to announce.
+    /// Captures and stages a snapshot row for the caller to announce.
     ///
-    /// # 🔴 Why the reply is a staged row and not a capture
-    ///
-    /// A `CapturedSandboxSnapshot` owns a temporary directory on this machine
-    /// and cannot cross a process boundary, so what crosses is what is left
-    /// once the bytes are durable: a [`StagedSnapshot`], which is a pure value
-    /// carrying everything the catalog row needs and nothing that points at
-    /// this disk. The caller commits it. Until it does, no reader anywhere can
-    /// resolve this snapshot.
-    ///
-    /// # 🔴 Why this node picks the snapshot id, and the caller picks the name
-    ///
-    /// Staging writes the bytes into the directory the id names. The id is
-    /// therefore a decision only the machine writing them can take — it is the
-    /// one that finds out whether the write worked. Everything else on the row
-    /// except the alias is a fact about *this* machine (its kernel, its
-    /// Firecracker, the images it resolved) and is read off this node's own
-    /// record of the sandbox, which is the record that saw the capture happen.
-    /// The alias is the single field staging never looks at, so it stays the
-    /// caller's, applied when the row is committed.
-    ///
-    /// # 🔴 What is left behind when the caller never commits
-    ///
-    /// Staged bytes. They are durable, they are reachable by id, and no row
-    /// points at them — the same residue a `publish` whose commit failed leaves
-    /// behind, and this build reclaims neither. The window is one round trip
-    /// wide and each loss costs one capture's worth of storage. Nothing else
-    /// breaks: an unannounced snapshot is invisible to every read path, so it
-    /// cannot be resolved, launched, or mistaken for a snapshot that works.
+    /// Uncommitted staged bytes remain durable but invisible to read paths.
     async fn checkpoint(
         &self,
         request: Request<pb::SandboxCheckpointRequest>,
     ) -> Result<Response<pb::SandboxCheckpointResponse>, Status> {
         let request = request.into_inner();
-        // 🔴 Classified, for the reason spelled out on `pause`: the caller
-        // reads an unclassified capture failure as terminal, so a malformed
-        // request that never reached the runtime must say it never reached it.
+        // Parse and fence failures never reached the runtime.
         let sandbox_id = convert::sandbox_id(&request.sandbox_id).map_err(untouched)?;
         let execution_id = convert::execution_id(&request.execution_id).map_err(untouched)?;
         self.fenced(sandbox_id, execution_id)
@@ -1227,11 +833,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 capture_op_failure_status(sandbox_id, SandboxOperation::Snapshot, &err)
             })?;
 
-        // 🔴 Non-terminal, and `capture_snapshot` is what makes that true rather
-        // than optimism: it has already put the sandbox back to `Running` by
-        // the time it hands over a capture. A terminal answer here would have
-        // the caller tear down a sandbox that is running and serving requests
-        // because a disk filled up.
+        // Staging failure is nonterminal because capture restored the sandbox to running.
         let staged = self
             .stage_for_caller(sandbox_id, &capture.metadata, capture.captured_snapshot)
             .await
@@ -1249,32 +851,9 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         }))
     }
 
-    /// Reopens the capture this node is holding.
+    /// Resumes from this node's persisted record.
     ///
-    /// # 🔴 Why nothing about the capture arrives with the request
-    ///
-    /// The bytes never left. `Pause` handed the caller a path on this node's
-    /// disk and this node's own encoding of its backend state, and the caller
-    /// stored those so it could tell *which machine* to come back to — not so
-    /// it could hand them back as an input. What reopens the sandbox is the
-    /// record this node already has: the paused metadata, the persisted
-    /// artifacts, and the paused-state handle its own factory decoded. So this
-    /// call carries an identity, a fence, and the run to start, and everything
-    /// else would be a second source of truth for a question that already has
-    /// one.
-    ///
-    /// # 🔴 The three answers, and why they may not be flattened
-    ///
-    /// - the record is here and names the run being resumed: proceed;
-    /// - **there is no record**: `NotFound`, which tells the caller the only
-    ///   copy of this sandbox is not on this machine — a conclusion it acts on
-    ///   by rebuilding from a published snapshot, or by giving the sandbox up;
-    /// - **the records could not be read**, or the node is not taking work:
-    ///   anything but `NotFound`. A caller that read those as absence would
-    ///   discard a sandbox whose bytes are sitting intact on this disk.
-    ///
-    /// The first two come out of [`fenced`](Self::fenced), which a paused
-    /// sandbox reaches through its record because it has no live handle.
+    /// NotFound remains distinct from record-read or availability failures.
     async fn resume(
         &self,
         request: Request<pb::SandboxResumeRequest>,
@@ -1282,19 +861,10 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         let request = request.into_inner();
         let sandbox_id = convert::sandbox_id(&request.sandbox_id)?;
         let paused_execution_id = convert::execution_id(&request.execution_id)?;
-        // 🔴 Required, and not `optional_execution_id`. An empty value on a
-        // create means "you choose", because a caller that keeps no record of
-        // its own has nothing to impose; a resume has no such caller. The only
-        // way to obtain the incarnation a resume runs under is the arbitration
-        // that decided the sandbox may come back, so a request that carries
-        // none is a resume nobody licensed.
+        // A resume must carry the execution ID granted by arbitration.
         let resumed_execution_id = convert::execution_id(&request.resumed_execution_id)?;
         if resumed_execution_id == paused_execution_id {
-            // 🔴 Refused rather than treated as a no-op. A resume starts a new
-            // run; one that reused the paused run's identity would leave every
-            // command written before the pause indistinguishable from one
-            // written after it, which is precisely what the incarnation on
-            // every other call here exists to tell apart.
+            // Resume always creates a new incarnation.
             return Err(Status::invalid_argument(format!(
                 "sandbox {sandbox_id} cannot be resumed as the same run it was paused under \
                  ({paused_execution_id}): a resume starts a new one"
@@ -1305,10 +875,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
 
         let timeout = match convert::optional_timeout(request.timeout_ms) {
             Some(timeout) => NewTimeout::Set(timeout),
-            // 🔴 The sandbox keeps what it was paused with, rather than picking
-            // up this node's configured default. The deadline belongs to the
-            // record the caller holds, and a node that substituted its own
-            // would move a deadline nobody agreed to move.
+            // Preserve the deadline stored with the paused sandbox.
             None => NewTimeout::UseExisting,
         };
 
@@ -1316,22 +883,12 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .resume_sandbox(
                 sandbox_id,
                 timeout,
-                // 🔴 Adopted, not minted. The decision was taken by the
-                // orchestrator that owns this sandbox and is already in its
-                // record; a node that minted here would start a run the
-                // cluster's record does not name.
+                // Adopt the execution claim already recorded by the caller.
                 ClaimedExecution::adopted_from_remote_claim(resumed_execution_id),
             )
             .await
             .map_err(|err| orchestrator_status(&err))?;
 
-        // 🔴 Reported rather than asserted. A resume that arrived for a sandbox
-        // this node had already brought back is answered by
-        // `resume_sandbox` with the run that is *up*, which is not the one that
-        // was asked for — and the caller, which holds the record, is the one
-        // that decides what to do about the disagreement. Refusing here would
-        // turn a node's honest answer into a failure of an operation that did
-        // not happen.
         Ok(Response::new(pb::SandboxResumeResponse {
             started: Some(self.running_sandbox(&metadata).await),
         }))
@@ -1377,16 +934,10 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .await
             .map_err(|err| orchestrator_status(&err))?;
 
-        // 🔴 One scan for the whole fork, not one per child. Every child that
-        // started is already registered and unlocked by the time `fork_sandbox`
-        // returns, so a single pass sees all of them — and asking once per
-        // child would re-read every sandbox on this node once per child.
+        // One live-state scan covers every completed child.
         let live = self.live_facts().await;
 
-        // 🔴 One result per requested child, in request order, paired by
-        // position. That is the contract the orchestrator's fork states and the
-        // one the caller's markers were assigned under; zipping is what keeps
-        // the two statements of it in step.
+        // Preserve request order by zipping outcomes with assignments.
         let results = outcomes
             .into_iter()
             .zip(&children)
@@ -1394,11 +945,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 Ok(metadata) => pb::ForkChildResult {
                     sandbox_id: metadata.id.to_string(),
                     execution_id: metadata.execution_id.to_string(),
-                    // 🔴 The same renderer `create` and `resume` answer with.
-                    // A child's address and rootfs size are *its own* — it was
-                    // given its own network slot — so they are read from that
-                    // child's live handle rather than blanked or copied from
-                    // the source.
+                    // Render each child's own live address and rootfs facts.
                     outcome: Some(pb::fork_child_result::Outcome::Started(
                         Self::started_sandbox(
                             &metadata,
@@ -1407,10 +954,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                     )),
                 },
                 Err(err) => pb::ForkChildResult {
-                    // 🔴 The id comes from the request, not from the failure:
-                    // a child that never started has no metadata to read it
-                    // out of, and a result with an empty id cannot be paired
-                    // with the child it belongs to.
+                    // A failed child has no metadata; identify it from the request.
                     sandbox_id: requested.sandbox_id.to_string(),
                     execution_id: String::new(),
                     outcome: Some(pb::fork_child_result::Outcome::Error(err.to_string())),
@@ -1450,10 +994,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         let execution_id = convert::execution_id(&request.execution_id)?;
         self.fenced(sandbox_id, execution_id).await?;
 
-        // 🔴 The hook has already run on the caller's side and this value is
-        // its answer, so what happens here is assignment. Running the hook
-        // again would be a second chance for the extension to change its mind
-        // about a value the caller has already recorded.
+        // The caller already ran the extension hook; assign its recorded answer.
         let params: Option<CustomExtensionParams> = convert::serialized(
             request.custom_extension_params.as_ref(),
             "custom_extension_params",
@@ -1467,29 +1008,8 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         Ok(Response::new(pb::SandboxParamsResponse {}))
     }
 
-    /// What this node is running under one sandbox id.
-    ///
-    /// # 🔴 Why this is not `list_sandboxes` with a filter
-    ///
-    /// The listing exists to be reconciled against, so it reports only the
-    /// sandboxes carrying the control plane's ownership marker — an unmarked
-    /// sandbox is nobody's and is left out entirely. A fork child started
-    /// through the API half is unmarked (`ForkChildSpec::control_plane_config`
-    /// arrives empty), so filtering the listing by id would answer `NOT_FOUND`
-    /// for precisely the sandboxes a caller most needs this for.
-    ///
-    /// This call answers a different question, and the difference is who is
-    /// asking: a caller that already holds the record for an id, wanting to
-    /// know what this machine is running under it. Ownership is not part of
-    /// that question.
-    ///
-    /// # 🔴 A read that fails must fail
-    ///
-    /// [`live_facts`](Self::live_facts) swallows the error with `.ok()`,
-    /// because there the read is a follow-up to a VM that has *already*
-    /// booted, and reporting a successful create as a failure would leak it.
-    /// Here the read is the whole call: an answer that could not look must not
-    /// come back shaped like one that looked and found nothing.
+    // Describes any running sandbox by ID, regardless of reconciliation ownership.
+    // Read failure remains distinct from a successful not-found result.
     async fn describe(
         &self,
         request: Request<pb::SandboxDescribeRequest>,
@@ -1503,9 +1023,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .await
             .map_err(|err| orchestrator_status(&err))?;
 
-        // 🔴 `NOT_FOUND` is an answer and it is this one: the node looked at
-        // what it is running and there is nothing under that id. It is not the
-        // answer for a node that could not look — that left above.
+        // NotFound is returned only after a successful live-state read.
         let sandbox = live
             .iter()
             .find(|candidate| candidate.sandbox_id == sandbox_id)
@@ -1523,9 +1041,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 .map(|ip| ip.to_string())
                 .unwrap_or_default(),
             rootfs_virtual_size: sandbox.rootfs_virtual_size.unwrap_or_default(),
-            // 🔴 Reported rather than turned into a `NOT_FOUND`. The sandbox is
-            // running; what the node could not do is read its live facts right
-            // now. Those are different, and the caller acts on the difference.
+            // Report handle-read quality separately from sandbox presence.
             facts_from_handle: sandbox.facts_from_handle,
         }))
     }
@@ -1538,16 +1054,12 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .orchestration
             .list_live_sandboxes()
             .await
-            // 🔴 The whole call fails. There is no partial answer: a caller
-            // that received "half the sandboxes, and something went wrong" and
-            // treated it as a listing would conclude the other half are gone.
+            // Fail the whole listing rather than return a dangerous partial view.
             .map_err(|err| orchestrator_status(&err))?;
 
         let owned = owned_by_control_plane(&live);
         if owned.len() != live.len() {
-            // Not a warning: a node that also serves user-facing creates is
-            // *expected* to be running sandboxes the control plane does not
-            // own, and so is a node running a template build.
+            // Unowned sandboxes are expected on mixed or template-building nodes.
             debug!(
                 running = live.len(),
                 owned = owned.len(),
@@ -1556,10 +1068,7 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         }
         for sandbox in &live {
             if !sandbox.facts_from_handle {
-                // Worth saying out loud: this sandbox's live facts came from
-                // its record because its handle was mid-operation, so anything
-                // reading `host_interaction_ip` here is reading a blank rather
-                // than an address.
+                // Busy handles contribute record-only facts with no live address.
                 warn!(
                     sandbox_id = %sandbox.sandbox_id,
                     "sandbox handle was busy; reported from its record"

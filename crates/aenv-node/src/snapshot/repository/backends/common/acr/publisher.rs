@@ -46,13 +46,7 @@ pub struct DiskImageExportOutcome {
     pub publication: Option<PersistedDiskImagePublication>,
 }
 
-/// Publishes a snapshot's disk-image deltas to their source registry.
-///
-/// 🔴 Holds an [`AcrPublicationRollback`] rather than being one. Undoing a
-/// publication is a registry `DELETE` and nothing more, which is why it lives
-/// on the other side of this seam: the half that owns catalog rows removes
-/// publications when a snapshot goes away, and it has no overlaybd layers to
-/// read.
+/// Publishes disk-image deltas while catalog owners retain rollback responsibility.
 pub struct AcrDiskImageExporter {
     rollback: AcrPublicationRollback,
 }

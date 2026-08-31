@@ -1,12 +1,5 @@
-//! Turning wire messages into the orchestrator's own types, and back.
-//!
-//! 🔴 Every conversion in here is fallible in the direction that matters. A
-//! protobuf message has no required fields: an id that was never set arrives as
-//! an empty string, an enum that was never set arrives as its zero value, and a
-//! nested message that was never set arrives as `None`. Accepting those as
-//! defaults is how a request that meant nothing gets acted on, so each one is
-//! named and refused here rather than allowed to become a plausible value
-//! further in.
+//! Fail-closed conversions between protobuf messages and orchestrator types.
+//! Missing required protobuf values are rejected rather than defaulted.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,13 +27,7 @@ pub fn execution_id(raw: &str) -> Result<ExecutionId, Status> {
         .map_err(|err| Status::invalid_argument(format!("execution_id {raw:?}: {err}")))
 }
 
-/// An incarnation the caller minted, if it minted one.
-///
-/// 🔴 Empty means "you choose", and it is the only reading available: the wire
-/// has no null string. What must not happen is an empty value being parsed into
-/// something — a caller that sent nothing gets a fresh incarnation and is told
-/// which one, and a caller that sent a malformed one is refused rather than
-/// given a different sandbox than it asked for.
+/// Parses an optional caller-supplied execution ID; empty means absent.
 pub fn optional_execution_id(raw: &str) -> Result<Option<ExecutionId>, Status> {
     if raw.is_empty() {
         return Ok(None);
@@ -48,13 +35,7 @@ pub fn optional_execution_id(raw: &str) -> Result<Option<ExecutionId>, Status> {
     execution_id(raw).map(Some)
 }
 
-/// The ownership marker a request carried, if it carried one.
-///
-/// 🔴 Zero bytes is `None`, not `Some(empty)`. Protobuf `bytes` cannot tell an
-/// unset field from an empty one, and the two possible readings are "the
-/// control plane does not own this" and "the control plane owns this but said
-/// nothing about it" — the second of which is not a thing. Collapsing them at
-/// the boundary is what keeps `Option` two-valued everywhere behind it.
+/// Converts empty protobuf bytes to no ownership marker.
 pub fn control_plane_config(raw: &[u8]) -> Option<ControlPlaneConfig> {
     ControlPlaneConfig::from_bytes(raw.to_vec())
 }
@@ -63,10 +44,7 @@ pub fn timeout_action(raw: i32) -> Result<SandboxTimeoutAction, Status> {
     match pb::TimeoutAction::try_from(raw) {
         Ok(pb::TimeoutAction::Pause) => Ok(SandboxTimeoutAction::Pause),
         Ok(pb::TimeoutAction::Delete) => Ok(SandboxTimeoutAction::Delete),
-        // 🔴 Not defaulted to `Pause`. proto3 gives every enum a zero value
-        // whether the sender meant it or not, and the two actions differ by
-        // whether a user's sandbox is kept or destroyed when its timeout
-        // elapses. A caller that did not say must be told it did not say.
+        // The protobuf zero value does not select pause or delete.
         Ok(pb::TimeoutAction::Unspecified) => Err(Status::invalid_argument(
             "timeout_action is required: TIMEOUT_ACTION_UNSPECIFIED means the sender set nothing, \
              and pause and delete are not interchangeable",
@@ -77,10 +55,7 @@ pub fn timeout_action(raw: i32) -> Result<SandboxTimeoutAction, Status> {
     }
 }
 
-/// Decodes a serde value carried as a versioned blob.
-///
-/// `None` for an absent message, which is how "the caller supplied nothing" is
-/// spelled for every optional document on this service.
+/// Decodes an optional versioned JSON blob.
 pub fn serialized<T>(value: Option<&pb::SerializedValue>, what: &str) -> Result<Option<T>, Status>
 where
     T: serde::de::DeserializeOwned,
@@ -102,36 +77,18 @@ where
         .map_err(|err| Status::invalid_argument(format!("{what}: {err}")))
 }
 
-/// The deadline a resume or a fork carries, or `None` when it carries none.
-///
-/// 🔴 **Not a create's answer.** On those two calls `0` means "the caller named
-/// no new deadline", and both read that as `NewTimeout::UseExisting` — keep the
-/// one the sandbox already has. A create has no existing deadline to keep, so
-/// the same zero there had to mean something else, and the two somethings it
-/// was made to mean are what [`create_expiry`] exists to tell apart.
+/// Converts a nonzero resume/fork timeout; zero keeps the existing deadline.
 pub fn optional_timeout(millis: u64) -> Option<Duration> {
     (millis > 0).then(|| Duration::from_millis(millis))
 }
 
-/// Who keeps the deadline of a sandbox this node is being asked to create.
-///
-/// 🔴 **An unset oneof is refused, and that refusal is the fix.** The field it
-/// replaced was a `uint64` whose `0` had to serve both "you decide, I named
-/// nothing" and "I keep this sandbox's deadline, keep none" — and the API half
-/// meant the second while the node acted on the first, so a node's own
-/// `default_sandbox_timeout_secs` paused a VM that its owner went on reporting
-/// as running. There is no answer to guess at here: a caller that says nothing
-/// is a caller that has not been taught which of the three it means.
+/// Converts the create-time deadline owner; an unset oneof is invalid.
 pub fn create_expiry(
     expiry: Option<pb::sandbox_create_request::Expiry>,
 ) -> Result<SandboxExpiry, Status> {
     match expiry {
         Some(pb::sandbox_create_request::Expiry::NodeKeptTimeoutMs(0)) => {
-            // 🔴 Refused rather than read as either neighbour. A zero-length
-            // deadline the node keeps would expire the sandbox the instant it
-            // started, so nobody means it: the sender meant `node_kept_default`
-            // or it meant `caller_kept`, and which one is not this node's to
-            // decide.
+            // A zero node-kept timeout is neither a default nor caller-kept deadline.
             Err(Status::invalid_argument(
                 "node_kept_timeout_ms must be greater than zero: a node-kept deadline of zero \
                  expires the sandbox as it starts. Send node_kept_default for this node's \
@@ -160,13 +117,7 @@ pub fn unix_millis(at: Option<SystemTime>) -> i64 {
         .unwrap_or(0)
 }
 
-/// Renders one live sandbox for the wire.
-///
-/// 🔴 Takes the marker separately from the sandbox, and by reference to a value
-/// that exists. The caller has already established that this sandbox is the
-/// control plane's; passing the marker in rather than re-reading it from the
-/// `Option` is what stops a future edit from quietly emitting an entry for a
-/// sandbox that has none.
+/// Renders a verified control-plane-owned sandbox for the wire.
 pub fn node_sandbox(
     sandbox: &LiveSandbox,
     control_plane_config: &ControlPlaneConfig,
@@ -222,8 +173,6 @@ mod tests {
 
     #[test]
     fn an_unset_timeout_action_is_refused() {
-        // 🔴 The control probe: the two real values do convert, so this is not
-        // a function that refuses everything.
         assert!(matches!(
             timeout_action(pb::TimeoutAction::Pause as i32),
             Ok(SandboxTimeoutAction::Pause)
@@ -262,18 +211,6 @@ mod tests {
         assert_eq!(optional_timeout(1_500), Some(Duration::from_millis(1_500)));
     }
 
-    /// 🔴 The three answers a create can give about its deadline, and the two
-    /// non-answers that are refused.
-    ///
-    /// This is the mapping the role split got wrong. "The caller named no
-    /// deadline" and "the caller keeps the deadline" were one value, and the
-    /// node acted on the first while the API half meant the second — so the
-    /// node's own `default_sandbox_timeout_secs` paused a running VM its owner
-    /// still reported as running. Each arm is named here, and so is each
-    /// refusal, because the arms differ by *nothing that any other assertion in
-    /// this crate reads*: a build that mapped `CallerKept` onto
-    /// `AfterConfiguredDefault` compiles, links, serves, and reproduces the
-    /// outage.
     #[test]
     fn a_create_says_which_of_the_three_answers_about_its_deadline_it_means() {
         use pb::sandbox_create_request::Expiry;
@@ -293,9 +230,6 @@ mod tests {
             SandboxExpiry::NotKeptHere
         );
 
-        // 🔴 And the two that are not answers. A sender that said nothing is
-        // the sender that caused this, and a node-kept zero is a sender that
-        // meant one of the other two arms and reached for the old sentinel.
         let unset = create_expiry(None).unwrap_err();
         assert_eq!(unset.code(), tonic::Code::InvalidArgument, "{unset}");
         assert!(unset.message().contains("expiry is required"), "{unset}");
@@ -305,17 +239,6 @@ mod tests {
         assert!(zero.message().contains("greater than zero"), "{zero}");
     }
 
-    /// 🔴 The wire tells the three apart, and tells all three from silence.
-    ///
-    /// Field names and numbers in a `.proto` are invisible to mutation testing
-    /// — `cargo mutants` has nothing to mutate in a generated struct literal —
-    /// so the thing that must not silently change is pinned by an assertion
-    /// instead. What is pinned is the property the fix rests on: three distinct
-    /// encodings, none of which is the empty message, and a `node_kept` arm
-    /// that is still *present* when its value is zero. That last one is the
-    /// whole difference from the `uint64 timeout_ms` this replaced, where a
-    /// zero and an unset field were the same bytes and therefore the same
-    /// question with two answers.
     #[test]
     fn the_wire_tells_the_three_expiry_answers_apart_and_from_saying_nothing() {
         use pb::sandbox_create_request::Expiry;
@@ -352,7 +275,6 @@ mod tests {
         assert_ne!(zero, caller);
         assert_ne!(named, default);
 
-        // And each survives the round trip as itself.
         for expiry in [
             Expiry::NodeKeptTimeoutMs(600_000),
             Expiry::NodeKeptTimeoutMs(0),
@@ -367,9 +289,6 @@ mod tests {
 
     #[test]
     fn a_sandbox_with_no_record_still_renders_what_is_known() {
-        // The fields a record would have supplied come back as the wire's own
-        // zero values, which is what "unset" is on this transport. What must
-        // not happen is the entry disappearing.
         let marker = ControlPlaneConfig::from_bytes(b"owned".to_vec()).expect("non-empty");
         let sandbox = LiveSandbox {
             sandbox_id: SandboxId::new(),

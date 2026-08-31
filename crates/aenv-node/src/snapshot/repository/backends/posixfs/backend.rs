@@ -90,13 +90,7 @@ impl PosixFsBackend {
     }
 }
 
-/// Composes a POSIX repository out of the importing byte half rooted at
-/// `root`, and no catalog.
-///
-/// 🔴 `NoSnapshotCatalog`, and this is the whole of what a node holds. Rows
-/// are PostgreSQL's and PostgreSQL is `aenv-api`'s; a node stages bytes and
-/// hands a `StagedSnapshot` back for the deciding half to commit. See
-/// `no_catalog`'s own module doc.
+/// Builds node artifact storage with no catalog access.
 pub fn posixfs_repository(root: &std::path::Path) -> SnapshotRepository {
     SnapshotRepository::new(
         Arc::new(NoSnapshotCatalog),
@@ -183,11 +177,6 @@ mod tests {
         PosixFsBackend::from_parts(config, test_overlaybd_layer_store(), cache)
     }
 
-    /// 🔴 The byte half `posixfs_repository` builds, under a catalog a test
-    /// can publish through. That function carries `NoSnapshotCatalog` — the
-    /// node holds no catalog — so a test that only wants to exercise the POSIX
-    /// *artifact* store has to supply one; see
-    /// `InMemorySnapshotCatalog`'s own doc for why it is this one.
     fn catalogued(repository: &SnapshotRepository) -> Arc<SnapshotRepository> {
         InMemorySnapshotCatalog::in_front_of(repository)
     }

@@ -42,11 +42,6 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::{Builder, Uuid};
 
-// 🔴 Hoisted into `aenv-core` (`image::regctl`) and re-exported here so the
-// call sites in this module and its neighbours keep their spelling. The move
-// is what lets `aenv-snapshot-image` — which lives in `aenv-api`, the half
-// that holds the only snapshot catalog — shell out to `regctl` without
-// depending on this crate.
 pub use aenv_core::image::regctl::{
     ensure_regctl_binary, regctl_command, regctl_stderr_is_not_found, run_regctl,
     REGCTL_RETRY_ATTEMPTS, REGCTL_RETRY_BASE_DELAY,

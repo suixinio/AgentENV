@@ -1,17 +1,6 @@
-//! `SnapshotManager` against a real POSIX repository.
-//!
-//! 🔴 In `aenv-node`: every one of these builds a `PosixFsBackend`, whose
-//! importing half reads overlaybd layers and so lives in this crate. The
-//! manager itself is `aenv-core`'s and is driven through its public API.
-//!
-//! 🔴 And every one of them supplies its own catalog. A node's repository
-//! carries `NoSnapshotCatalog` and refuses every catalog call, because the
-//! catalog is PostgreSQL and lives in `aenv-api`. What these tests exercise —
-//! stage, commit, resolve, delete — spans both halves, so they put
-//! `InMemorySnapshotCatalog` in front of the POSIX byte half and stand in for
-//! the committer. That is a fair stand-in for the flow and *not* a claim that a
-//! node can commit: `a_staged_snapshot_has_bytes_on_disk_and_no_row_anywhere`
-//! is the test that says what staging alone does.
+//! `SnapshotManager` against POSIX byte storage and a test-owned catalog.
+//! The combined fixture exercises stage, commit, resolve, and delete across
+//! the node/API storage split.
 
 use std::sync::Arc;
 
@@ -43,18 +32,6 @@ fn test_manager(root: &Path) -> SnapshotManager {
     )
 }
 
-/// 🔴 A manager assembled without a runtime resolver — which is what
-/// `aenv-api` gets — must *refuse* a resolve, not abort the process.
-///
-/// The refusal is typed: `RepositoryError::Unsupported`, downcastable, so
-/// a caller that forgot to fork on `ApiImpl::runs_sandbox_runtime` gets
-/// a legible 5xx on one request instead of taking every in-flight request
-/// down with it.
-///
-/// The control is the second half: the *same* record through a manager
-/// that does hold a resolver reaches the resolver and fails on the missing
-/// artifacts instead. Without it, "returns an error" would be satisfied by
-/// a manager that can never resolve anything at all.
 #[tokio::test]
 async fn a_manager_with_no_runtime_resolver_refuses_rather_than_panicking() {
     let record = SnapshotRecord::mock_ready(crate::snapshot::CommittedSnapshot::mock());
@@ -170,10 +147,6 @@ async fn load_runnable_uses_committed_snapshot_and_runtime_resolution() {
     assert!(runnable.manifest().vm_state.path.exists());
 }
 
-/// 🔴 P12, second half, against a real backend rather than a fake catalog.
-/// After `stage` and before `commit_staged` the artifacts are on disk and
-/// neither read path can see the snapshot. The control is the commit: the
-/// same two reads, run again after it, must both find it.
 #[tokio::test]
 async fn a_staged_snapshot_has_bytes_on_disk_and_no_row_anywhere() {
     let tempdir = TempDir::new().expect("tempdir should exist");
@@ -256,9 +229,6 @@ async fn a_staged_snapshot_has_bytes_on_disk_and_no_row_anywhere() {
     );
 }
 
-/// The staged value that reached the commit has to be the one that could
-/// have travelled — so run the round trip through the manager's own API,
-/// not just the repository's.
 #[tokio::test]
 async fn a_manager_staged_snapshot_commits_after_a_serde_round_trip() {
     let tempdir = TempDir::new().expect("tempdir should exist");
@@ -278,8 +248,6 @@ async fn a_manager_staged_snapshot_commits_after_a_serde_round_trip() {
         .await
         .expect("staging should work");
     let encoded = serde_json::to_vec(handle.staged()).expect("staged value should serialize");
-    // 🔴 Dropped before the commit: the local half is gone, and the commit
-    // still has to work. That is the property `aenv-api` depends on.
     drop(handle);
 
     let decoded: StagedSnapshot =
@@ -297,15 +265,11 @@ async fn a_manager_staged_snapshot_commits_after_a_serde_round_trip() {
         .is_some());
 }
 
-/// Builds a row staged somewhere this process cannot read.
+/// Builds a row staged on another node.
 pub fn staged_elsewhere(id: SnapshotId, source_sandbox_id: &str) -> StagedSnapshot {
     StagedSnapshot {
         commit: crate::snapshot::repository::SnapshotCommit {
             id,
-            // 🔴 Unnamed, always. A staging node is never told the alias —
-            // staging does not read one — so a test that seeded one here
-            // would be proving the committer *kept* a name rather than
-            // that it supplied one.
             alias: None,
             source: SnapshotPublishSource::Sandbox {
                 source_sandbox_id: source_sandbox_id.to_string(),
@@ -329,16 +293,6 @@ pub fn capture_of(source_sandbox_id: &str, id: SnapshotId) -> SnapshotPublishMet
     }
 }
 
-/// A capture that arrived already staged is committed where it lies, and
-/// the row it produces is the staging node's identity wearing this half's
-/// name.
-///
-/// 🔴 Both halves run in this one test, against the same repository, and
-/// each is the other's control. The local publish is what makes "no
-/// directory was written for the adopted id" mean something: the same
-/// assertion against the same directory finds the locally staged snapshot's
-/// bytes sitting there. Without it, a `stage_captured` that had silently
-/// stopped writing anything at all would pass.
 #[tokio::test]
 async fn a_capture_staged_elsewhere_is_committed_rather_than_staged_again() {
     let tempdir = TempDir::new().expect("tempdir should exist");
@@ -393,12 +347,6 @@ async fn a_capture_staged_elsewhere_is_committed_rather_than_staged_again() {
         "the row must keep the staging node's created_at_unix_ms, not the committing node's own clock"
     );
 
-    // 🔴 The pair that carries the whole claim: no *artifact* was written
-    // here for the adopted snapshot, and the identical look at the locally
-    // staged one finds its bytes. The directory itself is not the
-    // assertion — committing a row creates one either way, to hold the
-    // record — so `vm_state.bin` is what separates "the row was announced"
-    // from "the bytes were written here".
     assert!(
         !snapshots
             .join(staged_id.to_string())
@@ -432,13 +380,6 @@ async fn a_capture_staged_elsewhere_is_committed_rather_than_staged_again() {
         .is_some());
 }
 
-/// A staging that names a different sandbox is refused, and refused before
-/// anything is announced.
-///
-/// 🔴 The control is the same call with the sandbox ids agreeing. Without
-/// it "the row was not committed" is satisfied by an `adopt_staged` that
-/// refuses everything, which is the exact failure that would make the
-/// published arm silently useless.
 #[tokio::test]
 async fn a_staging_of_a_different_sandbox_is_refused_and_nothing_is_announced() {
     let tempdir = TempDir::new().expect("tempdir should exist");

@@ -307,12 +307,7 @@ async fn ensure_regctl(deps_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Turns the memory-snapshot background-download knobs into the storage
-/// engine's `DownloadConfig`.
-///
-/// 🔴 Lives here rather than on `MemorySnapshotBackgroundDownloadConfig`
-/// itself: `crate::cfg` is read by every role, including the one that links no
-/// storage engine, and this is the only place the conversion is needed.
+// Converts core configuration at the storage-engine boundary.
 fn to_overlaybd_download_config(
     config: &crate::cfg::MemorySnapshotBackgroundDownloadConfig,
 ) -> DownloadConfig {

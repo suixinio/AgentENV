@@ -60,10 +60,7 @@ impl OssBackend {
             client,
             managed_layers_repo_blob_url,
         } = oss_durable_parts(config, snapshot_image_storage)?;
-        // 🔴 Not `oss_durable_parts`' repository. That one carries the
-        // delete-only artifact half; this process holds bytes and has to be
-        // able to import them, so it composes the importing half instead.
-        // Neither carries a catalog — see `no_catalog`'s own module doc.
+        // Compose the importing byte half; neither repository carries a catalog.
         let repository = Arc::new(SnapshotRepository::new(
             Arc::new(NoSnapshotCatalog),
             Arc::new(import::OssSnapshotArtifactImporter::new(

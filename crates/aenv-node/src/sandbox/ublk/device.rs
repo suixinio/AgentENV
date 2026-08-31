@@ -737,12 +737,7 @@ fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSn
     }
 }
 
-/// Re-states a daemon "your request is wrong" refusal as the marker the API
-/// surface classifies on.
-///
-/// 🔴 A `context`, not a replacement: the daemon's own message and every frame
-/// under it stay in the chain, and only the *classification* is added. See
-/// [`InvalidSandboxRequest`].
+// Add classification context without replacing the daemon's error chain.
 fn mark_invalid_request(err: anyhow::Error) -> anyhow::Error {
     match err
         .chain()

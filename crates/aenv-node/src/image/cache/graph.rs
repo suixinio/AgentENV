@@ -201,9 +201,7 @@ impl ImageCacheMetadataStore {
         Ok(metadata)
     }
 
-    /// Boundedly stops background compaction/flush on this store, ahead of
-    /// process shutdown. See [`LocalKvStore::close`] for the mechanism and why
-    /// it needs to be explicit at all.
+    /// Boundedly stops background store work before process shutdown.
     pub async fn close(
         &self,
         timeout: std::time::Duration,

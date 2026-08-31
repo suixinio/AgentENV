@@ -1,11 +1,5 @@
-//! Probing a live build sandbox for the runtime versions a template snapshot
-//! records.
-//!
-//! 🔴 Split out of `crate::snapshot::types::version`, which owns the
-//! `SnapshotRuntimeVersions` value itself. That value is catalog data every
-//! role reads; probing it needs a running Firecracker VM, so it belongs to the
-//! side that has one. Keeping the two together was the heaviest single edge
-//! from `crate::snapshot` back into `crate::sandbox`.
+//! Probes a live build sandbox for recorded runtime versions.
+//! Catalog value types remain in `aenv-core`; node-only probing stays here.
 
 use std::path::PathBuf;
 use std::time::Duration;

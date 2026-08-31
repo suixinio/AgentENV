@@ -1,7 +1,4 @@
-//! Dense-exporting a sparse overlaybd layer onto local disk.
-//!
-//! 🔴 Split out of `common` when the byte half moved into its own crate: this
-//! is the one helper in that module that reads the overlaybd layer format.
+//! Dense-exporting sparse overlaybd layers to local disk.
 
 use std::path::Path;
 use std::sync::Arc;

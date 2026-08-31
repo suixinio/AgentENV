@@ -165,14 +165,7 @@ pub fn managed_snapshot_base() -> PathBuf {
 /// Implements [`SandboxBackend`] for use by the Orchestrator.
 pub struct FirecrackerSandbox {
     id: SandboxId,
-    /// This handle's incarnation, handed in by the orchestrator alongside `id`.
-    ///
-    /// 🔴 Kept here and never in `FirecrackerCommonConfig`: that config is
-    /// serialised into the paused state and into snapshots, so an incarnation
-    /// stored there would be read back at resume time and the sandbox would
-    /// come up claiming to be the run that produced the snapshot. There is no
-    /// setter, which is what makes "snapshot and the parent side of fork do not
-    /// change it" structural rather than a convention.
+    /// Immutable incarnation kept outside serialized snapshot configuration.
     execution_id: ExecutionId,
     launch: LaunchMode,
     work_dir: TempDir,

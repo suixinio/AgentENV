@@ -38,6 +38,7 @@ pub struct PostgresSnapshotCatalog {
 impl PostgresSnapshotCatalog {
     /// Wraps an already-connected and migrated pool.
     pub fn new(pool: PgPool, cluster_id: Uuid, node_id: String) -> Self {
+        metrics::describe_metrics();
         Self {
             pool,
             cluster_id,

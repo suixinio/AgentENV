@@ -20,13 +20,12 @@ use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{
     self, ForgetP2pArtifactRequest, ForgetP2pArtifactResponse, GetNodeRequest, GetNodeResponse,
     HeartbeatRequest, HeartbeatResponse, ListObservedNodesRequest, ListObservedNodesResponse,
-    ListP2pPeersRequest, ListP2pPeersResponse,
-    ListRegistrySandboxesRequest, ListRegistrySandboxesResponse, LookupNodeRequest,
-    LookupNodeResponse, LookupP2pArtifactRequest, LookupP2pArtifactResponse,
-    RecordAssignmentRequest, RecordAssignmentResponse, RecordP2pArtifactRequest,
-    RecordP2pArtifactResponse, ReportSandboxEventRequest, ReportSandboxEventResponse, SandboxEvent,
-    SandboxEventType, ScheduleRequest, ScheduleResponse, UnregisterNodeRequest,
-    UnregisterNodeResponse,
+    ListP2pPeersRequest, ListP2pPeersResponse, ListRegistrySandboxesRequest,
+    ListRegistrySandboxesResponse, LookupNodeRequest, LookupNodeResponse, LookupP2pArtifactRequest,
+    LookupP2pArtifactResponse, RecordAssignmentRequest, RecordAssignmentResponse,
+    RecordP2pArtifactRequest, RecordP2pArtifactResponse, ReportSandboxEventRequest,
+    ReportSandboxEventResponse, SandboxEvent, SandboxEventType, ScheduleRequest, ScheduleResponse,
+    UnregisterNodeRequest, UnregisterNodeResponse,
 };
 
 use super::placement::{ShadowPlacement, ShadowSource};

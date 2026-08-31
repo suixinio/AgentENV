@@ -19,6 +19,14 @@ pub const CATALOG_BUILD_REAPER_WARMUP_PASSES_TOTAL: &str =
 pub const CATALOG_BUILD_CLOCK_SKEW_TOTAL: &str =
     "agentenv_scheduler_catalog_build_clock_skew_total";
 
+/// Registers HELP text for [`CATALOG_RPC_TOTAL`]. Idempotent.
+pub fn describe_metrics() {
+    metrics::describe_counter!(
+        CATALOG_RPC_TOTAL,
+        "Snapshot catalog calls against PostgreSQL by operation (`rpc`) and outcome (`code`)."
+    );
+}
+
 pub fn record_catalog_rpc(op: &'static str, code: &str) {
     metrics::counter!(CATALOG_RPC_TOTAL, "rpc" => op, "code" => code.to_string()).increment(1);
 }

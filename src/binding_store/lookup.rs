@@ -346,6 +346,7 @@ pub async fn lookup_node(
 
     let entry = match deps.paused_registry {
         Some(registry) if registry.is_cluster_backed() => {
+            // A non-UUID sandbox id cannot have a registry row.
             match SandboxId::parse_str(sandbox_id) {
                 Ok(id) => match registry.get(&id).await {
                     Ok(entry) => entry,

@@ -587,7 +587,7 @@ impl FirecrackerSandbox {
     ///
     /// This only prepares the sandbox object and its per-instance workspace.
     /// Call [`FirecrackerSandbox::start`] or [`FirecrackerSandbox::start_nowait`] to boot it.
-    /// 🔴 This is a *create*, even though the backend below it boots through
+    /// This is a *create*, even though the backend below it boots through
     /// `LaunchMode::Resume`. The incarnation is handed in by the caller, who
     /// took the decision on the `LaunchPlan` variant; nothing here may infer it
     /// from the launch mode.

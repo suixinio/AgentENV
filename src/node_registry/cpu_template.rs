@@ -119,10 +119,10 @@ fn intersect_cpuid_modifiers(configs: &[CpuConfig]) -> Result<Vec<CpuidModifier>
             continue;
         }
         if leaf_count.get(&key).copied().unwrap_or(0) < n {
-            continue; // absent from at least one config
+            continue; // not present in every config
         }
         if is_kvm_read_only_leaf(key.0) {
-            continue; // KVM read-only leaf
+            continue; // KVM does not allow overriding this leaf
         }
 
         let mut reg_count: HashMap<String, usize> = HashMap::new();
@@ -142,7 +142,7 @@ fn intersect_cpuid_modifiers(configs: &[CpuConfig]) -> Result<Vec<CpuidModifier>
                 continue;
             }
             if reg_count.get(&register_mod.register).copied().unwrap_or(0) < n {
-                continue; // absent from at least one config
+                continue; // not present in every config
             }
             // Start AND reduction from its identity.
             let mut and_value: u32 = u32::MAX;

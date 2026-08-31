@@ -53,20 +53,6 @@ pub struct ImageCacheConfig {
     /// Budget for capacity-driven eviction of local commit bytes. Enforced only
     /// when `[image.cache.gc].enabled` is set: the GC evicts least-recently-used
     /// source configs once usage crosses the high watermark. Unset = no cap.
-    ///
-    /// 🔴 Settable from the environment because this is a *per-machine* number
-    /// and `config/default.toml` is a per-repository one. `deploy/k8s/run.sh`
-    /// copies that file over the cluster ConfigMap on every apply (run.sh:30),
-    /// and the ConfigMap is mounted by every node in the fleet — so the budget
-    /// a cluster picks has to be expressed somewhere the apply does not reach,
-    /// and it has to be able to differ from the value a checkout ships.
-    ///
-    /// The failure it removes is not loud. This budget plus
-    /// `remote_blocks.max_size_gb` plus `[backend.oss].cache_max_size_gb` is
-    /// what a node may put on its root disk; set them past what the disk holds
-    /// and the GC's high watermark — `capacity_gb` * `high_watermark_ratio` —
-    /// simply never trips, because the disk fills first. Nothing reports a
-    /// budget that cannot be reached; the machine just runs out of space.
     #[config(env = "AENV_IMAGE_CACHE_CAPACITY_GB")]
     pub capacity_gb: Option<u64>,
     #[config(nested)]

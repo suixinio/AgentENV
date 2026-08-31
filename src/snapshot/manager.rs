@@ -348,16 +348,8 @@ impl SnapshotManager {
     }
 
     /// Resolves a committed snapshot into node-local runnable artifact paths.
-    ///
-    /// 🔴 Refuses, rather than panicking, when this process was assembled
-    /// without a runtime resolver. That is not a defensive `unwrap` dressed up:
-    /// `aenv-api` is assembled that way on purpose (see
-    /// [`CentralCatalogUse`][crate::snapshot::repository::backends::CentralCatalogUse])
-    /// and every one of its callers already forks on
-    /// `ApiImpl::runs_sandbox_runtime` and ships the catalog row to a node
-    /// instead. A typed [`RepositoryError::Unsupported`] is what a future
-    /// caller that forgets the fork gets back — a 5xx with a legible reason,
-    /// on one request, rather than the whole api process aborting.
+    /// Returns [`RepositoryError::Unsupported`] when no runtime resolver is configured;
+    /// `aenv-api` is intentionally assembled without one.
     pub async fn resolve_runnable(
         &self,
         snapshot: SnapshotRecord,

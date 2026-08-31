@@ -185,7 +185,7 @@ fn server() -> Option<&'static PgTestServer> {
     SERVER
         .get_or_init(|| {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-            // 🔴 A thread that owns the child (and the data directory) and
+            // A thread that owns the child (and the data directory) and
             // never returns — see the Redis harness's identical note on why
             // this has to be a thread that outlives every test.
             let owner = std::thread::Builder::new()

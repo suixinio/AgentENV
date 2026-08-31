@@ -7,13 +7,6 @@ pub fn managed_layer_file_name(digest: &str) -> String {
 }
 
 /// Committed artifact layout for the POSIX-backed snapshot repository.
-///
-/// 🔴 Artifacts only. This carried the `catalog/records/` and
-/// `catalog/aliases/` paths too, plus their lock files and the per-snapshot
-/// `commit` marker, until the object-storage catalog was removed; the rows are
-/// PostgreSQL's now and this backend stores bytes alone. Existing repositories
-/// still have a `catalog/` directory on disk — frozen at the cutover, and read
-/// by nothing.
 pub struct PosixFsSnapshotArtifactLayout {
     root: PathBuf,
     snapshot_id: SnapshotId,

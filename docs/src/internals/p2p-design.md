@@ -82,14 +82,13 @@ At startup it:
 
 1. Creates the configured blob store directory.
 2. Opens an `iroh_blobs::store::fs::FsStore` with gated background GC.
-3. Opens a RocksDB-backed local catalog at `<p2p.store_dir>/iroh/catalog.db`.
-4. Binds an `iroh` endpoint, optionally using `[p2p].listen_addr`.
-5. Starts one router that serves both `iroh-blobs` data and AgentENV's catalog protocol.
-6. Publishes the local endpoint through `local_endpoint()` so observability heartbeat can advertise it.
+3. Binds an `iroh` endpoint, optionally using `[p2p].listen_addr`.
+4. Starts one router that serves both `iroh-blobs` data and AgentENV's catalog protocol.
+5. Publishes the local endpoint through `local_endpoint()` so observability heartbeat can advertise it.
 
 The backend uses one local catalog:
 
-- Published catalog: artifact key to the descriptor this node can serve. The in-memory map is loaded from RocksDB on startup; each RocksDB value is a compact JSON descriptor.
+- Published catalog: artifact key to the descriptor this node can serve. It lives in memory for the lifetime of the process and starts empty, so a restarted node serves peers nothing until publish or a remote fetch fills it again. Peers that hold a stale index entry get an empty answer and move to the next provider or to the origin.
 
 Lookup first checks the local published catalog, then asks scheduler for nodes indexed under the artifact key, and finally falls back to discovered peers over the AgentENV catalog ALPN in hint/discovery order. Scheduler-indexed and fallback candidates are still verified by querying each node's catalog; scheduler never stores locators or metadata. The descriptor carries the iroh blob hash in its backend locator, so `fetch` does not depend on prior in-process lookup state.
 
@@ -99,7 +98,7 @@ After a remote fetch downloads the blob into the local store, the iroh backend b
 
 Publish imports the local file into `FsStore`, applies a deterministic named tag derived from the artifact key (`agentenv:p2p:v1:{sha256(key)}`), builds a descriptor with this node as the only local catalog provider, local endpoint, iroh blob hash locator, and request metadata, upserts that descriptor into the local catalog, and best-effort records the key in scheduler.
 
-Unpublish removes the key from the local catalog, deletes the deterministic named tag, forgets the key in scheduler, persists the catalog, and returns whether a local publication was removed. Deleting the tag stops future catalog lookup immediately, but it does not synchronously delete the blob bytes. The iroh store reclaims untagged blobs through its GC.
+Unpublish removes the key from the local catalog, deletes the deterministic named tag, forgets the key in scheduler, and returns whether a local publication was removed. Deleting the tag stops future catalog lookup immediately, but it does not synchronously delete the blob bytes. The iroh store reclaims untagged blobs through its GC.
 
 GC is gated to avoid periodic full-store scans when there is no known deletion work:
 

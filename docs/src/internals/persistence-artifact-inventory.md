@@ -137,7 +137,6 @@ Owned by `src/p2p/*`.
 | Artifact | Location | Contents | Purpose | Lifecycle |
 | --- | --- | --- | --- | --- |
 | Iroh blob store | `<p2p.store_dir>/iroh` | `iroh-blobs` content-addressed data and internal metadata | Local store for published artifacts and cached fetches | Created on P2P transport init, grows on publish and successful remote fetch. These blobs are collected by GC after unpublish removes those tags. |
-| P2P catalog DB | `<p2p.store_dir>/iroh/catalog.db` | RocksDB keyed by artifact key; values are compact JSON artifact descriptors | Lets peers resolve stable keys into descriptors for this node | Loaded on startup. Individual entries are upserted on publish and after successful remote fetch, and deleted on unpublish. |
 
 Snapshot publication writes best-effort P2P catalog entries after repository commit:
 

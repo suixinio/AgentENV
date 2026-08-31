@@ -39,7 +39,6 @@ use crate::p2p::types::{
 };
 use crate::p2p::P2pByteStream;
 
-const CATALOG_DB_DIR: &str = "catalog.db";
 const ENDPOINT_ADDR_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_STORE_GC_INTERVAL: Duration = Duration::from_mins(5);
 const PUBLISH_TAG_PREFIX: &str = "agentenv:p2p:v1:";
@@ -129,9 +128,7 @@ impl IrohBlobsP2pTransport {
             .await
             .context("wait for P2P endpoint address")?;
         let local_endpoint = P2pEndpoint::from_iroh_addr(&local_addr)?;
-        let catalog_path = store_dir.join(CATALOG_DB_DIR);
-        let published_catalog =
-            PublishedArtifactCatalog::load(&catalog_path, &node_id, &local_endpoint).await?;
+        let published_catalog = PublishedArtifactCatalog::new(&node_id, &local_endpoint);
 
         // Serve both data and metadata from the same endpoint. The scheduler
         // only passes endpoint addresses around; it does not proxy catalog
@@ -366,7 +363,7 @@ impl IrohBlobsP2pTransport {
             backend_locator: Some(blob_hash.to_string()),
             metadata: metadata.clone(),
         };
-        self.published_catalog.upsert(local_descriptor).await?;
+        self.published_catalog.upsert(local_descriptor).await;
         Ok(())
     }
 
@@ -640,7 +637,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
 
     #[instrument(skip(self), fields(key = %key))]
     async fn unpublish(&self, key: &P2pArtifactKey) -> Result<bool> {
-        if self.published_catalog.remove(key).await?.is_none() {
+        if self.published_catalog.remove(key).await.is_none() {
             debug!("P2P unpublish skipped missing local artifact");
             return Ok(false);
         };
@@ -663,16 +660,10 @@ impl P2pTransport for IrohBlobsP2pTransport {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        let router_result = self
-            .router
+        self.router
             .shutdown()
             .await
-            .map_err(|err| Error::internal_message("shutdown embedded P2P endpoint", err));
-        // Close the local catalog even when router shutdown fails.
-        self.published_catalog
-            .close(crate::local_store::DEFAULT_CLOSE_TIMEOUT)
-            .await;
-        router_result
+            .map_err(|err| Error::internal_message("shutdown embedded P2P endpoint", err))
     }
 }
 
@@ -875,37 +866,6 @@ mod tests {
 
         drop(runtime);
         drop(transport);
-    }
-
-    #[test]
-    fn shutdown_still_closes_the_catalog_store() {
-        let source = include_str!("transport.rs");
-        let start = source
-            .find("async fn shutdown(&self) -> Result<()> {")
-            .expect("IrohBlobsP2pTransport::shutdown is no longer in this file");
-        let open = source[start..].find('{').expect("a body") + start;
-        let mut depth = 0usize;
-        let body = 'body: {
-            for (offset, byte) in source[open..].bytes().enumerate() {
-                match byte {
-                    b'{' => depth += 1,
-                    b'}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break 'body source[open..open + offset].to_string();
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            panic!("shutdown has no closing brace");
-        };
-
-        assert!(
-            body.contains("published_catalog") && body.contains(".close("),
-            "IrohBlobsP2pTransport::shutdown no longer closes the P2P artifact catalog's \
-             RocksDB store before process exit"
-        );
     }
 
     fn invalid_endpoint() -> P2pEndpoint {
@@ -1198,12 +1158,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn published_catalog_survives_transport_restart() -> Result<()> {
+    async fn a_restarted_transport_serves_nothing_until_it_republishes() -> Result<()> {
         let temp = tempfile::tempdir().context("create temp test dir")?;
         let store_dir = temp.path().join("provider-store");
         let config = p2p_config(store_dir);
-        let key = "test/p2p/iroh/persisted-catalog".to_string();
-        let bytes = b"artifact bytes retained across an iroh transport restart";
+        let key = "test/p2p/iroh/republished-catalog".to_string();
+        let bytes = b"artifact bytes a restarted transport must be told about again";
 
         let provider = test_transport(&config, "provider-node", Arc::new(NoopP2pPeerDiscovery))
             .await
@@ -1212,10 +1172,10 @@ mod tests {
             .publish(&P2pPublishRequest::bytes(key.clone(), bytes.as_slice()))
             .await
             .context("publish artifact")?;
-        let before_restart = provider.get_local(&key).await;
         assert_eq!(
-            before_restart
-                .as_ref()
+            provider
+                .get_local(&key)
+                .await
                 .context("descriptor before restart")?
                 .providers,
             vec![P2pArtifactProvider::Local]
@@ -1226,19 +1186,28 @@ mod tests {
         let restarted = test_transport(&config, "provider-node", Arc::new(NoopP2pPeerDiscovery))
             .await
             .context("restart provider P2P transport")?;
+        assert!(
+            restarted.get_local(&key).await.is_none(),
+            "a restarted transport must not claim to serve what it was never told about"
+        );
+
+        restarted
+            .publish(&P2pPublishRequest::bytes(key.clone(), bytes.as_slice()))
+            .await
+            .context("republish artifact")?;
         let descriptor = restarted
             .get_local(&key)
             .await
-            .context("list local catalog after restart")?;
+            .context("descriptor after republish")?;
         assert_eq!(descriptor.key, key);
         assert_eq!(descriptor.providers, vec![P2pArtifactProvider::Local]);
         assert!(blob_hash_from_descriptor(&descriptor).is_ok());
 
-        let destination = temp.path().join("downloaded-after-restart.bin");
+        let destination = temp.path().join("downloaded-after-republish.bin");
         let fetched_size = restarted
             .fetch(&descriptor, &destination)
             .await
-            .context("fetch persisted local artifact")?;
+            .context("fetch republished local artifact")?;
         assert_eq!(fetched_size, bytes.len() as u64);
         let downloaded = tokio::fs::read(&destination)
             .await
@@ -1252,11 +1221,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpublish_stops_remote_lookup_and_persists_across_restart() -> Result<()> {
+    async fn unpublish_stops_remote_lookup() -> Result<()> {
         let temp = tempfile::tempdir().context("create temp test dir")?;
         let store_dir = temp.path().join("provider-store");
         let config = p2p_config(store_dir.clone());
-        let key = "test/p2p/iroh/unpublish-persists".to_string();
+        let key = "test/p2p/iroh/unpublish-stops-lookup".to_string();
         let provider = test_transport(&config, "provider-node", Arc::new(NoopP2pPeerDiscovery))
             .await
             .context("start provider P2P transport")?;
@@ -1292,18 +1261,9 @@ mod tests {
             consumer.lookup(&key).await?.is_none(),
             "consumer should stop finding provider after unpublish"
         );
+        assert!(provider.get_local(&key).await.is_none());
         consumer.shutdown().await.context("shutdown consumer P2P")?;
         provider.shutdown().await.context("shutdown provider P2P")?;
-        drop(provider);
-
-        let restarted = test_transport(&config, "provider-node", Arc::new(NoopP2pPeerDiscovery))
-            .await
-            .context("restart provider P2P transport")?;
-        assert!(restarted.get_local(&key).await.is_none());
-        restarted
-            .shutdown()
-            .await
-            .context("shutdown restarted provider P2P")?;
         Ok(())
     }
 

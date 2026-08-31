@@ -47,7 +47,6 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-
 /// Opens a pre-byte row and binds its alias atomically.
 pub async fn begin_snapshot(
     pool: &PgPool,
@@ -182,7 +181,6 @@ async fn bind_alias(
         holder: holder.map(|id| id.to_string()).unwrap_or_default(),
     }))
 }
-
 
 // Arguments for atomically committing a ready snapshot.
 struct CommitArgs<'a> {
@@ -325,7 +323,6 @@ async fn observed_refusal(
     })
 }
 
-
 // Moves a snapshot and its optional active build to error atomically.
 async fn fail_snapshot(
     pool: &PgPool,
@@ -378,7 +375,6 @@ async fn fail_snapshot(
     Ok(CatalogWrite::Applied(()))
 }
 
-
 // Soft-deletes the row and alias idempotently.
 async fn delete_snapshot(
     pool: &PgPool,
@@ -423,7 +419,6 @@ async fn delete_snapshot(
         .map_err(backend_error("delete_snapshot"))?;
     Ok(true)
 }
-
 
 /// Admits a build atomically under the cluster ceiling and per-template exclusion.
 ///
@@ -556,7 +551,6 @@ async fn renew_build_lease(
     .map_err(backend_error("renew_build_lease"))?;
     Ok(updated.rows_affected() > 0)
 }
-
 
 pub async fn create(
     pool: &PgPool,

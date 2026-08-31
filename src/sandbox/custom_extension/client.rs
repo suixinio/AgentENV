@@ -43,7 +43,6 @@ use tracing::{debug, warn};
 use crate::cfg::ConfigManager;
 use crate::types::{CustomExtensionParams, ExecutionId, SandboxId};
 
-
 /// Process-wide custom extension client, or `None` when
 /// `[custom_extension].url` is unset.
 static GLOBAL_CLIENT: OnceLock<Option<Arc<CustomExtensionClient>>> = OnceLock::new();

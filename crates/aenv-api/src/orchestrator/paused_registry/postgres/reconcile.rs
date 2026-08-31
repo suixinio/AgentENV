@@ -180,7 +180,6 @@ const RECONCILE_DURATION_METRIC: &str = "agentenv_api_paused_registry_reconcile_
 const LAST_SUCCESS_METRIC: &str = "agentenv_api_paused_registry_last_success_timestamp_seconds";
 const READ_FAILURES_METRIC: &str = "agentenv_api_paused_registry_read_failures_total";
 
-
 // Bound leader-session statements server-side. Cancelling a client future on
 // the pinned advisory-lock connection can leave its protocol desynchronized.
 const TICK_BUDGET: Duration = Duration::from_secs(25);

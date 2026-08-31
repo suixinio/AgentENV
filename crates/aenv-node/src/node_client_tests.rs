@@ -37,7 +37,6 @@ use crate::node_client::placement::{
 };
 use crate::node_client::wire;
 
-
 struct RunningNode {
     endpoint: NodeEndpoint,
     _shutdown: oneshot::Sender<()>,
@@ -233,7 +232,6 @@ fn resolvable_snapshot_manager() -> SnapshotManager {
     )
 }
 
-
 #[derive(Default)]
 struct ScriptedNode {
     create: Mutex<Option<Result<pb::SandboxCreateResponse, Status>>>,
@@ -408,7 +406,6 @@ fn launch_config() -> SandboxLaunchConfig {
         ..Default::default()
     }
 }
-
 
 #[tokio::test]
 async fn a_sandbox_built_here_starts_on_the_node() {
@@ -785,7 +782,6 @@ async fn an_unreachable_node_does_not_mean_the_sandbox_stopped() {
         .await
         .expect("a node that says the sandbox is not there has answered");
 }
-
 
 struct ReplacementNodePlacement {
     node_id: String,
@@ -1729,7 +1725,6 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     );
 }
 
-
 #[tokio::test]
 async fn a_paused_sandbox_is_reopened_on_the_machine_that_holds_its_capture() {
     let node = real_node().await;
@@ -2132,7 +2127,6 @@ async fn a_paused_state_this_factory_did_not_produce_is_refused() {
         )
         .expect("a paused state from this factory");
 }
-
 
 async fn paused_stub(
     script: &Arc<ScriptedNode>,

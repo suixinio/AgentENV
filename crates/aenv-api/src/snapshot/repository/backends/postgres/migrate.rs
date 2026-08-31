@@ -413,7 +413,6 @@ mod pg {
             .expect("a ledger row this build does not recognize must not block a start");
     }
 
-
     async fn schema_facts(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
         sqlx::query_scalar(sql)
             .fetch_all(pool)

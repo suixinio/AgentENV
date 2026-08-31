@@ -111,7 +111,6 @@ mod pg {
         assert_eq!(outcome, MarkRunningOutcome::Adopted);
     }
 
-
     #[tokio::test]
     async fn begin_pause_then_complete_pause_lands_on_paused_with_a_snapshot() {
         let pool = isolated_schema_pool_or_skip!(
@@ -280,7 +279,6 @@ mod pg {
              this caller into a re-read-and-retry loop that walks straight around the fence"
         );
     }
-
 
     #[tokio::test]
     async fn claiming_an_untracked_sandbox_reports_not_found() {
@@ -461,7 +459,6 @@ mod pg {
         };
         assert_eq!(origin_node_id, "node-a");
     }
-
 
     #[tokio::test]
     async fn mark_running_adopts_a_freshly_claimed_sandbox() {
@@ -686,7 +683,6 @@ mod pg {
         assert_eq!(row.origin_node_id, "node-a");
     }
 
-
     #[tokio::test]
     async fn renew_sandbox_deadline_updates_only_the_deadline() {
         let pool =
@@ -765,7 +761,6 @@ mod pg {
             .unwrap();
         assert_eq!(outcome, DeadlineRenewalOutcome::NotTracked);
     }
-
 
     #[tokio::test]
     async fn renew_lease_only_renews_rows_the_caller_actually_holds() {
@@ -852,7 +847,6 @@ mod pg {
         );
     }
 
-
     #[tokio::test]
     async fn remove_deletes_a_matching_generation_and_reports_no_match_otherwise() {
         let pool = isolated_schema_pool_or_skip!(
@@ -879,7 +873,6 @@ mod pg {
         assert!(registry.remove(&sandbox_id, row.generation).await.unwrap());
         assert!(registry.get(&sandbox_id).await.unwrap().is_none());
     }
-
 
     #[tokio::test]
     async fn list_all_carries_lease_and_execution_columns_scoped_to_the_cluster() {
@@ -1001,7 +994,6 @@ mod pg {
         let row = registry.get(&sandbox_id).await.unwrap().unwrap();
         assert_eq!(row.state, PausedRegistryState::Paused);
     }
-
 
     #[tokio::test]
     async fn a_resuming_row_with_a_lapsed_lease_and_no_deadline_is_reclaimed() {
@@ -1247,7 +1239,6 @@ mod pg {
         );
     }
 
-
     #[tokio::test]
     async fn two_replicas_racing_claim_for_resume_on_the_same_row_produce_exactly_one_winner() {
         let pool = isolated_schema_pool_or_skip!(
@@ -1283,7 +1274,6 @@ mod pg {
             "exactly one of two concurrent claims on the same paused row must win: a={claim_a:?} b={claim_b:?}"
         );
     }
-
 
     struct SingleRosterRegistry(crate::node_registry::types::Roster);
 

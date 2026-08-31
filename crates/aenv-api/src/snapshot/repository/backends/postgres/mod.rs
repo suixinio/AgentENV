@@ -271,7 +271,6 @@ mod pg {
         }
     }
 
-
     #[tokio::test]
     async fn a_created_template_is_waiting_and_readable_only_at_any_status() {
         let catalog = catalog!("a_created_template_is_waiting_and_readable_only_at_any_status");
@@ -329,7 +328,6 @@ mod pg {
             other => panic!("expected AliasConflict, got {other:?}"),
         }
     }
-
 
     #[tokio::test]
     async fn publish_commit_opens_and_flips_a_row_in_one_call() {
@@ -503,7 +501,6 @@ mod pg {
             .expect("a real disk size at commit time must succeed");
     }
 
-
     #[tokio::test]
     async fn deleting_drops_the_row_and_its_alias() {
         let catalog = catalog!("deleting_drops_the_row_and_its_alias");
@@ -525,7 +522,6 @@ mod pg {
             .await
             .expect("deleting an already-deleted row should still succeed");
     }
-
 
     #[tokio::test]
     async fn listing_pages_newest_first_and_the_cursor_walks_every_row_once() {
@@ -630,7 +626,6 @@ mod pg {
             crate::snapshot::types::SnapshotSource::Template { .. }
         ));
     }
-
 
     #[tokio::test]
     async fn a_second_build_of_the_same_template_is_refused_while_one_is_active() {
@@ -846,7 +841,6 @@ mod pg {
             "the admitting node's own renewal must succeed"
         );
     }
-
 
     #[tokio::test]
     async fn committing_a_row_that_is_not_building_is_refused() {

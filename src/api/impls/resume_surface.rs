@@ -701,7 +701,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn only_a_pinned_location_pins_and_the_other_three_are_preferences() {
         let pinned = placement_from_lookup(response(
@@ -768,7 +767,6 @@ mod tests {
              It is a missing node that is not an answer"
         );
     }
-
 
     #[test]
     fn every_failed_precondition_stays_a_pin_refusal_and_the_two_known_ones_are_named() {
@@ -882,7 +880,6 @@ mod tests {
         assert_eq!(quoted_node_id("one \"unterminated"), None);
         assert_eq!(quoted_node_id("empty \"\" name"), None);
     }
-
 
     /// A `PausedSandboxRegistry` test double for stage 3 of `lookup_node`:
     /// `get`/`is_cluster_backed` answer from one fixed row, everything else
@@ -1325,7 +1322,6 @@ mod tests {
             "the three assertions above are only about wiring if this one holds: {wired:?}"
         );
     }
-
 
     #[test]
     fn only_an_unknown_authorization_still_needs_the_cluster_record() {

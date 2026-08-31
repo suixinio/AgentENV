@@ -20,7 +20,6 @@ use super::sql::EXTEND_LEASES_SQL;
 const WRITE_PHASE_METRIC: &str = "agentenv_api_paused_registry_write_phase";
 const GRACE_DOWNTIME_METRIC: &str = "agentenv_api_paused_registry_grace_downtime_seconds";
 
-
 /// Restart-grace measurements produced by [`enter`].
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]

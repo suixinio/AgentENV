@@ -1,6 +1,6 @@
 # 节点去嵌入式 DB：移除 RocksDB / LocalKvStore
 
-**日期**：2026-08-31（设计稿，未实施）
+**日期**：2026-08-31（已实施，本文按落地实现校准）
 **参照实现**：e2b-dev/infra `fdc33599b`（本地 `/home/debian/e2b-infra`，只读引用，未复制代码）
 **背景**：`docs/proposals/` 无前篇；起因是测试反复重编译 RocksDB 的构建成本分析。
 
@@ -58,11 +58,13 @@ JSON 文件，要么上推控制面；不为它配备嵌入式 DB。**
 
 - `load_all()` / `get(name)` / `put(name, value)` / `remove(name)`；无批写、无前缀
   （命名空间用子目录）。
-- `put` = 写 `.<name>.json.tmp` → 按 durability fsync → `rename` → 目录 fsync。
-  `LocalStoreDurability` 三档映射：`Full` = fsync 文件+目录；`Wal` = fsync 文件；
-  `Memory` = 不 fsync（测试）。
+- `put` = 写 `<name>.json.tmp` → 按 durability fsync → `rename` → 目录 fsync。
+  durability 由 `RecordDurability` 三档表达：`Full` = fsync 文件+目录；
+  `File` = fsync 文件；`Memory` = 不 fsync（测试）。
 - 启动扫描忽略并清理 `.tmp` 残留（崩溃窗口 = 半个临时文件，从不损坏已有记录）。
-- 文件名做保守编码（非 `[A-Za-z0-9._-]` 的 key 用 hash 命名、原 key 存 JSON 内）。
+- 文件名用可逆的 percent 转义（非 `[A-Za-z0-9._-]` 的字节写成 `%XX`，`%` 自身
+  也转义），因此 `load_all` 总能从目录列表还原 key，文件内容就是记录 JSON
+  本身、不套信封。
 
 RocksDB 的 `close(timeout)`/`LocalKvCloseOutcome`/后台线程取消、
 `close_shared_metadata_stores` 全部机制随之消失——文件没有后台工作。
@@ -87,28 +89,37 @@ P2P 默认 Disabled 且 origin 永远在。目录是派生态：
   也不在 tag 里；快照那一侧 `aenv-node` 持 `NoSnapshotCatalog`，枚举"本机写过
   字节的快照"要么新增节点本地持久化（正是本方案要删的东西），要么新增
   scheduler gRPC 面（阶段四裁决禁止）。空窗期 lookup miss 回落 origin。
-- `published_artifact_catalog_survives_transport_restart` 契约改为断言
+- `published_catalog_survives_transport_restart` 契约改为
+  `a_restarted_transport_serves_nothing_until_it_republishes`，断言
   "重启后不谎称可服务、重公告后可再服务"；
 - `unpublish` 语义验证结论：生产零调用方（仅 transport 自身测试调用），且其
   实现即删除保留 tag 并交给 GC 回收字节，因此不存在"撤销发布但字节保留"的
   刻意状态，重公告无复活风险。
 
-### 消费方三：镜像缓存图 → 派生内存图 + 侧车文件
+### 消费方三：镜像缓存图 → 纯派生内存图
 
-- **内存图**成为唯一运行时结构：启动时 `rebuild_from_configs`（已存在）建
-  ref 族；hold 族全内存——`runtime`/`operation` 本来启动即清，`paused` 在启动时
-  由暂停记录重导出（orchestrator 加载 `records/` 后对每条调用现有 `protect()`）。
-  首轮删除性 GC 以"paused hold 重导出完成"为类型化硬前置，而非调用顺序约定；
-  记录解码失败时该轮保持不删（沿用 `!reconciled` fail-closed）。
-- **hard-commit 元数据**：优先全派生——记录本就由 config seed
-  （`commit_store_hard_commits_from_config_paths`），digest 在文件名、size 用
-  stat，`trusted_descriptor` 导入是 `cfg(test)`-only。仅当实现中发现确有
-  config 拿不到的字段时才退回 `commits/<digest>.meta.json` 侧车。无记录的
-  commit 文件维持现有 fail-closed 行为。
+落地为完全派生：图只在内存里，磁盘上没有接替 `graph.db` 的任何文件——既无侧车
+也无版本文件。
+
+- **内存图**成为唯一运行时结构：每轮维护由 `rebuild_from_configs` 重建 ref 族；
+  hold 族全内存——`runtime`/`operation` 本来启动即清，`paused` 在启动时
+  由暂停记录重导出（`Orchestrator::new` 对每条恢复的暂停记录调用现有
+  `protect()`，再 `reconcile_paused`）。删除性 GC 以"paused hold 重导出完成"
+  为类型化硬前置：`run_maintenance` 需要一枚 `ReclaimAuthority`，而
+  `reconcile_namespace(Paused, ..)` 是它唯一的来源；未拿到即 `bail`，不删。
+  config 解析失败时整轮 rebuild 报错、该轮保持不删（fail-closed）。
+- **hard-commit 元数据**：全派生，未退回侧车。两个来源——已发布 config 的
+  `hard_refs`（digest/file/size 都在 config 里），以及 `indexes/` 里的转换索引
+  （`scan_indexed_hard_commits`），后者让"已落 commit 但尚未发布 config"的字节
+  也被记账。rebuild 对 hard-commit 事实只增不删，对 config ref 与 last-used
+  则整体替换，因此磁盘上消失的 config 会同时失去引用与配额。
+  `trusted_descriptor` 导入是 `cfg(test)`-only。无记录的 commit 文件维持现有
+  fail-closed 行为。
 - **last-used**：全内存（e2b 的 diff cache 用 ttlcache 内存态 + TTL/磁盘压力
   双驱逐，零持久化）。驱逐顺序允许近似：启动以 config 文件 mtime 作冷启动
   种子，运行中在内存更新，不 touch 文件、不写盘。
-- **schema/version** → 缓存根下 `layout-version` 文件。
+- **schema/version** 随之消失：磁盘上不再有需要版本化的图，旧 `metadata/`
+  目录按迁移表弃置删除。
 - `write_batch` 的跨 key 原子性需求随"派生索引进内存"而消解：磁盘上不再存在
   需要一起变更的多个文件。
 
@@ -116,8 +127,10 @@ P2P 默认 Disabled 且 origin 永远在。目录是派生态：
 
 - 删 `src/local_store.rs` 的 RocksDB 实现、根 `Cargo.toml:79` 的 `rocksdb`、
   `[profile.*.package.{rocksdb,librocksdb-sys}]` 四段。
-- `make check-crate-boundaries` 增加"全 workspace 无 rocksdb 依赖"守卫，
-  锚定 `Cargo.toml` 依赖行语法而非裸子串，落地前出变异证据（红→绿）。
+- `make check-crate-boundaries` 增加"全 workspace 无 rocksdb 依赖"守卫。落地实现
+  读的是 `cargo tree --workspace -e normal,build,dev` 解析出的依赖图而非
+  `Cargo.toml` 文本，因此比锚定依赖行更强：注释里写 `rocksdb` 不会误报，而任何
+  真实解析到 `rocksdb`/`librocksdb-sys` 的边都会红。变异证据（红→绿）见提交。
 - CLAUDE.md 的 "Local RocksDB helper" 段改为：节点本地元数据用派生重建或
   `JsonRecordDir` 原子 JSON，不引入嵌入式 DB。
 

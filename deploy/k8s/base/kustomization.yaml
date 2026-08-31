@@ -86,10 +86,10 @@ configMapGenerator:
       # plain generated gRPC client over `services/api/proto/scheduler.proto`,
       # the same schema `src/node_registry/grpc_service.rs`'s
       # `NodeRegistryGrpcService` implements, so pointing it at the api
-      # Deployment's own gRPC listener answers `ListNodes`/
-      # `ListObservedNodes`/`GetNode`/`Schedule`/`RecordAssignment`/
-      # `LookupNode`/`ListRegistrySandboxes` for real with no scheduler
-      # process running. `ListRegistrySandboxes`
+      # Deployment's own gRPC listener answers the RPCs the gateway actually
+      # sends — `LookupNode`/`RecordAssignment`/`ListObservedNodes`/`GetNode`/
+      # `ListRegistrySandboxes` — for real with no scheduler process running.
+      # `ListRegistrySandboxes`
       # (`services/gateway/internal/registry_list.go`) was the last gap --
       # `src/node_registry/grpc_service.rs`'s `list_registry_sandboxes` now
       # answers it against `PausedSandboxRegistry::list_all`, so every

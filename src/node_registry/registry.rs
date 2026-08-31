@@ -2291,7 +2291,7 @@ mod tests {
         );
         assert!(
             registry.snapshot(true).iter().any(|n| n.id == "node-a"),
-            "the full inventory view (ListNodes) should still show a pending node as known"
+            "the full inventory view (allow_lingering) should still show a pending node as known"
         );
     }
 

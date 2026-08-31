@@ -845,7 +845,6 @@ func TestFencingRefusalIsNeverFourOhFour(t *testing.T) {
 func TestSchedulerServiceNeverReturnsPermissionDenied(t *testing.T) {
 	frozen := map[string]struct{}{
 		"Schedule":           {},
-		"ListNodes":          {},
 		"LookupNode":         {},
 		"RecordAssignment":   {},
 		"Heartbeat":          {},

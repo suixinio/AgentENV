@@ -16,7 +16,6 @@ option go_package = "agentenv/services/api/proto;schedulerv1";
 // into a misdiagnosed server fault.
 service Scheduler {
   rpc Schedule(ScheduleRequest) returns (ScheduleResponse);
-  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   rpc LookupNode(LookupNodeRequest) returns (LookupNodeResponse);
   rpc RecordAssignment(RecordAssignmentRequest) returns (RecordAssignmentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
@@ -90,12 +89,6 @@ message ScheduleRequest {
 
 message ScheduleResponse {
   Node node = 1;
-}
-
-message ListNodesRequest {}
-
-message ListNodesResponse {
-  repeated Node nodes = 1;
 }
 
 message LookupNodeRequest {

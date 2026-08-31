@@ -19,8 +19,8 @@ use crate::orchestrator::{PausedRegistryListEntry, PausedRegistryState, PausedSa
 use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{
     self, ForgetP2pArtifactRequest, ForgetP2pArtifactResponse, GetNodeRequest, GetNodeResponse,
-    HeartbeatRequest, HeartbeatResponse, ListNodesRequest, ListNodesResponse,
-    ListObservedNodesRequest, ListObservedNodesResponse, ListP2pPeersRequest, ListP2pPeersResponse,
+    HeartbeatRequest, HeartbeatResponse, ListObservedNodesRequest, ListObservedNodesResponse,
+    ListP2pPeersRequest, ListP2pPeersResponse,
     ListRegistrySandboxesRequest, ListRegistrySandboxesResponse, LookupNodeRequest,
     LookupNodeResponse, LookupP2pArtifactRequest, LookupP2pArtifactResponse,
     RecordAssignmentRequest, RecordAssignmentResponse, RecordP2pArtifactRequest,
@@ -341,22 +341,6 @@ fn node_status_label(status: scheduler::NodeStatus) -> &'static str {
 
 #[tonic::async_trait]
 impl Scheduler for NodeRegistryGrpcService {
-    async fn list_nodes(
-        &self,
-        _request: Request<ListNodesRequest>,
-    ) -> Result<Response<ListNodesResponse>, Status> {
-        let nodes = self
-            .registry
-            .snapshot(/* allow_lingering */ true)
-            .into_iter()
-            .map(|node| scheduler::Node {
-                node_id: node.id,
-                endpoint: node.endpoint,
-            })
-            .collect();
-        Ok(Response::new(ListNodesResponse { nodes }))
-    }
-
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
@@ -1344,24 +1328,6 @@ mod tests {
             }),
             ..Default::default()
         }
-    }
-
-    #[tokio::test]
-    async fn list_nodes_reflects_discovery() {
-        let (_registry, mut client, _stop) = service_on_a_socket(vec![
-            node("node-a", "http://10.0.0.7:8000"),
-            node("node-b", "http://10.0.0.9:8000"),
-        ])
-        .await;
-
-        let response = client
-            .list_nodes(ListNodesRequest {})
-            .await
-            .expect("list_nodes answers")
-            .into_inner();
-        let mut ids: Vec<String> = response.nodes.iter().map(|n| n.node_id.clone()).collect();
-        ids.sort();
-        assert_eq!(ids, vec!["node-a".to_string(), "node-b".to_string()]);
     }
 
     #[tokio::test]

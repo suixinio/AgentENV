@@ -848,12 +848,6 @@ mod against_a_scheduler {
         ) -> Result<Response<scheduler::ScheduleResponse>, Status> {
             Err(Status::unimplemented("not used by this test"))
         }
-        async fn list_nodes(
-            &self,
-            _request: Request<scheduler::ListNodesRequest>,
-        ) -> Result<Response<scheduler::ListNodesResponse>, Status> {
-            Err(Status::unimplemented("not used by this test"))
-        }
         async fn report_sandbox_event(
             &self,
             _request: Request<scheduler::ReportSandboxEventRequest>,

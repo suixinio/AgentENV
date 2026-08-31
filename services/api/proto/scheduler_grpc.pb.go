@@ -20,7 +20,6 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	Scheduler_Schedule_FullMethodName              = "/scheduler.v1.Scheduler/Schedule"
-	Scheduler_ListNodes_FullMethodName             = "/scheduler.v1.Scheduler/ListNodes"
 	Scheduler_LookupNode_FullMethodName            = "/scheduler.v1.Scheduler/LookupNode"
 	Scheduler_RecordAssignment_FullMethodName      = "/scheduler.v1.Scheduler/RecordAssignment"
 	Scheduler_Heartbeat_FullMethodName             = "/scheduler.v1.Scheduler/Heartbeat"
@@ -51,7 +50,6 @@ const (
 // into a misdiagnosed server fault.
 type SchedulerClient interface {
 	Schedule(ctx context.Context, in *ScheduleRequest, opts ...grpc.CallOption) (*ScheduleResponse, error)
-	ListNodes(ctx context.Context, in *ListNodesRequest, opts ...grpc.CallOption) (*ListNodesResponse, error)
 	LookupNode(ctx context.Context, in *LookupNodeRequest, opts ...grpc.CallOption) (*LookupNodeResponse, error)
 	RecordAssignment(ctx context.Context, in *RecordAssignmentRequest, opts ...grpc.CallOption) (*RecordAssignmentResponse, error)
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
@@ -78,16 +76,6 @@ func (c *schedulerClient) Schedule(ctx context.Context, in *ScheduleRequest, opt
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ScheduleResponse)
 	err := c.cc.Invoke(ctx, Scheduler_Schedule_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *schedulerClient) ListNodes(ctx context.Context, in *ListNodesRequest, opts ...grpc.CallOption) (*ListNodesResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ListNodesResponse)
-	err := c.cc.Invoke(ctx, Scheduler_ListNodes_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +218,6 @@ func (c *schedulerClient) ListRegistrySandboxes(ctx context.Context, in *ListReg
 // into a misdiagnosed server fault.
 type SchedulerServer interface {
 	Schedule(context.Context, *ScheduleRequest) (*ScheduleResponse, error)
-	ListNodes(context.Context, *ListNodesRequest) (*ListNodesResponse, error)
 	LookupNode(context.Context, *LookupNodeRequest) (*LookupNodeResponse, error)
 	RecordAssignment(context.Context, *RecordAssignmentRequest) (*RecordAssignmentResponse, error)
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
@@ -255,9 +242,6 @@ type UnimplementedSchedulerServer struct{}
 
 func (UnimplementedSchedulerServer) Schedule(context.Context, *ScheduleRequest) (*ScheduleResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Schedule not implemented")
-}
-func (UnimplementedSchedulerServer) ListNodes(context.Context, *ListNodesRequest) (*ListNodesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ListNodes not implemented")
 }
 func (UnimplementedSchedulerServer) LookupNode(context.Context, *LookupNodeRequest) (*LookupNodeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LookupNode not implemented")
@@ -330,24 +314,6 @@ func _Scheduler_Schedule_Handler(srv interface{}, ctx context.Context, dec func(
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SchedulerServer).Schedule(ctx, req.(*ScheduleRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Scheduler_ListNodes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListNodesRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SchedulerServer).ListNodes(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Scheduler_ListNodes_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SchedulerServer).ListNodes(ctx, req.(*ListNodesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -578,10 +544,6 @@ var Scheduler_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Schedule",
 			Handler:    _Scheduler_Schedule_Handler,
-		},
-		{
-			MethodName: "ListNodes",
-			Handler:    _Scheduler_ListNodes_Handler,
 		},
 		{
 			MethodName: "LookupNode",

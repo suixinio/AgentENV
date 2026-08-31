@@ -74,7 +74,7 @@ Deployment model:
 
 Proto contract: `services/api/proto/scheduler.proto`
 
-RPCs: `Schedule`, `ListNodes`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ReportSandboxEvent`, `ListObservedNodes`, `ListP2pPeers`, `RecordP2pArtifact`, `ForgetP2pArtifact`, `LookupP2pArtifact`, `GetNode`, `UnregisterNode`, `ListRegistrySandboxes`
+RPCs: `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ReportSandboxEvent`, `ListObservedNodes`, `ListP2pPeers`, `RecordP2pArtifact`, `ForgetP2pArtifact`, `LookupP2pArtifact`, `GetNode`, `UnregisterNode`, `ListRegistrySandboxes`
 
 Runtime node heartbeats may include an opaque `P2pEndpoint` containing a backend name and backend-specific address. `aenv-api`'s native registry stores that endpoint with the observed-node record and returns ready peers through `ListP2pPeers(cluster_id, backend, exclude_node_id)`. It does not query artifact catalogs and never forwards artifact data.
 

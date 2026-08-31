@@ -26,7 +26,6 @@ import (
 
 type stubSchedulerClient struct {
 	scheduleFunc           func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error)
-	listNodesFunc          func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error)
 	lookupNodeFunc         func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error)
 	recordAssignmentFunc   func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error)
 	heartbeatFunc          func(context.Context, *schedulerv1.HeartbeatRequest, ...grpc.CallOption) (*schedulerv1.HeartbeatResponse, error)
@@ -65,13 +64,6 @@ func (s stubSchedulerClient) Schedule(ctx context.Context, req *schedulerv1.Sche
 		return nil, fmt.Errorf("unexpected Schedule call")
 	}
 	return s.scheduleFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) ListNodes(ctx context.Context, req *schedulerv1.ListNodesRequest, opts ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
-	if s.listNodesFunc == nil {
-		return nil, fmt.Errorf("unexpected ListNodes call")
-	}
-	return s.listNodesFunc(ctx, req, opts...)
 }
 
 func (s stubSchedulerClient) LookupNode(ctx context.Context, req *schedulerv1.LookupNodeRequest, opts ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {

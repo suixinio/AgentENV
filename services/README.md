@@ -330,7 +330,6 @@ is the only production implementation left.
 Methods:
 
 - Schedule
-- ListNodes
 - LookupNode
 - RecordAssignment
 - Heartbeat

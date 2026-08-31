@@ -673,12 +673,6 @@ impl ImageCacheService {
             .await
     }
 
-    /// Deleting GC is fail-closed: reconcile roots, collect live runtime refs,
-    /// then re-check each candidate under an operation hold before deleting.
-    /// Fail-closed deleting GC over the candidate hard commits, given the live
-    /// runtime refs the caller already computed. Optionally rebuilds the
-    /// config-derived metadata first (skip it when capacity eviction already
-    /// reconciled it this pass).
     #[cfg(test)]
     async fn test_reclaim_authority(&self) -> ReclaimAuthority {
         self.metadata_store()
@@ -688,6 +682,12 @@ impl ImageCacheService {
             .await
     }
 
+    /// Deleting GC is fail-closed: reconcile roots, collect live runtime refs,
+    /// then re-check each candidate under an operation hold before deleting.
+    /// Fail-closed deleting GC over the candidate hard commits, given the live
+    /// runtime refs the caller already computed. Optionally rebuilds the
+    /// config-derived metadata first (skip it when capacity eviction already
+    /// reconciled it this pass).
     async fn run_gc(
         self: &Arc<Self>,
         live_refs: ImageCacheLiveRuntimeRefs,

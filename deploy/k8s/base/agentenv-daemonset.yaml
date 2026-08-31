@@ -85,12 +85,12 @@ spec:
             # those names, so confique ignores them and no error is raised.
             # The manifest walk in
             # services/shared/config/snapshot_catalog_manifest_test.go is what
-            # keeps them out of this file. 阶段 2c / Stage B
-            # finished: PostgreSQL is the snapshot catalog, and the section that
-            # configures it belongs to the api half alone — this half links no
-            # PostgreSQL client at all and refuses to start if that section is
-            # configured for it (see TestDaemonSetNeverReadsPg, which is why
-            # this note may not spell the section's name).
+            # keeps them out of this file. PostgreSQL is the snapshot catalog,
+            # and the section that configures it belongs to the api half alone
+            # — this half links no PostgreSQL client at all and refuses to
+            # start if that section is configured for it (see
+            # TestDaemonSetNeverReadsPg, which is why this note may not spell
+            # the section's name).
             #
             # 🔴 So this node holds no catalog at all. Its repository carries
             # `NoSnapshotCatalog` (src/snapshot/repository/no_catalog.rs), which

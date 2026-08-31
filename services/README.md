@@ -202,7 +202,7 @@ make deploy-logs
 make deploy-down
 ```
 
-Container deployments use `deploy/docker/config/default.json`, where static node discovery and backend node endpoints are set for the Docker network.
+Container deployments use `deploy/docker/config/default.json` for log and gateway settings. Static node discovery lives in `deploy/docker/config/cluster-static-discovery-overlay.toml`, which `agentenv-api` picks up through `AENV_CONFIG_OVERLAY_PATH`.
 
 The compose stack also wires each runtime node for heartbeat reporting:
 
@@ -223,7 +223,7 @@ Plane" section for the current architecture.
 
 ### 🔴 Rolling the *node* half back is an image tag, not a flag
 
-This is a different rollback from the one above, and the mechanism changed.
+This is a different rollback, and the mechanism changed.
 Through 阶段三 the AgentENV server was one binary that could be `--role api`,
 `--role node` or `--role all`, and putting the DaemonSet back on `--role all`
 was how you got one process serving user-facing REST on every machine again.

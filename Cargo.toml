@@ -126,11 +126,10 @@ iroh-blobs = { version = "=0.101.0" }
 rand = "0.10"
 openssl-sys = { version = "0.9", optional = true }
 redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"] }
-# Stage A of the scheduler fold (docs/proposals/_sd-phase4-stageA-node-inventory.md):
-# `src/node_registry/kubernetes_discovery.rs` ports
-# `services/scheduler/internal/kubernetes_discovery.go`'s EndpointSlice/Pod
-# informers. `kube`'s default TLS backend is rustls; `openssl-tls` (backed by
-# `hyper-openssl`) is selected explicitly instead, for the same reason
+# `src/node_registry/kubernetes_discovery.rs` runs the EndpointSlice/Pod
+# informers that seed `aenv-api`'s node registry. `kube`'s default TLS backend
+# is rustls; `openssl-tls` (backed by `hyper-openssl`) is selected explicitly
+# instead, for the same reason
 # `crates/aenv-api`'s `sqlx` entry picks `tls-native-tls`: `reqwest` already
 # resolves to native-tls/openssl by default, and a second TLS stack in the same
 # binary is exactly what that comment argues against. `crates/aenv` is the

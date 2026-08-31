@@ -414,7 +414,7 @@ warmup timeout, Kubernetes discovery sub-table, and more).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `scheduler_endpoint` | string | unset | gRPC endpoint for the scheduler, for example `"http://127.0.0.1:9090"`. Used by scheduler heartbeat reporting and P2P peer discovery. |
+| `scheduler_endpoint` | string | unset | gRPC endpoint for the scheduler, for example `"http://agentenv-api:8002"`. Used by scheduler heartbeat reporting and P2P peer discovery. |
 | `node_discovery_mode` | string | `"kubernetes"` | Which discovery strategy seeds `aenv-api`'s own in-process node registry — built unconditionally: `"kubernetes"` or `"static"`. See `AENV_CLUSTER_NODE_DISCOVERY_MODE` in `env-vars.md`. |
 | `static_discovery_nodes` | array of `{id, endpoint}` | `[]` | Statically-configured node list, read only when `node_discovery_mode = "static"`. **TOML-file-only — no `env =` binding.** Set it in the file `AENV_CONFIG_PATH` names, or via an `AENV_CONFIG_OVERLAY_PATH` overlay (`deploy/docker/config/cluster-static-discovery-overlay.toml` is a tracked working example). |
 

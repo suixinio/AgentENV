@@ -376,8 +376,8 @@ configMapGenerator:
   # warning about a value it was always going to ignore.
   # 🔴 `snapshot-catalog-config` is GONE, and so are the two keys it carried.
   #
-  # 阶段 2c / Stage B moved the snapshot catalog out of object storage and into
-  # PostgreSQL in three steps, steered by AENV_SNAPSHOT_CATALOG_WRITE and
+  # The snapshot catalog moved out of object storage and into PostgreSQL in
+  # three steps, steered by AENV_SNAPSHOT_CATALOG_WRITE and
   # AENV_SNAPSHOT_CATALOG_READ:
   #
   #     object_store/object_store → both/object_store → both/postgres

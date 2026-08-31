@@ -53,18 +53,6 @@ x-postgres-credentials: &postgres-credentials
   POSTGRES_DB: agentenv
 
 services:
-  # 🔴 New in the crate split, and the stack does not serve the user-facing
-  # REST API without it. `agentenv-a`/`agentenv-b` used to run the pre-split
-  # single process and answer `/sandboxes`, `/snapshots` and `/templates`
-  # themselves; they are
-  # `aenv-node` now, which 404s all three. Everything a user calls goes to
-  # `agentenv-api`, which holds no `/dev/kvm` and boots nothing.
-  #
-  # 🔴 Two images, one tag. `agentenv-api:latest` and `agentenv-runtime:latest`
-  # must be built from the same commit — see
-  # `deploy/k8s/base/agentenv-api-deployment.yaml`'s note on
-  # `SerializedValue`'s single schema counter. `make deploy-up` builds both
-  # from this file, so a compose stack cannot skew on its own.
   redis:
     image: redis:7-alpine
     container_name: redis
@@ -96,6 +84,18 @@ services:
       retries: 10
     restart: unless-stopped
 
+  # 🔴 New in the crate split, and the stack does not serve the user-facing
+  # REST API without it. `agentenv-a`/`agentenv-b` used to run the pre-split
+  # single process and answer `/sandboxes`, `/snapshots` and `/templates`
+  # themselves; they are
+  # `aenv-node` now, which 404s all three. Everything a user calls goes to
+  # `agentenv-api`, which holds no `/dev/kvm` and boots nothing.
+  #
+  # 🔴 Two images, one tag. `agentenv-api:latest` and `agentenv-runtime:latest`
+  # must be built from the same commit — see
+  # `deploy/k8s/base/agentenv-api-deployment.yaml`'s note on
+  # `SerializedValue`'s single schema counter. `make deploy-up` builds both
+  # from this file, so a compose stack cannot skew on its own.
   agentenv-api:
     build:
       context: ..
@@ -148,7 +148,7 @@ services:
       # directly now. The node services above still set the key (they
       # heartbeat over it); nothing in this container reads it.
       # 🔴 Static discovery (ported from Go's own `scheduler.discovery.mode
-      # = "static"` branch, `services/scheduler/cmd/main.go`): there is no
+      # = "static"` branch): there is no
       # Kubernetes API in this compose stack, so `node_discovery_mode =
       # "kubernetes"` (the Rust-side default) would leave
       # `KubernetesDiscovery::connect` retrying forever against a client it

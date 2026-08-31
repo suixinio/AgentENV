@@ -1588,12 +1588,7 @@ where
         let outcome = self
             .shutdown_outcome
             .get_or_init(|| async move {
-                let result = this.run_shutdown_cleanup().await;
-                // Always close the persister inside the single-flight shutdown.
-                this.persister
-                    .close(crate::local_store::DEFAULT_CLOSE_TIMEOUT)
-                    .await;
-                ShutdownOutcome::from_result(result)
+                ShutdownOutcome::from_result(this.run_shutdown_cleanup().await)
             })
             .await;
 

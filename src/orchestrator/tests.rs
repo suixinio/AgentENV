@@ -4661,39 +4661,6 @@ async fn auto_evict_task_does_not_keep_orchestrator_alive() -> anyhow::Result<()
     Ok(())
 }
 
-#[test]
-fn shutdown_still_closes_the_persister_store() {
-    let source = include_str!("service.rs");
-    let body = |name: &str| {
-        let start = source
-            .find(name)
-            .unwrap_or_else(|| panic!("{name} is no longer in this file"));
-        let open = source[start..].find('{').expect("a body") + start;
-        let mut depth = 0usize;
-        for (offset, byte) in source[open..].bytes().enumerate() {
-            match byte {
-                b'{' => depth += 1,
-                b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return source[open..open + offset].to_string();
-                    }
-                }
-                _ => {}
-            }
-        }
-        panic!("{name} has no closing brace");
-    };
-
-    let shutdown = body("pub async fn shutdown(self: &Arc<Self>) -> Result<()>");
-    assert!(
-        shutdown.contains("persister") && shutdown.contains(".close("),
-        "Orchestrator::shutdown no longer closes the persister's RocksDB store before process \
-         exit — see local_store::LocalKvCloseOutcome::TimedOut's doc for why an un-bounded \
-         Drop of that store later is not caught by anything else"
-    );
-}
-
 #[tokio::test]
 async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations() -> Result<()> {
     setup();

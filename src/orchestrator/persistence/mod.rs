@@ -120,9 +120,6 @@ pub trait SandboxPersister: Send + Sync {
 
     /// Delete the persistence record and all associated artifacts.
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
-
-    /// Boundedly closes any durable local store owned by the persister.
-    async fn close(&self, _timeout: std::time::Duration) {}
 }
 
 #[derive(Default)]

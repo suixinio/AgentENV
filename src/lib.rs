@@ -14,6 +14,7 @@ pub mod orchestrator;
 pub mod p2p;
 pub mod privileges;
 pub mod proto;
+pub mod record_dir;
 #[cfg(test)]
 mod redis_test_server;
 pub mod runtime_snapshot;

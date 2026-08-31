@@ -10,14 +10,16 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{ClusterRegistration, PersistenceResult, SandboxPersistenceError, SandboxPersister};
-use crate::local_store::{LocalKvStore, LocalStoreDurability};
+use crate::local_store::LocalStoreDurability;
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
+use crate::record_dir::JsonRecordDir;
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
 const RECORD_VERSION: u32 = 1;
-const RECORD_DB_DIR: &str = "records.db";
+const RECORD_DIR: &str = "records";
+const LEGACY_RECORD_DB_DIR: &str = "records.db";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,7 +106,7 @@ pub struct FileBackedSandboxPersister {
     root: PathBuf,
     virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
-    db: OnceCell<LocalKvStore>,
+    records: OnceCell<JsonRecordDir>,
 }
 
 impl FileBackedSandboxPersister {
@@ -113,7 +115,7 @@ impl FileBackedSandboxPersister {
             root,
             virtualization_mode,
             durability: LocalStoreDurability::Sync,
-            db: OnceCell::new(),
+            records: OnceCell::new(),
         }
     }
 
@@ -127,8 +129,12 @@ impl FileBackedSandboxPersister {
         self
     }
 
-    fn records_db_path(&self) -> PathBuf {
-        self.root.join(RECORD_DB_DIR)
+    fn records_path(&self) -> PathBuf {
+        self.root.join(RECORD_DIR)
+    }
+
+    fn legacy_records_db_path(&self) -> PathBuf {
+        self.root.join(LEGACY_RECORD_DB_DIR)
     }
 
     fn artifacts_root(&self) -> PathBuf {
@@ -139,22 +145,57 @@ impl FileBackedSandboxPersister {
         self.artifacts_root().join(sandbox_id.to_string())
     }
 
-    async fn db(&self) -> PersistenceResult<LocalKvStore> {
-        self.db
+    async fn records(&self) -> PersistenceResult<JsonRecordDir> {
+        self.records
             .get_or_try_init(|| async {
-                LocalKvStore::open(self.records_db_path(), self.durability)
+                self.refuse_unmigrated_records().await?;
+                JsonRecordDir::open(self.records_path(), self.durability)
                     .await
-                    .map_err(|source| SandboxPersistenceError::store("open RocksDB", source))
+                    .map_err(|source| {
+                        SandboxPersistenceError::store("open paused sandbox records", source)
+                    })
             })
             .await
             .cloned()
     }
 
+    /// Refuses to serve records while an unconverted embedded-database
+    /// directory is still present, because its paused sandboxes are invisible
+    /// here and would be treated as orphans.
+    async fn refuse_unmigrated_records(&self) -> PersistenceResult<()> {
+        let legacy = self.legacy_records_db_path();
+        match fs::metadata(&legacy).await {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(SandboxPersistenceError::io(
+                    "inspect paused sandbox records",
+                    &legacy,
+                    source,
+                ))
+            }
+            Ok(metadata) if !metadata.is_dir() => return Ok(()),
+            Ok(_) => {}
+        }
+
+        Err(SandboxPersistenceError::store(
+            "open paused sandbox records",
+            anyhow::anyhow!(
+                "{legacy} holds paused sandbox records this build cannot read. Convert them with \
+                 `cargo run --manifest-path tools/rocksdb-migrate/Cargo.toml -- --store {root}`, \
+                 which writes {records} and leaves the old directory in place for you to remove. \
+                 If this node has no paused sandboxes to keep, `rm -rf {legacy}` instead.",
+                legacy = legacy.display(),
+                root = self.root.display(),
+                records = self.records_path().display(),
+            ),
+        ))
+    }
+
     async fn get_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<PersistedPausedRecord> {
         let bytes = self
-            .db()
+            .records()
             .await?
-            .get(sandbox_id.to_string())
+            .get(&sandbox_id.to_string())
             .await
             .map_err(|source| SandboxPersistenceError::store("read paused sandbox record", source))?
             .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
@@ -172,9 +213,9 @@ impl FileBackedSandboxPersister {
             }
         })?;
 
-        self.db()
+        self.records()
             .await?
-            .put(record.metadata.id.to_string(), bytes)
+            .put(&record.metadata.id.to_string(), bytes)
             .await
             .map_err(|source| {
                 SandboxPersistenceError::store("persist paused sandbox record", source)
@@ -182,9 +223,9 @@ impl FileBackedSandboxPersister {
     }
 
     async fn remove_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
-        self.db()
+        self.records()
             .await?
-            .delete(sandbox_id.to_string())
+            .remove(&sandbox_id.to_string())
             .await
             .map_err(|source| {
                 SandboxPersistenceError::store("remove paused sandbox record", source)
@@ -270,7 +311,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         F: SandboxBackendFactory,
     {
         info!(store = %self.root.display(), "loading paused sandbox records");
-        let records = self.db().await?.entries().await.map_err(|source| {
+        let records = self.records().await?.load_all().await.map_err(|source| {
             SandboxPersistenceError::store("scan paused sandbox records", source)
         })?;
         let mut sandboxes = Vec::new();
@@ -279,16 +320,14 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let mut rejected = 0_u64;
 
         for (key, bytes) in records {
-            let sandbox_id_from_key = std::str::from_utf8(&key)
-                .ok()
-                .and_then(|value| SandboxId::parse_str(value).ok());
+            let sandbox_id_from_key = SandboxId::parse_str(&key).ok();
             let record = match decode_record(&bytes) {
                 Ok(record) => record,
                 Err(_) if record_predates_executions(&bytes) => {
                     // Retain pre-incarnation records and report actionable recovery.
                     rejected += 1;
                     error!(
-                        record_key = %String::from_utf8_lossy(&key),
+                        record_key = %key,
                         store = %self.root.display(),
                         "paused sandbox record was written before sandboxes carried an execution \
                          id, so it cannot be loaded and is being kept rather than discarded. \
@@ -301,7 +340,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 }
                 Err(err) => {
                     rejected += 1;
-                    warn!(record_key = %String::from_utf8_lossy(&key), error = %err, "discarding invalid paused sandbox record");
+                    warn!(record_key = %key, error = %err, "discarding invalid paused sandbox record");
                     if let Some(sandbox_id) = sandbox_id_from_key {
                         let _ = self.remove_record(&sandbox_id).await;
                     }
@@ -422,9 +461,9 @@ impl SandboxPersister for FileBackedSandboxPersister {
         sandbox_id: &SandboxId,
     ) -> PersistenceResult<Option<PathBuf>> {
         let raw = self
-            .db()
+            .records()
             .await?
-            .get(sandbox_id.to_string())
+            .get(&sandbox_id.to_string())
             .await
             .map_err(|source| {
                 SandboxPersistenceError::store("read paused sandbox record", source)
@@ -483,29 +522,6 @@ impl SandboxPersister for FileBackedSandboxPersister {
         self.remove_record(sandbox_id).await?;
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
         Ok(())
-    }
-
-    /// Boundedly closes the paused-sandbox local store before shutdown.
-    async fn close(&self, timeout: std::time::Duration) {
-        let Some(db) = self.db.get() else {
-            return;
-        };
-        match db.close(timeout).await {
-            crate::local_store::LocalKvCloseOutcome::Closed => {
-                info!(
-                    store = %self.records_db_path().display(),
-                    "closed persisted-sandboxes store"
-                );
-            }
-            crate::local_store::LocalKvCloseOutcome::TimedOut => {
-                warn!(
-                    store = %self.records_db_path().display(),
-                    timeout_secs = timeout.as_secs(),
-                    "persisted-sandboxes store did not finish closing within timeout; \
-                     background RocksDB compaction/flush may still be running"
-                );
-            }
-        }
     }
 }
 
@@ -610,9 +626,9 @@ mod tests {
         sandbox_id: &SandboxId,
     ) -> anyhow::Result<bool> {
         Ok(persister
-            .db()
+            .records()
             .await?
-            .get(sandbox_id.to_string())
+            .get(&sandbox_id.to_string())
             .await?
             .is_some())
     }
@@ -990,9 +1006,9 @@ mod tests {
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
         persister
-            .db()
+            .records()
             .await?
-            .put(sandbox_id.to_string(), b"not-json")
+            .put(&sandbox_id.to_string(), b"not-json")
             .await?;
 
         persister.delete_record_and_artifacts(&sandbox_id).await?;
@@ -1007,9 +1023,9 @@ mod tests {
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
         persister
-            .db()
+            .records()
             .await?
-            .put(sandbox_id.to_string(), b"not-json")
+            .put(&sandbox_id.to_string(), b"not-json")
             .await?;
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
@@ -1043,9 +1059,9 @@ mod tests {
             .remove("execution_id")
             .expect("the field is there to remove");
         persister
-            .db()
+            .records()
             .await?
-            .put(sandbox_id.to_string(), serde_json::to_vec(&record)?)
+            .put(&sandbox_id.to_string(), serde_json::to_vec(&record)?)
             .await?;
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
@@ -1086,32 +1102,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_without_ever_opening_the_store_is_a_no_op() {
-        let temp = TempDir::new().expect("tempdir");
+    async fn each_record_is_one_json_file_named_for_its_sandbox() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
+        let snapshot_root = temp.path().join("artifacts");
+        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
 
-        persister.close(Duration::from_secs(1)).await;
+        let record_file = persister.records_path().join(format!("{sandbox_id}.json"));
+        let stored: PersistedPausedRecord =
+            serde_json::from_slice(&tokio::fs::read(&record_file).await?)?;
 
-        assert!(
-            persister.db.get().is_none(),
-            "close must not open the store on a persister that never used it"
-        );
+        assert_eq!(stored.version, RECORD_VERSION);
+        assert_eq!(stored.metadata.id, sandbox_id);
+
+        persister.delete_record(&sandbox_id).await?;
+        assert!(!record_file.exists());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn close_after_use_reports_closed() -> anyhow::Result<()> {
+    async fn an_unconverted_store_refuses_to_load_instead_of_reporting_no_records(
+    ) -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("snapshot");
-        persist_test_record(&persister, &snapshot_root).await?;
+        tokio::fs::create_dir_all(persister.legacy_records_db_path()).await?;
 
-        let db = persister.db().await?;
-        assert_eq!(
-            db.close(Duration::from_secs(5)).await,
-            crate::local_store::LocalKvCloseOutcome::Closed
+        let err = persister
+            .load_all(&MockBackendFactory::new())
+            .await
+            .expect_err("an unconverted store must not look empty");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("rocksdb-migrate"),
+            "the refusal must name the conversion tool: {message}"
         );
+        assert!(
+            message.contains(&persister.records_path().display().to_string()),
+            "the refusal must name where converted records go: {message}"
+        );
+        Ok(())
+    }
 
-        persister.close(Duration::from_secs(5)).await;
+    #[tokio::test]
+    async fn a_converted_store_loads_with_the_old_directory_still_present() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let snapshot_root = temp.path().join("artifacts");
+        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+        tokio::fs::create_dir_all(persister.legacy_records_db_path()).await?;
+
+        let unconverted = test_persister(temp.path());
+        assert!(unconverted
+            .load_all(&MockBackendFactory::new())
+            .await
+            .is_err());
+
+        tokio::fs::remove_dir_all(persister.legacy_records_db_path()).await?;
+        let converted = test_persister(temp.path());
+        let loaded = converted.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, sandbox_id);
         Ok(())
     }
 }

@@ -178,21 +178,14 @@ either comes back. What the switch was supposed to buy — a node serving the gR
 surface the API half drives it through — is simply what `aenv-node` does: it
 binds that listener unconditionally.
 
-🔴 **Rolling back is now an image tag, not a flag.** There was a `--role` flag
-(and an `AENV_ROLE` environment variable) while one binary could be any of three
-things, and `--role all` was the rollback target. Neither binary declares it any
-more — a manifest that still passes it is refused by argument parsing before the
-process starts, which is deliberate: an un-migrated manifest fails loudly instead
-of being ignored. Going back to a single process that serves REST on every node
-means deploying the pre-split image tag on the DaemonSet, a serial roll with a
-drain per machine; see `services/README.md`. Emptying the two gateway switches
-below alone does **not** do it any more, and — since this change — cannot even
-be attempted any more: `services/shared/config`'s `Config.Validate` refuses to
-load a gateway config with either one empty, so a current-generation gateway
-CrashLoopBackOffs rather than starting up with them cleared. Getting this
-rollback's gateway half working again means also pinning the **gateway's own
-image tag** back to a build from before that refusal existed, in the same
-apply — see `services/README.md`'s "Rolling the node half back" section.
+🔴 **Rolling back is an image tag, not a flag.** There is no `--role` flag and
+no `AENV_ROLE`; a manifest that still passes one is refused by argument parsing
+before the process starts, which is deliberate — an un-migrated manifest fails
+loudly instead of being ignored. Each half rolls back by deploying an earlier
+digest of its own image; see `services/README.md`. Going back to the pre-split
+single-process shape is not a supported rollback any more —
+`docs/proposals/2026-08-31-residue-decisions.md` §D3 records what it required
+and why it is retired.
 
 🔴 **Do not turn a gateway switch on by editing `config/gateway.json`.** An
 environment variable set to the empty string is ignored by the loader, so a

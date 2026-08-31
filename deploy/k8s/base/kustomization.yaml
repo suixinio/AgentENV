@@ -121,19 +121,10 @@ configMapGenerator:
   # (`agentenv-api-deployment.yaml`) always builds its own node registry,
   # with no switch left to gate it on.
   #
-  # 🔴 Rollback: `http://agentenv-scheduler:9090` no longer resolves to
-  # anything — the Go scheduler's Deployment/Service/PDB and the
-  # `services/scheduler` source itself were deleted outright (`e2734fd`),
-  # not merely commented out of `resources:`. Changing this key back to
-  # that address would only turn heartbeats (and, since P2P peer discovery
-  # shares this same `[cluster].scheduler_endpoint`,
-  # `src/p2p/mod.rs::peer_discovery_from_config` — P2P discovery too) into
-  # DNS failures. The only real rollback is checking out a commit from
-  # before `e2734fd` (or restoring the scheduler Deployment/Service/PDB
-  # manifests and a compatible scheduler image from git history) and
-  # rolling both this key and the api Deployment's
-  # `AENV_PAUSED_REGISTRY_BACKEND` back together — see that file's own
-  # comments.
+  # 🔴 `http://agentenv-scheduler:9090` no longer resolves to anything; do
+  # not point this key back at it. The rollback target is a prior image
+  # digest of the current architecture — see
+  # `docs/proposals/2026-08-31-residue-decisions.md` §D3.
   #
   # 🔴 It used to be a bare literal in that file, with not even the
   # indirection every other cluster-specific value here already gets — so

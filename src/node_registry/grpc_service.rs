@@ -1,104 +1,9 @@
-//! api's heartbeat-receiving plane (task's own "D5"), and the Rust home for
-//! the five RPC method bodies `services/scheduler/internal/service.go` hangs
-//! off `scheduler.Service` that belong to the node registry rather than to
-//! binding/routing state (task's own "D6"/"D3" — the ~130-line estimate in
-//! `docs/proposals/_sd-phase4-stageA-node-inventory.md` §1.2): `ListNodes`,
-//! `Heartbeat`, `ListObservedNodes`, `GetNode`, `UnregisterNode`.
+//! Implements the node-registry RPC subset of `scheduler.v1.Scheduler` for `aenv-api`.
 //!
-//! # Why this reuses `scheduler.v1.Scheduler` instead of a new proto
-//!
-//! `services/api/proto/scheduler.proto` is already the one schema both Go
-//! and Rust generate from (CLAUDE.md, `src/node_registry/mod.rs`'s sibling
-//! modules). Implementing the *same* generated
-//! [`crate::proto::scheduler::scheduler_server::Scheduler`] trait here,
-//! rather than inventing a parallel "node registry" service, means:
-//!
-//! - a node's dual heartbeat (`src/observability/reporter.rs`, task's own
-//!   "D5" sender side) dials this service with the exact same
-//!   `SchedulerClient` it already uses for the real scheduler — no second
-//!   generated client, no second wire format to keep in step;
-//! - the task's own equivalence-dump requirement
-//!   (`src/api/impls/admin.rs`'s node-registry dump) can call `list_nodes`/
-//!   `list_observed_nodes` here and compare the response types directly
-//!   against what a `grpcurl` against the real scheduler would print — same
-//!   message shapes, nothing to translate.
-//!
-//! # What is deliberately `unimplemented`
-//!
-//! `record_assignment`/`record_p2p_artifact`/`forget_p2p_artifact`/
-//! `lookup_p2p_artifact` **are** implemented (task's own "D3"/"D4" — see
-//! below), each gated the same way `report_sandbox_event` is.
-//! `list_p2p_peers` was deliberately left `unimplemented` by Stage A
-//! (`_sd-phase4-stageA-node-inventory.md` §7 risk 3 — explicitly not to be
-//! "helpfully" ported alongside the rest of Stage A) with a comment that
-//! called that "permanent." It was not: `AtomicNodeRegistry` already carries
-//! the method (`list_p2p_peers`, `src/node_registry/registry.rs`) with its
-//! own test coverage, and the only work Stage A skipped was wiring this one
-//! RPC body to it — now done, the same shape as `list_nodes` just above.
-//! `list_registry_sandboxes` was Stage C's own paused registry and stayed
-//! `unimplemented` here through Stage C for the identical reason
-//! `list_p2p_peers` did -- naming which Stage owns it rather than silently
-//! accepting and doing nothing, so a caller that dials the wrong half of
-//! this split by mistake gets an answer that says so. It now answers for
-//! real too, against [`PausedSandboxRegistry::list_all`]
-//! (`src/orchestrator/paused_registry/mod.rs`), the same shape
-//! `list_p2p_peers` follows: filtering/paging live in this file (mirroring
-//! Go's own `listRegistrySandboxes`, `service.go:849-943`), the actual read
-//! in the trait method's own backend.
-//!
-//! `schedule`/`lookup_node` (Stage D's remainder) **are** now implemented
-//! too, against [`crate::binding_store::lookup`]'s pure port of
-//! `lookup.go`/`service.go`'s `selectNode`. `schedule` needs nothing beyond
-//! what `new` already requires — Go's own `Schedule` never touches the
-//! binding store either, only `s.nodes`/`s.strategy` — so it is never
-//! gated behind a builder call the way the binding-store-backed RPCs are.
-//! `lookup_node` does need a binding store (its stage 1 is unconditional in
-//! Go too); with none wired it answers `Status::unimplemented`, the same
-//! shape `record_assignment` uses. Its stage 3 (the paused registry) is
-//! optional in a different way — see
-//! [`NodeRegistryGrpcService::with_paused_registry`] and
-//! `crate::binding_store::lookup`'s own module doc for why a missing or
-//! non-cluster-backed registry degrades gracefully rather than refusing.
-//!
-//! `report_sandbox_event` (task's own "D1") **is** implemented here now: it
-//! ports `applyProjectionDelete` (`service.go:602-643`) against
-//! [`crate::binding_store::BindingStore`], wired in via
-//! [`NodeRegistryGrpcService::with_binding_store`]. Every default path that
-//! does not call that builder method (every test that only calls `new`, and
-//! `src/bin/aenv-api.rs`'s real wiring until the config/assembly commit that
-//! follows this one) keeps answering `Unimplemented`, unchanged.
-//!
-//! # `Heartbeat`/`UnregisterNode`'s `ReconcileNode` half (task's own
-//! "D3"/"D6" — `_sd-phase4-stageA-node-inventory.md` §7 risk 1, §10)
-//!
-//! The real Go `Heartbeat` calls `s.store.ReconcileNode(node, roster, now)`
-//! right after `s.nodes.Heartbeat(...)` succeeds — ported here too now,
-//! gated the same way `report_sandbox_event` is (`None` binding store ->
-//! today's pre-D3 behavior unchanged: warm-up just means "the registry
-//! accepted a heartbeat"). Unlike `report_sandbox_event`, a `ReconcileNode`
-//! failure here **does** fail the RPC (`Unavailable`), matching Go exactly
-//! — a heartbeat whose roster never reached the binding store must not be
-//! silently treated as caught up.
-//!
-//! `UnregisterNode` also now calls `ReconcileNode` with an empty roster
-//! (deletes every binding the node owns), but treats its failure as
-//! best-effort rather than fatal: by the point it runs, the node's
-//! *identity* is already unregistered, and failing the whole call over a
-//! routes-cleanup hiccup would leave a caller unsure whether to retry an
-//! unregister that already took effect. `ArtifactStore::forget_node`
-//! (Go's `s.artifacts.ForgetNode(nodeID)`) is now also called there,
-//! wired in via `with_artifact_store` alongside `with_binding_store` —
-//! infallible (the in-memory index has no failure mode), so there is no
-//! best-effort/fatal distinction to make for it the way there is for the
-//! binding-store cleanup next to it.
-//!
-//! The heartbeat-admission race this paragraph used to describe (a node
-//! whose Pod is not yet `Serving` in discovery gets no binding refresh from
-//! its heartbeat, `errors.Is(err, ErrNodeNotInRegistry)`) has been fixed —
-//! see `AtomicNodeRegistry::admit_pending`'s own doc comment (task's own
-//! "D2"). This file already benefits from that fix without any change of
-//! its own: `self.registry.heartbeat(&req, now)` now succeeds for a pending
-//! node the same way it does for an active one.
+//! Heartbeats store the full roster in the node registry, including paused entries
+//! that renew paused-registry leases, but reconcile only routable entries into the
+//! binding store. Unregister removes identity first, so route cleanup is best-effort.
+//! Optional binding, artifact, and paused-registry dependencies gate their RPC groups.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -134,69 +39,22 @@ use super::warmup::WarmupGate;
 const NOT_STAGE_A: &str = "not served by api's Stage A node-registry service — see \
      src/node_registry/grpc_service.rs's module doc for which half owns this RPC";
 
-/// The `Scheduler` service `aenv-api` serves for the node-registry subset
-/// of its RPCs. See the module doc for the split.
+/// Serves the node-registry subset of `scheduler.v1.Scheduler`.
 ///
-/// `Clone` is cheap and intentional: both fields are `Arc`s, so a second
-/// handle (`src/bin/aenv-api.rs`'s observed-nodes metrics loop needs one
-/// alongside the copy `SchedulerServer::new` takes ownership of) is two
-/// atomic increments, not a second registry.
+/// Clones share registry, warm-up, placement, and metric state through `Arc`.
 #[derive(Clone)]
 pub struct NodeRegistryGrpcService {
     registry: Arc<AtomicNodeRegistry>,
     warmup: Arc<WarmupGate>,
-    /// Task's own "D1"/"D3": `None` until `with_binding_store` wires one in
-    /// -- every default path that does not call it (every pre-existing
-    /// test, and `src/bin/aenv-api.rs`'s real wiring until the config/
-    /// assembly commit that follows this one) keeps `report_sandbox_event`
-    /// answering `Unimplemented`, unchanged.
     binding_store: Option<Arc<dyn BindingStore>>,
-    /// Mirrors Go's `Service.projectionAuthoritative`
-    /// (`WithAuthoritativeProjection`). Must agree with whatever value the
-    /// binding store passed to `with_binding_store` was itself constructed
-    /// with -- the two are not the same runtime pointer, matching Go: it is
-    /// a construction-time value the process wiring passes to both, not
-    /// re-derived from one at call time.
+    /// Must match the binding store's construction-time authoritative setting.
     projection_authoritative: bool,
-    /// Mirrors Go's `Service.maxProjectionTTL`, consumed by
-    /// `resolve_projection_ttl` (`RecordAssignment`).
     max_projection_ttl: Duration,
-    /// Task's own "D4": `None` until `with_artifact_store` wires one in --
-    /// gates `record_p2p_artifact`/`forget_p2p_artifact`/
-    /// `lookup_p2p_artifact` the same way `binding_store` gates
-    /// `report_sandbox_event` et al.
     artifact_store: Option<Arc<dyn ArtifactStore>>,
-    /// `lookup_node`'s stage 3. `None` until `with_paused_registry` wires
-    /// one in -- see `crate::binding_store::lookup`'s module doc for why a
-    /// missing (or non-cluster-backed) registry degrades gracefully rather
-    /// than refusing the RPC the way a missing `binding_store` does.
     paused_registry: Option<Arc<dyn PausedSandboxRegistry>>,
-    /// `Schedule`'s placement strategy, and `lookup_node`'s `Paused`
-    /// branch's (`select_node`'s `hint = None` call). Round-robin, matching
-    /// Go's own `NewStrategy` fallback, and not wired to `AppConfig` -- it
-    /// is the only strategy this build has, so it is held concretely rather
-    /// than behind a one-implementation trait object.
-    ///
-    /// 🔴 One `Arc`, read by both call paths. The round-robin cursor lives
-    /// in this instance's atomic, so handing `schedule` and `lookup_node`
-    /// separate `RoundRobinStrategy` values would leave each rotating on
-    /// its own -- placement would stop alternating across the two paths
-    /// while every round-robin test kept passing. `Clone` on this service
-    /// clones the `Arc`, so a second handle shares the same cursor too.
+    /// Shared by `schedule` and paused lookup so both advance one round-robin cursor.
     strategy: Arc<RoundRobinStrategy>,
-    /// The placement *shadow* scorer — `crate::node_registry::placement`.
-    ///
-    /// 🔴 Built here, at construction, because that is where its 20 metric
-    /// handles are resolved. `metrics::counter!` is not a free macro: the
-    /// Prometheus recorder's `register_counter` goes through
-    /// `get_or_create_counter`, which takes an `RwLock`. Resolving handles
-    /// per call — worse, per candidate — would put an O(N) lock sequence on
-    /// every placement in exchange for an observation that is not allowed
-    /// to affect anything.
-    ///
-    /// 🔴 An `Arc`, like `strategy`, so `Clone`ing this service (the
-    /// observed-nodes metrics loop holds a second handle) shares one set of
-    /// handles rather than registering a second.
+    /// Resolves metric handles at construction, outside the placement hot path.
     shadow: Arc<ShadowPlacement>,
 }
 
@@ -215,20 +73,14 @@ impl NodeRegistryGrpcService {
         }
     }
 
-    /// Replaces the shadow scorer with one sampling `k` candidates —
-    /// `[cluster].placement_shadow_k`, which `AppConfig::validate` has
-    /// already refused if it is `0`.
-    ///
-    /// Still construction time: this rebuilds the handles rather than
-    /// mutating a live scorer, so the "resolve once, never on the hot path"
-    /// discipline holds however many builder methods a caller chains.
+    /// Replaces the shadow scorer with one sampling `k` candidates.
     #[must_use]
     pub fn with_placement_shadow_k(mut self, k: u32) -> Self {
         self.shadow = Arc::new(ShadowPlacement::new(k));
         self
     }
 
-    /// Swaps in a scorer a test has scripted the sample draws on.
+    /// Replaces the shadow scorer with a test-scripted scorer.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn with_placement_shadow(mut self, shadow: ShadowPlacement) -> Self {
@@ -236,31 +88,21 @@ impl NodeRegistryGrpcService {
         self
     }
 
-    /// `lookup_node`'s stage 3. Independent of `with_binding_store` -- a
-    /// deployment could in principle wire one without the other, though
-    /// `src/bin/aenv-api.rs` wires both (`build_paused_registry` always runs
-    /// once native mode is on, even when its backend is the node-local
-    /// `Local`/disabled one).
+    /// Wires the optional cluster-backed paused-sandbox registry.
     #[must_use]
     pub fn with_paused_registry(mut self, paused_registry: Arc<dyn PausedSandboxRegistry>) -> Self {
         self.paused_registry = Some(paused_registry);
         self
     }
 
-    /// Task's own "D4": wires the P2P artifact index. Independent of
-    /// `with_binding_store` -- a deployment could in principle wire one
-    /// without the other, though `src/bin/aenv-api.rs` wires both together.
+    /// Wires the optional P2P artifact index.
     #[must_use]
     pub fn with_artifact_store(mut self, artifact_store: Arc<dyn ArtifactStore>) -> Self {
         self.artifact_store = Some(artifact_store);
         self
     }
 
-    /// Task's own "D1"/"D3": wires the binding store this Stage builds.
-    /// Ports the construction-time half of Go's `WithAuthoritativeProjection`
-    /// `ServiceOption` (`service.go:166-173`) — see the struct field docs
-    /// above for why `projection_authoritative` is a separate argument
-    /// rather than read off the store.
+    /// Wires the binding store and its matching authoritative-projection setting.
     #[must_use]
     pub fn with_binding_store(
         mut self,
@@ -274,12 +116,7 @@ impl NodeRegistryGrpcService {
         self
     }
 
-    /// Ports `resolveProjectionTTL` (`service.go:656-673`): `<= 0` raw or
-    /// the switch off both mean "use the receiver's own `binding_ttl`"
-    /// (`Duration::ZERO`, the same sentinel `BindingStore::record`'s
-    /// `projection_ttl` already treats that way); a positive raw value is
-    /// clamped to `max_projection_ttl` when configured (`> Duration::ZERO`)
-    /// and exceeded, otherwise passed through unchanged.
+    /// Resolves the received projection TTL, applying the authoritative gate and cap.
     fn resolve_projection_ttl(&self, raw: Duration) -> (Duration, &'static str) {
         if !self.projection_authoritative || raw.is_zero() {
             return (Duration::ZERO, "default");
@@ -290,10 +127,7 @@ impl NodeRegistryGrpcService {
         (raw, "node")
     }
 
-    /// Shared validation for the three P2P artifact RPCs: `cluster_id`/
-    /// `backend`/`key` are always required; `node_id` is required and
-    /// resolved through discovery only when the caller passes `Some`
-    /// (`LookupP2pArtifact` has no node id of its own to resolve).
+    /// Validates required P2P artifact fields and resolves an optional node identity.
     fn validate_p2p_artifact_fields<'a>(
         &self,
         cluster_id: &'a str,
@@ -325,16 +159,7 @@ impl NodeRegistryGrpcService {
         Ok((cluster_id, backend, key, resolved_node_id))
     }
 
-    /// Ports `canonicalNodeID` (`reconcile.go:636-646`): resolves a node
-    /// identity the same way every other lookup in this service does, so a
-    /// row (or a caller's `node_id` filter) written under a node's previous
-    /// name is still attributed to that node. `""` in, `""` out -- an empty
-    /// filter/holder must never resolve to some node's real identity.
-    ///
-    /// Used by [`Self::list_registry_sandboxes`] to canonicalise both sides
-    /// of its `node_id` filter comparison before comparing them, exactly
-    /// like [`Self::validate_p2p_artifact_fields`]'s identical resolve does
-    /// for a single id above.
+    /// Resolves aliases while preserving the empty filter sentinel.
     fn canonical_node_id(&self, node_id: &str) -> String {
         let trimmed = node_id.trim();
         if trimmed.is_empty() {
@@ -351,8 +176,6 @@ impl NodeRegistryGrpcService {
             .increment(1);
     }
 
-    /// Ports `sandboxEventTypeLabel` (`metrics.go`, used from
-    /// `applyProjectionDelete`/`ReportSandboxEvent`).
     fn sandbox_event_type_label(event_type: SandboxEventType) -> &'static str {
         match event_type {
             SandboxEventType::Create => "create",
@@ -373,13 +196,7 @@ impl NodeRegistryGrpcService {
         .increment(1);
     }
 
-    /// Ports `applyProjectionDelete` (`service.go:602-643`) exactly,
-    /// including the metric outcome labels it emits at every early return.
-    /// Returns whether the delete actually removed something (`Deleted` or
-    /// `DeletedUnknownIncumbent`) — Go's own return value, currently unused
-    /// by its only caller (`ReportSandboxEvent` never inspects it either;
-    /// events are best-effort and the RPC never fails on their account) but
-    /// kept for parity and for tests to assert against directly.
+    /// Applies an incarnation-guarded projection delete and reports its outcome.
     async fn apply_projection_delete(
         &self,
         binding_store: &Arc<dyn BindingStore>,
@@ -396,10 +213,7 @@ impl NodeRegistryGrpcService {
             Self::record_sandbox_event(label, "ignored_no_sandbox");
             return false;
         }
-        // 🔴 `normalize_execution_id_reason`, not `normalize_execution_id`:
-        // this is the event path, not the roster path, and must not double
-        // count a dropped value into `node_registry_roster_entry_dropped_total`
-        // — see `binding_store::record`'s own doc comment on this function.
+        // This event path must not increment the roster-entry drop metric.
         let (execution, _reason) =
             crate::binding_store::record::normalize_execution_id_reason(&event.execution_id);
         if execution.is_empty() {
@@ -458,10 +272,6 @@ impl NodeRegistryGrpcService {
         metrics::counter!(LOOKUP_NODE_METRIC, "result" => label.as_str()).increment(1);
     }
 
-    /// Ports `executionAuthorityLabel` (`metrics.go`) and
-    /// `recordLookupExecutionAuthority`'s call site (`lookupDeps.answer`,
-    /// `lookup.go:403-427`) -- called once per successful `LookupNode`
-    /// answer, never on an error return.
     fn record_lookup_execution_authority(authority: scheduler::ExecutionAuthority) {
         let label = match authority {
             scheduler::ExecutionAuthority::Registry => "registry",
@@ -473,11 +283,6 @@ impl NodeRegistryGrpcService {
         metrics::counter!(LOOKUP_EXECUTION_AUTHORITY_METRIC, "authority" => label).increment(1);
     }
 
-    /// Ports `recordBindingArbitration` (`metrics.go:409-414`): a no-op for
-    /// `BindingDecision::NotArbitrated` (Go's `""`), which carries nothing
-    /// worth counting. Since the `[binding_store].arbitration` switch was
-    /// deleted, the one thing that still produces it is a write naming no
-    /// sandbox, dropped by both backends before any comparison happens.
     fn record_binding_execution(source: &'static str, decision: BindingDecision) {
         let label = decision.as_str();
         if label.is_empty() {
@@ -487,10 +292,7 @@ impl NodeRegistryGrpcService {
             .increment(1);
     }
 
-    /// Ports Go's `refreshObservedNodesMetrics`/`recordObservedNodes`
-    /// (`service.go:700-720`, `metrics.go`'s `schedulerObservedNodes`).
-    /// Called once at startup and then on the interval `RunObservedNodesMetrics`
-    /// wraps it in, by the caller in `src/bin/aenv-api.rs`.
+    /// Refreshes the observed-node gauge from the current registry snapshot.
     pub fn refresh_observed_nodes_metric(&self) {
         let mut counts: std::collections::HashMap<&'static str, u32> = [
             ("ready", 0),
@@ -518,32 +320,14 @@ impl NodeRegistryGrpcService {
 }
 
 const OBSERVED_NODES_METRIC: &str = "agentenv_api_node_registry_observed_nodes";
-/// Task's own "D1". Ports `agentenv_scheduler_sandbox_event_total`, renamed
-/// per this codebase's own convention for a ported scheduler metric (drop
-/// `scheduler`, use the Rust subsystem's own name — see
-/// `agentenv_scheduler_observed_nodes` -> `OBSERVED_NODES_METRIC` above for
-/// the precedent).
 const SANDBOX_EVENT_METRIC: &str = "agentenv_api_sandbox_event_total";
-/// Ports `agentenv_scheduler_projection_ttl_source_total`.
 const PROJECTION_TTL_SOURCE_METRIC: &str = "agentenv_api_projection_ttl_source_total";
-/// Ports `agentenv_scheduler_lookup_node_total`.
 const LOOKUP_NODE_METRIC: &str = "agentenv_api_lookup_node_total";
-/// Ports `agentenv_scheduler_lookup_execution_authority_total`.
 const LOOKUP_EXECUTION_AUTHORITY_METRIC: &str = "agentenv_api_lookup_execution_authority_total";
-/// Ports `agentenv_scheduler_binding_execution_total`. Named ahead of this
-/// port in `src/binding_store/arbitration.rs`'s own doc comment on
-/// `BindingDecision`.
 const BINDING_EXECUTION_METRIC: &str = "agentenv_api_binding_execution_total";
-/// Ports `agentenv_scheduler_schedule_duration_seconds`.
 const SCHEDULE_DURATION_METRIC: &str = "agentenv_api_schedule_duration_seconds";
-/// Ports `agentenv_scheduler_schedule_assignments_total`.
 const SCHEDULE_ASSIGNMENTS_METRIC: &str = "agentenv_api_schedule_assignments_total";
 
-/// The one conversion from the wire's whole seconds. A zero value becomes
-/// `Duration::ZERO`, which every reader of this treats as "no budget
-/// offered" and never as "no expiry" -- mirrors `registry.rs`'s own private
-/// copy of this same conversion (`projection_ttl_from_secs`), duplicated
-/// here rather than exposed across the module boundary for one call site.
 fn projection_ttl_from_secs(secs: u32) -> Duration {
     if secs == 0 {
         Duration::ZERO
@@ -565,8 +349,6 @@ fn node_status_label(status: scheduler::NodeStatus) -> &'static str {
 
 #[tonic::async_trait]
 impl Scheduler for NodeRegistryGrpcService {
-    /// Ports `service.go:440-450` — `s.nodes.Snapshot(true)`, direct proto
-    /// translation, no side effects.
     async fn list_nodes(
         &self,
         _request: Request<ListNodesRequest>,
@@ -583,8 +365,6 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(ListNodesResponse { nodes }))
     }
 
-    /// Ports `service.go:514-576` minus the `ReconcileNode`/warm-up-store
-    /// half — see the module doc's "🔴" section.
     async fn heartbeat(
         &self,
         request: Request<HeartbeatRequest>,
@@ -602,54 +382,18 @@ impl Scheduler for NodeRegistryGrpcService {
         let (node, cpu_config_json) = match self.registry.heartbeat(&req, now) {
             Ok(result) => result,
             Err(NodeNotInRegistry) => {
-                // 🔴 Matches the real scheduler's exact message
-                // (`node_registry.go`'s `ErrNodeNotInRegistry`,
-                // `service.go:531`) byte-for-byte — a node's dual heartbeat
-                // reporter (`src/observability/reporter.rs`) already matches
-                // on this string for the primary scheduler target, and it
-                // has to keep working the same way against this target.
+                // The dual-heartbeat reporter matches this scheduler error text exactly.
                 return Err(Status::invalid_argument(
                     "node is not in scheduler node list",
                 ));
             }
         };
 
-        // Task's own "D3": ports the `ReconcileNode` half of `Heartbeat`
-        // (`service.go:538-553`) that `grpc_service.rs`'s module doc used to
-        // list as still missing. `None` (no binding store wired yet, every
-        // default path today) falls back to the pre-D3 behavior: warm-up
-        // means "the registry accepted a heartbeat," nothing more.
+        // Warm-up means bindings were seeded when a binding store is configured.
         if let Some(binding_store) = &self.binding_store {
             let roster = super::registry::roster_from_heartbeat(&req);
-            // 🔴 The routing half of the roster, and only the routing half.
-            //
-            // The full roster already went into `self.registry.heartbeat`
-            // above, paused entries included, and it has to: that call is what
-            // feeds `rosters_in_cluster`, which is the *sole* renewal source
-            // for a paused sandbox's lease in the cluster registry
-            // (`paused_registry`'s `candidates_from_rosters`). A paused
-            // sandbox dropped from that path loses its lease, and a lapsed
-            // lease on a `publishing`/`local_only` row lets another node claim
-            // a snapshot that exists only on this node's disk.
-            //
-            // What a paused sandbox must not have is a *binding*. The gateway
-            // reads a projection hit as "there is a VM at the other end" and
-            // answers the data plane straight out of it; a hit on a parked
-            // sandbox is how a request that should have woken it gets a 410
-            // instead. Deleting the projection at pause time is not enough on
-            // its own either, because reconciliation reinstalls every entry it
-            // is given and the node keeps naming its paused sandboxes every
-            // five seconds — so the filter belongs here, on the way in, not on
-            // the delete.
-            //
-            // Withholding the entry is also what deletes an already-installed
-            // projection: `reconcile_node` removes the bindings this node owns
-            // that its roster no longer claims. That is the same branch that
-            // makes a resume race benign rather than dangerous — an in-flight
-            // heartbeat built while the sandbox was still `Paused` can delete
-            // a binding the resume has just written, which costs one
-            // projection miss and resolves as a wake that finds the sandbox
-            // already running.
+            // Paused entries must renew their registry leases but must not become routing
+            // projections. Reconciliation also removes projections for newly paused entries.
             let routable: Vec<_> = roster.iter().filter(|e| !e.paused).cloned().collect();
             let withheld = roster.len() - routable.len();
             if withheld > 0 {
@@ -674,10 +418,7 @@ impl Scheduler for NodeRegistryGrpcService {
                     }
                 }
             }
-            // Only now, with the roster actually applied to the store:
-            // warm-up is about the bindings being seeded, not about the
-            // node having said hello (matches Go's own comment on this
-            // exact ordering).
+            // Latch warm-up only after the roster reaches the binding store.
             self.warmup.reported_in(now);
         } else {
             self.warmup.reported_in(now);
@@ -686,7 +427,6 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(HeartbeatResponse { cpu_config_json }))
     }
 
-    /// Ports `service.go:722-727` — `s.nodes.ListObserved(cluster_id, now)`.
     async fn list_observed_nodes(
         &self,
         request: Request<ListObservedNodesRequest>,
@@ -698,8 +438,6 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(ListObservedNodesResponse { nodes }))
     }
 
-    /// Ports `service.go:800-812` — `s.nodes.GetObserved(...)`, `NotFound`
-    /// when absent.
     async fn get_node(
         &self,
         request: Request<GetNodeRequest>,
@@ -716,13 +454,7 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(GetNodeResponse { node: Some(node) }))
     }
 
-    /// Ports `service.go:814-847` minus the `ReconcileNode`/`ForgetNode`
-    /// half — see the module doc's "🔴" section. The alias resolution step
-    /// (`s.nodes.Resolve(nodeID)` before `UnregisterObserved`) is kept:
-    /// bindings/observations are held under a node's *current* identity, so
-    /// an unregister sent under a previous one (a pod name from before a
-    /// fleet upgrade renamed it) has to be resolved first or it clears
-    /// nothing — `node_registry.go`'s own comment on the same lines.
+    /// Resolves aliases before unregistering and cleaning up dependent indexes.
     async fn unregister_node(
         &self,
         request: Request<UnregisterNodeRequest>,
@@ -746,17 +478,7 @@ impl Scheduler for NodeRegistryGrpcService {
             .unregister_observed(&canonical_id, service_instance_id)
         {
             Ok(()) => {
-                // Task's own "D3": ports the `ReconcileNode` half of
-                // `UnregisterNode` (`service.go:814-847`) — an empty roster
-                // deletes every binding this node owns, the same as a
-                // heartbeat reporting nothing held. Best-effort, not fatal
-                // to the RPC: the node's identity is already unregistered
-                // by this point, and failing the whole call because
-                // cleanup of its *routes* hiccuped would leave a caller
-                // unsure whether to retry an unregister that already took
-                // effect. A stale binding this leaves behind still expires
-                // on its own TTL.
-                //
+                // Identity is already removed, so route cleanup is best-effort.
                 if let Some(binding_store) = &self.binding_store {
                     let node = crate::node_registry::types::Node {
                         id: canonical_id.clone(),
@@ -774,10 +496,7 @@ impl Scheduler for NodeRegistryGrpcService {
                         );
                     }
                 }
-                // Ports Go's `s.artifacts.ForgetNode(nodeID)` — drops every
-                // P2P artifact association this node held. Infallible (the
-                // in-memory index has no failure mode to report), so
-                // there is no best-effort/fatal distinction to make here.
+                // Artifact cleanup is infallible.
                 if let Some(artifact_store) = &self.artifact_store {
                     artifact_store.forget_node(&canonical_id);
                 }
@@ -789,12 +508,7 @@ impl Scheduler for NodeRegistryGrpcService {
         }
     }
 
-    /// Ports `Service.Schedule` (`service.go:326-343`): picks a node for a
-    /// sandbox that does not exist yet, so there is no node it would rather
-    /// be on (`prefer_node_id = ""`) -- see `crate::binding_store::lookup::select_node`
-    /// for the shared pipeline this and `lookup_node`'s `Paused` branch both
-    /// run. Needs nothing `new` does not already provide: no binding store,
-    /// no paused registry -- Go's own `Schedule` never touches either.
+    /// Places a new sandbox through the shared scheduling pipeline.
     async fn schedule(
         &self,
         request: Request<ScheduleRequest>,
@@ -836,10 +550,7 @@ impl Scheduler for NodeRegistryGrpcService {
         }
     }
 
-    /// Ports `lookupNode` (`lookup.go:134-373`) through
-    /// `crate::binding_store::lookup::lookup_node` -- this method is only
-    /// the parameter translation and the metric/status-code mapping, so
-    /// every branch's own reasoning lives in that module instead of here.
+    /// Resolves a sandbox location through the binding and paused registries.
     async fn lookup_node(
         &self,
         request: Request<LookupNodeRequest>,
@@ -891,16 +602,7 @@ impl Scheduler for NodeRegistryGrpcService {
         }
     }
 
-    /// Ports `RecordAssignment` (`service.go:463-512`, task's own "D3"):
-    /// validates the required fields, resolves the caller's node identity
-    /// through discovery (`AtomicNodeRegistry::resolve`, so an assignment
-    /// naming a pod's previous identity after a fleet-upgrade rename still
-    /// lands on the right binding), normalizes the execution id without the
-    /// roster-drop metric (same reasoning as `apply_projection_delete`:
-    /// this is not the roster path), resolves the projection TTL through
-    /// the same `projection_authoritative`/`max_projection_ttl` gate
-    /// `resolve_projection_ttl` implements, and records the binding through
-    /// the same arbitration a heartbeat's `ReconcileNode` uses.
+    /// Records an assignment after identity, execution-id, and projection-TTL normalization.
     async fn record_assignment(
         &self,
         request: Request<RecordAssignmentRequest>,
@@ -965,14 +667,7 @@ impl Scheduler for NodeRegistryGrpcService {
         }
     }
 
-    /// Ports `service.go:576-598` (`ReportSandboxEvent`): PAUSE/DELETE
-    /// events go through the guarded `apply_projection_delete`, every other
-    /// event type is only observed (a metric, not a state change). Never
-    /// fails on an individual event's account — events are best-effort
-    /// (`src/observability/reporter.rs`'s sender drops on failure without
-    /// retrying), so an unreachable binding store degrades this to "PAUSE/
-    /// DELETE stop refreshing bindings until the next heartbeat
-    /// reconciliation," not an RPC error.
+    /// Applies best-effort PAUSE/DELETE projection removal and observes other events.
     async fn report_sandbox_event(
         &self,
         request: Request<ReportSandboxEventRequest>,
@@ -1002,18 +697,7 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(ReportSandboxEventResponse {}))
     }
 
-    // ── `list_p2p_peers` right below and `list_registry_sandboxes` further
-    // down both now answer for real (see the module doc's correction
-    // above). Everything else from here on (the P2P artifact RPCs) is Stage
-    // D's own, gated behind whichever builder wires its dependency, the
-    // same as every RPC above this line.
-
-    /// Ports `service.go:728-734` — `s.nodes.ListP2pPeers(...)`, direct
-    /// proto translation, no side effects. See
-    /// [`NodeRegistry::list_p2p_peers`] for the filtering (ready peers,
-    /// matching backend, TTL-derived liveness) it delegates to; this method
-    /// exists only to unwrap the request and re-wrap the response, the same
-    /// shape as [`Self::list_nodes`] just above.
+    /// Lists live P2P peers matching the requested backend and exclusion.
     async fn list_p2p_peers(
         &self,
         request: Request<ListP2pPeersRequest>,
@@ -1028,13 +712,7 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(ListP2pPeersResponse { peers }))
     }
 
-    /// Ports `RecordP2pArtifact` (`service.go:739-760`, task's own "D4"):
-    /// validates the four required fields, resolves the caller's node
-    /// identity through discovery when possible (falling back to the
-    /// supplied id verbatim otherwise -- this index is a soft accelerator,
-    /// see `artifact_index`'s own module doc, and refusing a record over an
-    /// unresolvable identity would cost more hit rate than a
-    /// slightly-stale key ever would), and records the association.
+    /// Validates and records a P2P artifact association.
     async fn record_p2p_artifact(
         &self,
         request: Request<RecordP2pArtifactRequest>,
@@ -1055,7 +733,6 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(RecordP2pArtifactResponse {}))
     }
 
-    /// Ports `ForgetP2pArtifact` (`service.go:762-782`).
     async fn forget_p2p_artifact(
         &self,
         request: Request<ForgetP2pArtifactRequest>,
@@ -1076,11 +753,7 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(ForgetP2pArtifactResponse {}))
     }
 
-    /// Ports `LookupP2pArtifact` (`service.go:784-798`): the index lookup,
-    /// then `NodeRegistry::filter_p2p_peers` to turn raw node ids into live
-    /// peer descriptors -- `artifact_index::lookup_p2p_artifact_peers`
-    /// carries both halves so the same logic is reachable from a test
-    /// without a gRPC round trip.
+    /// Looks up an artifact and returns only currently live peer descriptors.
     async fn lookup_p2p_artifact(
         &self,
         request: Request<LookupP2pArtifactRequest>,
@@ -1106,29 +779,9 @@ impl Scheduler for NodeRegistryGrpcService {
         Ok(Response::new(LookupP2pArtifactResponse { peers }))
     }
 
-    /// Ports `listRegistrySandboxes` (`service.go:849-943`) against
-    /// [`PausedSandboxRegistry::list_all`]. Argument validation
-    /// (`page_size`, `state`) runs before the registry is even consulted,
-    /// matching Go: the answer to a bad request must not depend on whether
-    /// this deployment happens to run a registry at all.
+    /// Lists, filters, and keyset-pages cluster-backed paused-registry entries.
     ///
-    /// `self.paused_registry` being unwired and a wired registry whose
-    /// [`is_cluster_backed`](PausedSandboxRegistry::is_cluster_backed) is
-    /// `false` answer identically -- `FailedPrecondition` -- mirroring Go's
-    /// own default: `Service.registry` is never a literal nil pointer, it
-    /// defaults to `pausedregistry.Disabled()`, whose `List` answers
-    /// `ErrDisabled` the same way. See `crate::binding_store::lookup`'s
-    /// module doc for the identical reasoning `lookup_node`'s stage 3
-    /// already applies to this exact pair of cases.
-    ///
-    /// Filtering (`state` exact match, `node_id` matched against each row's
-    /// [`holder`](crate::orchestrator::PausedRegistryListEntry::holder),
-    /// both canonicalised through [`Self::canonical_node_id`] the same way
-    /// Go's `canonicalNodeID` is) and keyset paging (`page_token` a
-    /// strictly-greater sandbox id) happen here, over the unfiltered,
-    /// unpaginated listing [`PausedSandboxRegistry::list_all`] hands back --
-    /// that method carries no pagination of its own, matching Go's
-    /// `PostgresReader.List` having none either.
+    /// Argument validation precedes registry availability checks.
     async fn list_registry_sandboxes(
         &self,
         request: Request<ListRegistrySandboxesRequest>,
@@ -1168,9 +821,7 @@ impl Scheduler for NodeRegistryGrpcService {
             })
             .collect();
 
-        // The registry promises no ordering; paging over an unordered list
-        // would silently skip rows -- matches Go's own comment
-        // (`service.go:911-914`) verbatim.
+        // Sorting is required before keyset paging over the backend's unordered result.
         matched.sort_by_key(|entry| entry.sandbox_id);
 
         let mut next_page_token = String::new();
@@ -1194,13 +845,6 @@ impl Scheduler for NodeRegistryGrpcService {
     }
 }
 
-/// Ports `parseRegistryStateFilter` (`service.go:947-965`): an empty filter
-/// means every state; anything else is matched case-insensitively (Go's
-/// `ParseState` uses `strings.EqualFold`) against the five known values, and
-/// anything that matches none of them is refused by name rather than
-/// silently matching no row -- see [`PausedRegistryState::parse`]'s own doc
-/// (via `ParseState`'s identical Go-side comment) for why a state no row can
-/// hold must never be filtered on.
 fn parse_registry_state_filter(raw: &str) -> Result<Option<PausedRegistryState>, Status> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -1222,11 +866,6 @@ fn parse_registry_state_filter(raw: &str) -> Result<Option<PausedRegistryState>,
     )))
 }
 
-/// Ports `registrySandboxToProto` (`service.go:966-984`): direct field
-/// translation, `Option`s collapsing to the wire's own "empty/zero means
-/// absent" convention (matches every other proto conversion in this file --
-/// `claimed_by_node_id`/`snapshot_id`/`execution_id`, and the lease/deadline
-/// pair, all follow the same rule the response's own proto comments name).
 fn registry_sandbox_to_proto(entry: &PausedRegistryListEntry) -> scheduler::RegistrySandbox {
     scheduler::RegistrySandbox {
         sandbox_id: entry.sandbox_id.to_string(),
@@ -1328,13 +967,6 @@ mod tests {
             pod_name: String::new(),
         }
     }
-
-    // ---- report_sandbox_event: task's own "D1", parametrized over BOTH
-    //      binding store backends -- the exact RPC-layer gap the task
-    //      called out in Go's own test suite (every
-    //      `projection_service_test.go` `Service` used
-    //      `NewInMemoryBindingStore`; the Redis backend was only ever
-    //      exercised at the store layer). ----
 
     async fn service_with_binding_store(
         nodes: Vec<Node>,
@@ -1460,16 +1092,11 @@ mod tests {
             .expect("ReportSandboxEvent must never fail on an individual event's account");
     }
 
-    /// The full `applyProjectionDelete` behavior matrix, run once per
-    /// backend by the two `#[tokio::test]`s below. `binding_store` is
-    /// asserted against directly (not only through the RPC) so a failure
-    /// names exactly which guard broke.
     async fn assert_report_sandbox_event_behavior_matrix(binding_store: Arc<dyn BindingStore>) {
         use crate::proto::scheduler::SandboxEventType;
         const EXEC_1: &str = "00000000-0000-7000-8000-000000000001";
         const EXEC_2: &str = "00000000-0000-7000-8000-000000000002";
 
-        // 1. Switch off: even a matching PAUSE must not delete.
         {
             let (mut client, _stop) = service_with_binding_store(
                 vec![],
@@ -1500,7 +1127,6 @@ mod tests {
             );
         }
 
-        // 2. Switch on, matching incarnation, PAUSE: deletes.
         {
             let (mut client, _stop) =
                 service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
@@ -1531,8 +1157,6 @@ mod tests {
             );
         }
 
-        // 3. Switch on, matching incarnation, DELETE: also deletes (not
-        //    PAUSE-only).
         {
             let (mut client, _stop) =
                 service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
@@ -1564,8 +1188,6 @@ mod tests {
                 .is_none());
         }
 
-        // 4. Switch on, stale incarnation: the record survives -- "the
-        //    guard is the whole point," end to end through the actual RPC.
         {
             let (mut client, _stop) =
                 service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
@@ -1594,8 +1216,6 @@ mod tests {
             assert_eq!(binding.execution_id, EXEC_2);
         }
 
-        // 5. Switch on, empty execution id (an old reporter): ignored, not
-        //    an unguarded delete.
         {
             let (mut client, _stop) =
                 service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
@@ -1622,8 +1242,6 @@ mod tests {
             );
         }
 
-        // 6. Switch on, a non-PAUSE/DELETE type naming the same sandbox and
-        //    a matching execution id: observed only, never deletes.
         {
             let (mut client, _stop) =
                 service_with_binding_store(vec![], Arc::clone(&binding_store), true).await;
@@ -1683,10 +1301,6 @@ mod tests {
         assert_report_sandbox_event_behavior_matrix(store).await;
     }
 
-    /// Before `with_binding_store` is called (every default path today),
-    /// `ReportSandboxEvent` must answer `Unimplemented`, not silently
-    /// accept and do nothing -- same discipline as every other
-    /// not-yet-wired RPC in this file.
     #[tokio::test]
     async fn report_sandbox_event_without_a_binding_store_is_unimplemented() {
         let (_registry, mut client, _stop) = service_on_a_socket(vec![]).await;
@@ -1719,11 +1333,7 @@ mod tests {
         }
     }
 
-    /// A heartbeat that makes its node a live P2P peer:
-    /// `filter_p2p_peers_locked` requires `NodeStatus::Ready` *and* a
-    /// non-empty `P2pEndpoint`, neither of which `heartbeat_with_cpu_config`
-    /// sets (its snapshot is absent, which lands on `Connecting`, not
-    /// `Ready`).
+    /// Produces a ready P2P heartbeat; the generic helper produces `Connecting`.
     fn heartbeat_as_a_ready_p2p_peer(node_id: &str) -> HeartbeatRequest {
         HeartbeatRequest {
             node_id: node_id.to_string(),
@@ -1741,9 +1351,6 @@ mod tests {
         }
     }
 
-    /// `ListNodes` is a direct, side-effect-free translation of discovery
-    /// state — the control every other test in this file implicitly relies
-    /// on to prove discovery was seeded correctly.
     #[tokio::test]
     async fn list_nodes_reflects_discovery() {
         let (_registry, mut client, _stop) = service_on_a_socket(vec![
@@ -1762,10 +1369,6 @@ mod tests {
         assert_eq!(ids, vec!["node-a".to_string(), "node-b".to_string()]);
     }
 
-    /// The exact error message a node's dual heartbeat matches on
-    /// (`src/observability/reporter.rs`'s `HeartbeatNodeNotConfigured`
-    /// detection) has to come out of *this* service byte-for-byte, not just
-    /// "an InvalidArgument of some kind".
     #[tokio::test]
     async fn heartbeat_from_an_unknown_node_matches_the_real_schedulers_wording() {
         let (_registry, mut client, _stop) = service_on_a_socket(vec![]).await;
@@ -1778,16 +1381,6 @@ mod tests {
         assert_eq!(status.message(), "node is not in scheduler node list");
     }
 
-    /// 🔴 D6 (task's own label), end to end through the actual gRPC service
-    /// rather than through `AtomicNodeRegistry::heartbeat` directly (already
-    /// covered in `super::super::registry`'s own tests): three nodes
-    /// heartbeat their `cpu_config_json` over the wire, and the third node's
-    /// `HeartbeatResponse.cpu_config_json` carries the cluster's bitwise-AND
-    /// intersection — computed by `super::super::cpu_template`, whose own
-    /// tests separately prove byte-for-byte agreement with the real Go
-    /// `IntersectCpuConfigs`. Chained together, this is the proof that the
-    /// wire path this file adds does not lose or reorder anything between
-    /// "a node's heartbeat lands" and "the algorithm runs on it".
     #[tokio::test]
     async fn heartbeat_carries_the_cluster_cpu_intersection_back_once_everyone_has_reported() {
         let (_registry, mut client, _stop) = service_on_a_socket(vec![
@@ -1801,15 +1394,7 @@ mod tests {
         let cfg_b =
             r#"{"kvm_capabilities":["cap.a","cap.c"],"cpuid_modifiers":[],"msr_modifiers":[]}"#;
 
-        // 🔴 Seed both nodes with an empty-config heartbeat first, the same
-        // discipline `registry.rs`'s own intersection tests use and document
-        // why: "all configs ready" is gated on every node that has *ever
-        // heartbeated for this cluster* having a non-empty config, not on
-        // every node discovery knows about. Without this seeding step,
-        // node-a's very first heartbeat below would already look like "the
-        // whole (one-node) cluster has reported" and deliver an intersection
-        // of one config with itself — which is exactly the wrong thing this
-        // test needs to rule out.
+        // Seed both nodes so readiness requires both real CPU configurations.
         client
             .heartbeat(heartbeat_with_cpu_config("node-a", ""))
             .await
@@ -1819,9 +1404,6 @@ mod tests {
             .await
             .expect("node-b seed heartbeat");
 
-        // node-a reports its real config: the cluster is not "all configs
-        // ready" yet (node-b's seeded config is still empty), so no
-        // intersection comes back.
         let first = client
             .heartbeat(heartbeat_with_cpu_config("node-a", cfg_a))
             .await
@@ -1832,8 +1414,6 @@ mod tests {
             "intersection was computed before every node had reported"
         );
 
-        // node-b reports second: now every node has a config, and the
-        // reporting node (node-b) gets the intersection on its own response.
         let second = client
             .heartbeat(heartbeat_with_cpu_config("node-b", cfg_b))
             .await
@@ -1847,10 +1427,6 @@ mod tests {
         );
     }
 
-    /// `GetNode` is `NotFound` for a node that has never heartbeated, even
-    /// if discovery knows about it — the same semantics
-    /// `node_client::NativeNodePlacement`'s tests prove against the registry
-    /// directly, proven here against the actual RPC.
     #[tokio::test]
     async fn get_node_is_not_found_before_any_heartbeat() {
         let (_registry, mut client, _stop) =
@@ -1881,9 +1457,6 @@ mod tests {
         assert_eq!(response.node.expect("a node").node_id, "node-a");
     }
 
-    /// `UnregisterNode` refuses a service-instance mismatch (a stale
-    /// unregister racing a restart under the same node id) rather than
-    /// deleting a fresher record out from under it.
     #[tokio::test]
     async fn unregister_node_refuses_a_service_instance_mismatch() {
         let (registry, mut client, _stop) =
@@ -1924,18 +1497,6 @@ mod tests {
         );
     }
 
-    /// E2 (task's own label): `ListP2pPeers` now answers for real, end to
-    /// end through the actual gRPC service rather than through
-    /// `AtomicNodeRegistry::list_p2p_peers` directly (already covered in
-    /// `super::super::registry`'s own tests,
-    /// `list_p2p_peers_returns_only_ready_matching_peers` /
-    /// `list_p2p_peers_drops_expired_and_unregistered_nodes`). Three nodes
-    /// heartbeat as ready P2P peers, one under a different backend and one
-    /// excluded by id, and the response must reflect both filters — a
-    /// mutant that dropped either filter (e.g. ignored `backend` or
-    /// `exclude_node_id`, or returned every discovered node regardless of
-    /// whether it ever heartbeated) would still pass a test that only
-    /// checked "the RPC no longer errors."
     #[tokio::test]
     async fn list_p2p_peers_answers_from_the_registry() {
         let (_registry, mut client, _stop) = service_on_a_socket(vec![
@@ -1953,8 +1514,7 @@ mod tests {
             .heartbeat(heartbeat_as_a_ready_p2p_peer("node-b"))
             .await
             .expect("node-b heartbeats in");
-        // node-c heartbeats under a different P2P backend, and must not show
-        // up in an "iroh" lookup.
+        // A peer using another backend must be excluded.
         let mut other_backend = heartbeat_as_a_ready_p2p_peer("node-c");
         other_backend.p2p_endpoint = Some(crate::proto::scheduler::P2pEndpoint {
             backend: "smb".to_string(),
@@ -1989,12 +1549,7 @@ mod tests {
         );
     }
 
-    // ---- heartbeat/unregister_node's ReconcileNode wiring: task's own "D3" ----
-
-    /// A `BindingStore` double that always fails, for proving the two
-    /// different failure disciplines `heartbeat` and `unregister_node` use
-    /// (fatal vs. best-effort) without needing to actually take a real
-    /// Redis down mid-test.
+    /// Fails every binding-store operation to exercise RPC failure policy.
     struct FailingBindingStore;
 
     #[async_trait::async_trait]
@@ -2071,30 +1626,6 @@ mod tests {
         assert_eq!(binding.node.id, "node-a");
     }
 
-    // ---- paused sandboxes: registered, but never reconciled into a binding ----
-    //
-    // The two tests below are one guard split in half on purpose, because the
-    // two halves fail to two *different* mistakes and a single test would let
-    // either one hide behind the other:
-    //
-    //   * withhold too little -> a parked sandbox keeps a routing projection,
-    //     the gateway reads the hit as "there is a VM there", answers the data
-    //     plane from it and returns 410 instead of waking the sandbox.
-    //   * withhold too much  -> the entry never reaches the *registry*, whose
-    //     roster is the sole renewal source for that sandbox's lease in the
-    //     cluster paused registry. The lease lapses, another node claims a row
-    //     whose snapshot exists only on this node's disk, and the snapshot is
-    //     silently lost.
-    //
-    // The second is the worse failure and the easier one to introduce, since
-    // "filter the paused entries out of the heartbeat" reads like the obvious
-    // implementation right up until you notice which of the two independently
-    // derived rosters you filtered.
-
-    /// A `BindingStore` that records the roster `reconcile_node` was actually
-    /// handed. The filter is asserted on directly rather than inferred from a
-    /// downstream binding, so the test says which roster reached the store
-    /// even when the store would have made the same end state either way.
     #[derive(Default)]
     struct RecordingBindingStore {
         reconciled: std::sync::Mutex<Vec<Vec<crate::node_registry::types::RosterEntry>>>,
@@ -2148,8 +1679,6 @@ mod tests {
         }
     }
 
-    /// Builds the service in-process, handing back the registry so both sides
-    /// of the split can be observed from one heartbeat.
     fn service_with_registry(
         nodes: Vec<Node>,
         binding_store: Arc<dyn BindingStore>,
@@ -2165,7 +1694,6 @@ mod tests {
         (registry, service)
     }
 
-    /// One node reporting one running sandbox and one paused one.
     fn heartbeat_with_a_paused_sandbox() -> HeartbeatRequest {
         HeartbeatRequest {
             node_id: "node-a".to_string(),
@@ -2208,10 +1736,7 @@ mod tests {
             .map(|entry| entry.sandbox_id)
             .collect();
 
-        // 🔴 Asserted as an exact set, not with `contains`. A `!contains`
-        // assertion would also pass if the roster arrived empty, which is the
-        // over-withholding mistake the sibling test exists to catch -- and a
-        // guard that passes under the failure next door is not a guard.
+        // Exact equality also catches accidental removal of every roster entry.
         assert_eq!(
             reconciled,
             vec!["sbx-running".to_string()],
@@ -2272,13 +1797,6 @@ mod tests {
 
     #[tokio::test]
     async fn heartbeat_removes_the_projection_of_a_sandbox_that_has_since_paused() {
-        // The end-to-end shape of the cluster failure, against a real store:
-        // a sandbox that was running (and so had a projection) pauses, and the
-        // next heartbeat must take its projection away rather than reinstall
-        // it. Reinstalling is exactly what shipped -- the roster named the
-        // paused sandbox, reconciliation installs every entry it is given, and
-        // the five-second heartbeat meant the record never got the chance to
-        // expire.
         let store: Arc<dyn BindingStore> =
             Arc::new(crate::binding_store::InMemoryBindingStore::new(
                 crate::binding_store::BindingStoreSettings::default(),
@@ -2395,11 +1913,6 @@ mod tests {
             .await
             .expect_err("FailingBindingStore also fails the heartbeat reconcile in this setup");
 
-        // The node is still discoverable even though the heartbeat above
-        // never got recorded as observed (ReconcileNode failed before
-        // warmup/observed state would matter here) -- unregister_node only
-        // needs `resolve`, which comes from discovery, not from a
-        // successful heartbeat.
         client
             .unregister_node(UnregisterNodeRequest {
                 node_id: "node-a".to_string(),
@@ -2408,8 +1921,6 @@ mod tests {
             .await
             .expect("a binding-cleanup failure must not fail unregister_node itself");
     }
-
-    // ---- record_assignment: task's own "D3" ----
 
     #[tokio::test]
     async fn record_assignment_writes_a_binding_resolved_through_discovery() {
@@ -2429,9 +1940,7 @@ mod tests {
                 sandbox_id: "sbx-1".to_string(),
                 node: Some(crate::proto::scheduler::Node {
                     node_id: "node-a".to_string(),
-                    // Deliberately a stale endpoint the caller might have
-                    // cached -- resolving through discovery must use the
-                    // registry's own current endpoint, not this one.
+                    // Discovery, not this stale caller value, supplies the endpoint.
                     endpoint: "http://stale:9999".to_string(),
                 }),
                 execution_id: "00000000-0000-7000-8000-000000000001".to_string(),
@@ -2548,17 +2057,12 @@ mod tests {
         );
     }
 
-    // ---- P2P artifact index RPCs: task's own "D4" ----
-
     #[tokio::test]
     async fn record_then_lookup_p2p_artifact_round_trips_through_the_rpc() {
         let store: Arc<dyn crate::binding_store::artifact_index::ArtifactStore> =
             Arc::new(crate::binding_store::artifact_index::InMemoryArtifactStore::new(10));
         let (_registry, mut client, _stop) =
             service_with_artifact_store(vec![node("node-a", "http://10.0.0.7:8000")], store).await;
-        // filter_p2p_peers (LookupP2pArtifact's second half) requires the
-        // node to be a live, Ready P2P peer -- see
-        // heartbeat_as_a_ready_p2p_peer's own doc comment.
         client
             .heartbeat(heartbeat_as_a_ready_p2p_peer("node-a"))
             .await
@@ -2604,9 +2108,7 @@ mod tests {
             store,
         )
         .await;
-        // node-a is also a live P2P peer -- proves the exclusion filters
-        // it out specifically, rather than the index simply having nothing
-        // for it.
+        // Keep node-a live so exclusion, rather than liveness, removes it.
         client
             .heartbeat(heartbeat_as_a_ready_p2p_peer("node-a"))
             .await
@@ -2757,18 +2259,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
-    // ---- Schedule / LookupNode: Stage D's remainder ----
-    //
-    // Every test below calls the service directly (`service.schedule(...)`/
-    // `service.lookup_node(...)`) rather than over a socket -- there is
-    // nothing gRPC-transport-specific left to exercise once
-    // `record_assignment`/`heartbeat`'s own socket-based tests above prove
-    // the server wiring works, and a direct call is what lets
-    // `record_assignment_and_heartbeat_reconcile_report_binding_execution_decisions`
-    // hold a thread-local metrics recorder across the `.await` -- see that
-    // test's own comment, copied from `src/api/grpc/tests.rs`'s established
-    // pattern.
-
     use std::collections::HashMap as StdHashMap;
 
     use crate::binding_store::{BindingStoreSettings, InMemoryBindingStore};
@@ -2779,11 +2269,6 @@ mod tests {
     };
     use crate::types::{ExecutionId, SandboxId};
 
-    /// A minimal `PausedSandboxRegistry` test double: `get`/
-    /// `is_cluster_backed` answer from a fixed table, everything else
-    /// panics. `lookup_node`'s pure logic never calls the other eleven
-    /// methods -- a test that (incorrectly) drove this deep enough to need
-    /// one fails loudly instead of silently getting a made-up default.
     struct FakePausedRegistry {
         entries: StdHashMap<SandboxId, PausedSandboxEntry>,
         cluster_backed: bool,
@@ -2919,19 +2404,7 @@ mod tests {
         }
     }
 
-    /// A gate that is already warm regardless of when `warmed_up` is
-    /// called: its deadline is anchored at the Unix epoch, which every
-    /// `SystemTime::now()` a test observes is already past -- mirrors
-    /// `src/node_client/native_placement.rs`'s own `warm_gate` helper.
-    ///
-    /// 🔴 P1: `reported_in` is called explicitly, once, right here. Since
-    /// `WarmupGate::warmed_up`'s fix (a wall-clock deadline alone can no
-    /// longer latch `warm` on a registry that has received zero
-    /// heartbeats — see that method's own doc), a gate this helper hands
-    /// out has to actually report in at least once to go warm at all; the
-    /// already-past deadline above is what makes that one report latch
-    /// `warm` for good immediately, rather than requiring every node
-    /// discovery knows about to also be observed.
+    /// Returns a gate made warm by one report against an elapsed deadline.
     fn warm_gate(registry: &Arc<AtomicNodeRegistry>) -> Arc<WarmupGate> {
         let gate = Arc::new(WarmupGate::new(
             Arc::clone(registry) as Arc<dyn NodeRegistry>,
@@ -2942,8 +2415,7 @@ mod tests {
         gate
     }
 
-    /// A gate that stays cold for the lifetime of a test: an hour-long
-    /// timeout anchored at "now," with no heartbeat ever fed to it.
+    /// Returns a gate that stays cold for the test lifetime.
     fn cold_gate(registry: &Arc<AtomicNodeRegistry>) -> Arc<WarmupGate> {
         Arc::new(WarmupGate::new(
             Arc::clone(registry) as Arc<dyn NodeRegistry>,
@@ -2956,12 +2428,7 @@ mod tests {
         Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default()))
     }
 
-    /// A minimal `PausedSandboxRegistry` test double for
-    /// `list_registry_sandboxes`: `list_all`/`is_cluster_backed` answer from
-    /// a fixed listing, everything else panics -- mirrors `FakePausedRegistry`'s
-    /// own shape/doc for `lookup_node` above: one RPC group per fake, so a
-    /// test that (incorrectly) drives this one into a write path fails
-    /// loudly instead of silently getting a made-up default.
+    /// Lists fixed paused-registry entries and panics on unrelated operations.
     struct FakeListingRegistry {
         listing: PausedRegistryListing,
         cluster_backed: bool,
@@ -3006,14 +2473,7 @@ mod tests {
     #[tonic::async_trait]
     impl PausedSandboxRegistry for FakeListingRegistry {
         async fn list_all(&self) -> RegistryResult<PausedRegistryListing> {
-            // 🔴 The RPC must never reach here while `cluster_backed` is
-            // `false` -- it has to answer `FailedPrecondition` straight off
-            // the `is_cluster_backed` gate instead. A mutant that dropped or
-            // inverted that guard would sail past every assertion in
-            // `list_registry_sandboxes_...not_cluster_backed...` if this
-            // just quietly answered too; panicking here turns "the guard
-            // was skipped" into a hard test failure instead of a passing
-            // test with the wrong reason.
+            // A non-cluster-backed registry must be rejected before `list_all`.
             assert!(
                 self.cluster_backed,
                 "list_registry_sandboxes must gate on is_cluster_backed before calling list_all"
@@ -3125,12 +2585,7 @@ mod tests {
         }
     }
 
-    /// `status: Ready` is deliberate, not incidental: `schedulable_node`
-    /// (the `Publishing`/`LocalOnly` branch) also runs `filter_unschedulable`
-    /// on top of freshness, and a heartbeat with no snapshot at all
-    /// defaults to `Connecting`, which `can_accept_new_requests()` refuses --
-    /// every test that wants a node to be *schedulable*, not merely
-    /// *reporting*, needs this.
+    /// Produces a `Ready` heartbeat suitable for schedulability tests.
     fn heartbeat_req(node_id: &str, roster: Vec<(&str, &str)>) -> HeartbeatRequest {
         HeartbeatRequest {
             node_id: node_id.to_string(),
@@ -3155,11 +2610,6 @@ mod tests {
 
     #[tokio::test]
     async fn schedule_places_a_node_with_nothing_else_wired_and_round_robins() {
-        // The exact `service_on_a_socket(vec![])`-style bare service the
-        // now-removed `every_other_stages_rpc_is_unimplemented_not_silently_accepted`
-        // used to prove `Unimplemented` for -- `Schedule` now works with
-        // none of `with_binding_store`/`with_paused_registry` ever called,
-        // matching Go's own `Schedule`, which never touches either.
         let registry = Arc::new(AtomicNodeRegistry::new(
             vec![
                 node("node-a", "http://10.0.0.1:8000"),
@@ -3186,20 +2636,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The round-robin cursor is `RoundRobinStrategy`'s own atomic, so
-    /// it is the *instance* that carries scheduling state, not the argument
-    /// list. `schedule` and `lookup_node`'s `Paused` branch each build
-    /// their own `ScheduleDeps`; if either borrowed a freshly constructed
-    /// strategy rather than this service's single `Arc<RoundRobinStrategy>`,
-    /// both paths would still round-robin perfectly *on their own* and
-    /// every other test in this file would still pass -- while placement
-    /// quietly stopped rotating *across* the two paths, so the create path
-    /// and the resume path kept landing on the same node forever.
-    ///
-    /// `AtomicNodeRegistry::snapshot` sorts by node id, so the candidate
-    /// list is `[node-a, node-b, node-c]` on every call and the interleaved
-    /// sequence below is exact: one shared cursor yields a, b, c, a. Two
-    /// independent cursors would yield a, a, b, b.
     #[tokio::test]
     async fn schedule_and_lookup_node_advance_one_shared_round_robin_cursor() {
         let sandbox_id = SandboxId::new();
@@ -3211,9 +2647,7 @@ mod tests {
             ],
             Duration::from_secs(30),
         ));
-        // Empty origin: no preference to short-circuit the strategy with,
-        // so the `Paused` branch reaches `RoundRobinStrategy::select` the
-        // same way `Schedule` does.
+        // No origin preference, so paused lookup reaches the shared strategy.
         let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
             paused_entry(sandbox_id, PausedRegistryState::Paused, "", None),
             true,
@@ -3254,15 +2688,6 @@ mod tests {
         );
     }
 
-    /// 🔴 `agentenv_api_schedule_duration_seconds` and
-    /// `agentenv_api_schedule_assignments_total` are series a dashboard
-    /// already groups by, and the `strategy`/`status` label keys are part
-    /// of that identity. Round-robin being the only strategy this build has
-    /// is not a licence to drop the label or stop naming it: a series that
-    /// changes shape goes blank silently, with nothing failing anywhere.
-    ///
-    /// So this pins all three axes at the emission site -- both metric
-    /// names, both label keys, and the literal `round_robin` value.
     #[tokio::test]
     async fn schedule_metrics_are_named_and_labelled_exactly() {
         use metrics_util::debugging::DebuggingRecorder;
@@ -3283,9 +2708,6 @@ mod tests {
 
         drop(guard);
 
-        // (metric name, sorted (label key, label value) pairs) for every
-        // series the call emitted -- an exact shape, so an extra, missing,
-        // renamed or revalued label is a mismatch rather than a near miss.
         let series: Vec<(String, Vec<(String, String)>)> = snapshotter
             .snapshot()
             .into_vec()
@@ -3428,21 +2850,9 @@ mod tests {
         assert_eq!(resp.location(), scheduler::SandboxLocation::Bound);
     }
 
-    /// 🔴 Ports `Service.rosterPrefers`'s `default: execution > bestExecution`
-    /// arm: two nodes both report the same sandbox, both fresh, with
-    /// different named incarnations -- the lexicographically greater one
-    /// (execution ids are UUIDv7, so this is "newer") must win regardless
-    /// of iteration order. Proven both ways (`node-a`/`node-b` each go
-    /// first once) so an implementation that just "picks the first
-    /// reporter" cannot pass by accident.
     #[tokio::test]
     async fn lookup_node_roster_prefers_the_lexicographically_newer_incarnation() {
         let sandbox_id = SandboxId::new();
-        // `nodes_holding` always iterates in sorted node-id order (node-a
-        // before node-b), regardless of which one actually heartbeated
-        // first -- so proving the winner tracks the *incarnation*, not
-        // iteration position, means running this with the newer incarnation
-        // on each side of that fixed order in turn.
         for (lower, higher) in [("node-a", "node-b"), ("node-b", "node-a")] {
             let registry = Arc::new(AtomicNodeRegistry::new(
                 vec![
@@ -3486,9 +2896,6 @@ mod tests {
                 .await
                 .expect("a live roster hit")
                 .into_inner();
-            // "...0002" > "...0001" lexicographically: whichever node
-            // reported it (`higher`) must win, whether that is the node
-            // `nodes_holding` visits first (node-a) or second (node-b).
             assert_eq!(
                 resp.node.as_ref().unwrap().node_id,
                 higher,
@@ -3529,10 +2936,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
-    /// 🔴 A registry that answers `Some(entry)` but is not cluster-backed
-    /// must never reach the row -- the control that proves stage 3's
-    /// `is_cluster_backed()` guard has teeth, not just the ordinary "no
-    /// registry wired at all" path every other `NotFound` test exercises.
     #[tokio::test]
     async fn lookup_node_skips_a_registry_row_when_the_registry_is_not_cluster_backed() {
         let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
@@ -3571,12 +2974,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
-    /// 🔴 `Paused` never needs a heartbeat at all: `select_node` (the same
-    /// pipeline `Schedule` runs) only requires the origin to be in
-    /// discovery, not to have reported. A version that required liveness
-    /// here would refuse every paused sandbox for a full report interval
-    /// after every scheduler restart -- exactly the asymmetry
-    /// `lookup.go`'s own comment on `schedulableNode` calls out.
     #[tokio::test]
     async fn lookup_node_places_a_paused_sandbox_preferring_its_origin_node() {
         let sandbox_id = SandboxId::new();
@@ -3656,7 +3053,6 @@ mod tests {
             vec![node("node-a", "http://10.0.0.1:8000")],
             Duration::from_secs(30),
         ));
-        // node-a is discovered but has never heartbeated -- no roster at all.
         let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
             paused_entry(sandbox_id, PausedRegistryState::LocalOnly, "node-a", None),
             true,
@@ -3726,7 +3122,6 @@ mod tests {
             vec![node("node-a", "http://10.0.0.1:8000")],
             Duration::from_secs(30),
         ));
-        // node-a is discovered but has never heartbeated.
         let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
             paused_entry(sandbox_id, PausedRegistryState::Running, "node-a", None),
             true,
@@ -3744,11 +3139,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
-    /// 🔴 The same `Running` row as the previous test, but with a cold gate:
-    /// the holder being unreachable must not be asserted as a
-    /// `FailedPrecondition` fact while bindings are still being seeded --
-    /// it has to come back `Unavailable` (retryable) instead, exactly like
-    /// an ordinary `NotFound` would under the same cold gate.
     #[tokio::test]
     async fn lookup_node_withholds_a_running_rows_holder_unreachable_verdict_while_cold() {
         let sandbox_id = SandboxId::new();
@@ -3773,15 +3163,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
-    /// 🔴 Task's own independent metric wiring: `RecordAssignment`'s
-    /// `binding_store.record` and `Heartbeat`'s `binding_store.reconcile_node`
-    /// both used to discard the `Ok(BindingDecision)` they got back. This
-    /// proves both call sites now report `agentenv_api_binding_execution_total`
-    /// under their own `source` label, using the exact thread-local-recorder
-    /// pattern `src/api/grpc/tests.rs` established (`with_local_recorder`
-    /// only works for a full async round trip when the handler runs on the
-    /// calling thread, which calling the service directly guarantees and a
-    /// real socket would not).
     #[tokio::test]
     async fn record_assignment_and_heartbeat_reconcile_report_binding_execution_decisions() {
         use metrics_util::debugging::{DebugValue, DebuggingRecorder};
@@ -3844,13 +3225,6 @@ mod tests {
         );
     }
 
-    // ---- list_registry_sandboxes: ports `listRegistrySandboxes`
-    //      (`service.go:849-943`) against `PausedSandboxRegistry::list_all`.
-    //      Every test below calls the service directly, mirroring the
-    //      `Schedule`/`LookupNode` section's own reasoning: there is
-    //      nothing gRPC-transport-specific left to prove once this file's
-    //      socket-based tests elsewhere already cover server wiring. ----
-
     fn fixed_sandbox_id(n: u8) -> SandboxId {
         SandboxId::parse_str(&format!("00000000-0000-0000-0000-{n:012x}"))
             .expect("a well-formed fixed uuid")
@@ -3868,11 +3242,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
-    /// Mirrors Go's own default: `Service.registry` is never a literal nil
-    /// pointer, it defaults to `pausedregistry.Disabled()`, whose `List`
-    /// answers `ErrDisabled` (-> `FailedPrecondition`) exactly the same way
-    /// a registry that is wired but not cluster-backed does here. The fake's
-    /// own `list_all` panics if this ever reaches it -- see its doc.
     #[tokio::test]
     async fn list_registry_sandboxes_with_a_non_cluster_backed_registry_is_failed_precondition() {
         let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
@@ -3918,13 +3287,6 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
     }
 
-    /// Argument validation must run before the registry is even consulted --
-    /// mirrors Go's own comment on `parseRegistryStateFilter` running first:
-    /// the answer to a bad request must not depend on whether a registry
-    /// happens to be configured. Proved here by using the exact same
-    /// "no paused registry wired" service the `FailedPrecondition` test
-    /// above uses: an unknown state must still come back `InvalidArgument`,
-    /// never `FailedPrecondition`.
     #[tokio::test]
     async fn list_registry_sandboxes_rejects_an_unknown_state_before_consulting_the_registry() {
         let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
@@ -4064,12 +3426,6 @@ mod tests {
         assert_eq!(resp.sandboxes[0].origin_node_id, "node-b");
     }
 
-    /// Keyset paging: `page_size` truncates the sorted (by sandbox id)
-    /// listing and reports the last row's id as `next_page_token`; a
-    /// second call with that token as `page_token` picks up exactly where
-    /// the first left off. Sandbox ids are fixed (not `SandboxId::new()`)
-    /// so the expected page split is deterministic rather than depending
-    /// on UUIDv7 generation order within the same test.
     #[tokio::test]
     async fn list_registry_sandboxes_pages_with_a_token() {
         let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
@@ -4145,33 +3501,12 @@ mod tests {
         );
     }
 
-    // ---- Placement shadow scoring: the wiring, not the arithmetic ----
-    //
-    // The pressure formula, the sampler and the classification boundaries
-    // are pinned in `super::super::placement`'s own fixture suite. What is
-    // pinned *here* is everything between a real RPC and that arithmetic:
-    // that the producer's declared resources survive the trip, that each
-    // call path files its samples under its own `source`, that a preferred
-    // node produces no sample at all, and — most of all — that none of it
-    // moves the node the RPC actually returns.
+    // Placement arithmetic is covered in `placement`; these tests cover RPC wiring.
 
     use crate::node_registry::placement::ShadowPlacement;
     use metrics_util::debugging::{DebugValue, Snapshotter};
 
-    /// Every counter the recorder holds, drained **once**, keyed
-    /// `"<name>|<sorted labels>"`.
-    ///
-    /// 🔴 One drain, not one per assertion. `Snapshotter::snapshot()`
-    /// *consumes* what it reports: a second call answers empty, so a test
-    /// that snapshotted per metric would see its first assertion's data and
-    /// then a series of empty maps — every "this must not have been
-    /// incremented" assertion after the first would pass no matter what the
-    /// code did.
-    ///
-    /// 🔴 Zero-valued series are dropped. All 20 shadow handles are
-    /// resolved when the service is constructed — that is the point of
-    /// resolving them there — so the recorder reports every one of them,
-    /// incremented or not, and "absent" here means "never incremented".
+    /// Drains incremented counter series once; snapshots consume recorder state.
     struct DrainedCounters(StdHashMap<String, u64>);
 
     fn drain_counters(snapshotter: &Snapshotter) -> DrainedCounters {
@@ -4203,7 +3538,6 @@ mod tests {
                 .unwrap_or(0)
         }
 
-        /// Every incremented series of one metric, labels-only keys.
         fn series(&self, name: &str) -> StdHashMap<String, u64> {
             let prefix = format!("{name}|");
             self.0
@@ -4240,23 +3574,6 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
-    /// M-9 and M-10, in one test.
-    ///
-    /// 🔴 The assertion that matters most is the *first* one: `Schedule`
-    /// returns `node-a`, which is what the round-robin cursor says, while
-    /// the shadow scorer — looking at the same two nodes with the same
-    /// request — would have picked `node-z`. A shadow that leaked into the
-    /// return value fails the first assertion; a shadow that was deleted
-    /// from the production path fails the second.
-    ///
-    /// The fixture: both nodes hold 8 GiB of a 64 GiB machine, so
-    /// `after_mem` is `8193/65536 == 0.1250152587890625` for both on a
-    /// 1 MiB request. `node-a` is at 7 of 8 vCPU, so its `after_cpu` is
-    /// `1.0` and CPU is its bottleneck; `node-z` is idle, so memory is
-    /// its bottleneck and its pressure is the shared 0.1250152587890625.
-    /// `node-z` therefore wins the shadow by a wide margin — and loses the
-    /// real placement, because round-robin starts at cursor 0 and
-    /// `AtomicNodeRegistry::snapshot` sorts by id.
     #[tokio::test]
     async fn the_shadow_disagrees_without_moving_the_placement() {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
@@ -4284,7 +3601,7 @@ mod tests {
             .expect("node-z heartbeats");
 
         let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            // K = 2 over 2 candidates, drawn [node-a, node-z].
+            // K = 2 over scripted candidates [node-a, node-z].
             .with_placement_shadow(ShadowPlacement::new(2).with_scripted_rng([0, 0]));
 
         let placed = service
@@ -4328,7 +3645,6 @@ mod tests {
             0,
             "the shadow picked node-z, so nothing may be filed as agreement: {agreement:?}"
         );
-        // Both candidates were scoreable, under `schedule`'s own source.
         assert_eq!(
             counters.get(
                 "agentenv_api_placement_shadow_classification_total",
@@ -4338,7 +3654,6 @@ mod tests {
             "{:?}",
             counters.series("agentenv_api_placement_shadow_classification_total")
         );
-        // The hint stated both fields, so nothing is missing.
         assert!(
             counters
                 .series("agentenv_api_placement_missing_request_resources_total")
@@ -4347,26 +3662,6 @@ mod tests {
         );
     }
 
-    /// M-12 — the producer end, entered where production enters it.
-    ///
-    /// 🔴 Not "hand a hint to `schedule` and check it arrives". That test
-    /// passes with `place_new` still throwing its `resources` argument
-    /// away, which is exactly the bug: the caller knew the sandbox's size
-    /// and placement never saw it. This one starts at
-    /// `NativeNodePlacement::place_new` and lets the value travel.
-    ///
-    /// The fixture is built so the *answer* depends on the request size:
-    ///
-    /// - `node-a`: 8 vCPU idle, 1 GiB with 512 MiB taken.
-    ///   Blind (0, 0) -> `max(0, 0.5) = 0.5`.
-    ///   With (2, 512) -> `max(0.25, 1.0) = 1.0`.
-    /// - `node-z`: 5 of 8 vCPU taken, 8 GiB of 64 GiB taken.
-    ///   Blind (0, 0) -> `max(0.625, 0.125) = 0.625`.
-    ///   With (2, 512) -> `max(0.875, 0.1328125) = 0.875`.
-    ///
-    /// So a placement that sees the request prefers `node-z`; one that is
-    /// blind prefers `node-a`. Round-robin returns `node-a` either way, so
-    /// the shadow agrees exactly when the resources were dropped.
     #[tokio::test]
     async fn place_new_hands_placement_the_resources_it_was_given() {
         use crate::node_client::{NativeNodePlacement, NodePlacement};
@@ -4436,17 +3731,7 @@ mod tests {
         );
     }
 
-    /// §3.4's table, entered through a real `Schedule` call rather than
-    /// through the mapping function — so a wiring that forgot to consult
-    /// the hint at all is caught here as well.
-    ///
-    /// 🔴 The `Some(hint { kind: None })` row is built from raw bytes, not
-    /// from a struct literal: the shape it stands for is a peer that sent a
-    /// `oneof` tag this build does not know, and there is no way to
-    /// construct that from the generated Rust type. `12 02 1a 00` is
-    /// `ScheduleRequest.hint` (field 2, length 2) wrapping an unknown field
-    /// 3 of length 0 — so the outer hint decodes to `Some` and its `kind`
-    /// to `None`.
+    /// Covers every request-hint shape, including an unknown oneof tag decoded from bytes.
     #[tokio::test]
     async fn every_hint_shape_maps_onto_the_missing_request_resources_counter() {
         use prost::Message as _;
@@ -4479,7 +3764,6 @@ mod tests {
             }),
         };
 
-        // (label, request, counts as missing)
         let cases: Vec<(&str, ScheduleRequest, bool)> = vec![
             ("hint = None", ScheduleRequest { hint: None }, true),
             ("Some(hint { kind: None })", raw_unknown_kind, true),
@@ -4541,15 +3825,6 @@ mod tests {
         }
     }
 
-    /// K-2 and K-3 together: each caller's samples land under its own
-    /// `source`, and the `prefer_node_id` hit produces no sample at all.
-    ///
-    /// 🔴 The last part is not tidiness. `lookup_node`'s `Paused` branch
-    /// prefers the origin node, which by design is often *not* what a
-    /// resource scorer would pick. Scoring that path would file a
-    /// deliberate origin affinity as a shadow disagreement, and the
-    /// disagreement rate is the single number this whole feature exists to
-    /// produce.
     #[tokio::test]
     async fn each_call_path_reports_under_its_own_source_and_a_preference_reports_nothing() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -4568,8 +3843,6 @@ mod tests {
                 .expect("heartbeat");
         }
 
-        // (1) The paused branch with no origin preference: it reaches the
-        // strategy, so it scores — under `paused_lookup`.
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let guard = metrics::set_default_local_recorder(&recorder);
@@ -4605,9 +3878,6 @@ mod tests {
         assert_eq!(total_under("schedule"), 1, "{agreement:?}");
         assert_eq!(total_under("paused_lookup"), 1, "{agreement:?}");
 
-        // (2) The same branch, with an origin the candidate list contains.
-        // It returns before the strategy is ever asked, so there is nothing
-        // to shadow.
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let guard = metrics::set_default_local_recorder(&recorder);
@@ -4644,17 +3914,6 @@ mod tests {
         );
     }
 
-    /// A discovered node that has never sent a heartbeat stays in the real
-    /// candidate list — `filter_unschedulable` keeps it on purpose, so a
-    /// freshly started cluster has somewhere to put its first sandbox — and
-    /// the shadow classifies it `no_snapshot` rather than dropping it or
-    /// treating a missing snapshot as an empty one.
-    ///
-    /// 🔴 The wrong fix for "the scorer cannot score this node" is to
-    /// derive `UNHEALTHY` for it and hand that to `filter_unschedulable`.
-    /// That changes the real candidate set, which is exactly what a shadow
-    /// may not do — and on a cold cluster it would leave nothing to place
-    /// onto at all.
     #[tokio::test]
     async fn a_never_reported_node_stays_a_candidate_and_classifies_as_no_snapshot() {
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
@@ -4677,8 +3936,6 @@ mod tests {
 
         let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
             .with_placement_shadow(ShadowPlacement::new(2).with_scripted_rng([0, 0]));
-        // Two calls, so the cursor visits both slots of the candidate list
-        // and the silent node is demonstrably still in it.
         let mut placed = Vec::new();
         for _ in 0..2 {
             placed.push(
@@ -4715,10 +3972,6 @@ mod tests {
         );
     }
 
-    /// A burst of concurrent `Schedule` calls inside one heartbeat window
-    /// must distribute exactly as round-robin always did: the shadow adds
-    /// no second cursor, no lock ordering, and no path that could reorder
-    /// the atomic `fetch_add` the distribution comes from.
     #[tokio::test]
     async fn a_concurrent_burst_distributes_exactly_as_round_robin() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -4760,8 +4013,6 @@ mod tests {
                 .entry(handle.await.expect("the task joined"))
                 .or_insert(0) += 1;
         }
-        // 90 calls over one shared cursor and three candidates: exactly 30
-        // each, regardless of completion order.
         assert_eq!(counts.get("node-a").copied(), Some(30), "{counts:?}");
         assert_eq!(counts.get("node-b").copied(), Some(30), "{counts:?}");
         assert_eq!(counts.get("node-c").copied(), Some(30), "{counts:?}");

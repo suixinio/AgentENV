@@ -1,99 +1,11 @@
-//! [`NativeNodePlacement`]: `aenv-api`'s only [`NodePlacement`] implementation.
-//! It used to be one of two — selected by a now-deleted
-//! `[cluster].node_placement_source` switch, alongside a `Scheduler`
-//! alternative (`SchedulerNodePlacement`) that dialled a Go scheduler process
-//! over gRPC — but that process is deleted from the tree (see "Distributed
-//! Control Plane" in the repo's top-level `CLAUDE.md`) and
-//! `SchedulerNodePlacement` went with it, so this is what every `aenv-api`
-//! replica runs now, always, with no switch left to choose otherwise.
-//! (`docs/proposals/_sd-phase4-stageA-node-inventory.md` §5 — task's own "D7").
+//! In-process [`NodePlacement`] backed by the local node registry and scheduler surface.
 //!
-//! # 🔴 P1 (task's own "phase4-close"): all five methods now go local
+//! New placement, existing lookup, and assignment recording reuse
+//! [`NodeRegistryGrpcService`] directly. Node resolution and membership read the
+//! heartbeat-observed registry view.
 //!
-//! Every method answers from api's own process: `resolve_node` and
-//! `node_membership` from api's own `src/node_registry` node registry
-//! (`crate::node_registry::registry`) — both are, on the wire, the same
-//! question `GetNode` answers, and `GetNode` is squarely Stage A's
-//! (`node_registry.go`'s `GetObserved`, ported to
-//! [`crate::node_registry::registry::AtomicNodeRegistry::get_observed`]).
-//!
-//! `place_new`, `place_existing`, and `record_placement` now answer from
-//! [`crate::node_registry::grpc_service::NodeRegistryGrpcService`] — the
-//! exact same service object `assemble_api` hands `serve_on` to answer
-//! `Schedule`/`LookupNode`/`RecordAssignment` over the wire for any other
-//! caller (a query-only replica, a debugging `grpcurl`, ...) — called
-//! in-process as plain async functions rather than dialled: no socket, no
-//! serialization, and — the point of routing through that type rather than
-//! re-deriving its answers here — zero duplicated selection/lookup logic.
-//! `NodeRegistryGrpcService::schedule`/`lookup_node`/`record_assignment`
-//! are themselves thin translations over
-//! [`crate::binding_store::lookup::select_node`]/
-//! [`crate::binding_store::lookup::lookup_node`] (`Schedule`'s placement
-//! decision and `LookupNode`'s three-step binding → roster → registry
-//! ladder) plus `record_assignment`'s own field validation/normalization —
-//! see that module's own doc for why the three-stage lookup ladder is kept
-//! there rather than folded into the gRPC method bodies. This is the same
-//! reuse `docs/proposals/_sd-phase4-stageA-node-inventory.md` §5
-//! recommended for the two discovery-only methods, extended to the three
-//! placement-deciding ones now that Stage D exists to answer them.
-//!
-//! 🔴 Before this, `place_new`/`place_existing`/`record_placement` forwarded
-//! unconditionally to an inner `SchedulerNodePlacement` — meaning `aenv-api`
-//! under `Native` was simultaneously the gRPC *server* for
-//! `Schedule`/`LookupNode`/`RecordAssignment` (Stage D) and, for placement
-//! decisions, still a *client* of the Go scheduler for those same three
-//! calls, with nothing in the process ever answering its own server. A Go
-//! scheduler scaled to zero left every create failing even though the
-//! exact logic needed to place it was already running, unreached, in the
-//! same process. See `cluster_placement`'s own doc comment in
-//! `src/bin/aenv-api.rs`: placement no longer touches
-//! `[cluster].scheduler_endpoint` at all, now that `SchedulerNodePlacement`
-//! is deleted and this is the only implementation there is to construct.
-//!
-//! # Why `resolve_node` and `node_membership` share one registry call
-//!
-//! Both call [`AtomicNodeRegistry::get_observed`] with an empty cluster id
-//! (matching the deleted `SchedulerNodePlacement`'s own "blank means do not
-//! filter" convention on the same two methods) — mirroring the real Go `GetNode` RPC
-//! handler, which both `resolve_node` and `node_membership` dial on the
-//! scheduler side. A node discovery knows about but that has never sent a
-//! heartbeat has no `observed` record yet — but whether that reads as
-//! [`NodeMembership::Gone`] (or a bare refusal, for `resolve_node`) depends
-//! on [`WarmupGate::warmed_up`]: a miss while the gate is cold is a question
-//! this registry cannot yet answer honestly (it has not heard from every
-//! node discovery already knows about, or the deadline has not passed) and
-//! is refused with an `Err` rather than asserted as absence — see the field's
-//! own doc comment and `docs/proposals/_sd-phase4-stageA-node-inventory.md`
-//! §5's "D2" instruction: byte-for-byte once the registry is warm, which is
-//! the steady state both `docs/proposals/_sd-phase4-stageA-node-inventory.md`
-//! and `services/scheduler/internal/warmup.go`'s `TestLookupWithholdsNotFoundWhileCold`
-//! describe — never before it.
-//!
-//! 🔴 This was originally byte-for-byte "no observed record is `Gone`,"
-//! full stop, with no warm-up distinction at all — a straight, unguarded
-//! port of `GetObserved`. Independent review of Stage A caught it: a
-//! process's own registry starts *empty*, and every node is `Gone` by that
-//! definition until the first heartbeat round finishes, however long that
-//! takes on a large or slow-starting cluster — which is a state the deleted
-//! scheduler-backed `SchedulerNodePlacement` never had (a scheduler that
-//! cannot answer the question errors instead, `Err`, never `Gone`). `stub.rs`'s
-//! contract for `node_membership` acts on `Gone` alone and treats it as
-//! proof a sandbox's runtime is gone for good — so an api replica that had
-//! just restarted would confirm every live sandbox as gone the moment
-//! anything dialled it. [`WarmupGate`] is what closes that: not a Stage A
-//! quirk to fix later, but the exact reason `warmup.rs` exists.
-//!
-//! 🔴 A second, narrower version of the same bug survived Stage A and was
-//! only caught in the P1 pass this module doc now describes:
-//! [`WarmupGate::warmed_up`] used to latch warm at its wall-clock deadline
-//! *regardless* of whether any node had ever reported at all — so a
-//! registry that was simply cold (a freshly (re)started replica, or every
-//! replica of a rolling DaemonSet restart at once) still turned every
-//! `node_membership` answer into a confident `Gone` once the deadline
-//! passed, deleting live sandboxes' records. See [`WarmupGate::warmed_up`]'s
-//! own doc comment and this module's
-//! `node_membership_stays_cold_past_the_deadline_when_nothing_has_ever_reported`
-//! test for the fix and its proof.
+//! Registry misses become confirmed absence only after [`WarmupGate`] opens; before
+//! then they remain errors so a restarting replica cannot declare live runtimes gone.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -112,19 +24,7 @@ use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
 
-/// Replaces the port in a `scheme://host:port` address, keeping everything
-/// else the local registry said.
-///
-/// 🔴 Parsed rather than string-spliced, because an IPv6 literal is written
-/// `http://[::1]:8000` and the last colon in it is not the one before the
-/// port on any naive reading that also has to cope with `http://[::1]`.
-///
-/// 🔴 Formerly `SchedulerNodePlacement::rewrite_port` — moved here rather
-/// than deleted when that type was, because this is its one remaining
-/// caller: both [`NativeNodePlacement::node_service_endpoint`] and
-/// [`NativeNodePlacement::node_service_endpoint_from_wire`] still need to
-/// substitute the node service's own port into whatever address the
-/// registry (or the local scheduler surface) answered with.
+/// Replaces the port in an HTTP node address, including bracketed IPv6 literals.
 pub fn rewrite_port(endpoint: &str, port: u16) -> Result<String> {
     let mut url = url::Url::parse(&qualified(endpoint))
         .with_context(|| format!("node address {endpoint:?} is not a valid URI"))?;
@@ -143,15 +43,10 @@ mod rewrite_port_tests {
             rewrite_port("http://10.0.0.7:8000", 8001).unwrap(),
             "http://10.0.0.7:8001/"
         );
-        // A bare host:port is what a static discovery list carries.
         assert_eq!(
             rewrite_port("10.0.0.7:8000", 8001).unwrap(),
             "http://10.0.0.7:8001/"
         );
-        // 🔴 The control for the two above: an IPv6 literal, where the last
-        // colon in the string is inside the address rather than before the
-        // port. A splice on the last colon passes both cases above and turns
-        // this one into an address that does not resolve.
         assert_eq!(
             rewrite_port("http://[fd00::7]:8000", 8001).unwrap(),
             "http://[fd00::7]:8001/"
@@ -166,28 +61,14 @@ mod rewrite_port_tests {
     }
 }
 
-/// Placement backed entirely by api's own process — see the module doc for
-/// why the split that used to exist here between "answers locally" and
-/// "forwards to the scheduler" is gone.
+/// Placement backed entirely by the local API process.
 pub struct NativeNodePlacement {
     registry: Arc<AtomicNodeRegistry>,
-    /// The port the node sandbox service listens on — same role as
-    /// the deleted `SchedulerNodePlacement`'s own field of the same name, applied to
-    /// the address the local registry (or the local scheduler surface)
-    /// answers with.
+    /// Node sandbox-service port substituted into advertised addresses.
     node_service_port: u16,
-    /// Gates whether a registry miss may be answered as absence at all — see
-    /// the module doc's "Why `resolve_node` and `node_membership` share one
-    /// registry call" section. Shared with the heartbeat-receiving gRPC
-    /// service (`start_native_node_registry` builds one `Arc` and hands it
-    /// to both), so a heartbeat this process actually receives opens the
-    /// gate for placement lookups too, not just for its own consumer.
+    /// Prevents cold registry misses from becoming confirmed absence.
     warmup: Arc<WarmupGate>,
-    /// Answers `place_new`/`place_existing`/`record_placement` — see the
-    /// module doc. A clone of the same service `spawn_grpc_surface` serves
-    /// the real `Scheduler` RPCs from (cheap: every field behind it is an
-    /// `Arc` or `Copy`, per `NodeRegistryGrpcService`'s own `Clone` doc),
-    /// not a second instance with its own state.
+    /// Shared local service used by in-process and gRPC placement callers.
     local: NodeRegistryGrpcService,
 }
 
@@ -206,10 +87,7 @@ impl NativeNodePlacement {
         }
     }
 
-    /// Turns an [`ObservedNode`] into the node service's address — the same
-    /// two refusals the deleted `SchedulerNodePlacement::node_service_endpoint` made
-    /// (no id, no address), against the local registry's answer instead of
-    /// the scheduler's.
+    /// Converts an observed registry node into its sandbox-service endpoint.
     fn node_service_endpoint(&self, observed: ObservedNode) -> Result<NodeEndpoint> {
         if observed.node_id.is_empty() {
             bail!("the node registry named a node with no id");
@@ -227,13 +105,7 @@ impl NativeNodePlacement {
         })
     }
 
-    /// [`Self::node_service_endpoint`]'s counterpart for the wire
-    /// [`scheduler::Node`] shape `schedule`/`lookup_node` answer with,
-    /// rather than the [`ObservedNode`] `get_observed` answers with —
-    /// mirrored the deleted `SchedulerNodePlacement::node_service_endpoint` exactly,
-    /// including its two refusals, worded to name the local scheduler
-    /// surface rather than a remote one so an operator reading logs can
-    /// tell the two apart.
+    /// Converts a scheduler wire node into its sandbox-service endpoint.
     fn node_service_endpoint_from_wire(
         &self,
         node: Option<scheduler::Node>,
@@ -258,11 +130,7 @@ impl NativeNodePlacement {
 
 #[async_trait]
 impl NodePlacement for NativeNodePlacement {
-    /// Ports `SchedulerNodePlacement::place_new`'s call, in-process: the same
-    /// `NewSandboxHint` (never `NewColdSandboxHint`, for the same reason —
-    /// see that method's own doc) against
-    /// [`NodeRegistryGrpcService::schedule`] instead of a dialled
-    /// `Schedule` RPC.
+    /// Places a new sandbox through the local scheduler surface.
     async fn place_new(
         &self,
         _sandbox_id: SandboxId,
@@ -275,13 +143,7 @@ impl NodePlacement for NativeNodePlacement {
                     kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
                         scheduler::NewSandboxHint {
                             metadata: Default::default(),
-                            // 🔴 Stated, not dropped. This argument used to
-                            // be `_resources`: the caller already knew how
-                            // big the sandbox was, and placement threw it
-                            // away at the door, so every scoring question
-                            // downstream was answered blind. Both are
-                            // `Some(..)` even at zero — an explicit zero is
-                            // an answer, and this producer always has one.
+                            // Presence is explicit even at zero so scoring sees known resources.
                             cpu_count: Some(resources.cpu_count),
                             memory_mib: Some(u64::from(resources.memory_mib)),
                         },
@@ -294,10 +156,7 @@ impl NodePlacement for NativeNodePlacement {
         self.node_service_endpoint_from_wire(response.node)
     }
 
-    /// Ports `SchedulerNodePlacement::place_existing`'s call, in-process,
-    /// against [`NodeRegistryGrpcService::lookup_node`] — including the same
-    /// `NotFound`-is-`Ok(None)`, everything-else-is-`Err` split (see that
-    /// method's own doc comment for why the two are not interchangeable).
+    /// Locates an existing sandbox; only `NotFound` becomes `Ok(None)`.
     async fn place_existing(&self, sandbox_id: SandboxId) -> Result<Option<NodeEndpoint>> {
         let response = match self
             .local
@@ -314,15 +173,7 @@ impl NodePlacement for NativeNodePlacement {
             .map(Some)
     }
 
-    /// Answers from the local registry's heartbeat-derived view — see the
-    /// module doc for why this is `get_observed`, the same call
-    /// `node_membership` makes, rather than the discovery-only `resolve`.
-    ///
-    /// A miss is always an `Err` here (unlike `node_membership`, which has a
-    /// confident affirmative answer — `Gone` — to withhold): `resolve_node`
-    /// never had one to give in the first place, so the [`WarmupGate`] only
-    /// changes *why* the call failed, in the message, not whether it did.
-    /// See the module doc's warm-up section.
+    /// Resolves a node from the heartbeat-observed registry view.
     async fn resolve_node(&self, node_id: &str) -> Result<NodeEndpoint> {
         let Some(observed) = self.registry.get_observed(node_id, "", SystemTime::now()) else {
             if self.warmup.warmed_up(SystemTime::now()) {
@@ -335,8 +186,7 @@ impl NodePlacement for NativeNodePlacement {
             );
         };
         let resolved = self.node_service_endpoint(observed)?;
-        // Mirrors `SchedulerNodePlacement::resolve_node`'s own check: the
-        // answer has to be about the node that was asked for.
+        // The returned identity must match the requested node.
         if resolved.node_id != node_id {
             bail!(
                 "asked the node registry where node {node_id} is and it answered about node {}",
@@ -346,12 +196,7 @@ impl NodePlacement for NativeNodePlacement {
         Ok(resolved)
     }
 
-    /// See the module doc: this is the same registry call `resolve_node`
-    /// makes, not a discovery-only snapshot — reproducing exactly what the
-    /// scheduler's own `GetNode`-backed `node_membership` answers today,
-    /// *once the registry is warm* — see the module doc's warm-up section
-    /// and [`WarmupGate`]'s own doc comment for why a cold miss is refused
-    /// (`Err`) rather than answered `Gone`.
+    /// Reports membership from the observed view, withholding `Gone` while cold.
     async fn node_membership(&self, node_id: &str) -> Result<NodeMembership> {
         match self.registry.get_observed(node_id, "", SystemTime::now()) {
             Some(_) => Ok(NodeMembership::Present),
@@ -364,13 +209,7 @@ impl NodePlacement for NativeNodePlacement {
         }
     }
 
-    /// Ports `SchedulerNodePlacement::record_placement`'s call, in-process,
-    /// against [`NodeRegistryGrpcService::record_assignment`] — the same
-    /// wire fields (the node's *advertised* address, never the rewritten
-    /// node-service one; a zero `projection_ttl_secs`, read by the local
-    /// service as "use the node's own `binding_ttl`") that call already
-    /// sends, and the same discovery-backed node validation
-    /// `record_assignment` already runs.
+    /// Records the advertised node address through the local assignment surface.
     async fn record_placement(
         &self,
         sandbox_id: SandboxId,
@@ -418,11 +257,6 @@ mod tests {
         NativeNodePlacement::new(registry, 8001, warmup, local)
     }
 
-    /// [`placement`], but with a binding store wired onto the local
-    /// service — needed by every test that exercises `place_new`/
-    /// `place_existing`/`record_placement`, since `LookupNode`/
-    /// `RecordAssignment` answer `Unimplemented` without one (see
-    /// `NodeRegistryGrpcService::lookup_node`'s own doc).
     fn placement_with_binding_store(
         registry: Arc<AtomicNodeRegistry>,
         binding_store: Arc<dyn BindingStore>,
@@ -433,15 +267,7 @@ mod tests {
         NativeNodePlacement::new(registry, 8001, warmup, local)
     }
 
-    /// A gate that is already warm regardless of when `warmed_up` is called
-    /// against it: `reported_in` is called once, immediately, against a
-    /// deadline already long past (anchored at the Unix epoch, which every
-    /// `SystemTime::now()` this process will ever observe is already past),
-    /// which latches `warm` for good — mirrors
-    /// `src/node_registry/grpc_service.rs`'s own `warm_gate` helper
-    /// (including its own note on why `reported_in` has to be called
-    /// explicitly since P1: an unreported cold registry no longer opens on
-    /// wall-clock deadline alone, see `WarmupGate::warmed_up`'s own doc).
+    /// Returns an already-warm test gate.
     fn warm_gate() -> Arc<WarmupGate> {
         let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)))
             as Arc<dyn crate::node_registry::registry::NodeRegistry>;
@@ -454,9 +280,7 @@ mod tests {
         gate
     }
 
-    /// A gate that stays cold until its deadline passes, gated on `registry`
-    /// — the same registry `placement_with_warmup` is given, so a heartbeat
-    /// fed to one is visible to the other.
+    /// Returns a test gate that stays cold until its deadline.
     fn cold_gate(registry: Arc<AtomicNodeRegistry>, now: SystemTime) -> Arc<WarmupGate> {
         Arc::new(WarmupGate::new(
             registry as Arc<dyn crate::node_registry::registry::NodeRegistry>,
@@ -482,11 +306,6 @@ mod tests {
         }
     }
 
-    /// 🔴 P1: `place_new` answers from the local strategy/registry, round-
-    /// robining over the discovered nodes exactly as `Schedule` does over
-    /// the wire — proving it never reaches for a scheduler at all (there is
-    /// no scheduler endpoint anywhere in this test's setup for it to
-    /// reach).
     #[tokio::test]
     async fn place_new_answers_locally_and_round_robins() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -514,10 +333,6 @@ mod tests {
         );
     }
 
-    /// 🔴 P1: `place_new` with no discovered nodes at all must refuse
-    /// rather than hang waiting on an unreachable scheduler -- the direct
-    /// analogue of `NodeRegistryGrpcService`'s own
-    /// `schedule_returns_unavailable_when_no_nodes_are_discovered`.
     #[tokio::test]
     async fn place_new_refuses_when_no_nodes_are_discovered() {
         let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)));
@@ -530,11 +345,6 @@ mod tests {
         assert!(err.to_string().contains("no nodes available"), "{err}");
     }
 
-    /// 🔴 P1: `record_placement` writes into the local binding store, and
-    /// `place_existing` reads the same write straight back out -- both
-    /// in-process, both through `NodeRegistryGrpcService`. This is the
-    /// exact round trip a create makes: place, then record, then (on a
-    /// later request) look the same sandbox back up.
     #[tokio::test]
     async fn record_placement_then_place_existing_round_trips_through_the_local_binding_store() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -548,9 +358,6 @@ mod tests {
         let sandbox_id = SandboxId::new();
         let execution_id = ExecutionId::new();
 
-        // The node has to be resolvable through discovery for
-        // `record_assignment` to accept it -- the endpoint here is what
-        // `place_new`/`resolve_node` would have handed back.
         let node_endpoint = NodeEndpoint {
             node_id: "node-a".to_string(),
             endpoint: "http://10.0.0.7:8001/".to_string(),
@@ -569,10 +376,6 @@ mod tests {
         assert_eq!(resolved.node_id, "node-a");
         assert_eq!(resolved.endpoint, "http://10.0.0.7:8001/");
 
-        // And the control: a sandbox nothing was ever recorded for answers
-        // `Ok(None)`, not an error -- proving the round trip above actually
-        // depends on the write, not on `place_existing` always answering
-        // `Some`.
         let absent = placement
             .place_existing(SandboxId::new())
             .await
@@ -580,11 +383,6 @@ mod tests {
         assert!(absent.is_none(), "nothing was ever recorded for this id");
     }
 
-    /// 🔴 P1's own control against a mutation that would collapse
-    /// `place_existing`'s `Ok(None)` and `Err` cases into one: a binding
-    /// store that always fails must surface as `Err`, never as `Ok(None)` —
-    /// the exact distinction `NodePlacement::place_existing`'s own doc
-    /// comment says callers rely on.
     #[tokio::test]
     async fn place_existing_reports_a_binding_store_failure_as_an_error_not_a_clean_miss() {
         use crate::binding_store::{BindingDeleteOutcome, BindingStoreError};
@@ -638,12 +436,6 @@ mod tests {
         assert!(err.to_string().contains("could not locate"), "{err}");
     }
 
-    /// 🔴 Both faces of `resolve_node`: a node the registry has actually
-    /// heard from resolves with its port rewritten to the node service's;
-    /// a node discovery has never heartbeated for is refused, not defaulted.
-    /// The refusal case is the control — without it, a `NativeNodePlacement`
-    /// that resolved everything to some placeholder endpoint would also pass
-    /// the first half.
     #[tokio::test]
     async fn resolve_node_answers_from_the_local_registry_and_refuses_the_unheard_from() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -668,10 +460,6 @@ mod tests {
         assert_eq!(resolved.endpoint, "http://10.0.0.7:8001/");
         assert_eq!(resolved.advertised_endpoint, "http://10.0.0.7:8000");
 
-        // node-b is discovered (in the registry's `nodes_by_id`) implicitly
-        // through `Set`, which `AtomicNodeRegistry::new` never called for
-        // it — so this also covers "discovery has never heard of this node
-        // at all", not merely "no heartbeat yet".
         let err = placement
             .resolve_node("node-b")
             .await
@@ -679,12 +467,6 @@ mod tests {
         assert!(err.to_string().contains("no observed record"), "{err}");
     }
 
-    /// 🔴 `node_membership` is `Gone` for a node discovery has never heard
-    /// from — the same "not yet observed reads as gone" behaviour
-    /// `resolve_node`'s refusal above proves, checked here through the
-    /// other method so a future change that fixes one without the other is
-    /// caught. Both are compared against the same registry so the only
-    /// variable between the two assertions is which node is asked about.
     #[tokio::test]
     async fn node_membership_is_present_only_once_heartbeated() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -725,22 +507,6 @@ mod tests {
         );
     }
 
-    /// 🔴 P1: the Rust equivalent of `warmup_test.go`'s
-    /// `TestLookupWithholdsNotFoundWhileCold` — "the whole point" of the
-    /// gate, per that test's own Go comment — applied to the actual Rust
-    /// consumer wired to it, `NativeNodePlacement::node_membership`, since
-    /// Go's own test drives `Service.LookupNode`, which needs a
-    /// `BindingStore` this codebase has not ported yet (see `warmup.rs`'s
-    /// module doc). Before this test existed, this exact case had zero
-    /// coverage: `node_membership_is_present_only_once_heartbeated` above
-    /// only ever exercises a warm gate.
-    ///
-    /// A registry with a known node that has never heartbeated (`node-b`)
-    /// must not answer `Gone` while the gate is cold — an answer that flows
-    /// straight into `stub.rs`'s `RuntimeConfirmedGone`, and from there into
-    /// the orchestrator reading a perfectly live sandbox's runtime as gone.
-    /// It must refuse instead (`Err`), which is the one answer no caller can
-    /// mistake for confirmed absence.
     #[tokio::test]
     async fn node_membership_withholds_gone_while_the_registry_is_cold() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -762,9 +528,6 @@ mod tests {
         let warmup = cold_gate(Arc::clone(&registry), now);
         let placement = placement_with_warmup(Arc::clone(&registry), Arc::clone(&warmup));
 
-        // node-b has never heartbeated and the gate has not opened (node-a,
-        // the other node discovery knows about, has not reported either) —
-        // this must refuse, not answer `Gone`.
         let err = placement
             .node_membership("node-b")
             .await
@@ -774,9 +537,6 @@ mod tests {
             "{err}"
         );
 
-        // node-a heartbeats, but node-b — also known to discovery — still
-        // has not, so the gate stays shut per `stays_cold_until_every_known_node_reports`
-        // in `warmup.rs`'s own tests.
         registry
             .heartbeat(&heartbeat("node-a"), now)
             .expect("node-a is in discovery");
@@ -786,9 +546,6 @@ mod tests {
             .await
             .expect_err("node-b still has not reported; the gate is still cold");
 
-        // Once every node discovery knows about has reported (node-b now
-        // heartbeats too), the gate opens and the same question gets the
-        // real answer.
         registry
             .heartbeat(&heartbeat("node-b"), now)
             .expect("node-b is in discovery");
@@ -799,8 +556,6 @@ mod tests {
             "node-b just heartbeated and the gate is now warm"
         );
 
-        // And a node discovery never listed at all reads as `Gone` once
-        // warm, same as the always-warm test above.
         assert_eq!(
             placement.node_membership("node-c").await.unwrap(),
             NodeMembership::Gone,
@@ -808,12 +563,6 @@ mod tests {
         );
     }
 
-    /// The deadline half of the same coverage, updated for P1's fix to
-    /// `WarmupGate::warmed_up`: the gate must still open at its deadline
-    /// for a straggler once *something* has reported, but — unlike before
-    /// P1 — must not open at all if nothing ever has. See
-    /// `node_membership_stays_cold_past_the_deadline_when_nothing_has_ever_reported`
-    /// below for the second half.
     #[tokio::test]
     async fn node_membership_opens_at_the_warmup_deadline_for_a_silent_straggler() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -839,7 +588,6 @@ mod tests {
         ));
         let placement = placement_with_warmup(Arc::clone(&registry), Arc::clone(&warmup));
 
-        // node-a reports; node-b never does for the rest of this test.
         registry
             .heartbeat(&heartbeat("node-a"), start)
             .expect("node-a is in discovery");
@@ -850,13 +598,7 @@ mod tests {
             .await
             .expect_err("node-b has never heartbeated and the deadline has not passed");
 
-        // The deadline boundary itself, checked directly against the gate
-        // with a synthetic `now` (mirrors `warmup.rs`'s own
-        // `opens_at_the_deadline_for_a_silent_straggler_once_something_has_reported`):
-        // `node_membership` always calls `warmed_up` with a real
-        // `SystemTime::now()`, so exercising the boundary through the
-        // placement itself would require actually waiting real wall-clock
-        // time.
+        // Check the synthetic deadline directly instead of waiting on wall clock.
         assert!(
             !warmup.warmed_up(start + Duration::from_secs(14)),
             "the gate must still be shut one second before its deadline, even with node-a \
@@ -867,10 +609,7 @@ mod tests {
             "the gate must open at its deadline even with node-b still silent, now that \
              node-a has reported at least once"
         );
-        // `warm` is a one-way latch (`WarmupGate::warmed_up`'s own doc), so
-        // the direct check just above already flipped it for good --
-        // `node_membership`'s own internal (real) `SystemTime::now()` call
-        // now short-circuits on that latch regardless of the actual clock.
+        // The direct deadline check latches the gate for subsequent real-time calls.
         assert_eq!(
             placement.node_membership("node-b").await.unwrap(),
             NodeMembership::Gone,
@@ -878,16 +617,6 @@ mod tests {
         );
     }
 
-    /// 🔴 P1: the actual consumer-level proof of the bug fix — a registry
-    /// that has never received a single heartbeat must keep refusing
-    /// `node_membership`, arbitrarily far past its deadline, rather than
-    /// eventually asserting every node `Gone`. This is
-    /// `warmup.rs`'s own `stays_cold_past_the_deadline_when_nothing_has_ever_reported`,
-    /// proven through the real consumer the bug actually reached: before
-    /// the fix, this test would have failed at the final assertion, with
-    /// `node_membership("node-a")` answering `Gone` for a node that has
-    /// simply not had the chance to report to a freshly (re)started
-    /// replica yet.
     #[tokio::test]
     async fn node_membership_stays_cold_past_the_deadline_when_nothing_has_ever_reported() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -898,14 +627,7 @@ mod tests {
             }],
             Duration::from_secs(30),
         ));
-        // The deadline is anchored at the Unix epoch -- already long past by
-        // any `SystemTime::now()` this test (or `node_membership`'s own
-        // internal one) will ever observe, the same trick `warm_gate` above
-        // uses -- but *without* ever calling `reported_in`. The point is to
-        // exercise the deadline genuinely passing, through
-        // `node_membership`'s own real-clock `warmed_up` call, with zero
-        // heartbeats ever received: before the fix, this alone was enough
-        // to latch `warm` and answer `Gone`.
+        // Elapsed deadline with zero reports must remain cold.
         let warmup = Arc::new(WarmupGate::new(
             Arc::clone(&registry) as Arc<dyn crate::node_registry::registry::NodeRegistry>,
             Duration::from_secs(1),
@@ -919,13 +641,6 @@ mod tests {
         );
     }
 
-    /// `resolve_node`'s cold-registry case: always an `Err`, warm or not —
-    /// unlike `node_membership`, it never had a confident affirmative
-    /// answer to withhold, so the [`WarmupGate`] can only change *why* the
-    /// call failed. The control here is that the message says so: a caller
-    /// reading logs during a fleet-wide restart should not be told a
-    /// perfectly live node has "no observed record" when the truth is that
-    /// this replica has not warmed up yet.
     #[tokio::test]
     async fn resolve_node_names_warm_up_rather_than_absence_while_cold() {
         let registry = Arc::new(AtomicNodeRegistry::new(

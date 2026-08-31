@@ -12,65 +12,19 @@ use crate::proto::node::SERIALIZED_VALUE_VERSION;
 use crate::sandbox::SandboxCaptureError;
 use crate::types::SandboxId;
 
-/// Turns a gRPC failure into an ordinary error.
-///
-/// 🔴 Every code, including the ones that sound like answers. `NotFound` from a
-/// node means "not on that node", which is not the same as "not anywhere", and
-/// the only caller allowed to read it as an answer is the one that knows what
-/// it asked — see `RemoteSandboxStub::stop`.
+/// Converts any node gRPC status into an ordinary error without interpreting it as absence.
 pub fn into_error(status: Status) -> anyhow::Error {
     anyhow!("{}: {}", status.code(), status.message())
 }
 
-/// Whether a status means the call never reached the node at all — the
-/// connection could not be established or broke before an answer came back —
-/// as opposed to a status the node actually sent.
+/// Returns true only for client-generated `Unavailable` statuses with a transport source.
 ///
-/// # 🔴 Why `source().is_some()` is load-bearing and not `code()` alone
-///
-/// `Code::Unavailable` is not unambiguous by itself: it is exactly the code a
-/// node could deliberately send back (there is no such reply in this service
-/// today, but nothing about the protocol rules one out — see
-/// [`RemoteResumeFailure::from_status`], which already treats a *sent*
-/// `Unavailable` as an answer rather than a transport failure). What tells the
-/// two apart is how the client-side `Status` was built:
-///
-/// * a status the node actually sent is decoded off the wire by
-///   `Status::from_header_map`, which always sets `source: None` — there is no
-///   underlying Rust error, only bytes that were parsed;
-/// * a status this process manufactured because the call itself failed —
-///   connection refused, DNS failure, a connection that died mid-flight, the
-///   node never having been dialed at all — goes through tonic's
-///   `Status::from_error`, which always attaches the original transport error
-///   as the source.
-///
-/// So a status with no source is, whatever its code, something the node said.
-/// Treating it as unreachable and retrying would replay a request the node
-/// already refused for a reason of its own.
-///
-/// A caller that finds this true has learned nothing about the node's
-/// opinion of the request — only that the request never reached it — and may
-/// safely retry the same request once a fresh address has been resolved.
+/// A source-less status came from the node and must not be replayed.
 pub fn is_unreachable(status: &Status) -> bool {
     status.code() == tonic::Code::Unavailable && status.source().is_some()
 }
 
-/// Turns a gRPC failure on a capture into the classification the caller acts
-/// on.
-///
-/// # 🔴 A missing classification is terminal
-///
-/// The two outcomes are not symmetric. "Recoverable" tells the caller the
-/// runtime was put back and may go on serving; "terminal" tells it the runtime
-/// was mutated past safe resume and must be torn down. Reading an unclassified
-/// failure as recoverable would keep serving a VM that may have been snapshotted
-/// out from under itself; reading it as terminal costs one sandbox. So an error
-/// that arrived without a classification, or with one this build cannot decode,
-/// is terminal.
-///
-/// The classification travels in the status details and never in the code:
-/// `Internal` is produced by both kinds and by the transport itself, so a
-/// caller reading the code alone would be guessing.
+/// Converts a capture failure, treating missing or undecodable classification as terminal.
 pub fn into_capture_error(status: Status) -> SandboxCaptureError {
     let message = format!("{}: {}", status.code(), status.message());
     let unclassified = || {
@@ -79,11 +33,7 @@ pub fn into_capture_error(status: Status) -> SandboxCaptureError {
         ))
     };
 
-    // 🔴 Empty details are checked *before* the decode, and this is not
-    // defensive tidiness. prost decodes an empty buffer into a message with
-    // every field at its default, so `SandboxCaptureFailure::decode(b"")`
-    // succeeds and yields `terminal: false` — which would silently turn every
-    // ordinary transport failure into "recoverable, the sandbox is fine".
+    // Prost decodes empty bytes as recoverable defaults, so reject them before decoding.
     if status.details().is_empty() {
         return unclassified();
     }
@@ -96,32 +46,9 @@ pub fn into_capture_error(status: Status) -> SandboxCaptureError {
     }
 }
 
-/// Why a paused sandbox was not reopened on the node that holds its capture.
+/// Classifies why a node did not reopen its local capture.
 ///
-/// # 🔴 Three answers, because two of them end the same way and mean opposite
-/// things
-///
-/// A resume that did not happen leaves the caller with a decision to take, and
-/// the decision differs by *why*:
-///
-/// - [`CaptureAbsent`][Self::CaptureAbsent] — the node looked and is not
-///   holding this sandbox's capture. The only copy is not there, so the caller
-///   must rebuild the sandbox from a published snapshot or give it up; asking
-///   again will not change the answer.
-/// - [`NodeUnreachable`][Self::NodeUnreachable] — nobody answered, or the node
-///   answered that it is not taking work. The capture is presumed intact and
-///   the right move is to ask again later.
-/// - [`Refused`][Self::Refused] — the node answered and said no for a reason of
-///   its own: the fence named a run it is not holding, the request was
-///   malformed, something failed inside.
-///
-/// 🔴 The whole point of the type is that these cannot be collapsed. Reading an
-/// unreachable node as an absent capture discards a sandbox whose bytes are
-/// sitting intact on a disk that is merely offline — which is the same mistake,
-/// one layer up, as reading a failed store read as "the record is not there".
-/// Nothing above this layer acts on the difference *yet*, because the wake-up
-/// surface that will is still being assembled; what it must never do is arrive
-/// to find the difference already thrown away in a string.
+/// Absence, temporary unreachability, and node refusal must remain distinct.
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteResumeFailure {
     #[error("node {node_id} is not holding a paused capture for sandbox {sandbox_id}: {detail}")]
@@ -145,12 +72,7 @@ pub enum RemoteResumeFailure {
 }
 
 impl RemoteResumeFailure {
-    /// Classifies what a node said about a resume.
-    ///
-    /// 🔴 `Unavailable` covers both a transport that never delivered the call
-    /// and a node that delivered it and said it is not taking work, and they
-    /// are one class on purpose: both mean *the capture is still there, ask
-    /// again*, which is the only thing the caller does differently.
+    /// Classifies a node-returned resume status.
     pub fn from_status(node_id: &str, sandbox_id: SandboxId, status: Status) -> Self {
         let node_id = node_id.to_string();
         let detail = format!("{}: {}", status.code(), status.message());
@@ -173,10 +95,7 @@ impl RemoteResumeFailure {
         }
     }
 
-    /// A node this process could not open a connection to.
-    ///
-    /// 🔴 Never [`CaptureAbsent`][Self::CaptureAbsent]. A refused connection is
-    /// the one failure with no answer in it at all.
+    /// Constructs a failure for a connection that never reached the node.
     pub fn unreachable(node_id: &str, sandbox_id: SandboxId, detail: String) -> Self {
         Self::NodeUnreachable {
             node_id: node_id.to_string(),
@@ -224,11 +143,7 @@ pub fn serialized_value(
         .with_context(|| format!("decode {what}"))
 }
 
-/// An address a node reported, or `None` when it reported none.
-///
-/// 🔴 An unparseable address is `None` rather than an error: the field is
-/// informational — it is what the proxy would dial — and failing a whole create
-/// over it would trade a degraded sandbox for no sandbox.
+/// Parses an informational IPv4 address, returning `None` for absent or invalid input.
 pub fn host_ip(raw: &str) -> Option<Ipv4Addr> {
     (!raw.is_empty()).then(|| raw.parse().ok()).flatten()
 }
@@ -237,21 +152,8 @@ pub fn host_ip(raw: &str) -> Option<Ipv4Addr> {
 mod tests {
     use super::*;
 
-    /// A connection failure that never reached the node is retried; a status
-    /// the node actually sent — even the identically-coded `Unavailable` —
-    /// is not.
-    ///
-    /// 🔴 This is the distinction the stale-node-address retry in
-    /// `RemoteSandboxStub` depends on entirely: mutating the implementation so
-    /// it retried on `code() == Unavailable` alone (dropping the `source()`
-    /// check) would make this test pass exactly as before for the transport
-    /// case and start replaying every deliberate `Unavailable` answer too —
-    /// which is why the second assertion here matters as much as the first.
     #[test]
     fn only_a_status_with_no_answer_behind_it_counts_as_unreachable() {
-        // A transport failure: the call never produced an HTTP response, so
-        // tonic built this status from the connect error itself, and
-        // `Status::from_error` always attaches that error as the source.
         let transport_failure = Status::from_error(Box::new(tonic::ConnectError(Box::new(
             std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "tcp connect error"),
         ))));
@@ -261,8 +163,6 @@ mod tests {
             "a connect failure must be retried"
         );
 
-        // The node answering with the very same code is not a transport
-        // failure: nothing this process manufactured, no source attached.
         let sent_by_the_node = Status::unavailable("draining, try another node");
         assert_eq!(sent_by_the_node.code(), tonic::Code::Unavailable);
         assert!(
@@ -270,19 +170,10 @@ mod tests {
             "a status the node actually sent must not be retried, even at the same code"
         );
 
-        // And an ordinary application-level refusal is naturally excluded by
-        // the code check alone.
         let refused = Status::not_found("no such sandbox here");
         assert!(!is_unreachable(&refused));
     }
 
-    /// 🔴 The three answers a resume can come back with stay three.
-    ///
-    /// One call shape, one value different — the status code — and the
-    /// classification has to move with it. The pair that matters is the first
-    /// two: `NotFound` says the only copy of a sandbox is gone and licenses
-    /// throwing the sandbox away, and `Unavailable` says a machine is down and
-    /// licenses nothing at all.
     #[test]
     fn an_unreachable_node_is_not_a_capture_that_is_gone() {
         let sandbox_id = SandboxId::new();
@@ -304,22 +195,17 @@ mod tests {
             classify(Status::failed_precondition("that run is not the one here")),
             RemoteResumeFailure::Refused { .. }
         ));
-        // 🔴 And the default arm is a refusal rather than an absence: a node
-        // that failed inside has not told anyone the capture is gone.
         assert!(matches!(
             classify(Status::internal("something went wrong")),
             RemoteResumeFailure::Refused { .. }
         ));
 
-        // A connection that was never opened carries no answer at all.
         assert!(matches!(
             RemoteResumeFailure::unreachable("node-a", sandbox_id, "connection refused".into()),
             RemoteResumeFailure::NodeUnreachable { .. }
         ));
     }
 
-    /// The classification survives being carried as an ordinary error, which is
-    /// how it reaches the layer that acts on it.
     #[test]
     fn the_classification_survives_the_error_it_travels_in() {
         let sandbox_id = SandboxId::new();
@@ -334,9 +220,6 @@ mod tests {
             err.downcast_ref::<RemoteResumeFailure>(),
             Some(RemoteResumeFailure::NodeUnreachable { .. })
         ));
-        // 🔴 The control face: the same wrapping around the other answer comes
-        // back as the other answer, so this is not a downcast that matches
-        // whatever it is handed.
         let absent = anyhow::Error::new(RemoteResumeFailure::from_status(
             "node-a",
             sandbox_id,
@@ -364,9 +247,6 @@ mod tests {
         }
     }
 
-    /// 🔴 The direction that matters. An error with no classification — a
-    /// transport failure, a node from an older build, a status somebody wrote
-    /// by hand — must be read as terminal.
     #[test]
     fn an_unclassified_failure_is_terminal() {
         let err = into_capture_error(Status::internal("something went wrong"));

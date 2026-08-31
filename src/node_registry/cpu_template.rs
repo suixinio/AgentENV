@@ -1,39 +1,14 @@
-//! Port of `services/scheduler/internal/cpu_template.go` (300 lines) — the
-//! bitwise-AND intersection of Firecracker `cpu_config_json` blobs.
+//! Computes the conservative bitwise-AND intersection of Firecracker CPU configs.
 //!
-//! This is the algorithm behind the CPU-config-intersection link CLAUDE.md
-//! calls out as one that "must keep working" across the Stage A port: every
-//! node's heartbeat carries `MachineInfo.cpu_config_json`, the registry
-//! intersects every reporting node's config in a cluster, and the result
-//! rides back on the heartbeat response to gate what a node may hand
-//! Firecracker's pre-boot `PUT /cpu-config`. A leaf, register or MSR address
-//! only survives into the result if *every* config in the batch has it — a
-//! CPU feature only one machine offers must never be requested on a machine
-//! that lacks it, so intersection (not union) is the only safe operation.
-//!
-//! A pure, stateless function: JSON strings in, one JSON string out (or an
-//! error on malformed input). No knowledge of the registry, of a cluster, or
-//! of "every node has reported" — that gating (`allConfigsReadyLocked` in
-//! Go) belongs to whoever calls this, so it lives with the registry state in
-//! `super::registry`, not here.
-//!
-//! Ported field-for-field from `cpu_template.go`'s `cpuConfig` /
-//! `cpuidModifier` / `msrModifier` / `registerMod` shapes so the JSON produced
-//! here is byte-identical to what the Go scheduler emits for the same input
-//! (field order, `"0b"`-prefixed zero-padded bitmaps, empty arrays rather than
-//! `null`) — the two must agree because a heartbeat may be answered by
-//! whichever of the two implementations Stage A's placement switch currently
-//! selects, and a node applying the result cannot tell which one produced it.
+//! A capability, CPUID register, or MSR survives only when every input contains it.
+//! Callers own cluster completeness gating; this module is pure JSON transformation.
+//! Output preserves stable field order and zero-padded bitmap formatting.
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
-/// Mirrors Go's `cpuConfig`: the top-level Firecracker `cpu_config_json`
-/// structure. Field order matters — it is JSON output order, and Go's
-/// `encoding/json` emits struct fields in declaration order with no
-/// whitespace, which is what `serde_json::to_string` does too as long as the
-/// field order here matches.
+/// Firecracker CPU-config shape in output field order.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct CpuConfig {
     #[serde(default)]
@@ -66,19 +41,14 @@ struct MsrModifier {
     bitmap: String,
 }
 
-/// `(leaf, subleaf, flags)` — the composite key identifying a CPUID entry.
 type CpuidLeafKey = (u32, u32, i64);
 
-/// KVM refuses to let a leaf in this set be overridden (leaf `0xb`, the
-/// topology enumeration leaf).
+/// Returns whether KVM forbids overriding the CPUID leaf.
 fn is_kvm_read_only_leaf(leaf: u32) -> bool {
     leaf == 0xb
 }
 
-/// Computes a conservative bitwise-AND intersection of Firecracker
-/// `cpu_config_json` strings. Only entries present in every input config are
-/// retained; bitmap fields for shared entries are ANDed together. Returns an
-/// empty string when `jsons` is empty.
+/// Intersects configs, retaining only shared entries and ANDing their bitmaps.
 pub fn intersect_cpu_configs(jsons: &[String]) -> Result<String> {
     if jsons.is_empty() {
         return Ok(String::new());
@@ -112,7 +82,6 @@ fn make_cpuid_leaf_key(modifier: &CpuidModifier) -> Result<CpuidLeafKey> {
 fn intersect_cpuid_modifiers(configs: &[CpuConfig]) -> Result<Vec<CpuidModifier>> {
     let n = configs.len();
 
-    // Build per-config maps: leaf key -> register -> u32 bitmap value.
     let mut per_config: Vec<HashMap<CpuidLeafKey, HashMap<String, u32>>> = Vec::with_capacity(n);
     for (i, cfg) in configs.iter().enumerate() {
         let mut by_leaf: HashMap<CpuidLeafKey, HashMap<String, u32>> = HashMap::new();
@@ -134,7 +103,6 @@ fn intersect_cpuid_modifiers(configs: &[CpuConfig]) -> Result<Vec<CpuidModifier>
         per_config.push(by_leaf);
     }
 
-    // Count how many configs contain each leaf key.
     let mut leaf_count: HashMap<CpuidLeafKey, usize> = HashMap::new();
     for by_leaf in &per_config {
         for key in by_leaf.keys() {
@@ -142,23 +110,21 @@ fn intersect_cpuid_modifiers(configs: &[CpuConfig]) -> Result<Vec<CpuidModifier>
         }
     }
 
-    // Iterate in the order of configs[0] so output is deterministic.
+    // Preserve first-config order for deterministic output.
     let mut result = Vec::new();
     let mut seen_leaf: HashSet<CpuidLeafKey> = HashSet::new();
     for modifier in &configs[0].cpuid_modifiers {
-        // Already validated above.
         let key = make_cpuid_leaf_key(modifier)?;
         if !seen_leaf.insert(key) {
             continue;
         }
         if leaf_count.get(&key).copied().unwrap_or(0) < n {
-            continue; // not present in every config
+            continue; // absent from at least one config
         }
         if is_kvm_read_only_leaf(key.0) {
-            continue; // KVM does not allow overriding this leaf
+            continue; // KVM read-only leaf
         }
 
-        // Count how many configs have each register for this leaf.
         let mut reg_count: HashMap<String, usize> = HashMap::new();
         for by_leaf in &per_config {
             if let Some(registers) = by_leaf.get(&key) {
@@ -168,10 +134,7 @@ fn intersect_cpuid_modifiers(configs: &[CpuConfig]) -> Result<Vec<CpuidModifier>
             }
         }
 
-        // The register candidate set is seeded from configs[0], same
-        // conservative-but-not-maximal note as the Go source: registers
-        // present in configs[1..n] but absent in configs[0] are never
-        // visited, even if present in every config.
+        // Seed from the first config; entries absent there cannot be in the intersection.
         let mut register_mods = Vec::new();
         let mut seen_register: HashSet<String> = HashSet::new();
         for register_mod in &modifier.modifiers {
@@ -179,9 +142,9 @@ fn intersect_cpuid_modifiers(configs: &[CpuConfig]) -> Result<Vec<CpuidModifier>
                 continue;
             }
             if reg_count.get(&register_mod.register).copied().unwrap_or(0) < n {
-                continue; // not present in every config
+                continue; // absent from at least one config
             }
-            // AND across all configs. Starting value is all-ones (AND identity).
+            // Start AND reduction from its identity.
             let mut and_value: u32 = u32::MAX;
             for by_leaf in &per_config {
                 let value = by_leaf
@@ -236,7 +199,6 @@ fn intersect_msr_modifiers(configs: &[CpuConfig]) -> Result<Vec<MsrModifier>> {
     let mut result = Vec::new();
     let mut seen_addr: HashSet<u32> = HashSet::new();
     for modifier in &configs[0].msr_modifiers {
-        // Already validated above.
         let addr = parse_hex_u32(&modifier.addr)?;
         if !seen_addr.insert(addr) {
             continue;
@@ -293,8 +255,6 @@ fn parse_bitmap_u64(s: &str) -> Result<u64> {
     u64::from_str_radix(trimmed, 2).map_err(|e| anyhow!("invalid bitmap {s:?}: {e}"))
 }
 
-/// Serializes `v` as a `"0b"`-prefixed binary string, zero-padded to `bits`
-/// digits (32 for CPUID registers, 64 for MSRs).
 fn format_bitmap(v: u64, bits: usize) -> String {
     format!("0b{v:0bits$b}")
 }
@@ -540,13 +500,6 @@ mod tests {
         }
     }
 
-    // 🔴 Regression guard: intersection must never leak a config's own
-    // entries through unfiltered. If `intersect_cpuid_modifiers` (or the msr
-    // / kvm-capability counterparts) is ever simplified into "return
-    // configs[0]'s own data" — the kind of shortcut that looks harmless when
-    // configs[0] happens to be the narrowest one in a test fixture — this
-    // catches it: pairing a config that has entries against one that has
-    // none must intersect down to nothing, not echo the wide side.
     #[test]
     fn intersection_never_exceeds_the_narrowest_config() {
         let wide = build_config(
@@ -563,25 +516,8 @@ mod tests {
         assert!(result.msr_modifiers.is_empty());
     }
 
-    /// 🔴 D6 (task's own label): cross-language proof that this port and the
-    /// Go scheduler's `IntersectCpuConfigs` agree byte-for-byte, not merely
-    /// "logically" the way the fixtures above (built from Rust constructors
-    /// and compared against Rust-computed expectations) do. Every input/
-    /// output pair below was produced by *running the real Go function* —
-    /// `services/scheduler/internal/cpu_template.go`'s `IntersectCpuConfigs`
-    /// — against these exact JSON strings, from a temporary `_test.go` added
-    /// to `services/scheduler/internal` (same package, so it could see the
-    /// unexported function), `go test -run TestZZZGoldenDump -v`, output
-    /// captured, temporary file deleted (never committed — `git status
-    /// --porcelain services/` was empty afterward). If this Rust port and
-    /// the Go original ever disagree on any of these three inputs, a
-    /// heartbeat answered by one implementation and applied to a node that
-    /// trusts the other produces a different `PUT /cpu-config` body, which is
-    /// exactly the failure CLAUDE.md's "must keep working" chain is about.
     #[test]
     fn matches_the_real_go_implementation_byte_for_byte() {
-        // A single config: the intersection of one thing with itself is
-        // itself, byte-for-byte, field order included.
         let single_full = r#"{"kvm_capabilities":["cap.a","cap.b"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000001111"}]}],"msr_modifiers":[{"addr":"0x10","bitmap":"0b0000000000000000000000000000000000000000000000000000000011111111"}]}"#;
         assert_eq!(
             intersect_cpu_configs(&[single_full.to_string()]).expect("go golden: single_full"),
@@ -589,11 +525,6 @@ mod tests {
             "single-config intersection diverged from the real Go output"
         );
 
-        // Two configs: a kvm_capabilities set intersection, a leaf present in
-        // only one config dropped, an msr present in only one config
-        // dropped, and a bitmap AND on the leaf/addr both configs share
-        // (0xFF & 0xAA = 0xAA on the msr; two independent register ANDs on
-        // the cpuid leaf).
         let two_a = r#"{"kvm_capabilities":["cap.a","cap.b","cap.c"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000001111"},{"register":"ebx","bitmap":"0b00000000000000000000000011110000"}]},{"leaf":"0x7","subleaf":"0x0","flags":0,"modifiers":[{"register":"ecx","bitmap":"0b00000000000000000000000000000001"}]}],"msr_modifiers":[{"addr":"0x10","bitmap":"0b0000000000000000000000000000000000000000000000000000000011111111"},{"addr":"0x20","bitmap":"0b0000000000000000000000000000000000000000000000000000000000001111"}]}"#;
         let two_b = r#"{"kvm_capabilities":["cap.a","cap.c","cap.d"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000101"},{"register":"ebx","bitmap":"0b00000000000000000000000010100000"}]}],"msr_modifiers":[{"addr":"0x10","bitmap":"0b0000000000000000000000000000000000000000000000000000000010101010"}]}"#;
         let two_want = r#"{"kvm_capabilities":["cap.a","cap.c"],"cpuid_modifiers":[{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000101"},{"register":"ebx","bitmap":"0b00000000000000000000000010100000"}]}],"msr_modifiers":[{"addr":"0x10","bitmap":"0b0000000000000000000000000000000000000000000000000000000010101010"}]}"#;
@@ -604,10 +535,6 @@ mod tests {
             "two-config intersection diverged from the real Go output"
         );
 
-        // Three configs, all reporting leaf 0xb (the read-only topology
-        // leaf): Go's output drops it entirely, even though every config
-        // reported it — this is the case a naive "AND the field that all
-        // three share" rewrite would get wrong.
         let three_a = r#"{"kvm_capabilities":["cap.x"],"cpuid_modifiers":[{"leaf":"0xb","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000001111"}]},{"leaf":"0x1","subleaf":"0x0","flags":1,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000011"}]}],"msr_modifiers":[]}"#;
         let three_b = r#"{"kvm_capabilities":["cap.x"],"cpuid_modifiers":[{"leaf":"0xb","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000111"}]},{"leaf":"0x1","subleaf":"0x0","flags":1,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000110"}]}],"msr_modifiers":[]}"#;
         let three_c = r#"{"kvm_capabilities":["cap.x","cap.y"],"cpuid_modifiers":[{"leaf":"0xb","subleaf":"0x0","flags":0,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000011"}]},{"leaf":"0x1","subleaf":"0x0","flags":1,"modifiers":[{"register":"eax","bitmap":"0b00000000000000000000000000000111"}]}],"msr_modifiers":[]}"#;

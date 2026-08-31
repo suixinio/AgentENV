@@ -1,68 +1,12 @@
-//! Port of `services/scheduler/internal/kubernetes_discovery.go` (379
-//! lines) — turning EndpointSlice/Pod watches into the `Node` lists
-//! [`super::registry::AtomicNodeRegistry::set`] consumes.
+//! Converts Kubernetes EndpointSlice and Pod watches into node-registry discovery state.
 //!
-//! # What is fully ported and tested, and what is not
+//! Serving endpoints become active or lingering nodes; non-serving, non-terminating
+//! endpoints are admitted only for heartbeat identity until they become schedulable.
+//! Discovery sync must call `set` before `admit_pending`.
 //!
-//! Go's own test file (`kubernetes_discovery_test.go`) never drives
-//! `NewKubernetesDiscovery`/`Run` against a real or fake apiserver either —
-//! every test in it exercises either a pure function
-//! (`nodesFromEndpointSlices`, `nodeFromEndpoint`,
-//! `selectRoutableEndpointAddress`, `filterNodesByPodLabels`,
-//! `validateOptionalPodSelector`) or `AtomicNodeRegistry` directly, fed by
-//! those functions' output. This port draws the same boundary:
-//!
-//! - [`nodes_from_endpoint_slices`], [`filter_nodes_by_pod_labels`], and
-//!   [`validate_optional_pod_selector`] are pure, fully unit-tested below,
-//!   and cover every case `kubernetes_discovery_test.go` covers for them.
-//! - [`KubernetesDiscovery`] is the live watch glue — three `kube::runtime`
-//!   watchers (EndpointSlice, and two label-selected Pod watches) feeding a
-//!   registry via the pure functions above. **It compiles but has not been
-//!   exercised against a real Kubernetes API server in this change** — Stage
-//!   A's own construction plan calls for that verification on a live k3s
-//!   dev cluster (`docs/proposals/_sd-phase4-stageA-node-inventory.md` §9
-//!   step 4), which this agent was not able to do (no cluster access in this
-//!   session). Whoever picks this up next should treat `KubernetesDiscovery`
-//!   as the first thing to point at a real cluster and watch — RBAC
-//!   (`deploy/k8s/base/role.yaml`'s `endpointslices`/`pods` get/list/watch
-//!   rules, and the new `agentenv-api` ServiceAccount that needs to bind to
-//!   them), label-selector syntax the API server actually enforces, and the
-//!   `Serving`/`Terminating` condition semantics on a real EndpointSlice
-//!   controller's output.
-//! - 🔴 P6-d correction: the line that used to stand here — "nothing in
-//!   this file is wired into any assembly path" — stopped being true the
-//!   moment `src/bin/aenv-api.rs`'s `start_native_node_registry` started
-//!   calling [`KubernetesDiscovery::connect`]. It is wired in now,
-//!   unconditionally; what is still true from the paragraph above is that
-//!   none of that wiring has been exercised against a real apiserver.
-//!
-//! # 🔴 P6-a: no cache-sync gate across the three watchers (tracked, not fixed)
-//!
-//! Go's `Run` (`kubernetes_discovery.go`) calls `WaitForCacheSync` on all
-//! three informers before `syncFromStore` ever runs, and `syncFromStore`'s
-//! own first line is `if !d.cacheSynced() { return }` — so a discovery pass
-//! never publishes a registry state built from only *some* of the three
-//! watchers having reached their initial list. [`sync_from_state`] here has
-//! no equivalent gate: [`watch_endpoint_slices`] calls
-//! [`super::registry::AtomicNodeRegistry::set`] the moment its own
-//! `Event::InitDone` arrives, regardless of whether either pod-selector
-//! watch has reached its own `InitDone` yet. With a selector configured,
-//! this is a real window — the filter set the not-yet-synced watch would
-//! have contributed is empty until its `InitDone`, which
-//! [`filter_nodes_by_pod_labels`] reads as "no filter" rather than "filter
-//! not ready yet", so a node that should be excluded can be published as
-//! active for the span of that window.
-//!
-//! Left unfixed here per the task's own D2 discipline (port faithfully in
-//! this change; known gaps are tracked, not silently patched alongside
-//! unrelated work) — and currently latent regardless:
-//! `deploy/k8s/base/agentenv-api-deployment.yaml` configures neither
-//! `ignore_pod_selector` nor `no_schedule_pod_selector` today (the Go
-//! scheduler's own former discovery config, `deploy/k8s/base/config/
-//! scheduler.json`, deleted along with `services/scheduler`, did not set
-//! either one either), so every sync in this deployment already has all the
-//! pod-selector data there is (none) by construction. Whoever configures a
-//! selector for the first time should close this gap before relying on it.
+//! The three watchers currently have no common initial-cache synchronization gate.
+//! Configuring either Pod selector requires closing that gap so partially initialized
+//! watcher state cannot transiently publish an incorrectly unfiltered registry.
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -81,50 +25,23 @@ use tracing::warn;
 use super::registry::AtomicNodeRegistry;
 use super::types::Node;
 
-/// `discoveryv1.LabelServiceName` (`k8s.io/api/discovery/v1/well_known_labels.go`).
 const LABEL_SERVICE_NAME: &str = "kubernetes.io/service-name";
 
-/// 🔴 P2: how many *consecutive* watch errors a single stream may absorb
-/// before this task gives up and returns `Err`, ending `KubernetesDiscovery::run`
-/// (its `tokio::join!` propagates the first task error) so
-/// `run_kubernetes_discovery_with_retry` (`src/bin/aenv-api.rs`) tears the whole
-/// `KubernetesDiscovery` down and rebuilds it — a fresh `kube::Client`, not
-/// just a fresh watch — rather than the same task looping on the same
-/// connection forever. `.default_backoff()` below throttles *how fast* those
-/// errors can arrive (kube-runtime 4.2.0's `watcher()` has no backoff of its
-/// own: an unrecoverable failure, e.g. RBAC that will never resolve without
-/// an operator, would otherwise be an unthrottled LIST/WATCH loop against the
-/// apiserver); this constant is what stops the throttled loop from running
-/// forever in the first place. Reset to zero on any non-`Err` item, so a
-/// flaky connection that recovers between failures never accumulates toward
-/// this — only an unbroken run of failures does.
+/// Consecutive watch errors before rebuilding the client and all watch streams.
 const MAX_CONSECUTIVE_WATCH_ERRORS: u32 = 5;
 
-/// Stage A-local stand-in for `services/shared/config.SchedulerDiscoveryKubernetesConfig`.
-/// Built by `aenv-api`'s startup wiring out of
-/// [`crate::cfg::ClusterKubernetesDiscoveryConfig`], which is what an
-/// operator actually sets under `[cluster.kubernetes_discovery]`.
+/// Kubernetes watch configuration for node discovery.
 #[derive(Debug, Clone, Default)]
 pub struct KubernetesDiscoveryConfig {
     pub namespace: String,
     pub service_name: String,
     pub port: i32,
-    /// Defaults to `"http"` when empty.
     pub scheme: String,
-    /// Empty disables the ignore-pod filter entirely.
     pub ignore_pod_selector: String,
-    /// Empty disables the no-schedule-pod filter entirely.
     pub no_schedule_pod_selector: String,
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Pure functions — EndpointSlice/Pod objects to Node lists.
-// ─────────────────────────────────────────────────────────────────────────
-
-/// Converts a batch of `EndpointSlice` objects into active/lingering `Node`
-/// lists. Uses the `Serving` condition (not `Ready`) to decide whether an
-/// endpoint is usable, and `Terminating` to distinguish active from
-/// lingering nodes.
+/// Converts serving endpoints into active and terminating node lists.
 pub fn nodes_from_endpoint_slices(
     slices: &[EndpointSlice],
     cfg: &KubernetesDiscoveryConfig,
@@ -173,9 +90,7 @@ fn has_matching_endpoint_port(ports: Option<&[EndpointPort]>, port: i32) -> bool
         .any(|candidate| candidate.port == Some(port))
 }
 
-/// Converts one `EndpointSlice` endpoint into a `Node`. Returns `None` when
-/// the endpoint is not `Serving`, names no pod, or offers no routable
-/// address.
+/// Converts one serving endpoint with a pod identity and routable address.
 fn node_from_endpoint(endpoint: &Endpoint, port: i32, scheme: &str) -> Option<(Node, bool)> {
     let serving = endpoint
         .conditions
@@ -218,29 +133,7 @@ fn node_from_endpoint(endpoint: &Endpoint, port: i32, scheme: &str) -> Option<(N
     ))
 }
 
-/// Task's own "D2": the same `EndpointSlice` -> `Node` conversion as
-/// [`nodes_from_endpoint_slices`], but selecting the complement --
-/// endpoints that are *not* `Serving` and *not* `Terminating`. These are
-/// nodes discovery already vouches for (a real, RBAC-watched `EndpointSlice`
-/// names them, with a routable address) that have not yet passed their
-/// readiness probe, most commonly a rolling update's freshly recreated pod
-/// in the seconds before it becomes `Serving`.
-///
-/// Deliberately a separate function rather than a third return value on
-/// [`nodes_from_endpoint_slices`]: that function's `Serving` gate, its
-/// tests, and every existing caller are left untouched (this task's own
-/// "port faithfully, do not rewrite a working, tested function" discipline)
-/// -- this is new, additive classification over the same input, not a
-/// change to what "active"/"lingering" mean. See
-/// [`super::registry::AtomicNodeRegistry::admit_pending`] for why the
-/// result is admitted as a third bucket rather than folded into `active` or
-/// `lingering`.
-///
-/// A `!Serving && Terminating` endpoint (never became ready, now going
-/// away) is excluded from every bucket, matching
-/// [`nodes_from_endpoint_slices`]'s pre-existing behavior for it -- there is
-/// no rolling-update-shaped race to close for a pod that never served
-/// anything.
+/// Converts non-serving, non-terminating endpoints into heartbeat-only pending nodes.
 pub fn nodes_pending_from_endpoint_slices(
     slices: &[EndpointSlice],
     cfg: &KubernetesDiscoveryConfig,
@@ -274,10 +167,7 @@ pub fn nodes_pending_from_endpoint_slices(
     pending_by_id.into_values().collect()
 }
 
-/// Converts one `EndpointSlice` endpoint into a `Node` when it is neither
-/// `Serving` nor `Terminating` -- the complement of [`node_from_endpoint`]'s
-/// `Serving` branch, restricted further by excluding `Terminating` (see
-/// [`nodes_pending_from_endpoint_slices`]'s own doc comment for why).
+/// Converts one non-serving, non-terminating endpoint into a pending node.
 fn pending_node_from_endpoint(endpoint: &Endpoint, port: i32, scheme: &str) -> Option<Node> {
     let serving = endpoint
         .conditions
@@ -318,11 +208,7 @@ fn pending_node_from_endpoint(endpoint: &Endpoint, port: i32, scheme: &str) -> O
     })
 }
 
-/// Names the node an endpoint belongs to: the cluster's name for the
-/// machine (`endpoint.node_name`) when present, falling back to the pod
-/// name. See `node_registry.go`'s `nodeIDForEndpoint` doc comment for why
-/// the machine's own name — not the pod's — is what a paused sandbox's
-/// registry row has to keep matching across pod restarts.
+/// Uses the Kubernetes node name as stable identity, falling back to the pod name.
 fn node_id_for_endpoint(endpoint: &Endpoint, target_ref_name: &str) -> String {
     if let Some(name) = endpoint.node_name.as_deref() {
         let trimmed = name.trim();
@@ -341,8 +227,6 @@ fn select_routable_endpoint_address(addresses: &[String]) -> Option<String> {
         .map(|a| a.to_string())
 }
 
-/// `net.JoinHostPort` equivalent: wraps an IPv6 literal in brackets, leaves
-/// an IPv4 one bare.
 fn format_host_port(address: &str, port: i32) -> String {
     match IpAddr::from_str(address) {
         Ok(IpAddr::V6(_)) => format!("[{address}]:{port}"),
@@ -350,18 +234,9 @@ fn format_host_port(address: &str, port: i32) -> String {
     }
 }
 
-/// Removes nodes whose id (see [`node_id_for_endpoint`]) is present in
-/// `ignore_pod_ids`, and moves nodes present in `no_schedule_pod_ids` from
-/// `active` into `lingering`.
+/// Removes ignored nodes and moves no-schedule nodes from active to lingering.
 ///
-/// 🔴 Ported as-is from `filterNodesByPodLabels`, including a quirk it
-/// inherits rather than introduces: the lookup key is the node's *id*, which
-/// is the Kubernetes node name whenever `endpoint.node_name` was set (see
-/// [`node_id_for_endpoint`]) — not necessarily the pod name the selector
-/// actually filtered on. Go's own informer-store lookup has the identical
-/// shape (`d.config.Namespace + "/" + node.ID"`, `kubernetes_discovery.go`
-/// around line 300). Recorded here rather than fixed, per the task's
-/// direction not to correct pre-existing behavior discovered while porting.
+/// Selector results are keyed by node ID, matching the upstream behavior.
 pub fn filter_nodes_by_pod_labels(
     active: Vec<Node>,
     lingering: Vec<Node>,
@@ -404,22 +279,6 @@ pub fn filter_nodes_by_pod_labels(
         lingering_by_id.into_values().collect(),
     )
 }
-
-// ─────────────────────────────────────────────────────────────────────────
-// Pod selector syntax validation.
-//
-// 🔴 Not a port of `k8s.io/apimachinery/pkg/labels.Parse` — no equivalent
-// client-side label-selector parser ships in the `kube`/`k8s-openapi` crate
-// family (confirmed by inspecting `kube-core-4.2.0`'s `labels.rs`: `Selector`
-// is a typed builder, not a string parser). `watcher::Config::labels` passes
-// the raw string straight through as the `labelSelector` query parameter and
-// leaves syntax enforcement to the API server. What follows is a permissive,
-// self-contained syntax check covering the same requirement grammar
-// (existence, `!`, `=`/`==`/`!=`, `in (...)`/`notin (...)`, comma-joined) —
-// good enough to reject the kind of typo `validateOptionalPodSelector`
-// exists to catch at config-load time, not a byte-for-byte reimplementation
-// of Kubernetes' DNS-1123 key/value grammar.
-// ─────────────────────────────────────────────────────────────────────────
 
 pub fn validate_optional_pod_selector(raw: &str, field: &str) -> Result<()> {
     let selector = raw.trim();
@@ -484,7 +343,6 @@ fn validate_requirement(requirement: &str) -> Result<()> {
         validate_key(key)?;
         return validate_value_list(list);
     }
-    // A bare key: existence requirement.
     validate_key(requirement)
 }
 
@@ -522,11 +380,6 @@ fn validate_value(value: &str) -> Result<()> {
     Ok(())
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Live watch glue — see the module doc comment for what has and has not
-// been validated.
-// ─────────────────────────────────────────────────────────────────────────
-
 fn object_key(namespace: Option<&str>, name: Option<&str>) -> String {
     format!("{}/{}", namespace.unwrap_or(""), name.unwrap_or(""))
 }
@@ -538,10 +391,7 @@ struct DiscoveryState {
     no_schedule_pod_names: HashSet<String>,
 }
 
-/// Drives three `kube::runtime` watchers — one EndpointSlice watch scoped to
-/// `cfg.service_name`, and up to two Pod watches scoped to
-/// `cfg.ignore_pod_selector`/`cfg.no_schedule_pod_selector` — and calls
-/// [`AtomicNodeRegistry::set`] every time any of them changes.
+/// Drives EndpointSlice and optional Pod-selector watches into one registry.
 pub struct KubernetesDiscovery {
     client: Client,
     config: KubernetesDiscoveryConfig,
@@ -549,8 +399,7 @@ pub struct KubernetesDiscovery {
 }
 
 impl KubernetesDiscovery {
-    /// Validates the configured pod selectors and builds a discovery
-    /// instance. Connects no socket by itself — [`Self::run`] does that.
+    /// Validates selectors and constructs discovery without starting watches.
     pub fn new(
         client: Client,
         config: KubernetesDiscoveryConfig,
@@ -568,11 +417,7 @@ impl KubernetesDiscovery {
         })
     }
 
-    /// [`Self::new`], building the client via in-cluster config (falling
-    /// back to a local kubeconfig — `kube::Config::infer`'s standard
-    /// resolution order, a superset of Go's `rest.InClusterConfig`-only
-    /// approach, which is more useful for a developer running against a
-    /// local cluster and behaves identically inside a Pod).
+    /// Infers a Kubernetes client and constructs discovery.
     pub async fn connect(
         config: KubernetesDiscoveryConfig,
         registry: Arc<AtomicNodeRegistry>,
@@ -583,10 +428,7 @@ impl KubernetesDiscovery {
         Self::new(client, config, registry)
     }
 
-    /// Runs until one of the three watch streams ends (which, for
-    /// `kube::runtime::watcher`, only happens on cancellation — it retries
-    /// transient errors internally) or errors out. Never returns `Ok(())`
-    /// under normal operation; callers drive it as a background task.
+    /// Runs until cancellation or a watch exceeds its consecutive-error threshold.
     pub async fn run(self) -> Result<()> {
         let state = Arc::new(Mutex::new(DiscoveryState::default()));
 
@@ -612,10 +454,7 @@ impl KubernetesDiscovery {
             PodSelectorKind::NoSchedule,
         );
 
-        // Any of the three ending (they should not, under normal retrying
-        // operation) ends discovery entirely — mirrors Go's `Run`, where all
-        // three informers share one `ctx` and the whole thing tears down
-        // together.
+        // Any watch ending tears down the complete discovery instance.
         let (endpoint_result, ignore_result, no_schedule_result) =
             tokio::join!(endpoint_task, ignore_task, no_schedule_task);
         endpoint_result.context("endpointslice watch task panicked")??;
@@ -633,8 +472,7 @@ impl KubernetesDiscovery {
         let registry = registry_handle(&self.registry);
         let config = self.config.clone();
         if selector.trim().is_empty() {
-            // Disabled: resolve immediately, matching Go's `nil` informer
-            // (never runs, never blocks `Run`'s cache-sync wait).
+            // A disabled selector contributes no watch task.
             return tokio::spawn(async { Ok(()) });
         }
         let api: Api<Pod> = Api::namespaced(self.client.clone(), &config.namespace);
@@ -650,8 +488,6 @@ enum PodSelectorKind {
     NoSchedule,
 }
 
-/// A cheap, cloneable handle so each watch task can call `set` without
-/// holding a reference into `self`.
 fn registry_handle(registry: &Arc<AtomicNodeRegistry>) -> Arc<AtomicNodeRegistry> {
     registry.clone()
 }
@@ -664,8 +500,6 @@ async fn watch_endpoint_slices(
 ) -> Result<()> {
     let mut stream = Box::pin(stream);
     let mut pending: Vec<EndpointSlice> = Vec::new();
-    // 🔴 P2: reset on every non-`Err` item, incremented and checked only in
-    // the `Err` arm below — see [`MAX_CONSECUTIVE_WATCH_ERRORS`]'s own doc.
     let mut consecutive_errors: u32 = 0;
     while let Some(event) = stream.next().await {
         if event.is_ok() {
@@ -822,13 +656,7 @@ fn sync_from_state(
         let s = state.lock().expect("discovery state lock poisoned");
         let slices: Vec<EndpointSlice> = s.endpoint_slices.values().cloned().collect();
         let (active, lingering) = nodes_from_endpoint_slices(&slices, config);
-        // Task's own "D2": computed from the same slices, independent of
-        // the ignore/no-schedule pod-label filtering below -- a
-        // not-yet-Serving node cannot self-report anything a label
-        // selector would match against yet, and admitting it for
-        // heartbeat identity only (never for scheduling, see
-        // `AtomicNodeRegistry::admit_pending`) makes the label filters
-        // moot for it either way.
+        // Pending nodes are admitted for identity only, independently of scheduling filters.
         let pending = nodes_pending_from_endpoint_slices(&slices, config);
         (
             active,
@@ -838,13 +666,7 @@ fn sync_from_state(
             (!s.no_schedule_pod_names.is_empty()).then(|| s.no_schedule_pod_names.clone()),
         )
     };
-    // Empty selector strings mean "no filter," represented the same way Go
-    // represents a nil informer: `None` here, not an empty set — an empty
-    // set would (correctly, but pointlessly) filter nothing, while `None`
-    // documents the filter is off. Only meaningful when the selector is
-    // configured *and* has not (yet) matched anything, which `sync_from_state`
-    // cannot tell apart from "filter disabled" purely from an empty set, so
-    // the caller's `config` is consulted instead.
+    // `None` distinguishes a disabled selector from an initialized empty result.
     let ignore = if config.ignore_pod_selector.trim().is_empty() {
         None
     } else {
@@ -859,8 +681,7 @@ fn sync_from_state(
         filter_nodes_by_pod_labels(active, lingering, ignore.as_ref(), no_schedule.as_ref());
     let now = std::time::SystemTime::now();
     registry.set(active, lingering, now);
-    // Must run after `set()` -- see `AtomicNodeRegistry::admit_pending`'s
-    // own doc comment for why the order is load-bearing.
+    // Pending admission must follow `set`, which replaces discovered nodes.
     registry.admit_pending(pending);
 }
 
@@ -1009,8 +830,6 @@ mod tests {
         assert!(active.is_empty() && lingering.is_empty());
     }
 
-    // ---- nodes_pending_from_endpoint_slices: task's own "D2" ----
-
     #[test]
     fn not_yet_serving_and_not_terminating_is_pending() {
         let pending = nodes_pending_from_endpoint_slices(
@@ -1041,9 +860,6 @@ mod tests {
 
     #[test]
     fn a_terminating_and_not_serving_endpoint_is_not_pending() {
-        // Never became ready, now going away — no rolling-update-shaped
-        // race to close for it, matches nodes_from_endpoint_slices's own
-        // not_serving_terminating_is_excluded.
         let ep = endpoint_with_conditions("agentenv-node-a", "10.0.0.1", Some(false), Some(true));
         let pending =
             nodes_pending_from_endpoint_slices(&[endpoint_slice(8000, vec![ep])], &default_cfg());
@@ -1180,8 +996,6 @@ mod tests {
         }
     }
 
-    // ---- filter_nodes_by_pod_labels ----
-
     fn node(id: &str) -> Node {
         Node {
             id: id.to_string(),
@@ -1216,14 +1030,6 @@ mod tests {
         assert!(active.is_empty() && lingering.is_empty());
     }
 
-    // 🔴 Regression guard: `ignore` must remove a node from *both* output
-    // sets, not just the one it currently occupies. The two-line removal
-    // (`active_by_id.remove` and `lingering_by_id.remove`) is easy to
-    // simplify into one — e.g. by an editor mistaking the pair for
-    // redundant, since a node is normally only ever in one set at a time —
-    // but a node that is *already lingering* and starts matching the ignore
-    // selector has to disappear entirely, not survive because only the
-    // active-side removal was kept.
     #[test]
     fn ignore_removes_an_already_lingering_node_too() {
         let ignore: HashSet<String> = ["agentenv-node-a".to_string()].into_iter().collect();
@@ -1243,8 +1049,6 @@ mod tests {
         assert_eq!(ids(&active), vec!["a"]);
         assert_eq!(ids(&lingering), vec!["b"]);
     }
-
-    // ---- validate_optional_pod_selector ----
 
     #[test]
     fn validates_pod_selector_syntax() {
@@ -1281,9 +1085,6 @@ mod tests {
         assert!(validate_optional_pod_selector("a in (b", "f").is_err());
         assert!(validate_optional_pod_selector("a notin b)", "f").is_err());
     }
-
-    // ---- registry integration (mirrors the non-k8s-specific tests that
-    //      live alongside the discovery tests in kubernetes_discovery_test.go) ----
 
     fn unix(secs: u64) -> std::time::SystemTime {
         std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
@@ -1341,16 +1142,6 @@ mod tests {
         assert_eq!(snapshot[0].id, "agentenv-node-b");
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // P2: the consecutive-watch-error guard. `watch_endpoint_slices` and
-    // `watch_pod_selector` both accept any `impl Stream<Item =
-    // watcher::Result<Event<K>>>`, so these feed a synthetic, finite stream
-    // built with `futures::stream::iter` rather than a real apiserver —
-    // exactly the seam that makes this guard unit-testable at all without a
-    // live cluster (see the module doc's own note on what is and is not
-    // exercised against one).
-    // ─────────────────────────────────────────────────────────────────────
-
     fn empty_state() -> Arc<Mutex<DiscoveryState>> {
         Arc::new(Mutex::new(DiscoveryState::default()))
     }
@@ -1359,13 +1150,6 @@ mod tests {
         Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)))
     }
 
-    /// 🔴 The core of P2: an unbroken run of watch errors — RBAC that will
-    /// never resolve without an operator, say — must end this task with an
-    /// `Err` rather than loop on the same broken stream forever. That `Err`
-    /// is what makes `KubernetesDiscovery::run`'s `tokio::join!` return
-    /// `Err`, which is what makes `run_kubernetes_discovery_with_retry`
-    /// (`src/bin/aenv-api.rs`) actually rebuild the client and the watch
-    /// instead of a healthy-looking task quietly never doing either again.
     #[tokio::test]
     async fn endpoint_slice_watch_ends_after_consecutive_errors() {
         let events: Vec<watcher::Result<Event<EndpointSlice>>> = (0..MAX_CONSECUTIVE_WATCH_ERRORS)
@@ -1382,11 +1166,6 @@ mod tests {
         assert!(err.to_string().contains("times in a row"), "{err}");
     }
 
-    /// The control for the test above: one error short of the threshold
-    /// must not end the task — otherwise the test above would pass just as
-    /// well against a guard that fires on the very first error, which is a
-    /// stream that never recovers under real backoff either way and defeats
-    /// the whole point of *consecutive*.
     #[tokio::test]
     async fn endpoint_slice_watch_survives_a_run_of_errors_below_the_threshold() {
         let events: Vec<watcher::Result<Event<EndpointSlice>>> = (0..MAX_CONSECUTIVE_WATCH_ERRORS
@@ -1406,10 +1185,6 @@ mod tests {
         );
     }
 
-    /// The streak resets on any non-error item, so a flaky connection that
-    /// recovers between failures never accumulates toward the threshold —
-    /// only an *unbroken* run does. Twice the threshold's worth of errors,
-    /// split by one successful event, must survive.
     #[tokio::test]
     async fn endpoint_slice_watch_error_streak_resets_on_a_successful_event() {
         let mut events: Vec<watcher::Result<Event<EndpointSlice>>> = Vec::new();
@@ -1433,9 +1208,6 @@ mod tests {
         );
     }
 
-    /// Same guard, the pod-selector watch's independent implementation of
-    /// it — a change that fixed `watch_endpoint_slices` and forgot
-    /// `watch_pod_selector` would pass every test above.
     #[tokio::test]
     async fn pod_selector_watch_ends_after_consecutive_errors() {
         let events: Vec<watcher::Result<Event<Pod>>> = (0..MAX_CONSECUTIVE_WATCH_ERRORS)

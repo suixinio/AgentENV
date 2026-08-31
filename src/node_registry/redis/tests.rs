@@ -7,10 +7,7 @@ fn now_ms() -> i64 {
     super::super::registry::unix_millis(std::time::SystemTime::now())
 }
 
-/// A record freshly "heartbeated" right now — `pull_all`'s GC pass compares
-/// `last_seen_unix_ms` against *real* wall-clock time, so a fixture meant to
-/// survive a pull has to sit near it rather than at an arbitrary fixed
-/// offset.
+/// Builds a record fresh enough to survive wall-clock garbage collection.
 fn fresh(node_id: &str, report_ttl_secs: u64) -> StoredObservedRecord {
     sample(node_id, now_ms(), report_ttl_secs)
 }
@@ -43,8 +40,7 @@ fn machine_info(cpu_config_json: &str) -> StoredMachineInfo {
     }
 }
 
-/// Like [`fresh`], but carrying a machine info — as `registry.rs`'s
-/// `heartbeat` would hand to `SharedObservedStore::upsert`.
+/// Builds a fresh record with machine information.
 fn fresh_with_machine(
     node_id: &str,
     report_ttl_secs: u64,
@@ -93,7 +89,6 @@ async fn pull_all_prunes_an_entry_stale_past_its_own_gc_grace_window() {
     let grace_ms = (report_ttl_secs * GC_GRACE_MULTIPLIER * 1000) as i64;
     let now_ms = now_ms();
 
-    // Just inside the grace window: survives.
     let fresh_enough = now_ms - grace_ms + 5_000;
     store
         .upsert(
@@ -102,7 +97,6 @@ async fn pull_all_prunes_an_entry_stale_past_its_own_gc_grace_window() {
         )
         .await
         .unwrap();
-    // Well past the grace window: pruned.
     let too_stale = now_ms - grace_ms - 5_000;
     store
         .upsert(
@@ -154,11 +148,6 @@ async fn pull_all_skips_an_undecodable_field_without_failing_the_whole_pull() {
     assert!(!pulled.contains_key("node-garbage"));
 }
 
-/// The basic round trip for the hot/side-hash split: a record with a
-/// machine info comes back from a pull with that machine info intact, and
-/// the hot hash itself never carries it (proving the split is actually
-/// happening, not merely that the public API papers over an unsplit
-/// write).
 #[tokio::test]
 async fn a_machine_info_survives_the_hot_and_side_hash_split() {
     let store = store_or_skip!("a_machine_info_survives_the_hot_and_side_hash_split");
@@ -175,8 +164,6 @@ async fn a_machine_info_survives_the_hot_and_side_hash_split() {
         "pull_all must resolve machine_info back onto the record it hands out"
     );
 
-    // The hot hash's own copy of the field must actually be gone -- the
-    // whole point of the split -- while carrying a digest that names it.
     let (mut conn, hash_key) = raw(&store);
     let raw_hot: Option<String> = conn.hget(&hash_key, "node-a").await.unwrap();
     let decoded: StoredObservedRecord =
@@ -193,40 +180,24 @@ async fn a_machine_info_survives_the_hot_and_side_hash_split() {
     );
 }
 
-/// The negative-polarity half of the "only write when it changed" claim:
-/// an unchanged `machine_info` across two `upsert` calls for the same node
-/// must not rewrite the side hash a second time. Proven by planting a
-/// sentinel value in the side hash after the first (necessarily
-/// cache-populating) upsert and checking it is still there after a second,
-/// content-identical upsert -- if the side hash were rewritten
-/// unconditionally, the sentinel would be gone. A change in `machine_info`
-/// on a third upsert must still get through, which is the positive half:
-/// asserting only "changed writes" would also pass an implementation that
-/// writes on every call, and asserting only "unchanged skips" would also
-/// pass one that never writes at all.
 #[tokio::test]
 async fn an_unchanged_machine_info_is_not_rewritten_but_a_changed_one_still_is() {
     let store =
         store_or_skip!("an_unchanged_machine_info_is_not_rewritten_but_a_changed_one_still_is");
     let (mut conn, machine_hash_key) = raw_machine(&store);
 
-    // First upsert: populates the side hash and this replica's publish-side
-    // cache.
     store
         .upsert("node-a", &fresh_with_machine("node-a", 30, "cpuid-a"))
         .await
         .unwrap();
 
-    // Plant a sentinel directly in the side hash, standing in for "the
-    // value upsert would have written, if it wrote again".
+    // Sentinel reveals whether an unchanged upsert rewrites the side hash.
     let sentinel = "SENTINEL-not-actually-cpuid-a";
     let _: () = conn
         .hset(&machine_hash_key, "node-a", sentinel)
         .await
         .unwrap();
 
-    // Second upsert with the *same* machine_info content: must skip the
-    // side-hash write entirely, leaving the sentinel in place.
     store
         .upsert("node-a", &fresh_with_machine("node-a", 30, "cpuid-a"))
         .await
@@ -238,8 +209,6 @@ async fn an_unchanged_machine_info_is_not_rewritten_but_a_changed_one_still_is()
         "an upsert whose machine_info content is unchanged must not rewrite the side hash"
     );
 
-    // Third upsert with *different* machine_info content: must write
-    // through, clobbering the sentinel.
     store
         .upsert("node-a", &fresh_with_machine("node-a", 30, "cpuid-a-v2"))
         .await
@@ -254,21 +223,12 @@ async fn an_unchanged_machine_info_is_not_rewritten_but_a_changed_one_still_is()
     assert_eq!(decoded.cpu_config_json, "cpuid-a-v2");
 }
 
-/// Rolling-upgrade backward compatibility: a record written the pre-split
-/// way (inline `machine_info`, no `machine_digest` at all) must still come
-/// back from `pull_all` with `machine_info` intact -- this is what a
-/// not-yet-upgraded replica's own writes look like on the shared hash,
-/// through this replica's read side. Written directly through the raw
-/// connection rather than through `upsert`, because `upsert` always writes
-/// the *new* split format -- simulating the old format is the point.
 #[tokio::test]
 async fn pull_all_reads_a_pre_split_inline_record_from_an_old_peer() {
     let store = store_or_skip!("pull_all_reads_a_pre_split_inline_record_from_an_old_peer");
     let (mut conn, hash_key) = raw(&store);
 
-    // Hand-built JSON matching the pre-split wire shape: `machine_info`
-    // inline, no `machine_digest` key at all (an old build's serializer
-    // never emitted one).
+    // Pre-split wire shape has inline machine info and no digest field.
     let old_format = serde_json::json!({
         "node_id": "node-old",
         "endpoint": "http://node-old:8000",
@@ -307,10 +267,6 @@ async fn pull_all_reads_a_pre_split_inline_record_from_an_old_peer() {
     );
 }
 
-/// `remove` must clean up the side hash too, not just the hot hash --
-/// otherwise a departed node's machine info lingers forever with nothing
-/// left that ever `HDEL`s it (see `SharedObservedStore::remove`'s own doc
-/// on why there is no TTL to fall back on).
 #[tokio::test]
 async fn removing_a_node_also_clears_its_side_hash_entry() {
     let store = store_or_skip!("removing_a_node_also_clears_its_side_hash_entry");

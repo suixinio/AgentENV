@@ -1,118 +1,15 @@
-//! Port of `services/scheduler/internal/node_registry.go` (824 lines, minus
-//! the Kubernetes-discovery wiring, which lives separately — see
-//! `src/node_registry/mod.rs`) — the in-memory record of which nodes exist
-//! (from discovery) and what they last reported (from heartbeats).
+//! In-memory node registry fed by discovery snapshots and heartbeats.
 //!
-//! [`AtomicNodeRegistry`] is the concrete type; [`NodeRegistry`] is the trait
-//! every consumer should depend on (mirroring Go's implicit interface of the
-//! same name), so a future consumer can be tested against a fake without
-//! reaching for the concrete type.
+//! Discovery identity/endpoint state and heartbeat-observed state are kept under one
+//! lock. Roster reverse indexes and CPU-intersection caches must change with observed
+//! records, whether records arrive locally or through the shared store.
 //!
-//! 🔴 Both are wired into a live runtime path from Stage A on, unconditionally:
-//! `start_native_node_registry` (`src/bin/aenv-api.rs`) builds an
-//! [`AtomicNodeRegistry`] and hands it to `NodeRegistryGrpcService`, whose
-//! `Heartbeat` RPC is the process's real, network-reachable heartbeat
-//! surface. This matters below: a bug here is not a bug in a data structure
-//! nothing calls yet.
+//! CPU intersection is released only after every node that has heartbeated in the
+//! cluster supplies a non-empty config, and is invalidated when a new node reports.
+//! Heartbeats never register identities that discovery has not vouched for.
 //!
-//! Two data structures, kept in step under one lock:
-//!
-//! - **Discovery state** (`nodes_by_id` / `alias_to_id` / `lingering_ids`):
-//!   who exists and where, replaced wholesale by [`AtomicNodeRegistry::set`]
-//!   on every discovery sync.
-//! - **Observed state** (`observed` / `cpu_intersection` /
-//!   `intersection_sent` / `sandbox_holders`): what nodes have said about
-//!   themselves in heartbeats, updated incrementally by
-//!   [`AtomicNodeRegistry::heartbeat`].
-//!
-//! [`AtomicNodeRegistry::heartbeat`] is also where the CPU-config
-//! intersection link (`super::cpu_template`, CLAUDE.md's "must keep
-//! working" chain) actually runs: `all_configs_ready` gates
-//! `compute_intersection` on every node *that has ever reported a heartbeat
-//! for the cluster* having reported a non-empty `cpu_config_json` —
-//! deliberately not "every node discovery currently knows about," which is
-//! why every heartbeat test below that exercises the gate seeds each node
-//! with one empty-config heartbeat first, establishing the cluster's size
-//! before asking whether it is complete. Porting the intersection algorithm
-//! without this gate would trade "wait for everyone who might still report"
-//! for "compute against whoever has reported so far," which produces a
-//! *different*, incorrect intersection that only happens to match once
-//! every node has checked in — and, per
-//! `cpu_intersection_is_withheld_again_when_a_new_node_joins_the_cluster`
-//! below, must be invalidated again the moment a node this cache never
-//! accounted for reports in for the first time.
-//!
-//! # Deliberate divergence from Go: an all-empty [`AtomicNodeRegistry::set`]
-//! # is not applied immediately
-//!
-//! Go's `AtomicNodeRegistry.Set` (`node_registry.go`) applies every call it
-//! receives immediately and unconditionally, including one that reports zero
-//! active and zero lingering nodes. [`EmptySyncGuard`] below is this port's
-//! one intentional behavioral difference from that, and it exists because of
-//! a difference in what calling `set` with an empty list can mean here that
-//! it never could on the Go side:
-//!
-//! - [`super::kubernetes_discovery::nodes_from_endpoint_slices`]'s own doc
-//!   comment records that an empty result is not only an error path — a
-//!   `Service` rename or recreation, a mistyped label selector, or every
-//!   endpoint transiently reporting non-`Serving` all produce a **successful**
-//!   re-LIST with zero entries, indistinguishable at `set`'s call site from
-//!   "the cluster has genuinely scaled to zero nodes." The watcher rebuild
-//!   this crate performs after `MAX_CONSECUTIVE_WATCH_ERRORS` (see that
-//!   module) republishes exactly this shape on its first `InitDone`.
-//! - Applying that call immediately does not just clear `nodes_by_id`. `set`'s
-//!   own stale-cleanup pass then walks every `observed` record whose node id
-//!   is no longer in the new (empty) `nodes_by_id` — which, for an all-empty
-//!   sync, is every record — and calls `clear_roster` + `observed.remove` +
-//!   `intersection_sent.remove` on each one. That is not a discovery-only
-//!   change: it is this process's only record of which sandboxes exist on
-//!   which node evaporating in one call.
-//! - And it does not self-heal by itself: once a node is out of
-//!   `nodes_by_id`, its `Heartbeat` calls come back `NodeNotInRegistry`
-//!   (`heartbeat`'s own `canonical_id`/lookup below) until the *next*
-//!   successful, non-empty `set`. A registry emptied by one bad sync stays
-//!   empty — and every consumer reading it as "this node is gone" — until
-//!   discovery recovers.
-//!
-//! Go's port never had a live consumer for which any of that mattered — see
-//! this module's own correction above. This build's `Heartbeat` gRPC surface
-//! does, from Stage A on, and its downstream consequence is concrete, not
-//! theoretical: `RemoteSandboxStub::confirm_or_defer` reads "this node is
-//! gone" out of exactly this state and reports `RuntimeConfirmedGone`, which
-//! the orchestrator's pause path (`src/orchestrator/service.rs`) uses to
-//! *delete a paused sandbox's record from the cluster store*. A transient,
-//! self-correcting discovery blip must not be able to trigger that.
-//!
-//! [`EmptySyncGuard`] is the mitigation: an all-empty `set` while the
-//! registry currently holds nodes (or while an earlier all-empty `set` is
-//! already pending) is treated as *suspected*, not authoritative — it is
-//! withheld until either [`EmptySyncGuard::confirmations`] consecutive
-//! all-empty calls have arrived, or [`EmptySyncGuard::window`] has elapsed
-//! since the first one, whichever comes first. Either threshold reaching
-//! zero degrades to Go's original "apply immediately" behavior, which is
-//! deliberately still reachable rather than special-cased away — a real
-//! scale-to-zero must still actually take effect eventually, and does, via
-//! either threshold. A single non-empty `set` call at any point resets the
-//! pending state entirely: discovery reporting real nodes again is itself
-//! proof the empty answer was transient.
-//!
-//! What this module does *not* attempt: making `heartbeat` self-heal by
-//! auto-registering a node the discovery-derived `nodes_by_id` does not
-//! currently know about. `NodeNotInRegistry` — refusing a heartbeat from a
-//! node discovery has not (yet, or no longer) vouched for — mirrors Go's own
-//! `ErrNodeNotInRegistry` deliberately: discovery is this registry's sole
-//! source of truth for *which node ids are real*, matching the same RBAC
-//! -gated `EndpointSlice`/`Pod` watches, not an unauthenticated claim in a
-//! heartbeat payload. Letting a heartbeat insert an id `set` never vouched
-//! for would let anything that can reach the gRPC port assert its own
-//! identity into the registry, bypassing discovery entirely — a materially
-//! larger change to the trust model than delaying a wipe. With
-//! [`EmptySyncGuard`] in place, the remaining window where a genuinely live
-//! node's heartbeat is refused because of a wipe is bounded by the same
-//! confirmation/window thresholds and self-corrects on discovery's own next
-//! successful sync — a live [`super::kubernetes_discovery::KubernetesDiscovery`]
-//! watch re-lists continuously, not on some external trigger, so that next
-//! sync is not something an operator has to cause.
+//! An all-empty discovery sync is withheld until [`EmptySyncGuard`] confirms it,
+//! preventing a transient empty relist from erasing live runtime evidence.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock};
@@ -132,36 +29,20 @@ use super::redis::{
 };
 use super::types::{Node, Roster, RosterEntry};
 
-/// Mirrors Go's `defaultObservedReportTTL`.
 pub const DEFAULT_OBSERVED_REPORT_TTL: Duration = Duration::from_secs(30);
 
 const ROSTER_ENTRY_DROPPED_METRIC: &str = "node_registry_roster_entry_dropped_total";
 const EMPTY_SYNC_PENDING_METRIC: &str = "agentenv_api_node_registry_empty_sync_pending";
 
-/// How many consecutive all-empty [`AtomicNodeRegistry::set`] calls, or how
-/// much wall-clock time since the first one — whichever is reached first —
-/// before an all-empty sync is treated as confirmed rather than suspected.
-/// See this module's own doc comment for why an all-empty `set` is not
-/// applied on the first call the way Go's `Set` applies it.
+/// Confirms an all-empty discovery sync by consecutive sightings or elapsed time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EmptySyncGuard {
-    /// How many consecutive all-empty `set` calls confirm the wipe. `0` or
-    /// `1` both mean "the first call confirms it" — the same as Go's
-    /// unconditional-apply behavior, reachable deliberately rather than
-    /// special-cased away (see the module doc).
+    /// Consecutive empty syncs required; `0` or `1` applies the first.
     pub confirmations: u32,
-    /// How long the first all-empty `set` call may stand unconfirmed before
-    /// wall-clock time alone confirms it, independent of how many calls
-    /// arrived. `Duration::ZERO` means the first call confirms it
-    /// immediately, the same as `confirmations <= 1`.
+    /// Maximum confirmation window; zero applies the first empty sync.
     pub window: Duration,
 }
 
-/// Mirrors `services/scheduler/internal/kubernetes_discovery.go`'s own retry
-/// cadence loosely: long enough that one transient re-LIST (a Service
-/// recreation, a momentary label-selector mismatch) is very unlikely to
-/// still be reporting empty, short enough that a real scale-to-zero is not
-/// held stale for long.
 pub const DEFAULT_EMPTY_SYNC_CONFIRMATIONS: u32 = 3;
 pub const DEFAULT_EMPTY_SYNC_WINDOW: Duration = Duration::from_secs(60);
 
@@ -174,27 +55,21 @@ impl Default for EmptySyncGuard {
     }
 }
 
-/// Mirrors Go's `ErrNodeNotInRegistry`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("node is not in scheduler node list")]
 pub struct NodeNotInRegistry;
 
-/// Mirrors Go's `ErrServiceInstanceMismatch`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error("service instance mismatch")]
 pub struct ServiceInstanceMismatch;
 
-/// The behavior every node registry implementation must provide. Mirrors
-/// Go's `NodeRegistry` interface (`node_registry.go:17`) method-for-method.
+/// Node discovery and heartbeat-observation contract.
 pub trait NodeRegistry: Send + Sync {
-    /// Discovered nodes filtered by their derived status. See `NodeStatus`
-    /// in `scheduler.proto` for the full status derivation table.
+    /// Returns discovered nodes, optionally including lingering and pending nodes.
     fn snapshot(&self, allow_lingering: bool) -> Vec<Node>;
     fn contains(&self, node: &Node) -> bool;
     fn resolve(&self, node_id: &str) -> Option<Node>;
-    /// On success, the second element of the tuple is the cluster's CPU
-    /// intersection JSON, non-empty only the first time it has something new
-    /// to tell this node.
+    /// Records a heartbeat and returns any newly available CPU intersection.
     fn heartbeat(
         &self,
         req: &HeartbeatRequest,
@@ -222,94 +97,43 @@ pub trait NodeRegistry: Send + Sync {
         cluster_id: &str,
         now: SystemTime,
     ) -> Option<ObservedNode>;
-    /// The latest heartbeat-reported [`NodeSnapshot`] for a node. Unlike
-    /// [`NodeRegistry::get_observed`], this does not derive status from
-    /// discovery state or TTL — it returns only the raw snapshot, suitable
-    /// for scheduling decisions. `None` if the node has never sent a
-    /// heartbeat.
+    /// Returns the raw heartbeat snapshot without deriving status or TTL.
     fn peek_observed(&self, node_id: &str) -> Option<NodeSnapshot>;
-    /// [`NodeRegistry::peek_observed`], plus how stale that snapshot is —
-    /// one read, one verdict, for the placement scorer
-    /// (`super::placement`).
+    /// Returns the raw snapshot and freshness from one consistent registry read.
     ///
-    /// 🔴 Deliberately a second accessor rather than a second call. The
-    /// candidate list is built one node at a time under this registry's
-    /// `RwLock`; asking again during scoring would double the read count on
-    /// every placement, and the two reads could straddle a heartbeat and
-    /// disagree about which snapshot the freshness verdict belongs to.
-    ///
-    /// 🔴 `snapshot` here is byte-for-byte what `peek_observed` returns for
-    /// the same node — the real candidate list must not change shape
-    /// because a scorer was added. The freshness half is judged against the
-    /// record's own `report_ttl` (never a hardcoded default) and against
-    /// the API-receive-side `last_seen` (never the node's self-reported
-    /// `reported_at_unix_ms`), and answers
-    /// [`SnapshotFreshness::ClockSkew`] rather than unwrapping when
-    /// `last_seen` is in the future.
+    /// Freshness uses the record's receive-side timestamp and own report TTL.
     fn peek_observed_with_freshness(
         &self,
         node_id: &str,
         now: SystemTime,
     ) -> Option<(NodeSnapshot, SnapshotFreshness)>;
-    /// The sandbox roster a node reported in its last heartbeat, and when it
-    /// reported it.
+    /// Returns a node's latest normalized roster and receive time.
     fn roster_of(&self, node_id: &str) -> Option<(Vec<RosterEntry>, SystemTime)>;
-    /// Every node whose last heartbeat listed this sandbox. More than one is
-    /// normal during a cross-node takeover: the origin keeps its paused
-    /// record until its own reconciliation drops it.
+    /// Returns every node whose latest roster names the sandbox.
     fn nodes_holding(&self, sandbox_id: &str) -> Vec<String>;
-    /// One roster per node this scheduler answers for in a cluster, sorted
-    /// by node id.
+    /// Returns cluster rosters sorted by node ID.
     fn rosters_in_cluster(&self, cluster_id: &str) -> Vec<Roster>;
     fn unregister_observed(
         &self,
         node_id: &str,
         service_instance_id: &str,
     ) -> Result<(), ServiceInstanceMismatch>;
-    /// 🔴 P4 (`node_registry::dump`'s D6 recompute): the CPU-config
-    /// intersection actually cached and handed to a node over `Heartbeat`
-    /// for `cluster_id` — the *gated* value `all_configs_ready` unlocks, not
-    /// a fresh recompute. `None` both before any node in the cluster has
-    /// reported a `cpu_config_json` and, crucially, while the cluster is
-    /// only *partially* reported: unlike [`dump`](super::dump)'s own
-    /// recompute (which runs the algorithm over whichever configs happen to
-    /// be present right now, gate or no gate), this is `None` for exactly as
-    /// long as production is honestly withholding an answer. The two can
-    /// disagree — recompute non-empty, applied still `None` — whenever a
-    /// node discovery already knows about has not yet sent its first
-    /// `cpu_config_json`.
+    /// Returns the gated CPU intersection actually available to heartbeat responses.
     fn applied_cpu_intersection(&self, cluster_id: &str) -> Option<String>;
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct ObservedNodeRecord {
-    /// Always carries `Some` snapshot once constructed by
-    /// [`AtomicNodeRegistry::heartbeat`] — mirrors Go's `cloneSnapshot`,
-    /// which never returns a nil pointer.
+    /// Always contains a snapshot after construction from a heartbeat.
     node: ObservedNode,
     p2p_endpoint: Option<P2pEndpoint>,
     report_ttl: Duration,
-    /// The roster from this node's last heartbeat, normalized.
     entries: Vec<RosterEntry>,
     last_seen: SystemTime,
 }
 
 impl ObservedNodeRecord {
-    /// The TTL *this record* is judged against.
-    ///
-    /// 🔴 One helper, two callers, on purpose. `derive_observed_node_view`
-    /// (the status the observed/admin APIs report) and
-    /// `NodeRegistry::peek_observed_with_freshness` (the placement scorer's
-    /// freshness) have to agree: a deployment running a non-default
-    /// `observed_ttl` would otherwise have the registry calling a node
-    /// `UNHEALTHY` while the scorer, hardcoding
-    /// [`DEFAULT_OBSERVED_REPORT_TTL`], still counted it as healthy — and
-    /// the disagreement would be invisible on the default TTL, which is
-    /// what every test and every current deployment runs.
-    ///
-    /// A zero `report_ttl` falls back to the default rather than meaning
-    /// "never expires": that is the pre-existing convention, and a record
-    /// read back from the shared Redis store can carry one.
+    /// Returns this record's TTL, falling back to the default when stored as zero.
     fn effective_report_ttl(&self) -> Duration {
         if self.report_ttl > Duration::ZERO {
             self.report_ttl
@@ -319,11 +143,7 @@ impl ObservedNodeRecord {
     }
 }
 
-/// The wire-format conversions for `super::redis`'s shared observed store.
-/// Live here, not in `super::redis`, because `ObservedNodeRecord` is
-/// private to this module — see `super::redis`'s own module doc for why
-/// that boundary is deliberate. `SystemTime`/`Duration` become
-/// millisecond/second integers; everything else is a straight field copy.
+/// Converts private observed records to and from the shared-store wire shape.
 impl From<&ObservedNodeRecord> for StoredObservedRecord {
     fn from(record: &ObservedNodeRecord) -> Self {
         Self {
@@ -344,11 +164,7 @@ impl From<&ObservedNodeRecord> for StoredObservedRecord {
                     cpu_architecture: m.cpu_architecture.clone(),
                     cpu_config_json: m.cpu_config_json.clone(),
                 }),
-            // Always `None` here: this is the semantically-complete record
-            // `registry.rs` hands to `super::redis`, which computes and
-            // populates this field itself only for the copy it actually
-            // writes to the hot hash — see that module's own "splitting the
-            // near-static machine payload off the hot path" doc section.
+            // The Redis layer adds the digest only to the hot-hash copy it writes.
             machine_digest: None,
             snapshot: record.node.snapshot.as_ref().map(|s| StoredNodeSnapshot {
                 status: s.status,
@@ -463,11 +279,7 @@ impl From<StoredObservedRecord> for ObservedNodeRecord {
                     paused: e.paused,
                 })
                 .collect(),
-            // `unix_millis`'s inverse: a stored record's own `last_seen_unix_ms`
-            // is always a value `unix_millis(SystemTime::now())` produced on
-            // some replica, so this reconstructs the same instant rather than
-            // reusing whatever `SystemTime::now()` happens to be at merge
-            // time.
+            // Reconstruct the writer's receive instant rather than using merge time.
             last_seen: SystemTime::UNIX_EPOCH
                 + Duration::from_millis(last_seen_unix_ms.max(0) as u64),
         }
@@ -476,39 +288,21 @@ impl From<StoredObservedRecord> for ObservedNodeRecord {
 
 struct Inner {
     nodes_by_id: HashMap<String, Node>,
-    /// Maps a node's previous identity (its pod name) to its current one —
-    /// see [`Node`]'s doc comment on `pod_name`.
     alias_to_id: HashMap<String, String>,
     lingering_ids: HashSet<String>,
-    /// Task's own "D2": node ids admitted to `nodes_by_id` by
-    /// [`AtomicNodeRegistry::admit_pending`] rather than by [`AtomicNodeRegistry::set`] —
-    /// discovered (an `EndpointSlice` entry names them), but not yet
-    /// `Serving`. See `admit_pending`'s own doc comment for why this is a
-    /// third bucket rather than folded into `lingering_ids`.
+    /// Discovered but not-yet-serving nodes, admitted for heartbeat but not scheduling.
     pending_ids: HashSet<String>,
     observed_ttl: Duration,
     observed: HashMap<String, ObservedNodeRecord>,
     cpu_intersection: HashMap<String, String>,
     intersection_sent: HashSet<String>,
-    /// The reverse of the rosters: sandbox id -> the nodes that reported
-    /// holding it.
     sandbox_holders: HashMap<String, HashSet<String>>,
-    /// [`EmptySyncGuard`]'s bookkeeping: `None` when there is no pending
-    /// all-empty [`AtomicNodeRegistry::set`] call awaiting confirmation.
-    /// `Some((since, confirmations))` while one is pending — `since` is when
-    /// the *first* consecutive all-empty call arrived, `confirmations` how
-    /// many have arrived since (this one included).
+    /// First empty-sync time and consecutive confirmation count.
     pending_empty_sync: Option<(SystemTime, u32)>,
 }
 
 impl Inner {
-    /// Maps whatever identity a caller used onto the one discovery currently
-    /// uses for that node. Unknown identities are returned unchanged, so the
-    /// caller still gets its "not in the registry" answer.
-    ///
-    /// The order is the guarantee, not an optimization: a real node is
-    /// always resolved as itself, so an alias can never shadow one and
-    /// attribute one machine's heartbeat to another.
+    /// Resolves aliases after preferring an exact current node identity.
     fn canonical_id(&self, node_id: &str) -> String {
         if self.nodes_by_id.contains_key(node_id) {
             return node_id.to_string();
@@ -552,9 +346,7 @@ impl Inner {
         total > 0 && with_config == total
     }
 
-    /// Mirrors Go's `computeIntersectionLocked`: a malformed config makes
-    /// this an empty string, never an error the caller has to handle — one
-    /// node's bad JSON must not take down the whole cluster's intersection.
+    /// Returns an empty intersection for malformed input.
     fn compute_intersection(&self, cluster_id: &str) -> String {
         let jsons: Vec<String> = self
             .observed
@@ -572,9 +364,7 @@ impl Inner {
         intersect_cpu_configs(&jsons).unwrap_or_default()
     }
 
-    /// Moves a node from its previous roster to a new one, keeping the
-    /// reverse index in step. Must be called before the new record replaces
-    /// the old one in `self.observed`.
+    /// Replaces a node's roster while keeping the reverse index consistent.
     fn apply_roster(&mut self, node_id: &str, roster: &[RosterEntry]) {
         let next: HashSet<&str> = roster.iter().map(|e| e.sandbox_id.as_str()).collect();
 
@@ -598,7 +388,6 @@ impl Inner {
         }
     }
 
-    /// Drops a node from the reverse index entirely.
     fn clear_roster(&mut self, node_id: &str) {
         if let Some(record) = self.observed.get(node_id) {
             let sandbox_ids: Vec<String> = record
@@ -621,13 +410,7 @@ impl Inner {
         }
     }
 
-    /// Records a fresh observed record for `node_id` — keeps the roster
-    /// reverse index (`apply_roster`) and the CPU-intersection cache
-    /// (`invalidate_intersection`) in step exactly the same way regardless
-    /// of whether the record came from this replica's own heartbeat
-    /// (`AtomicNodeRegistry::heartbeat`) or was adopted from another
-    /// replica via `merge_remote` (`super::redis`'s shared observed
-    /// store). Shared so the two ingestion paths cannot drift apart.
+    /// Ingests a local or remote observation while updating roster and CPU caches.
     fn ingest_observed(&mut self, node_id: &str, record: ObservedNodeRecord) {
         let prev_cpu = self
             .observed
@@ -637,15 +420,7 @@ impl Inner {
             .unwrap_or_default();
         let existed = self.observed.contains_key(node_id);
         let cluster_id = record.node.cluster_id.clone();
-        // 🔴 `is_some_and`, not "treat a missing `machine_info` as an empty
-        // `cpu_config_json` and compare that": an omitted `machine_info`
-        // (as opposed to one explicitly sent with a blank
-        // `cpu_config_json`) must never itself count as a CPU change, or a
-        // heartbeat/merge that carries no machine info at all would wrongly
-        // invalidate a cluster's already-computed intersection every time
-        // one lands. Mirrors `AtomicNodeRegistry::heartbeat`'s pre-refactor
-        // inline check exactly — `heartbeat_delivers_intersection_exactly_once_per_node`
-        // and `multi_cluster_cpu_intersections_are_independent` pin this.
+        // Missing machine info does not invalidate an existing CPU intersection.
         let cpu_changed = record
             .node
             .machine_info
@@ -660,14 +435,7 @@ impl Inner {
         }
     }
 
-    /// Adopts a record pulled from the shared observed store, but only if
-    /// it is actually newer than what this replica already has — see
-    /// `super::redis`'s own module doc ("last write wins by `last_seen`")
-    /// for why: a node's heartbeat is pinned to one replica at a time, so a
-    /// stale pull of this replica's *own* not-yet-superseded write must
-    /// never regress `last_seen` backward, and a node that has since
-    /// reconnected to a different replica must win once that fact reaches
-    /// Redis.
+    /// Adopts a remote observation only when its receive timestamp is newer.
     fn merge_remote(&mut self, node_id: &str, record: ObservedNodeRecord) {
         let should_adopt = self
             .observed
@@ -678,16 +446,7 @@ impl Inner {
         }
     }
 
-    /// Recomputes and caches a cluster's CPU intersection if it is not
-    /// already cached and every node that has ever reported for the
-    /// cluster now has a config. Factored out of `AtomicNodeRegistry::heartbeat`
-    /// so `AtomicNodeRegistry::merge_remote_snapshot` can apply the exact
-    /// same gate: a node whose heartbeat only ever reached a *different*
-    /// replica must complete `all_configs_ready` the same way a locally
-    /// received one does, promptly on the merge that adopts it — not only
-    /// on whatever this replica's own next local heartbeat happens to be.
-    /// This is the correctness property the shared observed store exists
-    /// for; see `super::redis`'s own module doc.
+    /// Caches the CPU intersection once every observed cluster node has a config.
     fn refresh_intersection_if_ready(&mut self, cluster_id: &str) {
         if !self.cpu_intersection.contains_key(cluster_id) && self.all_configs_ready(cluster_id) {
             let result = self.compute_intersection(cluster_id);
@@ -697,10 +456,7 @@ impl Inner {
         }
     }
 
-    /// Builds the external `ObservedNode` view for a heartbeat record,
-    /// overriding the endpoint and status based on the current discovery
-    /// state. See `NodeStatus` in `scheduler.proto` for the full derivation
-    /// table.
+    /// Derives the external status and endpoint from heartbeat plus discovery state.
     fn derive_observed_node_view(&self, record: &ObservedNodeRecord, now_ms: i64) -> ObservedNode {
         let mut out = record.node.clone();
         if out.snapshot.is_none() {
@@ -728,8 +484,7 @@ impl Inner {
         } else if is_lingering {
             snapshot.status = NodeStatus::Lingering as i32;
         } else if snapshot.status() == NodeStatus::Unspecified {
-            // Active — keep the status reported by the node, defaulting an
-            // unset one to CONNECTING.
+            // Active nodes default an unspecified report to `Connecting`.
             snapshot.status = NodeStatus::Connecting as i32;
         }
 
@@ -737,24 +492,11 @@ impl Inner {
     }
 }
 
-/// A node registry backed by discovery syncs (`set`) and heartbeats
-/// (`heartbeat`), guarded by one `RwLock`. Ports Go's `AtomicNodeRegistry`
-/// (a `sync.RWMutex`-guarded struct, not an atomics-based one — the name is
-/// Go's, kept for the same reason `Node`/`RichNode` keep theirs: so a reader
-/// moving between the two implementations recognizes the type).
+/// Thread-safe registry backed by discovery syncs and heartbeats.
 pub struct AtomicNodeRegistry {
     inner: RwLock<Inner>,
     empty_sync_guard: EmptySyncGuard,
-    /// Set at most once, by [`Self::enable_shared_observed_publishing`] —
-    /// `Some` for exactly as long as `super::redis`'s shared observed store
-    /// is wired up (`[cluster.node_registry_store].backend = "redis"`; see
-    /// `src/bin/aenv-api.rs`'s `wire_shared_node_observed_store`). `None`
-    /// (the default for every other caller, including every test in this
-    /// module) makes [`Self::publish_upsert`]/[`Self::publish_remove`]
-    /// no-ops, so nothing about local behavior changes when no shared store
-    /// is configured — the same "absent means untouched" discipline
-    /// `aenv-node` already get for free by never
-    /// constructing this type's native-placement wiring at all.
+    /// Optional publisher for the shared observed store; initialized at most once.
     publish_tx: OnceLock<mpsc::UnboundedSender<PublishOp>>,
 }
 
@@ -763,11 +505,7 @@ impl AtomicNodeRegistry {
         Self::with_empty_sync_guard(nodes, observed_ttl, EmptySyncGuard::default())
     }
 
-    /// Same as [`Self::new`], with an explicit [`EmptySyncGuard`] instead of
-    /// [`EmptySyncGuard::default`] — for `start_native_node_registry`
-    /// (`src/bin/aenv-api.rs`), which wires `[cluster.kubernetes_discovery]`'s
-    /// configured thresholds through, and for tests exercising the guard's
-    /// own timing.
+    /// Constructs with explicit empty-sync confirmation thresholds.
     pub fn with_empty_sync_guard(
         nodes: Vec<Node>,
         observed_ttl: Duration,
@@ -794,28 +532,14 @@ impl AtomicNodeRegistry {
             empty_sync_guard,
             publish_tx: OnceLock::new(),
         };
-        // `inner.nodes_by_id` starts empty regardless of `nodes`, so this
-        // first call is never an empty-to-empty transition and the guard
-        // never engages here — not even when `nodes` is itself empty (the
-        // common case: every caller but `start_native_node_registry`'s
-        // bootstrap constructs with `Vec::new()` and populates through the
-        // first real discovery sync). `SystemTime::now()` is inert in
-        // exactly that situation; a test exercising the guard's own timing
-        // constructs with `Vec::new()` and drives `set` explicitly with its
-        // own clock instead.
+        // Initialization starts from an empty inner map, so the guard cannot engage.
         registry.set(nodes, Vec::new(), SystemTime::now());
         registry
     }
 
-    /// Turns on publishing of local `observed` writes to `super::redis`'s
-    /// shared store. Returns the receiving half of the channel — the caller
-    /// (`src/bin/aenv-api.rs`'s `wire_shared_node_observed_store`) drives
-    /// `super::redis::run_shared_observed_sync` with it as a background
-    /// task.
+    /// Enables shared observed publishing and returns its receiver.
     ///
-    /// Call exactly once, before this registry starts receiving heartbeats
-    /// — mirrored by the `expect` below, which turns a second call into an
-    /// immediate panic rather than a silently dropped first channel.
+    /// Must be called exactly once before heartbeats begin.
     pub fn enable_shared_observed_publishing(&self) -> mpsc::UnboundedReceiver<PublishOp> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.publish_tx
@@ -843,11 +567,7 @@ impl AtomicNodeRegistry {
         });
     }
 
-    /// Merges a snapshot pulled from the shared observed store
-    /// (`super::redis::SharedObservedStore::pull_all`) into this replica's
-    /// local view. See `Inner::merge_remote` for the per-node adoption
-    /// rule, and `super::redis`'s own module doc for why a pull never
-    /// deletes an entry absent from the snapshot.
+    /// Merges newer remote observations without deleting locally absent records.
     pub fn merge_remote_snapshot(&self, remote: HashMap<String, StoredObservedRecord>) {
         let mut inner = self.inner.write().expect("node registry lock poisoned");
         let mut touched_clusters: HashSet<String> = HashSet::new();
@@ -858,26 +578,15 @@ impl AtomicNodeRegistry {
             }
             inner.merge_remote(&node_id, record);
         }
-        // Same gate `heartbeat` applies inline, applied here too — a node
-        // whose heartbeat only ever reached a different replica must
-        // complete `all_configs_ready` promptly on the merge that adopts
-        // it, not only whenever this replica's own next local heartbeat
-        // happens to land. See `Inner::refresh_intersection_if_ready`'s own
-        // doc.
+        // Remote observations complete the same CPU-readiness gate as local heartbeats.
         for cluster_id in touched_clusters {
             inner.refresh_intersection_if_ready(&cluster_id);
         }
     }
 
-    /// Replaces the discovered node list. `active` nodes are serving and not
-    /// terminating; `lingering` nodes are serving but terminating (graceful
-    /// shutdown).
+    /// Replaces active and lingering discovery state.
     ///
-    /// An all-empty call (`active` and `lingering` both empty) is not
-    /// applied on the first sighting when the registry currently holds
-    /// nodes, or when an earlier all-empty call is already pending — see
-    /// [`EmptySyncGuard`] and this module's own doc comment for why, and for
-    /// what "applied" means once it is.
+    /// Empty state is applied only after [`EmptySyncGuard`] confirms it.
     pub fn set(&self, active: Vec<Node>, lingering: Vec<Node>, now: SystemTime) {
         let incoming_is_empty = active.is_empty() && lingering.is_empty();
 
@@ -966,76 +675,16 @@ impl AtomicNodeRegistry {
             inner.invalidate_intersection(&cluster_id);
         }
         drop(inner);
-        // Same discovery-driven cleanup on every replica (the Kubernetes
-        // watch feeding `set` is identical everywhere), so this is a
-        // harmless, idempotent `HDEL` no matter which replica gets here
-        // first — see `super::redis`'s own module doc ("absence never
-        // deletes... removal instead rides discovery-driven cleanup").
+        // Discovery-driven removals are idempotent across replicas.
         for node_id in &departed {
             self.publish_remove(node_id);
         }
     }
 
-    /// Task's own "D2" (`docs/proposals/_sd-phase4-stageDE-remainder.md`'s
-    /// D2, the race this port intentionally preserved through Stage A --
-    /// see this module's own doc comment on why `heartbeat` never
-    /// auto-registers an unknown id, and `grpc_service.rs`'s module doc for
-    /// where the race was left as-is pending this fix).
+    /// Admits discovered, not-yet-serving nodes for heartbeats but excludes them from
+    /// scheduling. Call after [`Self::set`] on every discovery sync.
     ///
-    /// Admits nodes discovery has vouched for -- they name a real
-    /// `EndpointSlice` endpoint with a routable address -- but that are not
-    /// yet `Serving`, so [`AtomicNodeRegistry::heartbeat`] accepts them and
-    /// a rolling update's freshly recreated pod does not have to wait out a
-    /// readiness probe before its binding-store roster (task's own "D3")
-    /// refreshes.
-    ///
-    /// Deliberately **not** folded into [`AtomicNodeRegistry::set`]'s
-    /// `active`/`lingering` split:
-    ///
-    /// - `lingering` already carries an established, different meaning --
-    ///   `heartbeat`'s own status-derivation forces a lingering node's
-    ///   reported [`NodeStatus`] to [`NodeStatus::Lingering`] regardless of
-    ///   what it self-reports, and
-    ///   [`super::kubernetes_discovery::filter_nodes_by_pod_labels`]'s
-    ///   `no_schedule_pod_ids` arm deliberately *promotes* a node into
-    ///   `lingering` to pull it out of scheduling while keeping it
-    ///   otherwise indistinguishable from a genuinely draining one.
-    ///   Reusing that bucket for "just starting up" would make a brand new
-    ///   node's observed status read `Lingering` the moment its first
-    ///   heartbeat lands -- the opposite of what it is.
-    /// - `active` gates scheduling eligibility today only by the absence of
-    ///   a consumer (`filter.rs`'s own doc says as much), but this task
-    ///   also builds `Schedule`, and `filter_unschedulable`'s documented
-    ///   policy is "fail open on what we do not know" -- a node with no
-    ///   heartbeat snapshot yet is *kept*, not dropped. Admitting a
-    ///   not-yet-ready node into `active` would make it an immediately
-    ///   eligible `Schedule` candidate before it can actually run a
-    ///   sandbox, trading one race (a stale binding address) for a worse
-    ///   one (routing a brand new sandbox onto a node that cannot yet run
-    ///   it). `pending_ids` is checked by [`AtomicNodeRegistry::snapshot`]
-    ///   the same way `lingering_ids` is, so a pending node is excluded
-    ///   from `snapshot(false)` (the scheduling view) without touching its
-    ///   reported status at all.
-    ///
-    /// Must be called after [`AtomicNodeRegistry::set`] on every discovery
-    /// sync, never before it: `set` unconditionally replaces `nodes_by_id`
-    /// from `active`/`lingering` alone, so a call before `set` would have
-    /// its admission wiped out immediately by the very next `set` call in
-    /// the same sync. `set`'s own stale-cleanup filter already spares
-    /// `pending_ids` members' observed state for exactly this ordering
-    /// (see its own diff), so a node that stays pending across consecutive
-    /// syncs keeps its roster instead of having it wiped and re-seeded
-    /// every cycle.
-    ///
-    /// `pending` fully replaces the previous pending set, mirroring `set`'s
-    /// own replace-not-merge semantics: a node this call does not name this
-    /// cycle -- because it became `Serving` (and is now in
-    /// `active`/`lingering` from the `set` call just before this one) or
-    /// because it genuinely disappeared -- is dropped from `pending_ids`,
-    /// and if `set` did not already promote it to active/lingering, its
-    /// identity and observed state are cleared the same way `set`'s own
-    /// stale-cleanup pass clears a node discovery stopped reporting
-    /// entirely.
+    /// The supplied set replaces prior pending state.
     pub fn admit_pending(&self, pending: Vec<Node>) {
         let mut inner = self.inner.write().expect("node registry lock poisoned");
 
@@ -1046,10 +695,7 @@ impl AtomicNodeRegistry {
             if node.id.is_empty() {
                 continue;
             }
-            // `set()` already classified this id active/lingering this
-            // cycle -- it has become Serving, so it must not be
-            // re-admitted (and thereby re-excluded from scheduling) as
-            // merely pending.
+            // `set` already promoted this node to active or lingering.
             if inner.nodes_by_id.contains_key(&node.id) {
                 continue;
             }
@@ -1066,8 +712,7 @@ impl AtomicNodeRegistry {
         let mut departed: Vec<String> = Vec::new();
         for node_id in previous_pending {
             if new_pending_ids.contains(&node_id) || inner.nodes_by_id.contains_key(&node_id) {
-                // Still pending, or `set()` promoted it to active/lingering
-                // this cycle -- either way it is not gone.
+                // Still discovered as pending, active, or lingering.
                 continue;
             }
             inner.nodes_by_id.remove(&node_id);
@@ -1133,10 +778,7 @@ impl NodeRegistry for AtomicNodeRegistry {
 
         let mut inner = self.inner.write().expect("node registry lock poisoned");
 
-        // Everything below keys off the canonical ID, never the one the node
-        // sent: a node mid-upgrade still reports its pod name, and recording
-        // it under that would give the same machine two observed
-        // identities.
+        // Store observations under discovery's current canonical identity.
         let node_id = inner.canonical_id(&req.node_id);
         let node = inner
             .nodes_by_id
@@ -1187,10 +829,7 @@ impl NodeRegistry for AtomicNodeRegistry {
         };
 
         let cluster_id = req.cluster_id.clone();
-        // Published to the shared observed store (when one is configured)
-        // below, after the local write — see `Self::publish_upsert`'s own
-        // doc. Cloned because `ingest_observed` takes ownership of `record`
-        // to insert it locally.
+        // Publish the same receive-side record after committing it locally.
         let published = StoredObservedRecord::from(&record);
         inner.ingest_observed(&node_id, record);
         inner.refresh_intersection_if_ready(&cluster_id);
@@ -1205,13 +844,7 @@ impl NodeRegistry for AtomicNodeRegistry {
         };
         drop(inner);
 
-        // 🔴 Outside the write lock, and unconditional on whether a shared
-        // store is even configured (`Self::publish_upsert` is a no-op then)
-        // — a heartbeat is published every time it is locally received, not
-        // only when something changed, because `last_seen`/resource usage
-        // legitimately changes on every call and every reader of the shared
-        // view (`list_observed`, `applied_cpu_intersection`'s own
-        // `all_configs_ready` gate on another replica) needs that freshness.
+        // Publish every heartbeat because timestamps and resource usage change each time.
         self.publish_upsert(&node_id, &published);
 
         match intersection_to_report {
@@ -1298,12 +931,9 @@ impl NodeRegistry for AtomicNodeRegistry {
         let record = inner.observed.get(node_id)?;
         let snapshot = record.node.snapshot.clone()?;
         let freshness = match now.duration_since(record.last_seen) {
-            // K-5: `last_seen` after `now`. Across API replicas the record
-            // travels through Redis carrying the writing replica's clock,
-            // so this is a state to report, not one to unwrap through.
+            // Cross-replica clock skew is reportable state, not an unwrap failure.
             Err(_) => SnapshotFreshness::ClockSkew,
-            // `>`, matching `derive_observed_node_view`'s own comparison:
-            // a record exactly at its TTL is still fresh on both paths.
+            // Exactly-at-TTL remains fresh, matching external status derivation.
             Ok(age) if age > record.effective_report_ttl() => SnapshotFreshness::Stale,
             Ok(_) => SnapshotFreshness::Fresh,
         };
@@ -1438,22 +1068,16 @@ fn filter_p2p_peers_locked(
     peers
 }
 
-/// Puts two cluster ids in a comparable form. Both sides are UUID text that
-/// travelled through a config file and an environment variable, and a
-/// difference in case or padding between them would silently empty the
-/// roster side of every comparison.
+/// Normalizes cluster IDs for roster comparisons.
 fn normalize_cluster_id(cluster_id: &str) -> String {
     cluster_id.trim().to_lowercase()
 }
 
-/// The one place a heartbeat's roster becomes the registry's.
 fn normalize_heartbeat_roster(req: &HeartbeatRequest) -> Vec<RosterEntry> {
     roster_from_heartbeat(req)
 }
 
-/// Normalizes a heartbeat's roster into the registry's shape: trimmed,
-/// deduplicated ids, each carrying whatever incarnation and pause state the
-/// node reported.
+/// Normalizes, trims, and deduplicates a heartbeat roster.
 pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> Vec<RosterEntry> {
     let mut out = Vec::with_capacity(req.roster.len());
     let mut seen: HashSet<String> = HashSet::with_capacity(req.roster.len());
@@ -1475,9 +1099,6 @@ pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> Vec<RosterEntry> {
     out
 }
 
-/// The one conversion from the wire's whole seconds. A zero value becomes
-/// `Duration::ZERO`, which every reader of this treats as "no budget
-/// offered" and never as "no expiry".
 fn projection_ttl_from_secs(secs: u32) -> Duration {
     if secs == 0 {
         Duration::ZERO
@@ -1486,10 +1107,7 @@ fn projection_ttl_from_secs(secs: u32) -> Duration {
     }
 }
 
-/// Trims, checks the shape, and lower-cases. A value that is not a canonical
-/// UUID is dropped rather than carried — arbitration orders these as
-/// strings, so anything that is not the shape it expects would order
-/// unpredictably against everything else.
+/// Returns a canonical lowercase execution UUID or drops it with a metric.
 fn normalize_execution_id(raw: &str) -> String {
     let (normalized, reason) = normalize_execution_id_reason(raw);
     if let Some(reason) = reason {
@@ -1498,8 +1116,7 @@ fn normalize_execution_id(raw: &str) -> String {
     normalized
 }
 
-/// The same rule as [`normalize_execution_id`] without the counter, and
-/// returns why it dropped a value instead of counting it.
+/// Applies execution-ID normalization without recording the drop metric.
 pub fn normalize_execution_id_reason(raw: &str) -> (String, Option<&'static str>) {
     let normalized = raw.trim().to_lowercase();
     if normalized.is_empty() {
@@ -1511,9 +1128,6 @@ pub fn normalize_execution_id_reason(raw: &str) -> (String, Option<&'static str>
     (normalized, None)
 }
 
-/// The shape check, deliberately narrow: ids come from a type whose display
-/// form is always canonical, so anything else on this path came from a
-/// caller this build does not recognize.
 fn is_canonical_uuid_text(s: &str) -> bool {
     let bytes = s.as_bytes();
     if bytes.len() != 36 {
@@ -1580,9 +1194,7 @@ mod tests {
         }
     }
 
-    /// A single-leaf, single-register cpu_config_json with the given eax
-    /// bitmap — enough surface for the intersection tests below without
-    /// depending on `cpu_template`'s private test helpers.
+    /// Builds the minimal CPU config fixture used by intersection tests.
     fn cpu_config_json(eax: u32) -> String {
         format!(
             r#"{{"kvm_capabilities":[],"cpuid_modifiers":[{{"leaf":"0x1","subleaf":"0x0","flags":0,"modifiers":[{{"register":"eax","bitmap":"0b{eax:032b}"}}]}}],"msr_modifiers":[]}}"#
@@ -1653,10 +1265,7 @@ mod tests {
         entries.iter().map(|e| e.sandbox_id.clone()).collect()
     }
 
-    /// A minimal `StoredObservedRecord` for `merge_remote_snapshot` tests —
-    /// simulates what `super::redis::SharedObservedStore::pull_all` would
-    /// hand back for a node whose heartbeat landed on a *different*
-    /// replica than the one running the test.
+    /// Builds a remote observed-record fixture.
     fn stored_record(
         node_id: &str,
         cluster_id: &str,
@@ -1677,9 +1286,7 @@ mod tests {
                 cpu_architecture: String::new(),
                 cpu_config_json,
             }),
-            // Simulating what `pull_all` hands back, which is always a
-            // fully-resolved `machine_info` — see `stored_record`'s own doc
-            // comment above.
+            // Pulled records contain fully resolved machine information.
             machine_digest: None,
             snapshot: None,
             last_seen_unix_ms: unix_millis(last_seen),
@@ -1688,8 +1295,6 @@ mod tests {
             entries: Vec::new(),
         }
     }
-
-    // ---- node_registry_test.go ----
 
     #[test]
     fn list_observed_filters_by_cluster() {
@@ -1785,8 +1390,6 @@ mod tests {
         assert_eq!(got.backend, endpoint.backend);
         assert_eq!(got.address, endpoint.address);
 
-        // ObservedNode carries no p2p_endpoint field at all (unlike Go, which
-        // asserts this via proto reflection) — the type simply has none.
         registry
             .get_observed("node-a", "cluster-a", now)
             .expect("observed node");
@@ -1968,14 +1571,7 @@ mod tests {
         let cfg = cpu_config_json(0xFF);
         let result = heartbeat_with_config(&registry, "node-a", "cluster-1", &cfg);
         assert!(!result.is_empty());
-        // 🔴 P6-f: exact string comparison, not `extract_eax`'s
-        // parse-into-`u32`. The self-intersection of one config is defined
-        // to be that config byte-for-byte (`cpu_template.rs`'s own golden
-        // test), and a `u32` round-trip cannot tell `"0b1111"` apart from
-        // `"0b00000000000000000000000000001111"` — both parse to 15 — so a
-        // regression that dropped zero-padding from the real formatter
-        // would pass this assertion silently while failing Go's own
-        // byte-for-byte test.
+        // Exact text pins the CPU-config formatter, including bitmap padding.
         assert_eq!(result, cfg);
     }
 
@@ -1996,15 +1592,6 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    /// 🔴 P4: `applied_cpu_intersection` is the gated value production
-    /// actually cached and would hand a node on its next heartbeat — not a
-    /// fresh recompute over whoever happens to have reported a non-empty
-    /// config right now. While node-b has heartbeated but not yet with a
-    /// `cpu_config_json` (the same "cluster size established, one member
-    /// still pending" state `heartbeat_withholds_cpu_intersection_until_all_nodes_ready`
-    /// above proves withholds the *heartbeat reply*), this must also stay
-    /// `None` — this is the accessor `node_registry::dump`'s D6 recompute
-    /// is checked against.
     #[test]
     fn applied_cpu_intersection_stays_none_while_the_cluster_is_only_partially_reported() {
         let registry = AtomicNodeRegistry::new(
@@ -2191,8 +1778,6 @@ mod tests {
         assert_eq!(err, NodeNotInRegistry);
     }
 
-    // ---- node_registry_roster_test.go ----
-
     #[test]
     fn roster_from_heartbeat_carries_the_paused_flag_both_ways() {
         let entries = roster_from_heartbeat(&HeartbeatRequest {
@@ -2242,9 +1827,6 @@ mod tests {
         assert_eq!(roster_ids(&roster), vec!["s1", "s2"]);
         assert_eq!(last_seen, now);
 
-        // The returned Vec is a copy: mutating it must not corrupt the
-        // registry (true by construction in Rust, but assert it anyway to
-        // keep parity with the Go test that checks it explicitly).
         let (again, _) = registry.roster_of("node-a").unwrap();
         assert_eq!(again[0].sandbox_id, "s1");
     }
@@ -2430,15 +2012,6 @@ mod tests {
         assert_eq!(after[0].node_id, "node-a");
     }
 
-    // 🔴 Regression guard: the CPU-intersection cache must be invalidated —
-    // not left standing — when a node neither of the previous two entries
-    // has heard from joins the same cluster. `heartbeat`'s `!existed` check
-    // is what does this (see the doc comment on `heartbeat` and on
-    // `invalidate_intersection`); a simplification that only invalidated on
-    // a *changed* config, and treated "brand new observation" as just
-    // another unchanged one, would leave a stale two-node intersection
-    // cached — and therefore deliverable — after a third node with a
-    // narrower config has already joined the cluster it claims to describe.
     #[test]
     fn cpu_intersection_is_withheld_again_when_a_new_node_joins_the_cluster() {
         let registry = AtomicNodeRegistry::new(
@@ -2450,9 +2023,6 @@ mod tests {
         );
         let cfg = cpu_config_json(0xFF);
 
-        // Both nodes report the identical config: the intersection is
-        // immediately computable and delivered on the heartbeat that
-        // completes the set.
         heartbeat_with_config(&registry, "node-a", "cluster-1", &cfg);
         let delivered = heartbeat_with_config(&registry, "node-b", "cluster-1", &cfg);
         assert!(
@@ -2460,10 +2030,6 @@ mod tests {
             "expected the intersection once both nodes agree"
         );
 
-        // A third node joins discovery and reports in for the first time,
-        // with no CPU config yet. The cached intersection must not survive
-        // this: the cluster's true size just changed, and the old answer no
-        // longer reflects "every known node agrees".
         registry.set(
             vec![
                 node("node-a", "http://node-a"),
@@ -2479,29 +2045,12 @@ mod tests {
             "a newcomer with no config yet must not receive a stale two-node intersection"
         );
 
-        // Nor may node-a be handed the stale answer again — the cache was
-        // invalidated, not merely withheld from the newcomer.
         let restale = heartbeat_with_config(&registry, "node-a", "cluster-1", &cfg);
         assert!(
             restale.is_empty(),
             "the intersection must stay withheld until node-c also reports a config"
         );
     }
-    // ---- kubernetes_discovery_test.go's registry-focused cases ----
-    //
-    // These five lived in kubernetes_discovery_test.go on the Go side
-    // (colocated with the discovery tests even though they exercise
-    // AtomicNodeRegistry alone), not node_registry_test.go /
-    // node_registry_roster_test.go. node_registry_reflects_endpoint_removal_across_syncs
-    // is ported in src/node_registry/kubernetes_discovery.rs, next to
-    // nodes_from_endpoint_slices, since it is the one that actually combines
-    // discovery output with registry state. lingering_node_gets_no_schedule_status_in_observed_view
-    // is Go's TestLingeringNodeGetsNoScheduleStatusInObservedView, whose
-    // assertion is already the first half of
-    // lingering_node_becomes_unhealthy_after_ttl above -- not duplicated
-    // again here. The remaining three below (snapshot filtering, the
-    // active/READY case, and discovery eviction clearing GetObserved/
-    // ListObserved) were not covered by any existing test until now.
 
     #[test]
     fn snapshot_filters_lingering_nodes() {
@@ -2539,16 +2088,6 @@ mod tests {
         assert_eq!(observed.snapshot.unwrap().status(), NodeStatus::Ready);
     }
 
-    /// 🔴 Renamed from `set_removes_observed_nodes_missing_from_discovery`:
-    /// with [`EmptySyncGuard`] in place, one all-empty `set` no longer
-    /// removes anything by itself — see this module's own doc comment on
-    /// the divergence from Go's `Set`. The removal mechanism this test
-    /// covers is unchanged; what changed is that it only fires once
-    /// confirmed. `an_all_empty_sync_is_withheld_until_confirmed` below
-    /// covers the withholding half on its own; this one drives the *default*
-    /// [`EmptySyncGuard`] all the way through confirmation, so production's
-    /// actual configuration is proven to still get there, not just a
-    /// specially-weakened guard built for the test.
     #[test]
     fn set_removes_observed_nodes_missing_from_discovery_once_the_empty_sync_is_confirmed() {
         let registry = AtomicNodeRegistry::new(
@@ -2560,16 +2099,12 @@ mod tests {
             .heartbeat(&ready_heartbeat("node-a", "cluster-a"), now)
             .unwrap();
 
-        // The first all-empty sync is only suspected, not applied.
         registry.set(Vec::new(), Vec::new(), now);
         assert!(
             registry.get_observed("node-a", "", now).is_some(),
             "a single empty discovery sync must not immediately remove a previously known node"
         );
 
-        // Reaching the default confirmation count applies it — one more
-        // call, since the first one above already counted as the first
-        // confirmation.
         for _ in 1..DEFAULT_EMPTY_SYNC_CONFIRMATIONS {
             registry.set(Vec::new(), Vec::new(), now);
         }
@@ -2578,9 +2113,6 @@ mod tests {
         assert!(registry.list_observed("", now).is_empty());
     }
 
-    // ---- EmptySyncGuard: the divergence from Go's Set (this module's own
-    //      doc comment) ----
-
     #[test]
     fn an_all_empty_sync_is_withheld_until_the_confirmation_count_is_reached() {
         let registry = AtomicNodeRegistry::with_empty_sync_guard(
@@ -2588,8 +2120,7 @@ mod tests {
             DEFAULT_OBSERVED_REPORT_TTL,
             EmptySyncGuard {
                 confirmations: 3,
-                // Large enough that only the count, never the window, can
-                // confirm within this test.
+                // Prevent the time window from confirming this fixture.
                 window: Duration::from_secs(10_000),
             },
         );
@@ -2620,8 +2151,7 @@ mod tests {
             vec![node("node-a", "http://node-a")],
             DEFAULT_OBSERVED_REPORT_TTL,
             EmptySyncGuard {
-                // High enough that the count alone never confirms within
-                // this test — only the window may.
+                // Force confirmation through the time window.
                 confirmations: 1_000,
                 window: Duration::from_secs(30),
             },
@@ -2659,17 +2189,12 @@ mod tests {
         );
         let now = unix(100);
 
-        // One confirmation in — one more would apply the wipe.
         registry.set(Vec::new(), Vec::new(), now);
         assert!(registry.snapshot(true).iter().any(|n| n.id == "node-a"));
 
-        // Discovery reports a real (even if different) node list again —
-        // proof the empty answer was transient. This must reset the count,
-        // not merely pause it.
         registry.set(vec![node("node-a", "http://node-a")], Vec::new(), now);
         assert!(registry.snapshot(true).iter().any(|n| n.id == "node-a"));
 
-        // A fresh empty sync must need the full count again, not "one more".
         registry.set(Vec::new(), Vec::new(), now);
         assert!(
             registry.snapshot(true).iter().any(|n| n.id == "node-a"),
@@ -2707,10 +2232,7 @@ mod tests {
 
     #[test]
     fn a_zero_confirmation_guard_applies_an_empty_sync_immediately_matching_go() {
-        // `EmptySyncGuard::confirmations = 0` (or `1`) with a zero window is
-        // Go's original "apply every Set call unconditionally" behavior —
-        // deliberately still reachable, not special-cased away. See this
-        // module's own doc comment.
+        // Zero thresholds exercise immediate empty-sync application.
         let registry = AtomicNodeRegistry::with_empty_sync_guard(
             vec![node("node-a", "http://node-a")],
             DEFAULT_OBSERVED_REPORT_TTL,
@@ -2723,9 +2245,6 @@ mod tests {
         registry.set(Vec::new(), Vec::new(), unix(100));
         assert!(registry.snapshot(true).is_empty());
     }
-
-    // ---- admit_pending: task's own "D2" (this module's own doc comment on
-    //      `admit_pending`) ----
 
     #[test]
     fn a_pending_node_cannot_heartbeat_before_admit_pending_is_called() {
@@ -2778,10 +2297,6 @@ mod tests {
 
     #[test]
     fn a_pending_nodes_reported_status_is_not_forced_to_lingering() {
-        // Contrast with `lingering`, which `derive_observed_node_view`
-        // forces to `NodeStatus::Lingering` regardless of what the node
-        // self-reports. A pending node is not draining — it is starting up
-        // — so its self-reported status must flow through unmodified.
         let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
         registry.set(Vec::new(), Vec::new(), unix(100));
         registry.admit_pending(vec![node("node-a", "http://node-a")]);
@@ -2806,7 +2321,6 @@ mod tests {
         registry.admit_pending(vec![node("node-a", "http://node-a")]);
         assert!(!registry.snapshot(false).iter().any(|n| n.id == "node-a"));
 
-        // Discovery's next sync now marks node-a Serving.
         registry.set(vec![node("node-a", "http://node-a")], Vec::new(), unix(101));
         registry.admit_pending(Vec::new());
 
@@ -2818,18 +2332,12 @@ mod tests {
 
     #[test]
     fn a_stale_pending_report_for_an_already_active_node_does_not_downgrade_it() {
-        // A discovery watch loop calling admit_pending can lag set() by
-        // however long its own last pending computation took — if that
-        // stale computation still names a node set() has *this cycle*
-        // already promoted to active, admit_pending must not re-flag it
-        // pending and pull it back out of the scheduling snapshot.
         let registry = AtomicNodeRegistry::new(Vec::new(), DEFAULT_OBSERVED_REPORT_TTL);
         registry.set(Vec::new(), Vec::new(), unix(100));
         registry.admit_pending(vec![node("node-a", "http://node-a")]);
 
         registry.set(vec![node("node-a", "http://node-a")], Vec::new(), unix(101));
-        // Stale: still names node-a, as if the pending computation that fed
-        // this call ran before set()'s promotion was known.
+        // Simulate a pending computation that predates `set` promotion.
         registry.admit_pending(vec![node("node-a", "http://node-a")]);
 
         assert!(
@@ -2840,13 +2348,7 @@ mod tests {
 
     #[test]
     fn a_pending_nodes_roster_survives_consecutive_admit_pending_calls_while_still_pending() {
-        // Zero-confirmation, zero-window guard so the all-empty set() calls
-        // below actually run their stale-cleanup pass immediately, rather
-        // than being withheld by EmptySyncGuard (which would make this test
-        // pass without ever reaching the code it means to exercise — a
-        // pending-only registry counts as "populated" for the guard's own
-        // purposes, so the default guard intercepts an all-empty set() here
-        // before set()'s cleanup filter even runs).
+        // Disable empty-sync withholding so this fixture reaches pending cleanup.
         let registry = AtomicNodeRegistry::with_empty_sync_guard(
             Vec::new(),
             DEFAULT_OBSERVED_REPORT_TTL,
@@ -2877,11 +2379,6 @@ mod tests {
             vec!["node-a".to_string()]
         );
 
-        // The next discovery cycle: set() still does not know about node-a
-        // (still not Serving), then admit_pending re-confirms it pending
-        // again. set()'s own stale-cleanup must not have wiped node-a's
-        // roster out from under this — that is exactly the bug this
-        // module's own doc comment on `admit_pending` explains.
         registry.set(Vec::new(), Vec::new(), unix(105));
         registry.admit_pending(vec![node("node-a", "http://node-a")]);
 
@@ -2894,12 +2391,7 @@ mod tests {
 
     #[test]
     fn a_pending_node_that_disappears_is_cleared_like_any_other_departed_node() {
-        // A zero-confirmation, zero-window guard so this test isolates
-        // admit_pending's own cleanup from EmptySyncGuard's separate,
-        // deliberate withholding of an all-empty set() once the registry is
-        // "populated" (which a pending-only admission also counts as) --
-        // that interaction is real and desirable, just not what this test
-        // is about.
+        // Disable empty-sync withholding to isolate pending-node cleanup.
         let registry = AtomicNodeRegistry::with_empty_sync_guard(
             Vec::new(),
             DEFAULT_OBSERVED_REPORT_TTL,
@@ -2917,9 +2409,6 @@ mod tests {
             .get_observed("node-a", "cluster-a", unix(100))
             .is_some());
 
-        // node-a's EndpointSlice entry is gone entirely on the next sync —
-        // never promoted, never renamed, just gone (pod deleted, not
-        // recreated).
         registry.set(Vec::new(), Vec::new(), unix(110));
         registry.admit_pending(Vec::new());
 
@@ -2932,10 +2421,6 @@ mod tests {
             .expect_err("node-a's identity must have been dropped along with its observed state");
         assert_eq!(err, NodeNotInRegistry);
     }
-
-    // ---- the shared-roster fix (`super::redis`): merge semantics, the
-    //      publish channel, and the one correctness-bearing property (CPU
-    //      intersection over the *merged*, cluster-wide view) ----
 
     #[test]
     fn stored_observed_record_round_trips_every_field() {
@@ -3033,13 +2518,8 @@ mod tests {
             vec![node("node-a", "http://node-a")],
             Duration::from_secs(30),
         );
-        // A fresh local heartbeat at t=200.
         heartbeat_with_roster(&registry, "node-a", "cluster-1", unix(200), &["sbx-fresh"]);
 
-        // A stale pull of this replica's own earlier write (t=100), as if
-        // the async publish round-tripped through redis late and the
-        // periodic pull picked up an older snapshot than what is already
-        // local.
         let mut stale = stored_record("node-a", "cluster-1", None, unix(100));
         stale.entries = vec![StoredRosterEntry {
             sandbox_id: "sbx-stale".to_string(),
@@ -3065,9 +2545,6 @@ mod tests {
         );
         heartbeat_with_roster(&registry, "node-a", "cluster-1", unix(100), &["sbx-old"]);
 
-        // node-a reconnected to a different replica and heartbeated there
-        // at t=200 with a different roster; this replica only learns of it
-        // through the next merge.
         let mut newer = stored_record("node-a", "cluster-1", None, unix(200));
         newer.entries = vec![StoredRosterEntry {
             sandbox_id: "sbx-new".to_string(),
@@ -3093,9 +2570,6 @@ mod tests {
         );
         heartbeat_with_roster(&registry, "node-a", "cluster-1", unix(100), &["sbx-a"]);
 
-        // A pull that only names node-b -- as if node-a's own
-        // not-yet-flushed first publish simply has not landed in redis
-        // yet.
         registry.merge_remote_snapshot(HashMap::from([(
             "node-b".to_string(),
             stored_record("node-b", "cluster-1", None, unix(100)),
@@ -3109,10 +2583,6 @@ mod tests {
         );
     }
 
-    /// The one correctness-bearing property of the whole fix: the CPU
-    /// intersection gate (`Inner::all_configs_ready`/`compute_intersection`)
-    /// must evaluate the merged, cluster-wide view — not just whatever
-    /// heartbeats happened to land on this particular replica.
     #[test]
     fn applied_cpu_intersection_incorporates_a_node_only_known_through_a_redis_merge() {
         let registry = AtomicNodeRegistry::new(
@@ -3133,9 +2603,6 @@ mod tests {
              discovered nodes"
         );
 
-        // node-b's heartbeat landed on a *different* replica in this
-        // simulation: this replica only learns of it through a
-        // shared-store merge, never a local `heartbeat` call.
         let cfg_b = cpu_config_json(0x0F);
         let stored_b = stored_record("node-b", "cluster-1", Some(cfg_b), unix(100));
         registry.merge_remote_snapshot(HashMap::from([("node-b".to_string(), stored_b)]));
@@ -3174,11 +2641,6 @@ mod tests {
         }
     }
 
-    /// The default, in-memory-only configuration every existing test in
-    /// this module (and every `aenv-node` process) runs
-    /// under — `enable_shared_observed_publishing` is never called, so
-    /// `heartbeat` must not panic or otherwise misbehave with `publish_tx`
-    /// unset. Compiling and returning normally is the assertion.
     #[test]
     fn heartbeat_does_not_require_a_shared_store_to_be_enabled() {
         let registry = AtomicNodeRegistry::new(
@@ -3205,9 +2667,6 @@ mod tests {
             .expect("heartbeat");
         let _ = rx.try_recv().expect("the heartbeat's own upsert");
 
-        // node-a's EndpointSlice entry is gone on the next discovery sync;
-        // node-b's is not, so this is an ordinary partial-departure sync,
-        // not an all-empty one -- `EmptySyncGuard` never engages.
         registry.set(vec![node("node-b", "http://node-b")], Vec::new(), unix(110));
 
         match rx
@@ -3219,34 +2678,12 @@ mod tests {
         }
     }
 
-    /// F-7 / M-5 / K-4 / K-5 — freshness, in one place.
-    ///
-    /// # 🔴 Why the report TTL comes off the record
-    ///
-    /// A registry running a non-default `observed_ttl` stamps that TTL onto
-    /// every record it ingests. A scorer that hardcoded
-    /// [`DEFAULT_OBSERVED_REPORT_TTL`] instead would call a node fresh that
-    /// the registry itself already derives `UNHEALTHY` for — and, because
-    /// every test and every current deployment runs the default TTL, the
-    /// disagreement would never show up. So the non-default case is
-    /// asserted first here, and the default second, against the same
-    /// helper `derive_observed_node_view` uses.
-    ///
-    /// # 🔴 Why `last_seen` and not `reported_at_unix_ms`
-    ///
-    /// `reported_at_unix_ms` is the *node's* clock, which the API half does
-    /// not own. The two cases below hold `now` fixed and move the two
-    /// timestamps in opposite directions, so an implementation that read
-    /// the node's own timestamp gets the answer backwards in both.
     #[test]
     fn peek_observed_with_freshness_judges_against_the_records_own_ttl() {
         let now = unix(1_000);
         let five_seconds = Duration::from_secs(5);
         let registry = AtomicNodeRegistry::new(vec![node("node-a", "http://node-a")], five_seconds);
 
-        // (1) Received 6s ago under a 5s TTL: stale. The node's own
-        // `reported_at` says "right now", so a mutant reading it answers
-        // Fresh.
         let mut beat = ready_heartbeat("node-a", "cluster-1");
         beat.snapshot
             .as_mut()
@@ -3259,8 +2696,6 @@ mod tests {
             .peek_observed_with_freshness("node-a", now)
             .expect("the node has reported");
         assert_eq!(freshness, SnapshotFreshness::Stale);
-        // The registry's own derivation agrees, which is the point of
-        // sharing `effective_report_ttl`.
         let derived = registry
             .get_observed("node-a", "cluster-1", now)
             .expect("observed view");
@@ -3269,9 +2704,6 @@ mod tests {
             NodeStatus::Unhealthy
         );
 
-        // (2) The reverse control: received 1s ago, but the node claims it
-        // measured itself 6s ago. Fresh — a mutant reading the node's
-        // timestamp answers Stale.
         let mut beat = ready_heartbeat("node-a", "cluster-1");
         beat.snapshot
             .as_mut()
@@ -3285,9 +2717,6 @@ mod tests {
             .expect("the node has reported");
         assert_eq!(freshness, SnapshotFreshness::Fresh);
 
-        // (3) The same 6s-old record under the *default* 30s TTL is fresh —
-        // so case (1)'s verdict really did come from the record's own TTL
-        // and not from a constant that happens to be smaller.
         let default_ttl = AtomicNodeRegistry::new(
             vec![node("node-a", "http://node-a")],
             DEFAULT_OBSERVED_REPORT_TTL,
@@ -3304,9 +2733,6 @@ mod tests {
         assert_eq!(freshness, SnapshotFreshness::Fresh);
     }
 
-    /// K-5 — `last_seen` after `now` is a state, not an `unwrap`. Reachable
-    /// across API replicas, where a record travels through Redis carrying
-    /// the writing replica's clock.
     #[test]
     fn peek_observed_with_freshness_reports_clock_skew_instead_of_panicking() {
         let now = unix(1_000);
@@ -3327,9 +2753,6 @@ mod tests {
         assert_eq!(freshness, SnapshotFreshness::ClockSkew);
     }
 
-    /// The snapshot half is byte-for-byte `peek_observed`'s, including for a
-    /// node discovery knows about that has never reported. Adding the
-    /// scorer must not change the candidate list.
     #[test]
     fn peek_observed_with_freshness_returns_the_same_snapshot_peek_observed_does() {
         let now = unix(1_000);
@@ -3350,10 +2773,6 @@ mod tests {
                 .map(|(snapshot, _)| snapshot),
             registry.peek_observed("node-a"),
         );
-        // 🔴 The invariant `freshness.is_none()` iff `snapshot.is_none()`:
-        // a discovered node with no heartbeat answers `None` on both
-        // accessors, and the scorer classifies it `no_snapshot` rather than
-        // having it disappear from the candidate list.
         assert_eq!(registry.peek_observed("node-silent"), None);
         assert!(registry
             .peek_observed_with_freshness("node-silent", now)

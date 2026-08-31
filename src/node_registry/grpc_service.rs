@@ -36,8 +36,9 @@ use super::registry::{
 use super::strategy::RoundRobinStrategy;
 use super::warmup::WarmupGate;
 
-const NOT_STAGE_A: &str = "not served by api's Stage A node-registry service — see \
-     src/node_registry/grpc_service.rs's module doc for which half owns this RPC";
+/// Suffix on `unimplemented` errors for the RPC groups an optional dependency gates.
+const NOT_WIRED: &str = "an assembled aenv-api wires every optional dependency, so a caller \
+     reaching this arm is talking to an in-process or test build";
 
 /// Serves the node-registry subset of `scheduler.v1.Scheduler`.
 ///
@@ -238,33 +239,24 @@ impl NodeRegistryGrpcService {
     pub fn describe_metrics() {
         metrics::describe_gauge!(
             OBSERVED_NODES_METRIC,
-            "Observed node count by derived status, as api's node registry currently has it \
-             (Stage A's counterpart to the scheduler's agentenv_scheduler_observed_nodes)."
+            "Observed node count by derived status, as api's node registry currently has it."
         );
-        metrics::describe_counter!(
-            LOOKUP_NODE_METRIC,
-            "LookupNode outcomes by result label (Stage D's counterpart to the scheduler's \
-             agentenv_scheduler_lookup_node_total)."
-        );
+        metrics::describe_counter!(LOOKUP_NODE_METRIC, "LookupNode outcomes by result label.");
         metrics::describe_counter!(
             LOOKUP_EXECUTION_AUTHORITY_METRIC,
-            "Execution authority carried on every successful LookupNode answer (Stage D's \
-             counterpart to the scheduler's agentenv_scheduler_lookup_execution_authority_total)."
+            "Execution authority carried on every successful LookupNode answer."
         );
         metrics::describe_counter!(
             BINDING_EXECUTION_METRIC,
-            "Binding-store arbitration outcomes by decision and write source (Stage D's \
-             counterpart to the scheduler's agentenv_scheduler_binding_execution_total)."
+            "Binding-store arbitration outcomes by decision and write source."
         );
         metrics::describe_histogram!(
             SCHEDULE_DURATION_METRIC,
-            "Schedule call latency by strategy and outcome (Stage D's counterpart to the \
-             scheduler's agentenv_scheduler_schedule_duration_seconds)."
+            "Schedule call latency by strategy and outcome."
         );
         metrics::describe_counter!(
             SCHEDULE_ASSIGNMENTS_METRIC,
-            "Successful Schedule placements by strategy (Stage D's counterpart to the \
-             scheduler's agentenv_scheduler_schedule_assignments_total)."
+            "Successful Schedule placements by strategy."
         );
     }
 
@@ -557,8 +549,8 @@ impl Scheduler for NodeRegistryGrpcService {
     ) -> Result<Response<LookupNodeResponse>, Status> {
         let Some(binding_store) = self.binding_store.clone() else {
             return Err(Status::unimplemented(format!(
-                "LookupNode needs a binding store, and this deployment has not wired one in \
-                 yet: {NOT_STAGE_A}"
+                "LookupNode needs a binding store, and this deployment has none wired: \
+                 {NOT_WIRED}"
             )));
         };
         let req = request.into_inner();
@@ -609,8 +601,8 @@ impl Scheduler for NodeRegistryGrpcService {
     ) -> Result<Response<RecordAssignmentResponse>, Status> {
         let Some(binding_store) = self.binding_store.clone() else {
             return Err(Status::unimplemented(format!(
-                "RecordAssignment needs a binding store, and this deployment has not wired one \
-                 in yet: {NOT_STAGE_A}"
+                "RecordAssignment needs a binding store, and this deployment has none wired: \
+                 {NOT_WIRED}"
             )));
         };
         let req = request.into_inner();
@@ -674,8 +666,8 @@ impl Scheduler for NodeRegistryGrpcService {
     ) -> Result<Response<ReportSandboxEventResponse>, Status> {
         let Some(binding_store) = self.binding_store.clone() else {
             return Err(Status::unimplemented(format!(
-                "ReportSandboxEvent needs a binding store, and this deployment has not wired \
-                 one in yet: {NOT_STAGE_A}"
+                "ReportSandboxEvent needs a binding store, and this deployment has none \
+                 wired: {NOT_WIRED}"
             )));
         };
         let req = request.into_inner();
@@ -719,7 +711,8 @@ impl Scheduler for NodeRegistryGrpcService {
     ) -> Result<Response<RecordP2pArtifactResponse>, Status> {
         let Some(artifact_store) = self.artifact_store.clone() else {
             return Err(Status::unimplemented(format!(
-                "RecordP2pArtifact needs an ArtifactStore, and this deployment has not wired                  one in yet: {NOT_STAGE_A}"
+                "RecordP2pArtifact needs an ArtifactStore, and this deployment has none \
+                 wired: {NOT_WIRED}"
             )));
         };
         let req = request.into_inner();
@@ -739,7 +732,8 @@ impl Scheduler for NodeRegistryGrpcService {
     ) -> Result<Response<ForgetP2pArtifactResponse>, Status> {
         let Some(artifact_store) = self.artifact_store.clone() else {
             return Err(Status::unimplemented(format!(
-                "ForgetP2pArtifact needs an ArtifactStore, and this deployment has not wired                  one in yet: {NOT_STAGE_A}"
+                "ForgetP2pArtifact needs an ArtifactStore, and this deployment has none \
+                 wired: {NOT_WIRED}"
             )));
         };
         let req = request.into_inner();
@@ -760,7 +754,8 @@ impl Scheduler for NodeRegistryGrpcService {
     ) -> Result<Response<LookupP2pArtifactResponse>, Status> {
         let Some(artifact_store) = self.artifact_store.clone() else {
             return Err(Status::unimplemented(format!(
-                "LookupP2pArtifact needs an ArtifactStore, and this deployment has not wired                  one in yet: {NOT_STAGE_A}"
+                "LookupP2pArtifact needs an ArtifactStore, and this deployment has none \
+                 wired: {NOT_WIRED}"
             )));
         };
         let req = request.into_inner();

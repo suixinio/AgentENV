@@ -80,8 +80,8 @@ async fn async_main() -> anyhow::Result<()> {
 async fn build_pg_pool(config: &AppConfig) -> anyhow::Result<sqlx::PgPool> {
     let settings = PgPoolSettings::from_config(config.pg.as_ref())?.context(
         "[pg] is required for aenv-api: [pg].dsn is unset or blank, and PostgreSQL is the only \
-         snapshot catalog there is (object storage held one until the Stage B cutover and holds \
-         byte artifacts alone now). Without it this replica would start with no catalog, and \
+         snapshot catalog there is (object storage holds byte artifacts alone). Without it this \
+         replica would start with no catalog, and \
          every snapshot, template and paused-sandbox request would have nowhere to read or write \
          a row. Set [pg].dsn for this half — it is TOML-file-only, with no environment binding \
          (confique cannot descend into AppConfig::pg's Option), so supply it through the file \
@@ -384,7 +384,8 @@ async fn start_native_node_registry(
                     "aenv-api needs [cluster.kubernetes_discovery].namespace and .service_name \
                      (AENV_CLUSTER_KUBERNETES_DISCOVERY_NAMESPACE / \
                      AENV_CLUSTER_KUBERNETES_DISCOVERY_SERVICE_NAME) when (the default) \
-                     [cluster].node_discovery_mode = \"kubernetes\": Stage A's node registry has \
+                     [cluster].node_discovery_mode = \"kubernetes\": the api half's node \
+                     registry has \
                      nothing to discover nodes from otherwise. Set \
                      AENV_CLUSTER_NODE_DISCOVERY_MODE=static and \
                      [cluster].static_discovery_nodes for a non-Kubernetes deployment."

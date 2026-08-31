@@ -229,7 +229,7 @@ pub async fn build_paused_registry(
         PausedRegistryBackendKind::Postgres => {
             let factory = postgres.context(
                 "paused_registry.backend = \"postgres\" requires [pg].dsn to be configured \
-                 (the shared PostgreSQL pool this process already builds for Stage B's \
+                 (the shared PostgreSQL pool this process already builds for the snapshot \
                  catalog, if [pg] is set)",
             )?;
 
@@ -238,9 +238,7 @@ pub async fn build_paused_registry(
                 "paused_registry.backend = \"postgres\" requires a heartbeat roster \
                  source (aenv-api's own node registry, which assemble_api always builds) \
                  -- without it, running sandboxes' registry leases have no renewal path \
-                 and will eventually be wrongly reclaimed even while healthy (this is the \
-                 exact failure Fix A, commit 151d00b, closed for the now-deleted \
-                 central/gRPC backend)",
+                 and will eventually be wrongly reclaimed even while healthy",
             )?;
 
             // Background loops consume the validated roster after assembly.

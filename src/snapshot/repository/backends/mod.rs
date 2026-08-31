@@ -50,9 +50,9 @@ pub fn build_snapshot_backend(
 
     let catalog = pg.context(
         "no snapshot catalog is configured: [pg].dsn is unset and PostgreSQL is the only \
-         snapshot catalog there is. Object storage held one until the Stage B cutover and \
-         holds byte artifacts alone now, so starting without [pg] would leave every snapshot \
-         and template request with nowhere to read or write a row. Set [pg].dsn for this half \
+         snapshot catalog there is. Object storage holds byte artifacts alone, so starting \
+         without [pg] would leave every snapshot and template request with nowhere to read or \
+         write a row. Set [pg].dsn for this half \
          — it is TOML-file-only, with no environment binding (confique cannot descend into \
          AppConfig::pg's Option), so supply it through the file AENV_CONFIG_PATH names or an \
          AENV_CONFIG_OVERLAY_PATH overlay, the way deploy/k8s/base's pg-dsn.toml and \

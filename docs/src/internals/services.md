@@ -78,4 +78,20 @@ RPCs: `Schedule`, `ListNodes`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `R
 
 Runtime node heartbeats may include an opaque `P2pEndpoint` containing a backend name and backend-specific address. `aenv-api`'s native registry stores that endpoint with the observed-node record and returns ready peers through `ListP2pPeers(cluster_id, backend, exclude_node_id)`. It does not query artifact catalogs and never forwards artifact data.
 
+## Metric Name Cross-Walk
+
+`aenv-api` exports the node-registry metrics under `agentenv_api_*`. Dashboards
+and alerts written against the deleted Go scheduler's names need this mapping:
+
+| Deleted `services/scheduler` name | Current `aenv-api` name |
+| --- | --- |
+| `agentenv_scheduler_observed_nodes` | `agentenv_api_node_registry_observed_nodes` |
+| `agentenv_scheduler_lookup_node_total` | `agentenv_api_lookup_node_total` |
+| `agentenv_scheduler_lookup_execution_authority_total` | `agentenv_api_lookup_execution_authority_total` |
+| `agentenv_scheduler_binding_execution_total` | `agentenv_api_binding_execution_total` |
+| `agentenv_scheduler_schedule_duration_seconds` | `agentenv_api_schedule_duration_seconds` |
+| `agentenv_scheduler_schedule_assignments_total` | `agentenv_api_schedule_assignments_total` |
+
+Constants live in `src/node_registry/grpc_service.rs`.
+
 For full configuration details (header compatibility, timeouts, logging), see the [services README](https://github.com/kvcache-ai/AgentENV/blob/main/services/README.md).

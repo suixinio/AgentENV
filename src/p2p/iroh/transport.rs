@@ -39,6 +39,7 @@ use crate::p2p::types::{
 };
 use crate::p2p::P2pByteStream;
 
+const LEGACY_CATALOG_DB_DIR: &str = "catalog.db";
 const ENDPOINT_ADDR_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_STORE_GC_INTERVAL: Duration = Duration::from_mins(5);
 const PUBLISH_TAG_PREFIX: &str = "agentenv:p2p:v1:";
@@ -98,6 +99,15 @@ impl IrohBlobsP2pTransport {
         tokio::fs::create_dir_all(&store_dir)
             .await
             .with_context(|| format!("create P2P blob store dir {}", store_dir.display()))?;
+
+        let stale_catalog = store_dir.join(LEGACY_CATALOG_DB_DIR);
+        if crate::record_dir::discard_unreadable_store(&stale_catalog).await {
+            warn!(
+                store = %stale_catalog.display(),
+                "discarded a P2P catalog this build cannot read; this node advertises nothing \
+                 until it publishes again"
+            );
+        }
 
         // Run one startup GC pass to clean up blobs whose retention tags were
         // removed before a previous process exited.
@@ -1164,10 +1174,21 @@ mod tests {
         let config = p2p_config(store_dir);
         let key = "test/p2p/iroh/republished-catalog".to_string();
         let bytes = b"artifact bytes a restarted transport must be told about again";
+        let stale_catalog = config
+            .store_dir
+            .join(IROH_BACKEND_ID)
+            .join(LEGACY_CATALOG_DB_DIR);
+        tokio::fs::create_dir_all(&stale_catalog)
+            .await
+            .context("seed a catalog store this build cannot read")?;
 
         let provider = test_transport(&config, "provider-node", Arc::new(NoopP2pPeerDiscovery))
             .await
             .context("start provider P2P transport")?;
+        assert!(
+            !stale_catalog.exists(),
+            "a catalog store this build cannot read must be discarded at startup"
+        );
         provider
             .publish(&P2pPublishRequest::bytes(key.clone(), bytes.as_slice()))
             .await

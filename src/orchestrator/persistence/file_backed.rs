@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::{ClusterRegistration, PersistenceResult, SandboxPersistenceError, SandboxPersister};
 use crate::local_store::LocalStoreDurability;
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
-use crate::record_dir::JsonRecordDir;
+use crate::record_dir::{discard_unreadable_store, JsonRecordDir};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
@@ -148,7 +148,15 @@ impl FileBackedSandboxPersister {
     async fn records(&self) -> PersistenceResult<JsonRecordDir> {
         self.records
             .get_or_try_init(|| async {
-                self.refuse_unmigrated_records().await?;
+                let legacy = self.legacy_records_db_path();
+                if discard_unreadable_store(&legacy).await {
+                    warn!(
+                        store = %legacy.display(),
+                        "discarded paused sandbox records this build cannot read; the sandboxes \
+                         they described are gone, and any cluster registry rows still naming them \
+                         are orphans an operator has to clear"
+                    );
+                }
                 JsonRecordDir::open(self.records_path(), self.durability)
                     .await
                     .map_err(|source| {
@@ -157,38 +165,6 @@ impl FileBackedSandboxPersister {
             })
             .await
             .cloned()
-    }
-
-    /// Refuses to serve records while an unconverted embedded-database
-    /// directory is still present, because its paused sandboxes are invisible
-    /// here and would be treated as orphans.
-    async fn refuse_unmigrated_records(&self) -> PersistenceResult<()> {
-        let legacy = self.legacy_records_db_path();
-        match fs::metadata(&legacy).await {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(SandboxPersistenceError::io(
-                    "inspect paused sandbox records",
-                    &legacy,
-                    source,
-                ))
-            }
-            Ok(metadata) if !metadata.is_dir() => return Ok(()),
-            Ok(_) => {}
-        }
-
-        Err(SandboxPersistenceError::store(
-            "open paused sandbox records",
-            anyhow::anyhow!(
-                "{legacy} holds paused sandbox records this build cannot read. Convert them with \
-                 `cargo run --manifest-path tools/rocksdb-migrate/Cargo.toml -- --store {root}`, \
-                 which writes {records} and leaves the old directory in place for you to remove. \
-                 If this node has no paused sandboxes to keep, `rm -rf {legacy}` instead.",
-                legacy = legacy.display(),
-                root = self.root.display(),
-                records = self.records_path().display(),
-            ),
-        ))
     }
 
     async fn get_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<PersistedPausedRecord> {
@@ -1121,49 +1097,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unconverted_store_refuses_to_load_instead_of_reporting_no_records(
-    ) -> anyhow::Result<()> {
+    async fn a_store_this_build_cannot_read_is_discarded_on_load() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        tokio::fs::create_dir_all(persister.legacy_records_db_path()).await?;
+        let legacy = persister.legacy_records_db_path();
+        tokio::fs::create_dir_all(&legacy).await?;
+        tokio::fs::write(legacy.join("CURRENT"), b"opaque").await?;
+        let stranded = persister.sandbox_artifact_root(&SandboxId::new());
+        tokio::fs::create_dir_all(&stranded).await?;
 
-        let err = persister
-            .load_all(&MockBackendFactory::new())
-            .await
-            .expect_err("an unconverted store must not look empty");
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
-        let message = err.to_string();
+        assert!(loaded.is_empty());
+        assert!(!legacy.exists());
         assert!(
-            message.contains("rocksdb-migrate"),
-            "the refusal must name the conversion tool: {message}"
-        );
-        assert!(
-            message.contains(&persister.records_path().display().to_string()),
-            "the refusal must name where converted records go: {message}"
+            !stranded.exists(),
+            "artifacts no surviving record retains must be cleaned up like any other orphan"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn a_converted_store_loads_with_the_old_directory_still_present() -> anyhow::Result<()> {
+    async fn discarding_an_unreadable_store_leaves_current_records_alone() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
+        let seeder = test_persister(temp.path());
         let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
-        tokio::fs::create_dir_all(persister.legacy_records_db_path()).await?;
+        let (sandbox_id, _paused_state) = persist_test_record(&seeder, &snapshot_root).await?;
+        tokio::fs::create_dir_all(seeder.legacy_records_db_path()).await?;
 
-        let unconverted = test_persister(temp.path());
-        assert!(unconverted
-            .load_all(&MockBackendFactory::new())
-            .await
-            .is_err());
-
-        tokio::fs::remove_dir_all(persister.legacy_records_db_path()).await?;
-        let converted = test_persister(temp.path());
-        let loaded = converted.load_all(&MockBackendFactory::new()).await?;
+        let persister = test_persister(temp.path());
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, sandbox_id);
+        assert!(!persister.legacy_records_db_path().exists());
         Ok(())
     }
 }

@@ -73,21 +73,25 @@ RocksDB 的 `close(timeout)`/`LocalKvCloseOutcome`/后台线程取消、
 `PersistedPausedRecord`（含 `version`，`ensure_supported_version` 原样保留）。
 所有操作单记录，语义一比一。`cleanup_orphan_artifacts` 等 scrub 逻辑不变。
 
-### 消费方二：P2P catalog → 纯内存 + 启动重公告
+### 消费方二：P2P catalog → 纯内存 + 惰性重公告
 
 e2b 的 peer 路由态刻意短命（TTL + 上传完成即注销）：字节到达持久层后 P2P
-状态没有存在价值。AgentENV 同构：publish 走 `P2pPublishMode::Reference`
-（引用本地既有文件），key 可由 digest/路径重导出（`artifact.rs` 的
-`layer_key_from_digest`/`extract_sha256_digest`），registry hint 已随节点
-注销/过期丢弃，P2P 默认 Disabled 且 origin 永远在。目录是派生态：
+状态没有存在价值。AgentENV 同构：registry hint 已随节点注销/过期丢弃，
+P2P 默认 Disabled 且 origin 永远在。目录是派生态：
 
-- catalog 纯内存，不再有任何落盘；
-- aenv-node 启动加重公告 pass：扫描本地已缓存 artifact，重新
-  `publish(Reference)` + `RecordP2pArtifact`，温启动目录与 hint；
+- catalog 纯内存，进程内有效，不再有任何落盘；
+- 重公告是惰性的，走既有的两条事件路径：ublk daemon 下载完一层后调
+  `/p2p-control/publish-layer`，快照提交后 `commit_and_advertise`。启动不做
+  枚举 pass——节点侧没有可枚举的真相源：iroh 保留 tag 存的是 `sha256(key)`
+  而非 key，descriptor 的 `LayerMetadata`（`fetch_byte_range` 依赖其 `size`）
+  也不在 tag 里；快照那一侧 `aenv-node` 持 `NoSnapshotCatalog`，枚举"本机写过
+  字节的快照"要么新增节点本地持久化（正是本方案要删的东西），要么新增
+  scheduler gRPC 面（阶段四裁决禁止）。空窗期 lookup miss 回落 origin。
 - `published_artifact_catalog_survives_transport_restart` 契约改为断言
-  "重公告后可再服务"，或随语义一并删除；
-- 落地前验证项：`unpublish` 的调用点是否总伴随字节删除——若存在"撤销发布
-  但字节保留"的刻意状态，重公告会复活它，需在删除字节的路径上收敛。
+  "重启后不谎称可服务、重公告后可再服务"；
+- `unpublish` 语义验证结论：生产零调用方（仅 transport 自身测试调用），且其
+  实现即删除保留 tag 并交给 GC 回收字节，因此不存在"撤销发布但字节保留"的
+  刻意状态，重公告无复活风险。
 
 ### 消费方三：镜像缓存图 → 派生内存图 + 侧车文件
 
@@ -119,14 +123,18 @@ e2b 的 peer 路由态刻意短命（TTL + 上传完成即注销）：字节到�
 
 ## 迁移（存量集群：dev-sg、pve-mf）
 
+三个存储统一按弃置处理：`aenv-node` 启动见到旧目录即 warn 并尽力删除，随后
+以空状态起步。
+
 | 存储 | 策略 |
 | --- | --- |
-| `records.db` | **唯一不可丢**。独立迁移工具 `tools/rocksdb-migrate/`，**不入 workspace**（自带 lockfile，日常构建图零 rocksdb），读旧库写 `records/*.json`。新 `aenv-node` 启动见到旧目录即拒绝启动并给出可执行指引（与 `--setup-host` 的校验哲学一致）；无暂停沙箱的节点直接删目录。 |
-| `catalog.db` | 弃置删除，无接替目录（纯内存 + 启动重公告）。registry hint 本就随节点注销/过期丢弃，残余脏 hint 由"lookup 失败换下一个 peer"消化。 |
-| `graph.db` | 不迁移。启动 rebuild_from_configs + 由迁移后的暂停记录重建 paused hold；commit 侧车由 seed 路径首轮补齐。重建成功后删除旧目录。 |
+| `records.db` | 用户裁决可丢弃。启动 warn + 删除旧目录，以空 `records/` 起步。代价见下。 |
+| `catalog.db` | 弃置删除，无接替目录（纯内存 + 惰性重公告）。registry hint 本就随节点注销/过期丢弃，残余脏 hint 由"lookup 失败换下一个 peer"消化。 |
+| `graph.db` | 弃置删除。启动 rebuild_from_configs 重建 ref 族，paused hold 由暂停记录重导出，commit 元数据由 seed 路径首轮补齐。 |
 
-否决的替代：在 aenv-node 里留一个 off-default 的 rocksdb 只读 feature 做原地
-迁移——CI/开发构建图照样背上编译成本，违背本方案动机。
+丢弃 `records.db` 的代价是 rollout runbook 事项：滚动到本版本时，存量节点上的
+暂停沙箱全部不可恢复，api 半边 paused registry 里对应的行随之成为孤儿，需要在
+滚动窗口内一并清理。节点侧不自动清理远端数据库。
 
 ## 终局方向（对照 e2b，不在本次范围）
 
@@ -161,8 +169,8 @@ repository + commit row"，`records/` 降级为仅覆盖上传窗口的 staging�
 构建时长的即期缓解（rocksdb 裁 feature 只留 snappy、sccache/缓存卫生）与本
 方案独立，可先行。本方案分四步，**编译收益在第 4 步才兑现**：
 
-1. `JsonRecordDir` 原语 + `file_backed` 切换 + 迁移工具；
-2. P2P catalog 内存化 + 启动重公告 pass（含 `unpublish` 语义验证）；
+1. `JsonRecordDir` 原语 + `file_backed` 切换 + 旧目录弃置；
+2. P2P catalog 内存化（含 `unpublish` 语义验证）；
 3. 镜像缓存图派生化（最大的一步，含 hold 内存化与暂停记录到 `protect()` 的
    启动接线）;
 4. 删 rocksdb 依赖 + 边界守卫 + CLAUDE.md/配置文档收尾，随后按集群迁移

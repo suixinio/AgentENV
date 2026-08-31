@@ -182,6 +182,39 @@ impl JsonRecordDir {
     }
 }
 
+/// Removes a node-local store directory this build cannot read, reporting
+/// whether one was there.
+///
+/// Removal failure is logged rather than propagated: the directory is inert to
+/// this build either way, and callers rebuild their state without it.
+pub async fn discard_unreadable_store(path: &Path) -> bool {
+    match fs::metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return false,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(err) => {
+            tracing::warn!(
+                store = %path.display(),
+                error = %err,
+                "could not inspect a store this build cannot read"
+            );
+            return false;
+        }
+    }
+
+    match fs::remove_dir_all(path).await {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::warn!(
+                store = %path.display(),
+                error = %err,
+                "could not remove a store this build cannot read"
+            );
+            true
+        }
+    }
+}
+
 fn syncs_file(durability: LocalStoreDurability) -> bool {
     matches!(
         durability,
@@ -379,6 +412,25 @@ mod tests {
             records.get("a%2Fb").await?.as_deref(),
             Some(&b"literal"[..])
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn discarding_a_store_reports_only_a_directory_that_was_there() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let absent = temp.path().join("absent");
+        let file = temp.path().join("a-file");
+        let store = temp.path().join("store");
+        tokio::fs::write(&file, b"not a store").await?;
+        tokio::fs::create_dir_all(store.join("nested")).await?;
+        tokio::fs::write(store.join("nested").join("data"), b"payload").await?;
+
+        assert!(!discard_unreadable_store(&absent).await);
+        assert!(!discard_unreadable_store(&file).await);
+        assert!(discard_unreadable_store(&store).await);
+
+        assert!(file.exists());
+        assert!(!store.exists());
         Ok(())
     }
 

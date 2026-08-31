@@ -113,6 +113,9 @@ impl OssBackend {
     }
 
     /// Upload `body` to an `oss://` / `s3://` URL.
+    ///
+    /// The one write path on this backend; `write_at` bails and names it. Only the
+    /// docker-gated `tests/oss_backend_minio.rs` exercises it, never `make test-unit`.
     pub async fn upload_bytes(&self, url: impl AsRef<str>, body: Vec<u8>) -> Result<()> {
         let location = ParsedOssUrl::parse(
             url.as_ref(),

@@ -183,7 +183,8 @@ impl ImageFile {
     }
 
     /// Export the writable upper layer as a standalone sealed layer.
-    /// Deliberately retained without a production caller for direct layer export.
+    /// Deliberately retained without a production caller; the live pause path is
+    /// `create_snapshot_and_restack`'s `close_seal_and_reopen` + restack.
     pub async fn export_upper_as_sealed(&self, args: CommitArgs) -> Result<()> {
         let state = self.state.read().await;
         state

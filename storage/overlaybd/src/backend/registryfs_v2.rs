@@ -1528,17 +1528,6 @@ impl Drop for RegistryUploader {
     }
 }
 
-pub async fn new_registry_uploader(
-    local_file: Arc<LocalFile>,
-    options: RegistryUploaderOptions,
-) -> Result<RegistryUploader> {
-    RegistryUploader::new(local_file, options).await
-}
-
-pub async fn registry_uploader_fini(uploader: &mut RegistryUploader) -> Result<String> {
-    uploader.finish().await
-}
-
 #[derive(Debug)]
 pub struct RegistryFileImplV2 {
     url: String,

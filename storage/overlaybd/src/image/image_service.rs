@@ -425,10 +425,6 @@ impl ImageService {
             .await
     }
 
-    pub async fn open_remote_blob(&self, url: &str) -> Result<Arc<dyn VirtualFile>> {
-        self.open_remote_blob_with_size(url, None).await
-    }
-
     pub(crate) async fn open_source_blob_with_size(
         &self,
         url: &str,

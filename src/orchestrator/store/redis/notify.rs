@@ -1,20 +1,5 @@
-//! The wake-up channel.
-//!
-//! One Redis pub/sub connection per replica, one channel, and the routing key
-//! in the payload. That is enough because a subscriber filters locally; a
-//! channel per sandbox would mean a `SUBSCRIBE`/`UNSUBSCRIBE` round trip on
-//! every wait.
-//!
-//! 🔴 This is not the lifecycle-event channel, and the two must not be merged.
-//! What travels here is "something you were waiting on moved" — a routing key,
-//! a shape that will not change. Lifecycle events carry orchestration payloads
-//! that change with the orchestration logic. Hanging the observability reporter
-//! off this channel would tie the heartbeat's wire format to the state machine.
-//!
-//! Everything here is an optimisation. Every wait in this module also has a
-//! poll fallback, so a dropped notification costs latency and never
-//! correctness — which is what makes it safe for the subscriber task to
-//! reconnect silently.
+//! Best-effort Redis wake-up channel with polling fallback.
+//! One channel carries local routing keys; missed notifications cost latency only.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,9 +10,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
-/// A modest per-key buffer. Waiters treat a lagged channel exactly as they
-/// treat a received notification — go and read the truth — so overflow is not
-/// a lost wake-up.
+// Overflow is harmless because waiters always re-read authoritative state.
 const WAKE_BUFFER: usize = 8;
 
 pub struct Notifier {
@@ -57,12 +40,7 @@ impl Notifier {
         }
     }
 
-    /// Registers interest in a routing key.
-    ///
-    /// 🔴 Callers must subscribe **before** they read the value they are
-    /// waiting on. The other order has a window in which the value changes
-    /// after the read and before the subscription, and the waiter then sleeps
-    /// until the poll fallback fires.
+    /// Subscribes before callers read to close the lost-wake window.
     pub fn subscribe(&self, routing_key: &str) -> broadcast::Receiver<()> {
         self.waiters
             .entry(routing_key.to_string())
@@ -70,9 +48,7 @@ impl Notifier {
             .subscribe()
     }
 
-    /// Best-effort wake-up. A failure here is logged and dropped: the poll
-    /// fallback covers it, and failing an otherwise successful write because
-    /// its notification did not go out would be worse than the delay.
+    /// Publishes a best-effort wake-up covered by polling fallback.
     pub async fn publish(&self, routing_key: &str) {
         let mut connection = self.publisher.clone();
         let published: redis::RedisResult<()> = redis::cmd("PUBLISH")
@@ -122,10 +98,7 @@ async fn subscriber_loop(
             }
         }
 
-        // 🔴 Wake everyone on the way back round. A subscription that dropped
-        // may have swallowed notifications, and a waiter that re-reads the
-        // truth for no reason costs one round trip, where a waiter that never
-        // wakes costs the caller its whole patience.
+        // Wake all waiters after reconnect because notifications may have been missed.
         wake_all(&waiters);
 
         tokio::time::sleep(backoff).await;
@@ -139,7 +112,7 @@ fn wake(waiters: &DashMap<String, broadcast::Sender<()>>, routing_key: &str) {
         None => return,
     };
     if empty {
-        // Nobody is listening any more; do not keep the entry for ever.
+        // Drop routing entries with no receivers.
         waiters.remove_if(routing_key, |_, sender| sender.receiver_count() == 0);
     }
 }

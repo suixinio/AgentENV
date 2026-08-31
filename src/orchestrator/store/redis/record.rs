@@ -1,33 +1,5 @@
-//! What actually goes into a record key.
-//!
-//! # 🔴 `SandboxMetadata` does not survive a round trip through serde
-//!
-//! ```ignore
-//! // orchestrator/store/metadata.rs
-//! #[serde(skip)]
-//! pub paused_state: Option<Arc<dyn PausedSandboxState>>,
-//! ```
-//!
-//! `#[serde(skip)]` means the value encodes cleanly and comes back gone. A
-//! store that simply serialised the struct and left `resume_sandbox` reading
-//! that field would therefore make **every resume fail**, and would do it only
-//! when a resume was actually attempted, long after the type checked and the
-//! tests passed. `resume_sandbox` reads
-//! [`MetadataStore::paused_handle`](super::super::MetadataStore::paused_handle)
-//! instead, and [`PausedStateRef`] below is what this store answers it with.
-//!
-//! The fix already exists in this repository, in the file-backed persister:
-//! `PausedSandboxState::encode() -> Value` and
-//! `SandboxBackendFactory::decode_paused_state(PathBuf, Value)` are a matched
-//! serialisable boundary, and `PersistedPausedRecord` stores exactly the pair
-//! `{ artifact_root, state }`. [`PausedStateRef`] below is that same pair, not
-//! a new format — which is what lets a record written here be understood by
-//! the same decode path that reads a persisted one.
-//!
-//! The handle itself stays a handle: `paused_state` remains `#[serde(skip)]`
-//! and remains node-local. Under `aenv-api` there is no backend factory to
-//! turn the reference back into one, and there should not be: the reference
-//! travels to the node that owns the bytes and is decoded there.
+//! Versioned Redis record preserving metadata fields skipped by plain serde.
+//! Paused state travels as the same serializable reference used by the file persister.
 
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -38,116 +10,54 @@ use serde_json::Value;
 use super::super::{Result, SandboxMetadata, StoreError};
 use crate::types::{ExecutionId, SandboxId};
 
-/// Bumped whenever the meaning of an existing field changes.
+/// Current stored-record schema version.
 pub const RECORD_VERSION: u32 = 1;
 
-/// A serialisable stand-in for `paused_state`.
-///
-/// Same shape as `PersistedPausedRecord`'s `artifact_root` + `state` pair, on
-/// purpose.
+/// Serializable paused-state reference.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct PausedStateRef {
-    /// Where the paused bytes live **on the node that produced them**.
-    ///
-    /// 🔴 A node-local path, which is the whole reason a record has to carry
-    /// `origin_node_id` as well: an `api` replica holding this path has no way
-    /// to know which machine it means.
-    ///
-    /// 🔴 Nothing populates this, and a resume does not need it to. The store
-    /// never sees an artifact root — `pause_sandbox_inner` allocates it from
-    /// the persister and hands it straight to the backend — and both in-tree
-    /// factories read the location out of the encoded state itself and ignore
-    /// the argument when decoding. Under `aenv-api` the directory the node
-    /// named travels *inside* `state`, because `RemotePausedState` puts it
-    /// there along with the machine it is on. Whoever needs it at this level
-    /// has to supply it; until then it decodes as `None`, which
-    /// `Orchestrator::paused_state_for_resume` passes on as an empty path.
+    /// Node-local artifact path; `origin_node_id` identifies its machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_root: Option<PathBuf>,
     /// The backend's own encoding of its paused state.
     pub state: Value,
 }
 
-/// The bytes under a record key.
+/// Versioned JSON stored under a sandbox record key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredSandboxRecord {
-    /// 🔴 First, and without `#[serde(default)]`. A record whose version this
-    /// build does not understand has to fail loudly; defaulting it would make
-    /// every such record look like a brand-new one.
+    /// Required schema version.
     pub version: u32,
 
-    /// Incremented on every write. The compare-and-set at the end of a
-    /// read-modify-write compares this.
-    ///
-    /// 🔴 Not replaced by `execution_id`: a `keep_alive` does not start a new
-    /// incarnation but does change the record, so an incarnation-only
-    /// predicate would let two concurrent `keep_alive`s overwrite each other.
+    /// Monotonic revision used by read-modify-write CAS.
     pub rev: u64,
 
-    /// 🔴 Flattened, with the field names `SandboxMetadata` already uses, so
-    /// that a Lua script can read `execution_id` and `state` straight out of
-    /// `cjson.decode(raw)` without unwrapping a nesting level.
+    /// Flattened so Lua can read state and execution predicates directly.
     #[serde(flatten)]
     pub metadata: SandboxMetadata,
 
-    /// Expiry in unix milliseconds, or absent when the sandbox has none.
-    ///
-    /// 🔴 Redundant with `metadata.expires_at`, and deliberately so: Lua cannot
-    /// compare serde's `SystemTime` encoding, and the eviction script has to
-    /// re-check expiry atomically with the state write. Derived in
-    /// [`StoredSandboxRecord::new`] and nowhere else — a second assignment site
-    /// is how the two come to disagree.
+    /// Lua-comparable expiry milliseconds derived by [`StoredSandboxRecord::new`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<i64>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_state_ref: Option<PausedStateRef>,
 
-    /// When the run in progress started, in unix milliseconds.
-    ///
-    /// 🔴 `SandboxMetadata::running_since` is `#[serde(skip)]`, and its own
-    /// comment explains why: it names an interval inside *one process's* run,
-    /// and a record used to leave the process only at pause, by which point the
-    /// interval had already been charged into `running_elapsed`. Persisting it
-    /// would have charged a node outage as running time.
-    ///
-    /// That reasoning does not extend to this store, and following it here
-    /// would be a silent product regression. A record leaves the process on
-    /// **every write** now, so dropping the field means every read anchors
-    /// `lifetime_deadline` at `now` instead of at the start of the run — and a
-    /// deadline that recedes with the clock is a lifetime ceiling that never
-    /// bites.
-    ///
-    /// The hazard the original note names is also no longer the same hazard: if
-    /// every `api` replica is down, the VMs on the nodes keep running, so
-    /// charging that stretch as running time is the correct answer rather than
-    /// an error.
+    /// Current running-interval start retained separately from skipped metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running_since_ms: Option<i64>,
 
-    /// The node carrying this sandbox: the one running it while it is running,
-    /// the one whose disk holds the bytes while it is paused.
-    ///
-    /// 🔴 Nothing populates this in this batch; it is here because the record
-    /// format is the thing that cannot be changed later. Two independent lines
-    /// of reasoning arrived at it — the structural half needed it for placement,
-    /// and `PausedStateRef::artifact_root` above needs it to mean anything.
+    /// Node running the sandbox or holding its paused bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_node_id: Option<String>,
 
-    /// Whether the sandbox's bytes exist anywhere but the origin node's disk.
-    ///
-    /// 🔴 Defaults to `false`, which is the fail-closed reading: a record of
-    /// unknown provenance is treated as unpublished, so a resume is pinned to
-    /// the origin and fails loudly if that node is gone. The alternative
-    /// failure — scheduling the sandbox onto a machine that does not have its
-    /// bytes — is worse and quieter.
+    /// Whether bytes are durable beyond the origin node; defaults fail-closed.
     #[serde(default)]
     pub published: bool,
 }
 
 impl StoredSandboxRecord {
-    /// Builds a record from live metadata, encoding the paused-state handle.
+    /// Builds a stored record and serializes any paused-state handle.
     pub fn new(metadata: &SandboxMetadata, rev: u64) -> Result<Self> {
         let paused_state_ref = match metadata.paused_state.as_ref() {
             Some(state) => Some(PausedStateRef {
@@ -171,13 +81,7 @@ impl StoredSandboxRecord {
         })
     }
 
-    /// Carries forward the fields a write must not silently drop.
-    ///
-    /// 🔴 `origin_node_id`, `published` and the paused-state reference describe
-    /// where the sandbox's bytes are. A write that recomputed them from
-    /// `SandboxMetadata` alone would erase them, because `SandboxMetadata` does
-    /// not carry them — and erasing `published` in particular flips a resume
-    /// from "pinned to the node that has the bytes" to "pinned, but to nothing".
+    /// Preserves placement fields absent from [`SandboxMetadata`].
     pub fn inherit_placement_from(&mut self, previous: &Self) {
         if self.origin_node_id.is_none() {
             self.origin_node_id = previous.origin_node_id.clone();
@@ -196,16 +100,7 @@ impl StoredSandboxRecord {
         self.metadata.execution_id
     }
 
-    /// How long the record key should live, or `None` when the node has no
-    /// lifetime ceiling configured.
-    ///
-    /// 🔴 Rounded up and floored at 1, never 0 and never negative. And note
-    /// what the grace is for: the record must outlive the sandbox it describes
-    /// by a wide margin, because a record that vanishes while the VM is still
-    /// running makes that VM an orphan, and an orphan is killed. This is the
-    /// mirror image of the projection-TTL defect from stage 1 — that one made
-    /// a long TTL short; getting this one wrong with a bare `SET` makes a
-    /// finite TTL infinite.
+    /// Derives a positive, rounded record TTL beyond the sandbox deadline.
     pub fn record_ttl(&self, now: SystemTime, grace: Duration) -> Option<Duration> {
         let deadline = self.metadata.lifetime_deadline(now)?;
         let remaining = deadline.duration_since(now).unwrap_or(Duration::ZERO);
@@ -223,64 +118,25 @@ impl StoredSandboxRecord {
         })
     }
 
-    /// 🔴 A record that will not decode is a backend error, never a "sandbox
-    /// not found". The caller's response to absence is to delete things.
+    /// Decode failures are backend errors, never absence.
     pub fn decode(raw: &[u8]) -> Result<Self> {
         let mut record: Self =
             serde_json::from_slice(raw).map_err(|source| StoreError::Backend {
                 source: anyhow::Error::from(source).context("failed to decode sandbox record"),
             })?;
         ensure_supported_version(record.version)?;
-        // Restore the two fields `SandboxMetadata` refuses to carry itself.
+        // Restore fields intentionally skipped by `SandboxMetadata`.
         record.metadata.running_since = record.running_since_ms.map(from_unix_millis);
         Ok(record)
     }
 
-    /// The metadata, with the paused-state handle left empty.
-    ///
-    /// Callers under the pre-split single process restore the handle from their own factory;
-    /// callers under `aenv-api` pass [`StoredSandboxRecord::paused_state_ref`]
-    /// to the node that owns the bytes and let it decode there.
+    /// Returns metadata while leaving remote paused state as a separate reference.
     pub fn into_metadata(self) -> SandboxMetadata {
         self.metadata
     }
 }
 
-/// One active-state record, encoded for a node to hold on the api half's
-/// behalf.
-///
-/// # 🔴 The name, and why it is not `control_plane_config`
-///
-/// `ControlPlaneConfig` is the **ownership marker**: an opaque envelope the api
-/// half attaches at create time, whose presence is what makes a sandbox appear
-/// in `ListSandboxes`. This is what goes *inside* that envelope. Two different
-/// questions — *do we own this sandbox?* and *what did our record of it say?* —
-/// and one field carrying both would eventually have to answer one of them
-/// wrongly. Putting this on `SandboxMetadata` would be worse still: the payload
-/// is an encoding of the record that contains `SandboxMetadata`, so a field on
-/// it would contain its own container.
-///
-/// # What it is for
-///
-/// Exactly one thing: rebuilding the store after it is lost. This deployment
-/// cannot make Redis highly available — two machines, every volume pinned to
-/// one of them — so "the store is gone, rebuild it from the nodes" is the main
-/// path rather than a fallback, and a main path that has never been run is the
-/// same thing as no path at all.
-///
-/// It therefore has to carry **the whole record**, not a hand-picked subset. A
-/// summary of the identifiers cannot reconstruct `resources`, `max_lifetime`,
-/// `network_policy`, `custom_extension_params`, `runtime_versions`, `context`,
-/// `startup`, `image_configs`, `virtualization_mode`, `created_at`, or the
-/// placement fields — and a rebuilt record missing any of those is a sandbox
-/// the control plane can list and cannot correctly manage.
-///
-/// # Not a cross-language contract
-///
-/// The node stores these bytes and returns them; it never parses them. So this
-/// is the api half's contract with its own future self, versioned by
-/// [`RECORD_VERSION`] like every other record here, and a node never has to be
-/// upgraded in step with it.
+/// Versioned active-state payload stored opaquely by nodes for store-loss recovery.
 #[derive(Clone, Debug)]
 pub struct ActiveStateRecord(StoredSandboxRecord);
 
@@ -293,9 +149,7 @@ impl ActiveStateRecord {
         self.0.encode()
     }
 
-    /// 🔴 Rejects a version it does not understand, exactly as a record read
-    /// from the store does. A blob that came back from a node running against a
-    /// newer api half is not a blank record.
+    /// Rejects unsupported record versions.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         Ok(Self(StoredSandboxRecord::decode(bytes)?))
     }
@@ -304,12 +158,7 @@ impl ActiveStateRecord {
         &self.0.metadata
     }
 
-    /// The record to insert during a rebuild.
-    ///
-    /// 🔴 The revision restarts at 1. The number counted writes against a
-    /// store that no longer exists, and carrying it forward would let a write
-    /// still in flight from before the loss compare-and-set successfully
-    /// against the rebuilt record.
+    /// Resets revision to one for insertion into a rebuilt store.
     pub fn into_record(mut self) -> StoredSandboxRecord {
         self.0.rev = 1;
         self.0
@@ -335,8 +184,7 @@ pub fn from_unix_millis(millis: i64) -> SystemTime {
 pub fn to_unix_millis(time: SystemTime) -> i64 {
     match time.duration_since(UNIX_EPOCH) {
         Ok(delta) => delta.as_millis().min(i64::MAX as u128) as i64,
-        // Pre-epoch instants cannot be produced by any path here, and clamping
-        // is the only answer that keeps the ZSET ordering meaningful.
+        // Clamp impossible pre-epoch values to preserve ordering.
         Err(_) => 0,
     }
 }
@@ -369,8 +217,6 @@ mod tests {
         }
     }
 
-    /// 🔴 The defect this whole module exists for. Without the reference, a
-    /// paused record round-trips into one that resume rejects.
     #[test]
     fn paused_state_survives_a_round_trip_as_a_reference() {
         let mut paused = metadata();
@@ -395,8 +241,6 @@ mod tests {
         );
     }
 
-    /// The control for the test above: a plain serde round trip of the
-    /// metadata loses the handle, which is exactly why the reference exists.
     #[test]
     fn a_plain_metadata_round_trip_still_loses_the_handle() {
         let mut paused = metadata();
@@ -406,9 +250,6 @@ mod tests {
         assert!(back.paused_state.is_none());
     }
 
-    /// 🔴 Lua reads these two out of the decoded record directly. If the
-    /// flatten is ever removed, the scripts silently stop finding them and
-    /// every predicate they carry evaluates against `nil`.
     #[test]
     fn execution_and_state_are_top_level_in_the_encoded_json() {
         let record = StoredSandboxRecord::new(&metadata(), 7).unwrap();
@@ -422,10 +263,6 @@ mod tests {
         assert_eq!(json.get("version").and_then(Value::as_u64), Some(1));
     }
 
-    /// 🔴 `running_since` is `#[serde(skip)]` on the metadata, so without the
-    /// explicit field a Redis-backed record would come back with the clock
-    /// stopped — and `lifetime_deadline` would then anchor at `now` on every
-    /// read, which is a lifetime ceiling that recedes for ever and never bites.
     #[test]
     fn the_running_clock_survives_the_round_trip() {
         let started = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -439,15 +276,11 @@ mod tests {
         let decoded = StoredSandboxRecord::decode(&encoded).unwrap();
         assert_eq!(decoded.metadata.running_since, Some(started));
 
-        // The control: a plain metadata round trip still loses it, which is why
-        // the record carries it separately.
         let bytes = serde_json::to_vec(&sandbox).unwrap();
         let back: SandboxMetadata = serde_json::from_slice(&bytes).unwrap();
         assert!(back.running_since.is_none());
     }
 
-    /// And with the clock preserved, the deadline of a running sandbox is
-    /// pinned rather than receding.
     #[test]
     fn a_restored_running_clock_keeps_the_lifetime_deadline_pinned() {
         let started = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
@@ -471,11 +304,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The seam with the node lane. `control_plane_config` lives on
-    /// `SandboxMetadata`, which is `#[serde(flatten)]`ed into the stored
-    /// record, so its encoding is this store's problem too — and it is a
-    /// `Vec<u8>`, which plain serde would render into a JSON array of
-    /// per-byte numbers inside every record.
     #[test]
     fn the_ownership_marker_survives_the_stored_record() {
         use crate::orchestrator::store::ControlPlaneConfig;
@@ -502,9 +330,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The rolling-upgrade case. A record written by a replica that predates
-    /// the marker must still decode, or the first upgrade makes every existing
-    /// record unreadable at once.
     #[test]
     fn a_record_written_before_the_ownership_marker_existed_still_decodes() {
         let encoded = StoredSandboxRecord::new(&metadata(), 1)
@@ -519,7 +344,6 @@ mod tests {
         assert!(decoded.metadata.control_plane_config.is_none());
     }
 
-    /// The rebuild payload carries the whole record and restarts the revision.
     #[test]
     fn the_active_state_record_round_trips_and_restarts_the_revision() {
         let mut sandbox = metadata();
@@ -546,7 +370,6 @@ mod tests {
         assert_eq!(record.metadata.max_lifetime, Some(Duration::from_secs(600)));
     }
 
-    /// A payload from a newer api half is refused, not read as a blank record.
     #[test]
     fn an_active_state_record_from_a_newer_build_is_refused() {
         let stored = StoredSandboxRecord::new(&metadata(), 1).unwrap();
@@ -583,7 +406,6 @@ mod tests {
         let raw = serde_json::to_vec(&json).unwrap();
         assert!(StoredSandboxRecord::decode(&raw).is_err());
 
-        // A record with no version at all is not a version-1 record either.
         let mut json: Value = serde_json::from_slice(
             &StoredSandboxRecord::new(&metadata(), 1)
                 .unwrap()
@@ -596,9 +418,6 @@ mod tests {
         assert!(StoredSandboxRecord::decode(&raw).is_err());
     }
 
-    /// 🔴 `execution_id` must not acquire a default the way `max_lifetime` did:
-    /// a record with no incarnation that quietly gets a fresh one is a record
-    /// whose fencing compares a value nobody ever ran under.
     #[test]
     fn a_record_without_an_incarnation_is_refused() {
         let mut json: Value = serde_json::from_slice(
@@ -631,10 +450,8 @@ mod tests {
             .unwrap()
             .record_ttl(now, Duration::from_secs(10))
             .unwrap();
-        // 1.5s rounds up to 2s, plus the 10s grace.
         assert_eq!(ttl, Duration::from_secs(12));
 
-        // An already-exhausted budget still yields a positive TTL.
         sandbox.running_elapsed = Duration::from_secs(999);
         let ttl = StoredSandboxRecord::new(&sandbox, 1)
             .unwrap()

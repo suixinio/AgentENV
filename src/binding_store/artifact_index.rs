@@ -1,24 +1,5 @@
-//! Task's own "D4": ports `services/scheduler/internal/store.go`'s
-//! `InMemoryArtifactStore` (lines 508-651) — the P2P artifact-to-node hint
-//! index (`src/p2p/discovery/mod.rs`'s `peers_for_key`/`record_key`/
-//! `forget_key`, `LookupP2pArtifact`/`RecordP2pArtifact`/
-//! `ForgetP2pArtifact`).
-//!
-//! # Accepted degradation, not a defect (task's own "D4"/Q5)
-//!
-//! Go's version is a single process-wide cache; every scheduler replica
-//! (there was only ever one) held the whole index. Once this lives in api
-//! (N replicas), each replica only knows the subset of records it
-//! personally handled — there is no shared backend here, on purpose. This
-//! was investigated and resolved before this file was written
-//! (`docs/proposals/_sd-phase4-open-questions-resolved.md`'s Q5): the index
-//! is consulted as an accelerator, never as the source of truth —
-//! [`crate::p2p::iroh::transport::IrohBlobsP2pTransport::lookup_with_hints`]
-//! unconditionally falls back to a full/hinted peer poll on a miss or an
-//! error, and that fallback's candidate set comes from heartbeat discovery,
-//! entirely independent of this index. A per-replica partial index
-//! therefore degrades hit rate, never correctness — accept the degradation,
-//! do not back this with Redis.
+//! Per-replica P2P artifact-to-node hint index.
+//! It is only an accelerator: lookup misses fall back to heartbeat discovery.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -27,7 +8,6 @@ use std::time::SystemTime;
 use crate::node_registry::registry::NodeRegistry;
 use crate::proto::scheduler::P2pPeer;
 
-/// Mirrors Go's `artifactIndexKey`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ArtifactIndexKey {
     cluster_id: String,
@@ -35,18 +15,13 @@ struct ArtifactIndexKey {
     key: String,
 }
 
-/// The behavior every artifact index backend must provide. Mirrors Go's
-/// implicit `ArtifactStore` interface — `record`/`forget`/`lookup`/
-/// `forget_node`.
+/// Artifact hint index contract.
 pub trait ArtifactStore: Send + Sync {
     fn record(&self, cluster_id: &str, backend: &str, key: &str, node_id: &str);
     fn forget(&self, cluster_id: &str, backend: &str, key: &str, node_id: &str);
-    /// Every node id this index currently associates with the artifact,
-    /// most-recently-touched first, capped at `limit` entries (`0` =
-    /// unlimited).
+    /// Returns associated node ids, most recently touched first; `0` is unlimited.
     fn lookup(&self, cluster_id: &str, backend: &str, key: &str, limit: usize) -> Vec<String>;
-    /// Drops every association naming `node_id` — the `UnregisterNode`
-    /// cleanup path.
+    /// Drops every association for `node_id`.
     fn forget_node(&self, node_id: &str);
 }
 
@@ -57,24 +32,18 @@ struct Entry {
 
 struct Inner {
     entries: HashMap<ArtifactIndexKey, Entry>,
-    /// Reverse index for `forget_node`, mirroring Go's `nodeKeys`.
     node_keys: HashMap<String, std::collections::HashSet<ArtifactIndexKey>>,
     clock: u64,
 }
 
-/// Ports Go's `InMemoryArtifactStore`. Capacity-bounded: once at capacity, a
-/// new key evicts the least-recently-touched existing one. Eviction is O(n)
-/// in the number of keys currently held — deliberately simple rather than a
-/// true intrusive LRU list, since this index is an accelerator (see the
-/// module doc) and a rare, occasional O(n) scan on eviction is not on any
-/// hot path a caller waits synchronously on.
+/// Capacity-bounded in-memory artifact index with O(n) eviction.
 pub struct InMemoryArtifactStore {
     capacity: usize,
     inner: Mutex<Inner>,
 }
 
 impl InMemoryArtifactStore {
-    /// Go's own default capacity is 1,000,000 keys.
+    /// Go's default capacity of 1,000,000 keys.
     pub const DEFAULT_CAPACITY: usize = 1_000_000;
 
     pub fn new(capacity: usize) -> Self {
@@ -180,8 +149,6 @@ impl ArtifactStore for InMemoryArtifactStore {
         let Some(entry) = inner.entries.get_mut(&index_key) else {
             return Vec::new();
         };
-        // A read also counts as a touch, keeping hot keys warm -- mirrors
-        // Go's own `s.lru.Get(indexKey)` on the read path.
         entry.touched = now;
         if limit == 0 || entry.nodes.len() <= limit {
             entry.nodes.clone()
@@ -208,11 +175,7 @@ impl ArtifactStore for InMemoryArtifactStore {
     }
 }
 
-/// Ports the `LookupP2pArtifact` RPC's second half: turns the index's raw
-/// node ids into live peer descriptors via
-/// [`NodeRegistry::filter_p2p_peers`], the same way `service.go:784-798`
-/// does. A free function, not a method, since it needs both a
-/// `dyn ArtifactStore` and a `dyn NodeRegistry` and belongs to neither.
+/// Resolves indexed node ids to live P2P peer descriptors.
 #[allow(clippy::too_many_arguments)]
 pub fn lookup_p2p_artifact_peers(
     artifacts: &dyn ArtifactStore,

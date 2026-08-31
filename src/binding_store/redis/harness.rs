@@ -1,31 +1,6 @@
-//! Test support: a real Redis, and a policy about what happens when there
-//! isn't one. Deliberately mirrors `src/orchestrator/store/redis/harness.rs`
-//! (and `crates/aenv-api/src/pg/harness.rs`, which mirrors that same one) down
-//! to the skip/required policy — see `crates/aenv-api/src/pg/harness.rs`'s own
-//! doc comment for why duplicating this pattern per Redis-backed subsystem,
-//! rather than sharing one generic module across all of them, is this
-//! codebase's established choice: `AENV_REDIS_TEST_REQUIRED=1` turns "no
-//! Redis" into a failure, not a skip; without it, `SKIPPED[redis]: <test>`
-//! prints to stderr and `make test-with-redis` greps for that line and fails
-//! on it.
-//!
-//! # What is shared with the other Redis harnesses, and what is not
-//!
-//! Shared, via [`crate::redis_test_server`]: the mechanical process
-//! bootstrap only — free port, `redis-server` spawn under `PR_SET_PDEATHSIG`,
-//! the readiness probe, `redis://…/<db>` URL construction, the
-//! `AENV_REDIS_TEST_REQUIRED` predicate, and the bounds check on a database
-//! counter.
-//!
-//! 🔴 **Not** shared, deliberately: the [`OnceLock`] below and therefore this
-//! suite's own `redis-server` process; `NEXT`, its own counter over its own
-//! [`DATABASES`] logical databases; and [`store_for`], which takes a
-//! [`BindingStoreSettings`] and a [`RedisBindingStoreConfig`] tweak no other
-//! harness has. One shared server would let another suite's namespace flush
-//! reach into a database this one is mid-test on; one shared counter would
-//! hand two suites the same database number.
-//! `crate::redis_test_server::tests` fails by name if either separation is
-//! undone.
+//! Real-Redis test harness with visible optional skips.
+//! This suite owns a separate server and database counter so sibling namespace
+//! cleanup cannot interfere with its tests.
 
 use std::sync::atomic::AtomicU32;
 use std::sync::OnceLock;
@@ -35,11 +10,9 @@ use crate::redis_test_server::{self, RedisTestServer};
 use super::{RedisBindingStore, RedisBindingStoreConfig};
 use crate::binding_store::BindingStoreSettings;
 
-/// 🔴 This suite's own space, not a shared one — see the module doc.
 const DATABASES: u32 = 512;
 
-/// 🔴 This suite's own `redis-server`, started once for this test binary.
-/// Deliberately not shared with `orchestrator::store` or `node_registry`.
+/// This suite's dedicated Redis server.
 pub(crate) fn server() -> Option<&'static RedisTestServer> {
     static SERVER: OnceLock<Option<RedisTestServer>> = OnceLock::new();
     SERVER
@@ -53,9 +26,7 @@ pub(crate) fn server() -> Option<&'static RedisTestServer> {
         .as_ref()
 }
 
-/// 🔴 This suite's own logical-database counter. Handed to
-/// [`redis_test_server::next_db`] by reference precisely so that it stays this
-/// suite's; see `crate::redis_test_server::tests`.
+/// This suite's dedicated logical-database counter.
 pub(crate) fn db_counter() -> &'static AtomicU32 {
     static NEXT: AtomicU32 = AtomicU32::new(1);
     &NEXT

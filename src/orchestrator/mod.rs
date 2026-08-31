@@ -120,25 +120,14 @@ pub enum OrchestratorError {
         timeout: String,
     },
 
-    /// The sandbox is already past the lifetime ceiling it was created under,
-    /// so there is no window left to extend into.
-    ///
-    /// 🔴 This is the *only* thing about the ceiling that refuses a request. A
-    /// keep-alive asking for more time than the ceiling leaves is clamped, not
-    /// rejected — see `SandboxMetadata::_set_timeout`.
+    /// The sandbox has no remaining lifetime budget.
     #[error("sandbox {sandbox_id} has exceeded its maximum lifetime")]
     SandboxLifetimeExceeded {
         sandbox_id: SandboxId,
         deadline: SystemTime,
     },
 
-    /// The caller asked for something that cannot be built, decided before any
-    /// of it is attempted.
-    ///
-    /// 🔴 Distinct from [`OrchestratorError::InternalError`] on purpose: this
-    /// one is the caller's fault and is answered with a 400, so a request that
-    /// pairs the wrong number of things together is refused rather than
-    /// reported as a fault in the node.
+    /// The caller requested an operation that cannot be constructed.
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 

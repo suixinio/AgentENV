@@ -1,30 +1,5 @@
-//! The reservation primitive: three answers, not four.
-//!
-//! # 🔴 What this is actually for here
-//!
-//! The usual justification — de-duplicating concurrent creates, so that a
-//! client's retry waits for the first attempt instead of getting a conflict —
-//! **does not apply to this API**. `NewSandbox` has no `sandboxID` field; the
-//! server mints one with `SandboxId::new()`. A client that retries `POST
-//! /sandboxes` gets a second sandbox, not a collision, so `AlreadyInStorage`
-//! and `AlreadyPending` can never be returned on that path.
-//!
-//! Two other things do need it, and the second is the dangerous one:
-//!
-//! 1. `restore_sandbox` takes a **caller-supplied** id. Two replicas handling a
-//!    resume of the same paused sandbox both call it with the same id.
-//!
-//! 2. 🔴 The creation window is otherwise **invisible to the cluster**.
-//!    `store.add` runs *after* the VM exists — after image pulls, after boot,
-//!    after waiting for envd — so for seconds to tens of seconds there is a
-//!    running VM with no record anywhere. Anything reconciling a node's
-//!    `ListSandboxes` against the store sees a VM with no record and concludes
-//!    orphan, and the treatment for an orphan is to kill it. The pending set is
-//!    what makes that window visible.
-//!
-//! Getting the reason wrong matters, because the obvious conclusion from "the
-//! server mints the id" is that this primitive can be skipped — which would
-//! take the second reason with it.
+//! Creation reservation visible across replicas.
+//! It deduplicates caller-supplied ids and keeps in-progress VMs from appearing orphaned.
 
 use std::sync::Arc;
 
@@ -76,10 +51,7 @@ pub async fn reserve(inner: &Arc<StoreInner>, sandbox_id: &SandboxId) -> Result<
                 inner: Arc::clone(inner),
             }),
         ))),
-        // 🔴 The script has no branch that produces this. Reported as a backend
-        // fault rather than panicking, because a `LimitExceeded` arriving from
-        // a build that cannot produce one means the script in Redis is not the
-        // script in this binary.
+        // This build has no script branch producing quota rejection.
         scripts::RESERVE_LIMIT_EXCEEDED => Err(backend_msg(
             "reservation script reported a quota rejection, but this build has no tenant model \
              and no script branch that can produce one; the loaded script does not match this binary",
@@ -132,8 +104,7 @@ struct RedisStartWaiter {
 impl StartWaiter for RedisStartWaiter {
     async fn wait(&self, sandbox_id: &SandboxId) -> Result<SandboxMetadata> {
         let inner = &self.inner;
-        // Subscribe before the first probe: the creation may finish between the
-        // two otherwise, and the waiter then sleeps until the poll fires.
+        // Subscribe before probing to close the lost-wake window.
         let mut wake = inner.subscribe(&routing::reservation(sandbox_id));
 
         loop {
@@ -145,7 +116,7 @@ impl StartWaiter for RedisStartWaiter {
     }
 }
 
-/// `None` means "still pending"; `Some` means the creation has an answer.
+/// `None` means pending; `Some` carries the creation result.
 async fn try_read_result(
     inner: &Arc<StoreInner>,
     sandbox_id: &SandboxId,
@@ -165,10 +136,7 @@ async fn try_read_result(
         return Ok(None);
     }
 
-    // 🔴 Read the result once more. e2b found this race in production: the
-    // owner can publish its result between the first read above and this
-    // pending check, and without the second read a creation that succeeded is
-    // reported as one that vanished.
+    // Re-read after pending disappears to close the owner-publication race.
     if let Some(result) = read_settled(inner, sandbox_id).await? {
         return Ok(Some(result));
     }
@@ -200,7 +168,6 @@ async fn read_settled(
         return Ok(Some(Err(backend_msg(payload))));
     }
 
-    // An empty payload means success, and success means there is a record.
     match inner.read_record(sandbox_id).await? {
         Some(record) => Ok(Some(Ok(record.into_metadata()))),
         None => Ok(Some(Err(StoreError::SandboxNotFound {

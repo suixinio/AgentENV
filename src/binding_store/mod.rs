@@ -1,55 +1,10 @@
-//! Task's own "D1"/"D3": the routing/binding store — ports
-//! `services/scheduler/internal/store.go` (`BindingStore`,
-//! `InMemoryBindingStore`) and `services/scheduler/internal/redis_store.go`
-//! (`RedisBindingStore`).
-//!
-//! # What this is, and what it deliberately is not
-//!
-//! A binding maps a sandbox id to the node currently answering for it, so
-//! gateway can proxy data-plane traffic without asking `api`/scheduler on
-//! every request (`GATEWAY_ROUTING_PROJECTION_READ=on`, reading the same
-//! Redis key space this store's [`redis`] backend writes). It is
-//! deliberately **not** folded into `src/orchestrator/store/redis`
-//! (`RedisMetadataStore`, api's own sandbox-metadata CAS store) even though
-//! both may end up pointed at the same Redis: that store's failure model is
-//! "control plane down blocks sandbox operations"; this one's whole reason
-//! to exist is "control plane down does not block a gateway proxying an
-//! already-running sandbox" (阶段 1's core deliverable). Mixing the two
-//! key spaces would couple their lifetimes for no benefit — see
-//! `src/orchestrator/store/redis/config.rs`'s own collision guard, which
-//! refuses a `key_prefix` that overlaps [`record::DEFAULT_KEY_PREFIX`].
-//!
-//! # The four operations, and the guard that makes `Delete` safe
-//!
-//! [`BindingStore::get`]/[`BindingStore::record`]/
-//! [`BindingStore::reconcile_node`] mirror Go one to one. [`BindingStore::delete`]
-//! is the one the interface comment (`store.go:14-30`) calls "the guard is
-//! the whole point": a late PAUSE/DELETE event for a sandbox that has since
-//! been resumed elsewhere under a new incarnation must not tear down the
-//! live record — it is refused ([`BindingDeleteOutcome::RejectedStale`])
-//! rather than applied. Both backends implement this guard; `contract`
-//! (test-only) runs the same assertions against both so a fix made to one
-//! and forgotten for the other turns red rather than invisible.
+//! Routing projection from sandbox id to serving node.
+//! Its key space and failure model remain separate from the orchestrator metadata store.
+//! Deletes are incarnation-fenced, and both backends run the shared contract suite.
 
 pub mod arbitration;
 pub mod artifact_index;
-/// 🔴 Test-only, and `cfg(any(test, feature = "test-support"))` rather than a
-/// plain `cfg(test)`.
-///
-/// Production has one binding store: `aenv-api` is a multi-replica Deployment
-/// and a routing table one replica cannot see is a silent misroute, so
-/// `build_binding_store` constructs [`redis::RedisBindingStore`]
-/// unconditionally — there is no `[binding_store].backend` to select anything
-/// else with any more. What keeps this implementation alive is [`contract`],
-/// which runs the same assertions against both backends so a fix made to one
-/// and forgotten for the other turns red instead of invisible; that needs a
-/// second implementation to compare against, not a second deployable one.
-///
-/// `cfg(test)` alone would not do: it is per-crate, so `aenv-node`'s and
-/// `aenv-api`'s own test suites — which depend on `aenv-core` as an ordinary
-/// dependency, compiled without *its* `cfg(test)` — would lose the symbol.
-/// The `test-support` feature exists for exactly this, and both crates
-/// already take `aenv-core` with it enabled.
+/// Test-only in-memory backend; production routing uses Redis.
 #[cfg(any(test, feature = "test-support"))]
 pub mod in_memory;
 pub mod lookup;
@@ -72,42 +27,26 @@ pub use arbitration::BindingDecision;
 pub use in_memory::InMemoryBindingStore;
 pub use redis::{RedisBindingStore, RedisBindingStoreConfig};
 
-/// A sandbox's current binding: the node answering for it, and (when known)
-/// the execution incarnation that installed it. Mirrors Go's `Binding`
-/// (`store.go:60-84`).
+/// A sandbox's serving node and, when known, execution incarnation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Binding {
     pub node: Node,
-    /// Lowercase canonical UUIDv7, or empty when not known — see
-    /// [`record::normalize_execution_id_reason`].
+    /// Canonical UUIDv7, or empty when unknown.
     pub execution_id: String,
-    /// `Duration::ZERO` means "use the store's own `binding_ttl`", never
-    /// "forever". Only meaningful on a write ([`BindingStore::record`]);
-    /// [`BindingStore::get`] does not return it back — the record carries
-    /// its own expiry, not a re-exposed TTL (matches Go's `Get`, which
-    /// returns only `Node`/`ExecutionID`).
+    /// `ZERO` selects the store's configured binding TTL.
     pub projection_ttl: Duration,
 }
 
-/// Ports Go's `BindingDeleteOutcome` (`store.go:32-58`) — the closed set of
-/// answers [`BindingStore::delete`] may give, and the value both
-/// `agentenv_api_sandbox_event_total{outcome}` (task's own "D1") and
-/// `agentenv_api_binding_sweep_total{outcome}` (task's own "D4") report.
+/// Guarded delete outcome and its metrics label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingDeleteOutcome {
     /// Nothing held the sandbox (already absent, or expired).
     Absent,
     /// The record named the incarnation the caller supplied; removed.
     Deleted,
-    /// The record named no incarnation (an old writer, or a heartbeat that
-    /// had none to name); removed anyway — deliberately asymmetric
-    /// with the write path's "unknown never displaces known" rule, because
-    /// an event that supplies a *known* incarnation is stronger evidence
-    /// than a record that never named one.
+    /// An event with a known incarnation removed a record with none.
     DeletedUnknownIncumbent,
-    /// The record named a *different* incarnation than the caller supplied
-    /// — refused. This is the guard: a late event for a superseded
-    /// incarnation must not tear down the live record.
+    /// Refused because the record names another incarnation.
     RejectedStale,
 }
 
@@ -122,12 +61,7 @@ impl BindingDeleteOutcome {
     }
 }
 
-/// A store-level failure — Redis unreachable, a malformed record, and the
-/// like. Every [`BindingStore`] caller maps this to `Unavailable`, never to
-/// "not found": a caller that cannot tell "this sandbox has no binding"
-/// apart from "the store could not be asked" must always assume the latter
-/// — see `lookup.rs`'s own module doc for why this distinction is the
-/// entire point of the three-stage lookup ladder.
+/// Store failures are never interpreted as absence.
 #[derive(Debug, Error)]
 #[error("binding store unavailable: {0}")]
 pub struct BindingStoreError(pub String);
@@ -138,8 +72,7 @@ impl BindingStoreError {
     }
 }
 
-/// The behavior every binding store backend must provide. Mirrors Go's
-/// `BindingStore` interface (`store.go:14-30`).
+/// Contract implemented by every binding-store backend.
 #[async_trait]
 pub trait BindingStore: Send + Sync {
     /// The sandbox's current binding, or `None` when absent or expired.
@@ -149,10 +82,7 @@ pub trait BindingStore: Send + Sync {
         now: SystemTime,
     ) -> Result<Option<Binding>, BindingStoreError>;
 
-    /// Installs (or refreshes) a binding under this store's configured
-    /// arbitration rule. The returned [`BindingDecision`] is for metrics —
-    /// a rejected challenger leaves the existing record untouched, which is
-    /// not itself an error.
+    /// Records a binding; rejected challengers leave the incumbent untouched.
     async fn record(
         &self,
         sandbox_id: &str,
@@ -160,11 +90,7 @@ pub trait BindingStore: Send + Sync {
         now: SystemTime,
     ) -> Result<BindingDecision, BindingStoreError>;
 
-    /// Reconciles every binding this store has recorded for `node` against
-    /// its freshly reported `roster`: entries not in the new roster are
-    /// removed (an empty roster removes everything the node owns), entries
-    /// in it are recorded through the same arbitration `record` uses. One
-    /// decision per roster entry, in the same order.
+    /// Reconciles all bindings owned by `node` against its latest roster.
     async fn reconcile_node(
         &self,
         node: Node,
@@ -172,12 +98,7 @@ pub trait BindingStore: Send + Sync {
         now: SystemTime,
     ) -> Result<Vec<(String, BindingDecision)>, BindingStoreError>;
 
-    /// Removes a sandbox's binding, but only if the record still names the
-    /// incarnation `execution_id` supplies — see the module doc's "the
-    /// guard is the whole point". `execution_id` must already be
-    /// normalized and non-empty; an empty one is the caller's mistake to
-    /// refuse before calling this (mirrors Go: `applyProjectionDelete`
-    /// refuses an empty execution id before ever reaching `store.Delete`).
+    /// Removes a binding only when it still names `execution_id`.
     async fn delete(
         &self,
         sandbox_id: &str,
@@ -186,20 +107,12 @@ pub trait BindingStore: Send + Sync {
     ) -> Result<BindingDeleteOutcome, BindingStoreError>;
 }
 
-/// Shared tuning both backends read the same way. Mirrors the constructor
-/// arguments Go threads through `NewInMemoryBindingStoreWithModes`/
-/// `NewRedisBindingStoreWithModes`.
+/// Tuning shared by all binding-store backends.
 #[derive(Debug, Clone)]
 pub struct BindingStoreSettings {
-    /// The TTL a binding gets when the caller does not supply its own
-    /// (`Binding::projection_ttl <= Duration::ZERO`).
+    /// Default TTL when a write supplies none.
     pub binding_ttl: Duration,
-    /// Mirrors Go's `projectionAuthoritative`: whether a heartbeat refresh
-    /// of the *same* incarnation may keep the record's existing deadline
-    /// (`KEEPTTL`) instead of always re-arming it. `false` means every
-    /// write always sets a fresh deadline — the safe default before a
-    /// deployment's `SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE` switch is
-    /// turned on.
+    /// Whether same-incarnation heartbeat refreshes preserve the current deadline.
     pub projection_authoritative: bool,
 }
 

@@ -1,8 +1,4 @@
-//! The global expiry index, the bounded sweep over it, and the healer.
-//!
-//! The index replaces a full table scan. `list_expired` used to walk every
-//! record in the process; on Redis that would be `SMEMBERS` plus an `MGET` of
-//! the whole keyspace, once per replica per eviction tick.
+//! Global bounded expiry index and repair loop.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -15,16 +11,9 @@ use super::record::{to_unix_millis, StoredSandboxRecord};
 use super::{backend, now_millis, scripts, RoundReadiness, StoreInner};
 use crate::orchestrator::SandboxState;
 
-/// How many members `SSCAN` asks for per round trip while healing.
 const HEAL_SCAN_COUNT: usize = 256;
 
-/// The score a record should carry in the expiry index, if any.
-///
-/// 🔴 A record with no `expires_at` is still indexed, at its lifetime deadline.
-/// That is the positive form of the same hole the transition reaper closes: a
-/// sandbox that "never expires" still needs a coordinate something can find it
-/// by, or a stuck one is invisible for ever. Only a record with neither an
-/// expiry nor a ceiling has no coordinate at all.
+// Expiry-less records use their lifetime deadline when one exists.
 fn desired_score(metadata: &SandboxMetadata, now: SystemTime) -> Option<i64> {
     metadata
         .expires_at
@@ -78,9 +67,7 @@ pub async fn expired_batch(
             .iter()
             .map(|(_, member)| inner.keys().record(&member.sandbox_id))
             .collect();
-        // 🔴 A failed chunk abandons the whole round. Acting on the part that
-        // came back would mean evicting on the strength of a record we could
-        // not read.
+        // Abort the whole round if any chunk cannot be read.
         let raws: Vec<Option<Vec<u8>>> = redis::cmd("MGET")
             .arg(&keys)
             .query_async(&mut connection)
@@ -96,9 +83,7 @@ pub async fn expired_batch(
             };
             let record = StoredSandboxRecord::decode(&raw)?;
 
-            // 🔴 The member names an incarnation, and the record may be a
-            // different one. Removing this member is safe precisely because it
-            // is scoped: it cannot unindex the incarnation that is live.
+            // Incarnation-scoped members can be removed without unindexing replacements.
             if record.execution_id() != member.execution_id {
                 metrics::counter!(
                     "agentenv_store_expiry_index_swept_total",
@@ -117,11 +102,7 @@ pub async fn expired_batch(
                 continue;
             }
 
-            // 🔴 A record that is not `Running` is either mid-transition — in
-            // which case leaving it alone is right — or stuck, in which case
-            // the evictor is the exit. The cutoff is what tells them apart, and
-            // it has to be longer than the longest legal transition or a
-            // sandbox that is merely pausing gets swept as stuck.
+            // Transitional records become evictable only after the stale cutoff.
             if record.metadata.state != SandboxState::Running {
                 let overdue = record
                     .metadata
@@ -160,12 +141,7 @@ pub async fn expired_batch(
     Ok(expired)
 }
 
-/// Moves the score of members that are already there, and creates none.
-///
-/// 🔴 `XX`, never a bare `ZADD`. A member read a moment ago may have been
-/// deleted since by a concurrent `remove`, and a bare `ZADD` would put it back
-/// — an index entry for a sandbox that no longer exists, planted by the very
-/// sweep whose job is to remove such things.
+/// Rescores existing members with `ZADD XX`, never recreating removed entries.
 pub async fn rescore_existing_members(
     connection: &mut redis::aio::ConnectionManager,
     key: &str,
@@ -185,24 +161,9 @@ pub async fn rescore_existing_members(
     Ok(())
 }
 
-/// One healer round: puts back index members that should exist and do not.
-///
-/// # 🔴 Why this is safe to run on every replica with no leader election
-///
-/// Every insertion is `ZADD NX`, so concurrent rounds cannot fight and cannot
-/// move a score that a real write has just set. The only race left is with a
-/// concurrent `remove`, and it can only plant an *orphan* member — one whose
-/// record is gone. An orphan is swept by the next sweep once its score passes.
-/// It is never a wrongful eviction, because eviction re-reads the record and
-/// re-checks expiry inside a script.
-///
-/// 🔴 That argument depends on the eviction re-check already existing. Order
-/// matters: the re-check first, the healer second. The other order plants
-/// entries with no safety net under them.
+/// Repairs missing members with `ZADD NX`, safe to run concurrently.
 pub async fn heal_expiry_index(inner: &Arc<StoreInner>) -> Result<usize> {
-    // 🔴 Re-read every round, so it is a kill switch that works without a
-    // redeploy, and reported in three states so that "this round healed
-    // nothing" cannot be read as "there was nothing to heal".
+    // Kill switches and warm-up state are re-evaluated every round.
     match inner.healer_readiness() {
         RoundReadiness::Disabled => {
             debug!("expiry healer is switched off");
@@ -221,8 +182,7 @@ pub async fn heal_expiry_index(inner: &Arc<StoreInner>) -> Result<usize> {
     let mut healed = 0usize;
 
     loop {
-        // 🔴 `SSCAN`, not `SMEMBERS`. The healer walks the whole membership
-        // set; pulling it in one reply blocks Redis for the duration.
+        // Use SSCAN so a repair round does not fetch the full set at once.
         let (next, members): (u64, Vec<String>) = redis::cmd("SSCAN")
             .arg(inner.keys().index())
             .arg(cursor)
@@ -272,8 +232,7 @@ async fn heal_batch(
     let mut wanted: Vec<(i64, String)> = Vec::new();
     for raw in raws.into_iter().flatten() {
         let record = StoredSandboxRecord::decode(&raw)?;
-        // 🔴 Skip the very young. A record still being written by whoever is
-        // creating it is not a record that has lost its index entry.
+        // Skip records young enough to still be under construction.
         if now
             .duration_since(record.metadata.created_at)
             .map(|age| age < config.heal_grace)
@@ -304,8 +263,7 @@ async fn heal_batch(
     invocation.key(inner.keys().expiry());
     let mut missing = 0usize;
     for ((score, member), present) in wanted.iter().zip(existing) {
-        // A legitimate score is a unix millisecond count and can never be zero,
-        // so a zero reads as missing just as a nil does.
+        // Unix-millisecond scores are never zero.
         if present.is_some_and(|score| score != 0.0) {
             continue;
         }

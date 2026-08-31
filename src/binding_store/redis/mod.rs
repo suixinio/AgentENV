@@ -1,11 +1,4 @@
-//! Task's own "D3": ports `services/scheduler/internal/redis_store.go`'s
-//! `RedisBindingStore` — the binding store backend gateway's read path
-//! already speaks to (`services/shared/routing.Reader`,
-//! `GATEWAY_ROUTING_PROJECTION_READ=on`), and the one `scheduler.redis_addr`
-//! (Go) pointed multiple scheduler replicas at for the HA
-//! primary/`--query-only` split — see this crate's `mod.rs` doc for why
-//! that split disappears once binding lives in api (task's own "D3", §Q
-//! "api is already N replicas").
+//! Redis binding-store backend compatible with the gateway routing reader.
 
 pub mod scripts;
 
@@ -27,56 +20,20 @@ use super::record::{
 use super::{Binding, BindingDeleteOutcome, BindingStore, BindingStoreError, BindingStoreSettings};
 use crate::node_registry::types::{Node, RosterEntry};
 
-/// Redis-specific tuning, alongside the backend-agnostic
-/// [`BindingStoreSettings`]. Mirrors the extra constructor arguments Go's
-/// `NewRedisBindingStoreWithModes` takes beyond what `InMemoryBindingStore`
-/// needs.
+/// Redis-specific binding-store configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RedisBindingStoreConfig {
     /// `redis://host:port[/db]`.
     pub url: String,
-    /// 🔴 Defaults to the exact Go value
-    /// ([`super::record::DEFAULT_KEY_PREFIX`]) — this is gateway's read
-    /// path, not an internal choice this build is free to rename.
+    /// Gateway-compatible key namespace.
     pub key_prefix: String,
-    /// How long a node's reverse-index set (`{prefix}:node:{id}`) lives
-    /// without a refresh. Deliberately not tied to the projection TTL —
-    /// it is reconciliation bookkeeping, not a route (Go's
-    /// `defaultRedisNodeIndexTTL`, 1 hour).
+    /// Reverse-index TTL, independent from projection TTL.
     pub node_index_ttl: Duration,
-    /// How long a single Redis command (a script `EVAL`, a `GET`) may run
-    /// before `redis::aio::ConnectionManager` times it out and reconnects.
-    ///
-    /// 🔴 Renamed from `operation_timeout`: the field existed under that
-    /// name before this change with the same 2s default, but nothing ever
-    /// read it — `RedisBindingStore::connect` built its `ConnectionManager`
-    /// with `ConnectionManager::new(client)`, which ignores this struct
-    /// entirely and applies redis-rs's own built-in 500ms default instead.
-    /// Renaming rather than merely wiring it up in place because
-    /// "`operation_timeout`, silently unused" and "`response_timeout`,
-    /// actually applied" are different enough claims that reusing the old
-    /// name over the exact same bug site invites the next reader to assume
-    /// the old name was already live. 500ms was measured too tight against
-    /// this exact production Redis: a `ZRANGEBYSCORE` on
-    /// `crate::orchestrator::store::redis::expiry` (a neighbor on the same
-    /// instance) was observed taking 292ms, plus cross-node RTT on every
-    /// command. This field's pre-existing 2s default already had the right
-    /// order of magnitude in mind; it simply never took effect until now.
-    ///
-    /// Trade-off: a genuinely unreachable Redis now takes up to this long
-    /// (per call, not cumulative) to be detected, instead of the crate's
-    /// 500ms default this connection was actually running under. Audited
-    /// as acceptable: `src/binding_store/` has no `select!` racing a store
-    /// call against a shorter deadline, and no health/readiness probe
-    /// touches this store synchronously (`src/api/server.rs`'s `/health`
-    /// is a bare `"ok"`) — every caller already treats a
-    /// `BindingStoreError` as retryable (`Schedule`/`LookupNode`/
-    /// `RecordAssignment` return it up to the gRPC caller, and the sweep
-    /// task in `src/binding_store/sweep.rs` retries on its own next round).
+    /// Per-command response timeout.
+    /// Applied to every Redis command before reconnecting.
     pub response_timeout: Duration,
-    /// How long a fresh TCP connection attempt (initial connect, or a
-    /// reconnect after a `response_timeout`) may take.
+    /// Fresh connection-attempt timeout.
     pub connect_timeout: Duration,
 }
 
@@ -145,8 +102,7 @@ impl RedisBindingStore {
         }
     }
 
-    /// Test-only: a raw connection to the same Redis, for assertions the
-    /// store's own API deliberately cannot make (`PTTL`, key existence).
+    /// Raw test connection for assertions outside the store API.
     #[cfg(test)]
     pub fn raw_connection(&self) -> redis::aio::ConnectionManager {
         self.connection.clone()

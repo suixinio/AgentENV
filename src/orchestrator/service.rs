@@ -46,47 +46,7 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
-/// How many expired sandboxes [`Orchestrator::evict_expired_sandboxes`] asks
-/// its store for per round.
-///
-/// 🔴 Before this existed, `evict_expired_sandboxes` called
-/// `MetadataStore::list_expired`, which on the Redis backend
-/// (`RedisMetadataStore::list_expired`) requests `expired_batch(now,
-/// usize::MAX)` — and `expiry::expired_batch`'s own `count = -1` special
-/// case for `usize::MAX` means that was an *unbounded* `ZRANGEBYSCORE
-/// -inf <now> LIMIT 0 -1` against the whole expiry index, once per
-/// `auto_evict_interval_ms` (1s default) tick, per replica. This is the
-/// `expired_batch`-with-a-real-limit call the trait's own doc comment
-/// already says an evictor needs ("a fixed amount of work per round
-/// instead of pulling the whole table") — `evict_expired_sandboxes` just
-/// was not the caller using it.
-///
-/// The value matches `RedisStoreConfig::expired_batch_limit`'s own default
-/// (256): on the Redis backend, `expired_batch` already clamps any
-/// non-`usize::MAX` limit to `min(limit, config.expired_batch_limit)`, so
-/// passing a larger number here would silently be capped there anyway;
-/// matching it makes this the effective bound on every backend, including
-/// `InMemoryMetadataStore`, which has no such clamp of its own.
-///
-/// # Why a round that does not finish the backlog is still safe
-///
-/// `ZRANGEBYSCORE ... LIMIT 0 N` returns the `N` *lowest-scoring* (i.e.
-/// oldest-overdue) members of the range, not an arbitrary `N`. Every
-/// successful write that changes a record's expiry-relevant state
-/// (`scripts::UPDATE`'s `rescore_flag` arm, driven by `crud.rs`) issues a
-/// paired `ZREM`/`ZADD` against the same index in the same script — so a
-/// sandbox this round evicts is not returned by the *next* round's query,
-/// and the next-oldest `N` take its place. A round capped at
-/// `AUTO_EVICT_BATCH_LIMIT` is therefore not "the rest gets dropped": it is
-/// "the rest is still the oldest-first queue this exact query will ask
-/// about again one second from now" (`auto_evict_interval_ms`). The one
-/// case that does *not* advance is a sandbox whose eviction attempt itself
-/// fails (`evict_expired_sandboxes`'s own `warn!` + `continue`) — its score
-/// is untouched, so it keeps sorting first and keeps being retried every
-/// round, exactly like the healer/reaper backstops elsewhere in this store
-/// retry a stuck record — but it can only ever occupy its own one slot in
-/// a batch, never the other `AUTO_EVICT_BATCH_LIMIT - 1`, so a
-/// persistently-failing sandbox cannot starve the rest of the backlog.
+/// Maximum expired sandboxes processed per eviction round.
 const AUTO_EVICT_BATCH_LIMIT: usize = 256;
 
 #[derive(Clone, Debug)]
@@ -144,77 +104,34 @@ pub struct Orchestrator<S: MetadataStore, F: SandboxBackendFactory, P: SandboxPe
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
-    /// Node-level isolation. While set, this node refuses work that would put a
-    /// *new* sandbox on it and reports itself draining in its heartbeat, but
-    /// keeps serving everything it already holds: isolation is about what
-    /// arrives next, not about what is already here.
-    ///
-    /// Deliberately separate from `is_shutting_down`. A shutting-down node is
-    /// on its way out and refuses lifecycle work outright; an isolated node is
-    /// perfectly healthy and may be un-isolated again.
+    /// Node isolation rejects new placements while preserving existing sandboxes.
     scheduling_disabled: std::sync::atomic::AtomicBool,
-    /// When isolation last changed, in unix milliseconds; zero means never.
-    /// Reported by the admin API so an operator can see how long a node has
-    /// been out of rotation.
+    /// Unix milliseconds of the last isolation change; zero means never.
     scheduling_disabled_changed_at_ms: AtomicI64,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     pub image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
-    /// Cluster-wide bookkeeping for paused sandboxes, wired in after
-    /// construction because it is built from the snapshot repository, which the
-    /// orchestrator otherwise has no reason to know about. Unset means every
-    /// pause stays node-local, which is the default.
+    /// Optional cluster-wide paused-sandbox lifecycle hook.
     paused_publisher: OnceCell<Arc<dyn PausedSandboxPublisher>>,
 }
 
-/// What can be driven for a sandbox this process is holding no handle for.
-///
-/// # 🔴 Three answers, because two of them used to be told apart by nothing
-///
-/// [`Orchestrator::sandboxes`] is a *process-local* map of live backends. For a
-/// single process, an id missing from it means the sandbox's runtime is gone,
-/// and the pause and snapshot paths acted on exactly that reading: they deleted
-/// the record. `aenv-api` is deployed as several replicas behind a Service
-/// with no session affinity, and there the same absence usually means something
-/// else entirely — *another replica started it* — because a sandbox's record is
-/// shared and its handle is not.
-///
-/// Read as the first, the second destroys the sandbox: the record goes, the VM
-/// stays up on its node, and nothing left in the cluster can name it. So the
-/// two are separate values here, and the caller has to say which one it is
-/// acting on.
-///
-/// 🔴 And a fourth answer that is not a variant: `Err`. "I could not reach the
-/// store" and "I could not reach the machine" are neither of the three, and a
-/// caller that folded either into [`RuntimeGone`](Self::RuntimeGone) would be
-/// deleting records because a network was slow.
+/// Outcome when a process-local sandbox handle is absent.
 enum AbsentHandle {
-    /// The sandbox runs on a machine this half can address, and the backend to
-    /// drive it with has been rebuilt from the record. Usable exactly like the
-    /// handle that was not here.
+    /// Backend adopted from the authoritative record.
     Adopted(SandboxHandle),
-    /// The runtime the record describes is gone, on either of two grounds
-    /// this factory can establish on its own: this factory's sandboxes live
-    /// in the process that started them, and there is none here; or its
-    /// sandboxes live elsewhere and the placement source has independently
-    /// confirmed — via [`RuntimeConfirmedGone`] — that the machine they
-    /// depended on has left the cluster. This is the only answer that
-    /// entitles a caller to clean the record up.
+    /// Runtime independently confirmed gone; record cleanup is allowed.
     RuntimeGone,
-    /// The store has no record under this id: the sandbox does not exist. There
-    /// is nothing to drive and nothing to clean up.
+    /// No authoritative record exists.
     NoRecord,
 }
 
-/// What a teardown should do with the sandbox's cluster-wide record.
+/// Whether teardown removes the cluster record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ClusterDisposition {
-    /// The sandbox is gone for good: clear its row and the snapshot behind it.
+    /// Permanently remove the cluster record and snapshot.
     Forget,
-    /// Only this node's copy is going: the row describes a sandbox that is
-    /// alive elsewhere, and the snapshot it names is that sandbox's recovery
-    /// point.
+    /// Preserve the cluster record for a sandbox alive elsewhere.
     KeepClusterRecord,
 }
 
@@ -222,16 +139,7 @@ impl<F> Orchestrator<InMemoryMetadataStore, F, DisabledSandboxPersister>
 where
     F: SandboxBackendFactory,
 {
-    /// A throwaway orchestrator for tests and examples.
-    ///
-    /// Fixed at [`AccessTokenSeedPolicy::MayGenerate`] rather than taking one,
-    /// because that is what it is for: no configured envd access-token seed
-    /// required of whoever calls it.
-    ///
-    /// 🔴 The factory is an argument. It used to be fixed at
-    /// `FirecrackerSandboxFactory`, which made the one convenience constructor
-    /// in this module the reason the orchestrator named a sandbox runtime at
-    /// all.
+    /// Creates a test orchestrator with an in-memory store.
     pub async fn with_in_memory_store(factory: F) -> Arc<Self> {
         Self::new(
             AccessTokenSeedPolicy::MayGenerate,
@@ -249,10 +157,7 @@ impl<F> Orchestrator<InMemoryMetadataStore, F, FileBackedSandboxPersister>
 where
     F: SandboxBackendFactory,
 {
-    /// 🔴 No seed policy argument: `aenv-node` is the only caller and a node
-    /// generates its own seed under `$AENV_HOME/secrets/`. A replicated
-    /// process, which may not, does not build a file-backed persister at all —
-    /// see `assemble_api`'s own note on `DisabledSandboxPersister`.
+    /// Creates a node-local file-backed orchestrator.
     pub async fn with_file_backed_store_and_factory(
         factory: F,
         image_refs: Arc<dyn RuntimeImageRefs>,
@@ -280,13 +185,7 @@ where
     F: SandboxBackendFactory,
     P: SandboxPersister + 'static,
 {
-    /// An orchestrator with no background tasks, for a test.
-    ///
-    /// 🔴 Not [`Orchestrator::new`]: that starts the eviction and maintenance
-    /// loops and restores persisted sandboxes. Tests drive the transitions
-    /// themselves. Behind `feature = "test-support"` so `aenv-node`'s own
-    /// suite can build one too — the struct's fields are this module's
-    /// business, not something a sibling crate should be spelling out.
+    /// Creates an orchestrator without background tasks for tests.
     #[cfg(any(test, feature = "test-support"))]
     pub fn from_test_parts(
         store: S,
@@ -319,22 +218,7 @@ where
         }
     }
 
-    /// Builds the orchestrator this process will run.
-    ///
-    /// `seed_policy` is carried no further than construction: the only thing it
-    /// decides is whether this process may invent its own envd access-token
-    /// seed when none is configured. A replicated half may not — see
-    /// [`AccessTokenSeedPolicy`].
-    ///
-    /// # 🔴 `image_refs` is an argument and not a default
-    ///
-    /// It used to be read here from the node-local layer cache
-    /// (`local_image_services_from_global_config`), which meant every process
-    /// holding an orchestrator opened that cache — including one with no layers
-    /// on its disk to protect. Whether this machine has a layer cache is a fact
-    /// about the machine, not about the orchestrator, so the caller states it:
-    /// a node passes its cache's own handle, and a process that runs no
-    /// sandboxes passes [`DisabledRuntimeImageRefs`][crate::image::DisabledRuntimeImageRefs].
+    /// Builds the orchestrator with explicit role-owned dependencies.
     pub async fn new(
         seed_policy: AccessTokenSeedPolicy,
         store: S,
@@ -471,21 +355,9 @@ where
         self.image_refs.unpin_best_effort(owner).await;
     }
 
-    /// Works out what can be driven for a sandbox whose handle is not here.
-    ///
-    /// Called only after the process-local map has come up empty; the three
-    /// answers and the error are described on [`AbsentHandle`].
-    ///
-    /// 🔴 The adopted backend is started before it is handed back, and `start`
-    /// on it starts nothing: it is where a stub for an already-running sandbox
-    /// finds the machine it is on and opens a channel to it. Handing back an
-    /// unattached backend would move that round trip inside the caller's
-    /// rollback-shaped code, where its failure is much easier to mistake for
-    /// the operation's own.
+    /// Resolves a sandbox absent from the process-local handle table.
     async fn absent_handle(&self, sandbox_id: SandboxId) -> Result<AbsentHandle> {
-        // 🔴 The store first, and its error propagates. A caller that could not
-        // read the record has learned nothing about the sandbox, and every
-        // answer below is a claim about a record that was read.
+        // Store errors propagate; they are not evidence of runtime absence.
         let Some(metadata) = self.store.get(&sandbox_id).await? else {
             return Ok(AbsentHandle::NoRecord);
         };
@@ -503,13 +375,7 @@ where
         };
 
         if let Err(error) = backend.start().await {
-            // 🔴 Downcast before the message below stringifies it away.
-            // `start` is shared by every backend, local and remote, and only a
-            // remote stub's `attach` can ever tag a failure this way — see
-            // `RuntimeConfirmedGone`'s doc. It means the placement source has
-            // independently confirmed the node this sandbox depended on is no
-            // longer part of the cluster, which is the one case a caller here
-            // may treat as more than "could not reach it this time".
+            // Only a typed placement confirmation authorizes record cleanup.
             if error.downcast_ref::<RuntimeConfirmedGone>().is_some() {
                 warn!(
                     %sandbox_id,
@@ -591,17 +457,8 @@ where
         .await
     }
 
-    /// Rebuilds a sandbox from a published snapshot under an ID it already had.
-    ///
-    /// This is the cross-node half of resume. The sandbox was paused on another
-    /// node and its snapshot committed to the shared repository; this node
-    /// brings it back under the *same* ID, so clients keep addressing it exactly
-    /// as before and the envd access token — derived from the sandbox ID —
-    /// stays valid.
-    ///
-    /// The caller owns the decision that this node may take the sandbox over.
-    /// Nothing here checks whether another node still holds it, so this must
-    /// only be called after winning a claim in the paused-sandbox registry.
+    /// Restores a published snapshot under its existing sandbox id.
+    /// The caller must already own the paused-registry claim.
     pub async fn restore_sandbox(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
@@ -614,16 +471,7 @@ where
         .await
     }
 
-    /// What a create's [`SandboxExpiry`] means to the record this orchestrator
-    /// is about to write.
-    ///
-    /// 🔴 The one place the configured default is reached for on a create, and
-    /// the one place [`SandboxExpiry::NotKeptHere`] becomes
-    /// [`NewTimeout::None`]. A record with no `expires_at` is never in the
-    /// expiry index and so is never seen by
-    /// [`evict_expired_sandboxes`](Self::evict_expired_sandboxes) — which is
-    /// the whole of what "the caller keeps this deadline" buys, and the reason
-    /// this may not fall back to the default for any reason at all.
+    /// Converts explicit expiry ownership into a record timeout.
     fn new_timeout_for(&self, expiry: SandboxExpiry) -> NewTimeout {
         match expiry {
             SandboxExpiry::After(timeout) => NewTimeout::Set(timeout),
@@ -661,11 +509,7 @@ where
             execution_id,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
-        // 🔴 The three-answer value, not a duration. What this line used to log
-        // was `timeout=None` for both "the caller named none" and "the caller
-        // keeps this one's deadline", which is exactly the pair that has to be
-        // told apart — and a split cluster's create is logged twice, once per
-        // half, so this is where the disagreement is visible or nowhere.
+        // Log the three-state expiry decision without collapsing its meanings.
         info!(?expiry, "creating sandbox");
         let new_timeout = self.new_timeout_for(expiry);
 
@@ -706,11 +550,7 @@ where
                 ))
                 .await
             }
-            // 🔴 The same record, the same launch config and the same
-            // transitional metadata as the arm above — built by the same
-            // function, from the same catalog row — with the one difference
-            // that nothing here has resolved that row into local bytes. See
-            // `SandboxLaunchSource::SnapshotRecord`.
+            // The node resolves catalog snapshots into local bytes.
             SandboxLaunchSource::SnapshotRecord(record) => {
                 let SnapshotCreateParts {
                     launch_config,
@@ -822,13 +662,7 @@ where
                     snapshot_id: image_ref.clone(),
                     env_vars,
                     network: network_policy.runtime_policy(),
-                    // 🔴 Empty, and not a placeholder to fill in: this field is
-                    // read only by a factory that boots a local Firecracker VM
-                    // directly from it, and the only factory that ever builds
-                    // from this launch source (`RemoteSandboxBackendFactory`)
-                    // does not — it ships sandbox_id/policy/etc. over the wire
-                    // and the node builds its own launch config from what it
-                    // resolves. See `SandboxBackendFactory::build_from_image_ref`.
+                    // Remote factories build the node's launch config after resolution.
                     extra_mmds: serde_json::Map::new(),
                     custom_extension_params: custom_extension_params.clone(),
                     envd_access_token,
@@ -848,15 +682,7 @@ where
                     virtualization_mode: ConfigManager::global_config().virtualization_mode,
                     runtime_versions: configured_runtime_versions(),
                     resources,
-                    // 🔴 `context` and `image_configs` are left at their
-                    // `Default` (empty) here rather than guessed at: this
-                    // process cannot resolve the image and so does not know
-                    // them yet. `launch_sandbox` overwrites both with the
-                    // node's answer once `start_nowait` returns
-                    // (`SandboxRuntimeInfo::resolved_image_facts`); if that
-                    // never arrives — an older node, or a launch that fails
-                    // first — the record keeps these placeholders rather than
-                    // anything invented.
+                    // Resolution facts are filled from the node's start response.
                     timeout_action,
                     auto_resume,
                     user_metadata,
@@ -930,14 +756,7 @@ where
 
         info!("forking sandboxes");
 
-        // The CAS runs before the handle is resolved, not after: it is what
-        // makes `source_metadata.execution_id` below authoritative rather
-        // than a snapshot that a concurrent pause+resume could invalidate out
-        // from under this call. Nothing can move the execution id while
-        // `Forking` holds — the only op that does is a resume, and a resume
-        // requires `Paused`, not `Forking` — so any handle checked against it
-        // from here on is checked against the truth for the whole rest of
-        // this operation.
+        // Hold `Forking` before resolving the authoritative source execution.
         let source_metadata = self
             .store
             .update_if_state(&source_sandbox_id, &[SandboxState::Running], |metadata| {
@@ -956,13 +775,7 @@ where
             })?
             .previous;
 
-        // 🔴 A replica that did not start the source sandbox is not a replica
-        // the source sandbox is missing from. Answering `SandboxNotFound` here
-        // made a fork fail on whichever of the api replicas the request
-        // happened to reach. Nor is a replica whose cached handle a
-        // pause+resume elsewhere has since superseded: `cached_handle_for_execution`
-        // discards that one exactly as if it had never been here, so it also
-        // falls through to `absent_handle` below.
+        // Rebuild a missing or stale cached handle from the authoritative record.
         let source_handle = self
             .cached_handle_for_execution(source_sandbox_id, source_metadata.execution_id)
             .await;
@@ -996,10 +809,7 @@ where
             },
         };
 
-        // 🔴 One entry per child, and the ownership marker is carried alongside
-        // the identity rather than derived from the source: the clone of the
-        // parent's metadata below would otherwise hand every child the
-        // parent's own record.
+        // Caller-assigned child identity and ownership travel together.
         let children: Vec<ForkChildAssignment> = match children {
             ForkChildren::Fresh(count) => (0..count)
                 .map(|_| ForkChildAssignment {
@@ -1014,11 +824,7 @@ where
             .iter()
             .map(|child| SandboxForkSpec {
                 sandbox_id: child.sandbox_id,
-                // A fork child is a brand-new sandbox, so it is a brand-new
-                // incarnation. Minted here, next to the child's metadata below
-                // being a clone of the parent's, because that clone is what
-                // would otherwise carry the parent's — unless the caller has
-                // already minted one and recorded it.
+                // Fork children receive a fresh or caller-assigned incarnation.
                 execution_id: child.execution_id.unwrap_or_else(ExecutionId::new),
                 envd_access_token: source_metadata
                     .secure
@@ -1094,23 +900,13 @@ where
 
             let mut metadata = source_metadata.clone();
             metadata.id = sandbox_id;
-            // 🔴 The clone above carries the parent's incarnation. Leaving it
-            // would give two live VMs one identity, with nothing to warn about
-            // it: fencing would read them as the same run and refuse neither.
+            // Replace the cloned parent's incarnation.
             metadata.execution_id = spec.execution_id;
-            // 🔴 And the ownership marker, for the same reason one line up: the
-            // clone carries the marker that names the *parent*, and a child
-            // reporting itself under it would be a second sandbox answering to
-            // one identity. `Fresh` clears it, which is the fail-closed
-            // direction — a child nobody claims is left alone.
+            // Replace the cloned parent's ownership marker.
             metadata.control_plane_config = child.control_plane_config;
             metadata.state = SandboxState::Running;
             metadata.created_at = now;
-            // 🔴 And the lifetime clock with it. The clone above carries the
-            // parent's spent budget; leaving it would hand a child forked from
-            // a sandbox that has been running for 23 hours a one-hour life,
-            // which is neither what `created_at = now` above says nor what a
-            // fresh sandbox on this node would get.
+            // Fork children start a fresh lifetime budget.
             metadata.restart_lifetime_clock(now);
             metadata.paused_state = None;
             metadata.update_timeout(new_timeout);
@@ -1188,12 +984,7 @@ where
         Ok(self.store.list_ids().await?)
     }
 
-    /// Lists every sandbox this node tracks together with the incarnation it is
-    /// running under and the TTL its routing projection should carry.
-    ///
-    /// The same set [`list_sandbox_ids`](Self::list_sandbox_ids) reports, which
-    /// is deliberate: the heartbeat sends both, and a receiver that finds them
-    /// describing different sets could not tell which one to believe.
+    /// Lists the same sandbox set as ids, adding execution and projection TTL.
     pub async fn list_sandbox_roster(&self) -> Result<Vec<SandboxRosterEntry>> {
         let now = SystemTime::now();
 
@@ -1205,21 +996,9 @@ where
             .map(|metadata| SandboxRosterEntry {
                 sandbox_id: metadata.id,
                 execution_id: metadata.execution_id,
-                // The repair path for a projection write that was lost: it has
-                // to reinstall the record with the sandbox's real remaining
-                // budget, not with the receiver's default, or a single dropped
-                // write silently downgrades that sandbox's routing record for
-                // good.
+                // Repair writes use the sandbox's remaining projection budget.
                 projection_ttl_secs: metadata.projection_ttl_secs(now),
-                // 🔴 `Paused` exactly, not "anything that is not running".
-                // The flag's only job is to keep a *routing projection* off a
-                // sandbox that has no VM behind it, and the transitional
-                // states each already own their routing: `Resuming` is on its
-                // way to having a VM and its resume path writes the binding
-                // it will need, `Pausing` still has one attached. Widening
-                // this to the transitional states would drop and reinstall a
-                // projection on every pause/resume round trip for no gain,
-                // and would race the resume path's own write.
+                // Only fully paused sandboxes lack a live routing target.
                 paused: metadata.state == SandboxState::Paused,
             })
             .collect())
@@ -1237,32 +1016,10 @@ where
         Ok(self.store.list_filtered(filter).await?)
     }
 
-    /// The sandboxes this node is actually running.
-    ///
-    /// # 🔴 Membership comes from the handles, attributes come from the records
-    ///
-    /// [`list_sandboxes`][Self::list_sandboxes] answers from the metadata
-    /// store, which is this node's *account* of what it holds. This one answers
-    /// from the table of live sandbox handles, which is what it holds. Anything
-    /// reconciling a cluster's idea of a sandbox against the machine running it
-    /// needs the second: comparing an account against an account cannot find a
-    /// discrepancy between them.
-    ///
-    /// # 🔴 Never waits on a busy handle
-    ///
-    /// Reading the live facts needs the handle's lock, and that lock is held
-    /// for the whole of a pause, a fork or a teardown. Waiting for it would
-    /// make this call as slow as the slowest operation on the node, and the
-    /// caller is deciding whether sandboxes still exist — so a busy handle
-    /// contributes its membership and whatever its record knows, marked
-    /// [`LiveSandbox::facts_from_handle`] `false`. What it must never do is
-    /// drop the sandbox from the list: "not here" is the answer that gets a
-    /// live VM torn down.
+    /// Lists live handles, using records only for attributes.
+    /// Busy handles remain listed with `facts_from_handle = false`.
     pub async fn list_live_sandboxes(&self) -> Result<Vec<LiveSandbox>> {
-        // Snapshot the handle table and let go of its lock before touching the
-        // store: the store may be a network round trip away, and holding the
-        // table's read lock across one blocks every create and teardown on the
-        // node.
+        // Release the handle-table lock before store I/O.
         let handles: Vec<(SandboxId, SandboxHandle)> = {
             let sandboxes = self.sandboxes.read().await;
             sandboxes
@@ -1275,16 +1032,9 @@ where
         }
 
         let ids: Vec<SandboxId> = handles.iter().map(|(id, _)| *id).collect();
-        // 🔴 A read that fails is an error, not an empty set of attributes. A
-        // caller told "these sandboxes have no records" would conclude
-        // something very different from what "I could not read the records"
-        // means.
+        // Store failure is not an empty attribute set.
         let records = self.store.get_many(&ids).await?;
-        // 🔴 And a read that only *partly* worked is the same failure wearing a
-        // success. A batch that skipped some ids returns rows for the rest, and
-        // every id it skipped then looks exactly like a sandbox with no record
-        // — which is how a live, claimed sandbox drops out of the answer the
-        // cluster reconciles against and gets treated as one that has gone.
+        // Partial reads cannot authorize absence.
         if !records.covers(&ids) {
             return Err(OrchestratorError::StoreOperationFailed(
                 StoreError::Backend {
@@ -1314,9 +1064,7 @@ where
 
             if let Ok(sandbox) = handle.try_lock() {
                 entry.facts_from_handle = true;
-                // 🔴 The handle's incarnation wins over the record's. The
-                // record says which run this node filed; the handle is the run
-                // that is up, and that is the one an orphan check compares.
+                // The live handle's incarnation is authoritative.
                 entry.execution_id = Some(sandbox.execution_id());
                 entry.host_interaction_ip = sandbox.host_interaction_ip();
                 entry.rootfs_virtual_size = sandbox.runtime_info().rootfs_virtual_size;
@@ -1338,21 +1086,7 @@ where
         self.access_tokens.matches(sandbox_id, candidate)
     }
 
-    /// The incarnation of this sandbox that is alive on this node right now, or
-    /// `None` when no VM of it is up here.
-    ///
-    /// 🔴 Only positive evidence. `None` means "this node is not currently
-    /// serving this sandbox" and never "this node is serving an old one". A
-    /// sandbox that is paused here, or being resumed here, or has never been
-    /// here, all answer `None` — because their records name a run that is not
-    /// the one about to serve traffic. A caller that refused on the strength of
-    /// one of those would refuse every request in a cross-node resume window,
-    /// which is precisely the window a user is waiting through.
-    ///
-    /// Reads the runtime route table rather than the backend handle: taking the
-    /// sandbox mutex on the data-plane path would queue every request behind a
-    /// pause or a snapshot, and the route table already holds the value the
-    /// backend was built with.
+    /// Returns the execution currently serving traffic on this node.
     pub async fn live_execution_id(&self, sandbox_id: &SandboxId) -> Option<ExecutionId> {
         self.proxy_routes
             .read()
@@ -1444,12 +1178,7 @@ where
             });
         }
 
-        // 🔴 The ceiling refuses here and nowhere else. An over-long renewal is
-        // clamped by `_set_timeout` below and succeeds; only a sandbox that has
-        // already outlived its ceiling is refused, because there is no window
-        // left to clamp into. Reversing this — refusing anything that asks for
-        // more than the ceiling allows — would hand a new 400 to every client
-        // that passes a generous timeout.
+        // Only an already-exhausted lifetime ceiling refuses renewal.
         let now = SystemTime::now();
         if let Some(deadline) = metadata.lifetime_deadline(now) {
             if now >= deadline {
@@ -1498,19 +1227,7 @@ where
         if timeout_updated {
             info!(?valid_timeout, "sandbox keep-alive timeout updated");
 
-            // Mirror the new deadline into the cluster registry. Best-effort,
-            // like every other write on `PausedSandboxPublisher`: the local
-            // record above is already the authoritative one, and this only
-            // keeps `ReclaimExpiredHoldings`' cluster-wide backstop from
-            // judging the sandbox against a deadline as stale as its last
-            // resume — see `renew_deadline`'s own doc.
-            //
-            // 🔴 `update_result.current.expires_at`, not `valid_timeout` and
-            // not `new_expire_time` from the closure above: `set_timeout`
-            // clamps to the sandbox's lifetime ceiling before it lands on the
-            // record, and this has to carry the same, already-clamped value
-            // out — never the caller's raw request, which the ceiling was
-            // never applied to at all.
+            // Mirror the already-clamped deadline best-effort into the registry.
             if let Some(publisher) = self.paused_publisher() {
                 publisher
                     .renew_deadline(
@@ -1539,16 +1256,7 @@ where
         .await
     }
 
-    /// Tears down a local copy of a sandbox the cluster says belongs elsewhere.
-    ///
-    /// Identical to [`delete_sandbox`](Self::delete_sandbox) except that it
-    /// leaves the cluster record and the snapshot behind it completely alone,
-    /// and that difference is the whole point. The sandbox is not being
-    /// deleted — it is alive on another node, under the row this node is about
-    /// to stop disagreeing with. Routing a discard through the ordinary delete
-    /// would hand `forget_sandbox` a row in a parked state, which it is
-    /// entitled to clear from any node, and the other node's snapshot would go
-    /// with it.
+    /// Tears down only the local copy while preserving the cluster record.
     pub async fn discard_superseded_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("discard_superseded", sandbox_id, async move {
@@ -1641,14 +1349,7 @@ where
             }
         };
 
-        // The authoritative execution for this sandbox, read now that this
-        // call exclusively holds it in `Killing`. Nothing else can move the
-        // execution id while that holds — the only op that does is a resume,
-        // and a resume requires `Paused`, not `Killing` — so the detached
-        // handle below is checked against the truth, not a stale local copy.
-        // Nothing has mutated the backend yet at this point, so a failure
-        // here rolls back to `previous_state` exactly like the "could not
-        // reach the sandbox" branch below it does.
+        // Read the authoritative execution after exclusively entering `Killing`.
         let expected_execution_id = match self.store.get(&sandbox_id).await {
             Ok(Some(metadata)) => metadata.execution_id,
             Ok(None) => {
@@ -1669,26 +1370,14 @@ where
         let (handle, removed_route) = self
             .detach_sandbox_handle_and_route_checked(&sandbox_id, expected_execution_id)
             .await;
-        // See the matching note in `pause_sandbox_inner`: an adopted backend is
-        // never filed in the running set.
         let handle_was_held_here = handle.is_some();
-
-        // 🔴 A delete that finds no handle used to drop straight through to
-        // "remove the record", answer 204, and never tell anybody's machine.
-        // On a replicated deciding half that is how a sandbox becomes an orphan
-        // VM: the user is told it is gone, the node goes on running it, and the
-        // only thing that named it has just been erased.
+        // Adopted backends are operation-scoped and never cached as locally running.
         let handle = match handle {
             Some(handle) => Some(handle),
             None => match self.absent_handle(sandbox_id).await {
                 Ok(AbsentHandle::Adopted(handle)) => Some(handle),
-                // Nothing is running that this half can reach, so there is
-                // nothing to stop — and the record below is the last of it.
                 Ok(AbsentHandle::RuntimeGone) | Ok(AbsentHandle::NoRecord) => None,
-                // 🔴 Refused rather than completed. The record is the only
-                // remaining handle on a VM that may well still be up, and a
-                // delete that forgot it because a lookup timed out would be the
-                // orphan this branch exists to prevent.
+                // Store or placement uncertainty must not authorize deleting the record.
                 Err(error) => {
                     warn!(error = %error, "could not reach the sandbox while deleting; leaving its record alone");
                     self.restore_proxy_route(sandbox_id, removed_route).await;
@@ -1704,14 +1393,7 @@ where
             },
         };
 
-        // Read before `handle` is moved into the stop below: the real machine
-        // this delete is about to stop the sandbox on, when this process did
-        // not run it itself. `forget` needs this to tell a sandbox this
-        // operation just stopped from one the registry names as running
-        // somewhere this operation never touched — see
-        // `PausedSandboxPublisher::forget`'s doc, and `mark_sandbox_running`'s
-        // identical read for the mirror-image case (bringing a sandbox up,
-        // not tearing it down).
+        // Capture the real holding node before moving the backend into stop.
         let holding_node_id_for_forget = match handle.as_ref() {
             Some(handle) => {
                 let sandbox = handle.lock().await;
@@ -1720,7 +1402,6 @@ where
             None => None,
         };
 
-        // If a runtime could be reached, attempt to stop it.
         if let Some(handle) = handle {
             let stop_result = {
                 let mut sandbox = handle.lock().await;
@@ -1764,9 +1445,7 @@ where
         }
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
-        // The sandbox is gone, so its cluster row and the snapshot behind it are
-        // garbage. Done here rather than at the API so an expiry-driven delete
-        // cleans up as thoroughly as a requested one.
+        // Permanent deletion also removes cluster recovery state.
         if disposition == ClusterDisposition::Forget {
             if let Some(publisher) = self.paused_publisher() {
                 publisher
@@ -1779,8 +1458,7 @@ where
         Ok(())
     }
 
-    /// Wires in cluster-wide pause bookkeeping. Idempotent; later calls are
-    /// ignored, so the first wiring wins.
+    /// Wires cluster pause bookkeeping once; the first publisher wins.
     pub fn set_paused_publisher(&self, publisher: Arc<dyn PausedSandboxPublisher>) {
         if self.paused_publisher.set(publisher).is_err() {
             warn!("paused sandbox publisher was already wired; ignoring");
@@ -1791,14 +1469,7 @@ where
         self.paused_publisher.get()
     }
 
-    /// Publishes a just-paused sandbox to the cluster and records the outcome
-    /// on the local record.
-    ///
-    /// Called from `pause_sandbox_inner` rather than from its callers, so that
-    /// an API pause, an expiry auto-pause and a shutdown pause all reach the
-    /// cluster identically. Doing it per call site is what left the latter two
-    /// unpublished, and those are the two whose sandboxes most need to survive
-    /// losing the node.
+    /// Publishes every locally completed pause through the shared lifecycle hook.
     async fn publish_paused_sandbox(&self, sandbox_id: SandboxId, outcome: PauseOutcome) {
         let Some(publisher) = self.paused_publisher() else {
             return;
@@ -1808,10 +1479,7 @@ where
             return;
         };
 
-        // From here on the cluster knows about this sandbox, so a later
-        // reconciliation is allowed to act on what the registry says about it.
-        // Recording that on the local record is what keeps reconciliation off
-        // records that predate the registry.
+        // Registration allows later reconciliation to act on registry absence.
         if let Err(err) = self
             .persister
             .mark_cluster_registered(&sandbox_id, &registered_as)
@@ -1821,12 +1489,7 @@ where
         }
     }
 
-    /// Whether a paused record was ever announced to a cluster registry, and
-    /// under which node identity.
-    ///
-    /// Only announced records may be discarded by reconciliation, and only
-    /// against the identity they were announced under — which is what makes
-    /// what the registry says about them mean anything at all.
+    /// Returns whether and under which identity this paused record was registered.
     pub async fn paused_record_cluster_registration(
         &self,
         sandbox_id: SandboxId,
@@ -1837,21 +1500,7 @@ where
             .map_err(|err| OrchestratorError::InternalError(err.to_string()))
     }
 
-    /// Where on this machine's disk a paused sandbox's capture was written.
-    ///
-    /// # 🔴 Why this is a read of its own rather than a value `pause_sandbox`
-    /// returns
-    ///
-    /// The directory is allocated inside the pause and handed to the backend,
-    /// and it is the *persisted record* that keeps it afterwards. A caller that
-    /// took it from the return value of one call could only ever learn it about
-    /// the pause it just performed — and a pause that found the sandbox already
-    /// paused does no work and has no directory to report, while the bytes are
-    /// sitting in one all the same.
-    ///
-    /// 🔴 `Ok(None)` means this node holds no paused record for the sandbox,
-    /// never "the disk could not be read": the persister keeps those apart and
-    /// so does this.
+    /// Returns the persisted local capture path, confirmed absence, or an error.
     pub async fn paused_artifact_root(
         &self,
         sandbox_id: &SandboxId,
@@ -1862,49 +1511,8 @@ where
             .map_err(OrchestratorError::from)
     }
 
-    /// The real machine a paused sandbox will reopen on, when that machine is
-    /// already knowable — before anything has tried to resume it.
-    ///
-    /// # 🔴 Read-only. Never a claimant, never a self-comparison
-    ///
-    /// It is tempting to use this as the identity a cross-node resume claims
-    /// under, so that `claimed_by_node_id` names the real machine instead of
-    /// this process's own pod identity while a resume is in flight. a0487f0 tried
-    /// exactly that and it is wrong twice over. First, mechanically: the
-    /// claim's identity is also `mark_running`'s CAS guard, and quoting the
-    /// real machine there while `mark_running` still had to name it *after*
-    /// placement made every claim this method could answer fail its own
-    /// confirmation. Second, and the reason this stays read-only even now
-    /// that the guard is fixed: this value comes from *shared* cluster state,
-    /// not from this process. Two different api replicas resuming the same
-    /// sandbox concurrently can both read the identical answer here, both
-    /// claim under it, and the loser's "is this claim mine" self-comparison
-    /// (`arbitration`'s doc) would then read the winner's claim as its own —
-    /// a value has to be unique to the *deciding process* to stand in for
-    /// "was this decided by me", and this one is not. `self.paused.node_id()`
-    /// is; use that for any claim or self-comparison, always.
-    ///
-    /// So: read-only, and specifically for a caller with no better answer for
-    /// *where a sandbox will end up running* — the one shape that is safe is
-    /// [`PausedSandboxPublisher::mark_running`]'s `holding_node_id`, which
-    /// only ever lands in `origin_node_id`, a plain write with no comparison
-    /// anywhere near it.
-    ///
-    /// # 🔴 Why `paused_handle`, not `SandboxMetadata::paused_state`
-    ///
-    /// That field is `#[serde(skip)]` and comes back `None` from any store
-    /// that serialises a record and reads it back in — which on the api half
-    /// is every store, since replicas share state through one. Reading `None`
-    /// as "not paused here" would make this always fall back, silently
-    /// reintroducing the bug this method exists to close. `paused_handle` is
-    /// the question with the answers this needs: see its own doc for the
-    /// three-way split.
-    ///
-    /// `None` covers every case that is not "a remote record names a
-    /// machine" — no record, a local record (this process already knows the
-    /// answer, itself), a remote record with no machine attached, and a store
-    /// that could not be read. Callers must fall back to their own identity
-    /// for all of those, exactly as this call's own caller does.
+    /// Returns the remote origin node recorded for a paused sandbox, if available.
+    /// This read-only hint must never be reused as a claim identity.
     pub async fn paused_origin_node_id(&self, sandbox_id: &SandboxId) -> Option<String> {
         match self.store.paused_handle(sandbox_id).await {
             Ok(PausedHandle::Remote { origin_node_id, .. }) => origin_node_id,
@@ -1912,32 +1520,14 @@ where
         }
     }
 
-    /// The real machine currently running `sandbox_id`, straight from the
-    /// live backend.
-    ///
-    /// `None` on a backend that runs the VM in this same process — which is
-    /// the correct, common answer everywhere but the api half — and on a
-    /// sandbox this process holds no handle for at all. See
-    /// [`SandboxBackend::holding_node_id`] for the convention this reads.
+    /// Returns the real machine reported by the live backend, if remote.
     pub async fn sandbox_holding_node_id(&self, sandbox_id: &SandboxId) -> Option<String> {
         let handle = self.sandboxes.read().await.get(sandbox_id).cloned()?;
         let sandbox = handle.lock().await;
         sandbox.holding_node_id().map(str::to_string)
     }
 
-    /// Drops this node's local copy of a paused sandbox, leaving the sandbox
-    /// itself alone.
-    ///
-    /// Used when the cluster registry says the sandbox has moved on — another
-    /// node resumed it, or it was destroyed — so the local paused record is a
-    /// leftover from before. This is deliberately **not** a delete: the sandbox
-    /// may well be running on another node right now, so no `Delete` lifecycle
-    /// event is published and nothing is reported as killed.
-    ///
-    /// Returns whether a record was actually discarded. Anything other than
-    /// `Paused` is left untouched, so a stale reconciliation decision can never
-    /// take down a live sandbox, and a resume that started in the meantime wins
-    /// the state CAS.
+    /// Discards only a local paused copy after cluster state has moved on.
     #[tracing::instrument(
         name = "discard_local_paused_record",
         skip(self),
@@ -1999,15 +1589,7 @@ where
             .shutdown_outcome
             .get_or_init(|| async move {
                 let result = this.run_shutdown_cleanup().await;
-                // 🔴 Best-effort and unconditional, even when the cleanup pass
-                // above failed: the persister's RocksDB store (persisted
-                // sandboxes; see `FileBackedSandboxPersister::close`) is not
-                // holding anything that pause failures above would make unsafe
-                // to close, and skipping this on failure would leave exactly
-                // the nodes whose shutdown already went wrong also the ones
-                // whose store teardown stays unbounded. Runs once, inside the
-                // single-flight `get_or_init`, alongside the cleanup pass
-                // itself.
+                // Always close the persister inside the single-flight shutdown.
                 this.persister
                     .close(crate::local_store::DEFAULT_CLOSE_TIMEOUT)
                     .await;
@@ -2029,24 +1611,7 @@ where
             .map(|outcome| outcome.metadata)
     }
 
-    /// [`Self::pause_sandbox`], handing the capture back instead of publishing
-    /// it here.
-    ///
-    /// # 🔴 Its one caller has no sandbox of its own and no publisher either
-    ///
-    /// The node service serves a `Pause` for a process that decided the pause,
-    /// holds the cluster's record of the sandbox, and will commit the row. This
-    /// machine's own publisher is not that process — on `aenv-node` it is
-    /// `DisabledPausedSandboxRegistry`, which records nothing — so letting the
-    /// ordinary path run would offer the capture to a publisher that drops it,
-    /// and the caller would be told the pause produced nothing publishable.
-    ///
-    /// 🔴 [`PauseOutcome::publishable`] is `None` here whenever the pause did
-    /// not *happen* on this call: a sandbox already paused, or a concurrent
-    /// pause this one joined. That is not this path failing to produce a
-    /// capture. The capture belongs to the pause that made it and is long gone,
-    /// and `None` says exactly that to a caller that reads it as "nothing to
-    /// publish" — which is the reading the wire has always documented.
+    /// Pauses and returns the capture to the caller without local publication.
     pub async fn pause_sandbox_for_publication(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
@@ -2092,9 +1657,7 @@ where
                         .join_concurrent_pause(sandbox_id)
                         .await
                         .map(PauseOutcome::nothing_to_publish),
-                    // Already paused: idempotent success. The capture belongs to
-                    // the pause that produced it and is long gone, so there is
-                    // nothing left to publish here.
+                    // An already-completed pause has no new capture to return.
                     SandboxState::Paused => match self.store.get(&sandbox_id).await? {
                         Some(metadata) => Ok(PauseOutcome::nothing_to_publish(metadata)),
                         None => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
@@ -2163,17 +1726,7 @@ where
             }
         };
 
-        // The authoritative execution for this sandbox, read now that this
-        // call exclusively holds it in `Pausing`. Nothing else can move the
-        // execution id while that holds — the only op that does is a resume,
-        // and a resume requires `Paused`, not `Pausing` — so the detached
-        // handle below is checked against the truth, not a stale local copy.
-        //
-        // Nothing has touched the backend yet at this point (the pinned
-        // image refs and allocated artifact root above are the only side
-        // effects so far), so a failure here gets exactly the same rollback
-        // as the two branches immediately above it: release the refs, put
-        // the record back to `Running`, return.
+        // Read the authoritative execution after exclusively entering `Pausing`.
         let expected_execution_id = match self.store.get(&sandbox_id).await {
             Ok(Some(metadata)) => metadata.execution_id,
             Ok(None) => {
@@ -2202,22 +1755,14 @@ where
             .detach_sandbox_handle_and_route_checked(&sandbox_id, expected_execution_id)
             .await;
 
-        // 🔴 Whether the backend below is this process's own. A handle rebuilt
-        // from the record is built for one operation and is never put into the
-        // running set: that map is what this process is *running*, and a
-        // replica that filed a stub for somebody else's sandbox in it would go
-        // on reporting a sandbox it does not hold, with a backend that goes
-        // stale the moment the sandbox is resumed on another machine.
+        // Adopted backends remain operation-scoped, not locally cached.
         let handle_was_held_here = handle.is_some();
         let handle = match handle {
             Some(handle) => handle,
             None => match self.absent_handle(sandbox_id).await {
-                // The sandbox is running on a machine this half addresses, and
-                // this replica simply is not the one that started it.
+                // This replica adopted the remote runtime for the operation.
                 Ok(AbsentHandle::Adopted(handle)) => handle,
-                // 🔴 The only branch that may still remove the record: this
-                // factory's sandboxes live in this process, so a record with no
-                // handle here describes a runtime that is gone.
+                // Confirmed runtime absence permits record cleanup.
                 Ok(AbsentHandle::RuntimeGone) => {
                     warn!("sandbox handle not found while pausing, removing from store");
                     self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
@@ -2225,17 +1770,13 @@ where
                     self.store.remove(&sandbox_id).await?;
                     return Err(OrchestratorError::SandboxNotFound(sandbox_id));
                 }
-                // Nothing to remove: something else already took the record.
                 Ok(AbsentHandle::NoRecord) => {
                     warn!("sandbox record disappeared while pausing");
                     self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                         .await;
                     return Err(OrchestratorError::SandboxNotFound(sandbox_id));
                 }
-                // 🔴 Not knowing is not a licence to delete. The record stays
-                // exactly as it was and the sandbox goes back to `Running`, so
-                // a retry — on this replica or another — finds the same
-                // sandbox it would have found had this call never happened.
+                // Uncertainty rolls the record back without deletion.
                 Err(error) => {
                     warn!(error = %error, "could not reach the sandbox while pausing; leaving its record alone");
                     self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
@@ -2256,14 +1797,7 @@ where
         };
 
         // Pause the sandbox and capture the paused state for resuming later.
-        //
-        // 🔴 Whether anyone is waiting to commit a publishable capture is asked
-        // *now*, before the backend is told to make one. A backend that has to
-        // write durable bytes to produce one — which is every backend driving a
-        // sandbox on another machine — would otherwise write them for a
-        // publisher that is about to drop the capture, and unannounced bytes
-        // are unreachable by every read path there is. See
-        // [`PausedSandboxPublisher::wants_publishable_capture`].
+        // Ask before capture whether anyone will attempt publication.
         let committer_waiting = match publication {
             PausePublication::ByCaller => true,
             PausePublication::Here => self
@@ -2332,10 +1866,7 @@ where
                 .await?
                 .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
             metadata.state = SandboxState::Paused;
-            // 🔴 Before `persist_paused` below, not after. The persisted copy
-            // is what a restarted node reads back, and `running_since` is not
-            // serialised — so a run charged only into the in-memory record
-            // would be given back for free by the next node restart.
+            // Charge running time before persisting the paused record.
             metadata.sync_running_clock(SystemTime::now());
             metadata.paused_state = Some(paused_state.clone());
             metadata
@@ -2408,9 +1939,7 @@ where
         );
         info!("sandbox paused");
 
-        // The sandbox is already paused and locally resumable, so this runs
-        // after the point of no return on purpose: it can only add cross-node
-        // recovery, never take the pause away.
+        // Publication is best-effort after the sandbox is locally resumable.
         let outcome = PauseOutcome {
             metadata: paused_metadata,
             publishable,
@@ -2420,68 +1949,22 @@ where
             PausePublication::Here => {
                 let metadata = outcome.metadata.clone();
                 self.publish_paused_sandbox(sandbox_id, outcome).await;
-                // 🔴 Emptied on the way out rather than left populated. This arm
-                // has already handed the capture to the publisher; a caller
-                // finding one here would be looking at a capture that has been
-                // consumed, and the only thing it could do with it is publish it
-                // a second time.
+                // The capture has already been handed to the local publisher.
                 Ok(PauseOutcome::nothing_to_publish(metadata))
             }
-            // 🔴 No publisher call at all, not even a best-effort one. The
-            // caller is the process that will commit, and this machine offering
-            // the same capture to its own publisher as well is how one pause
-            // comes to write two rows.
+            // Caller publication must not also invoke the local publisher.
             PausePublication::ByCaller => Ok(outcome),
         }
     }
 
-    /// Where this resume gets the runtime state it has to reopen.
-    ///
-    /// # 🔴 Not `SandboxMetadata::paused_state`, and the field is why
-    ///
-    /// That field is `#[serde(skip)]`. It survives inside the process that
-    /// captured it and comes back `None` from any store that writes a record
-    /// out and reads it in — which is every store the API half runs on. Read
-    /// through `get`, the resulting `None` says two opposite things at once:
-    /// *this sandbox was never paused*, and *this store cannot hand out
-    /// handles, the bytes are on another machine*. Answering the second with
-    /// the first is a 500 on every resume, describing a state the sandbox is
-    /// not in.
-    ///
-    /// [`MetadataStore::paused_handle`] is asked instead, and it has the three
-    /// answers the question has.
-    ///
-    /// # 🔴 Four ways this can end, and no two of them license the same move
-    ///
-    /// - the store could not be reached — [`OrchestratorError::StoreOperationFailed`],
-    ///   and the right move is to ask again;
-    /// - there is no record at all — [`OrchestratorError::SandboxNotFound`],
-    ///   which the resume surface acts on by rebuilding the sandbox from the
-    ///   cluster's published snapshot;
-    /// - there is a record and it carries no capture — the sandbox cannot be
-    ///   reopened from this record, and saying so is not the same as saying
-    ///   there is no record;
-    /// - there is a reference and this process cannot decode it — the bytes are
-    ///   somewhere, and this build is not the one that can reach them.
-    ///
-    /// The last two are both internal failures and are deliberately not one
-    /// message: the first is a record that lost its capture, the second is a
-    /// factory that does not understand a capture that is still there.
+    /// Resolves local or remote paused runtime state without conflating absence and error.
     async fn paused_state_for_resume(
         &self,
         sandbox_id: SandboxId,
     ) -> Result<Arc<dyn PausedSandboxState>> {
         match self.store.paused_handle(&sandbox_id).await? {
-            // The store kept the handle in this process; it is already the
-            // thing the factory wants.
             PausedHandle::Local(state) => Ok(state),
-            // 🔴 Decoded by *this* factory, which is the seam that makes the
-            // reference mean something: on a node it turns back into local
-            // paths, and on the API half it turns into the machine and the run
-            // a `Resume` is addressed to. `artifact_root` is whatever the
-            // record carried — both in-tree factories read the location out of
-            // the encoded state itself and ignore the argument — so an absent
-            // one is passed on as such rather than refused.
+            // Decode remote state through this role's backend factory.
             PausedHandle::Remote {
                 reference,
                 origin_node_id,
@@ -2521,12 +2004,7 @@ where
     /// duplicating the work. On success the sandbox is ready for use when this
     /// method returns.
     ///
-    /// 🔴 The [`ClaimedExecution`] is the resume's licence, not a parameter of
-    /// convenience: the only way to obtain one is the resume arbitration, so
-    /// every path that reaches this function — the REST resume, the cross-node
-    /// rebuild, and the data-plane auto-resume — has been through that one
-    /// decision point. Taking it by value is what makes one claim start one
-    /// sandbox.
+    /// Consumes one granted claim token to start one resumed execution.
     pub async fn resume_sandbox(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
@@ -2592,12 +2070,7 @@ where
             });
         }
 
-        // 🔴 Before the sandbox is moved to `Resuming`, and that ordering is the
-        // whole of the fix. Read afterwards, a sandbox whose capture cannot be
-        // got at is left sitting in `Resuming` for ever — a transitional state
-        // with no owner, which every later resume, pause and delete waits on
-        // until the wait times out. Read here, the refusal leaves it `Paused`,
-        // which is what it still is.
+        // Resolve paused state before moving the record to `Resuming`.
         let paused_state = self.paused_state_for_resume(sandbox_id).await?;
 
         match self
@@ -2666,24 +2139,8 @@ where
                 metadata.execution_id,
                 metadata.resources,
             );
-            // Tell the cluster the sandbox is live again. Its snapshot stays
-            // behind as the sandbox's durable fallback until the next pause
-            // replaces it.
+            // Mirror the resumed execution, deadline, and real holding node.
             if let Some(publisher) = self.paused_publisher() {
-                // The deadline goes with the write. Reclamation needs one, and
-                // until the first lease renewal the row would otherwise carry
-                // none — a window in which losing this node strands the row
-                // permanently.
-                // 🔴 The incarnation the claim allocated, not a fresh one.
-                // The registry's cross-node branch matches on exactly this
-                // value, so minting here would fail every cross-node resume.
-                //
-                // 🔴 The real machine, read off the backend `launch_sandbox`
-                // just started, not this process's own identity. `None` on
-                // every backend that runs the VM in this same process — the
-                // publisher falls back to its own identity for exactly that
-                // case, mirroring `publish_paused`'s identical fallback for
-                // the paused half of the same question.
                 let holding_node_id = self.sandbox_holding_node_id(&sandbox_id).await;
                 publisher
                     .mark_running(
@@ -2744,13 +2201,7 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
-        // The authoritative execution for this sandbox, read now that this
-        // call exclusively holds it in `Snapshotting`. Nothing else can move
-        // the execution id while that holds, so a cached handle is checked
-        // against the truth, not a stale local copy of it. Nothing has
-        // touched the backend yet at this point, so a failure here rolls
-        // back to `Running` exactly like the "could not reach the sandbox"
-        // branch below it does.
+        // Read authoritative execution after exclusively entering `Snapshotting`.
         let expected_execution_id = match self.store.get(&sandbox_id).await {
             Ok(Some(metadata)) => metadata.execution_id,
             Ok(None) => {
@@ -2771,8 +2222,7 @@ where
             }
         };
 
-        // Get the sandbox handle, discarding it first if a pause+resume this
-        // replica never observed has already superseded it.
+        // Discard cached handles superseded by another execution.
         let handle = self
             .cached_handle_for_execution(sandbox_id, expected_execution_id)
             .await;
@@ -2780,9 +2230,7 @@ where
             Some(handle) => handle,
             None => match self.absent_handle(sandbox_id).await {
                 Ok(AbsentHandle::Adopted(handle)) => handle,
-                // 🔴 See the matching branch in `pause_sandbox_inner`: this is
-                // the only reading of a missing handle that means the sandbox
-                // is gone, and so the only one that may take the record.
+                // Only confirmed runtime absence authorizes record cleanup.
                 Ok(AbsentHandle::RuntimeGone) => {
                     warn!("sandbox handle not found while snapshotting, removing from store");
                     self.detach_sandbox_handle_and_route(&sandbox_id).await;
@@ -2905,12 +2353,7 @@ where
             });
         }
 
-        // As in `fork_sandbox_inner`: on a replicated deciding half the handle
-        // usually lives on another replica, and that is not a conflict — nor
-        // is a handle this replica does hold but whose execution
-        // `metadata.execution_id` above has already superseded;
-        // `cached_handle_for_execution` discards that one exactly as if it
-        // had never been here.
+        // Rebuild missing or superseded cached handles from the record.
         let sandbox = self
             .cached_handle_for_execution(sandbox_id, metadata.execution_id)
             .await;
@@ -2993,9 +2436,7 @@ where
             });
         }
 
-        // A handle this replica holds but whose execution `metadata.execution_id`
-        // above has already superseded is discarded exactly as if it had
-        // never been cached — see `cached_handle_for_execution`.
+        // Discard cached handles superseded by the authoritative execution.
         let sandbox = self
             .cached_handle_for_execution(sandbox_id, metadata.execution_id)
             .await;
@@ -3042,17 +2483,7 @@ where
         Ok(new_params)
     }
 
-    /// Assigns an already-approved custom extension params value to a
-    /// running sandbox, with no hook involved.
-    ///
-    /// The node-reachable half of
-    /// [`patch_sandbox_custom_extension_params`](Self::patch_sandbox_custom_extension_params):
-    /// the deciding half runs the patch-params hook and then calls this to
-    /// apply what the hook approved; a node's `update_params` RPC handler
-    /// calls this directly, because by the time a request reaches it the hook
-    /// has already run once, on the caller's side, and running it again would
-    /// be a second chance for the extension to change its mind about a value
-    /// the caller has already recorded.
+    /// Applies already-approved custom extension parameters without invoking hooks.
     pub async fn replace_sandbox_custom_extension_params(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
@@ -3088,9 +2519,7 @@ where
             });
         }
 
-        // A handle this replica holds but whose execution `metadata.execution_id`
-        // above has already superseded is discarded exactly as if it had
-        // never been cached — see `cached_handle_for_execution`.
+        // Discard cached handles superseded by the authoritative execution.
         let sandbox = self
             .cached_handle_for_execution(sandbox_id, metadata.execution_id)
             .await;
@@ -3114,16 +2543,7 @@ where
             .await
     }
 
-    /// The assign-then-persist tail shared by
-    /// [`patch_sandbox_custom_extension_params_inner`](Self::patch_sandbox_custom_extension_params_inner)
-    /// and
-    /// [`replace_sandbox_custom_extension_params_inner`](Self::replace_sandbox_custom_extension_params_inner).
-    ///
-    /// The backend assignment is tried first and its failure is returned
-    /// without touching the metadata store: a caller that gets `Err` here
-    /// must not also see `GET` report a value the running sandbox never
-    /// received — the store staying stale on failure is the point, not a
-    /// side effect.
+    /// Applies extension parameters to the backend before persisting them.
     async fn apply_custom_extension_params(
         &self,
         sandbox_id: SandboxId,
@@ -3184,12 +2604,7 @@ where
         Ok(metrics)
     }
 
-    /// How many times this orchestrator has thrown away a process-local
-    /// sandbox handle because its execution no longer matched the
-    /// authoritative metadata record — see
-    /// [`OrchestratorCounters::record_stale_handle_discarded`] for what that
-    /// means and why every store read used to investigate one shows nothing
-    /// wrong.
+    /// Number of cached handles discarded after execution supersession.
     pub fn stale_handle_discards(&self) -> u64 {
         self.counters.stale_handles_discarded()
     }
@@ -3350,9 +2765,7 @@ where
             return Ok(Vec::new());
         }
 
-        // Bounded, not `list_expired` (unbounded) — see
-        // `AUTO_EVICT_BATCH_LIMIT`'s own doc for why a capped round is
-        // still guaranteed to make progress on the whole backlog.
+        // Process a bounded oldest-first eviction batch.
         let expired = self
             .store
             .expired_batch(SystemTime::now(), AUTO_EVICT_BATCH_LIMIT)
@@ -3364,9 +2777,7 @@ where
                 continue;
             }
             if let Err(err) = match metadata.timeout_action {
-                // Publishing happens inside the pause, so an expired sandbox is
-                // just as recoverable from another node as an explicitly paused
-                // one — which matters more here, not less: nobody is watching.
+                // Auto-pauses publish recovery state like explicit pauses.
                 SandboxTimeoutAction::Pause => self
                     .pause_sandbox_inner(metadata.id, PausePublication::Here)
                     .await
@@ -3472,36 +2883,13 @@ where
         });
     }
 
-    /// Puts this orchestrator's own record of a sandbox onto the create that
-    /// is about to be sent to the machine that will run it.
-    ///
-    /// # 🔴 Why here and not at the API surface
-    ///
-    /// The marker is the control plane's record of *this* sandbox, and a
-    /// record is only complete once the incarnation is minted — which happens
-    /// in [`LaunchPlan::for_create_from_snapshot`], below the surface that
-    /// decided to create anything. A marker written earlier would name a run
-    /// that had not been chosen yet, and fencing compares exactly that value.
-    ///
-    /// # 🔴 Why it is a no-op almost everywhere
-    ///
-    /// Only a factory whose sandboxes run on other machines asks for one
-    /// ([`SandboxBackendFactory::stamps_control_plane_ownership`]), so on
-    /// `aenv-node` this returns on its first line. That is
-    /// the property that keeps `None` meaning what it has always meant on the
-    /// user-facing REST surface: not that a marker went missing, but that no
-    /// control plane owns this sandbox.
-    ///
-    /// A caller that supplied its own marker keeps it: that is the node
-    /// service's create, where the marker arrived from the control plane and
-    /// this process is not it.
+    /// Stamps complete create metadata as the node's opaque ownership marker.
     fn stamp_control_plane_ownership(&self, plan: &mut LaunchPlan) {
         if !self.factory.stamps_control_plane_ownership() {
             return;
         }
         let LaunchPlan::Create(plan) = plan else {
-            // A resume drives a sandbox that already exists, and its marker was
-            // written when it was created.
+            // Resumes retain the marker assigned at creation.
             return;
         };
         if plan.metadata.control_plane_config.is_none() {
@@ -3518,8 +2906,7 @@ where
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
 
-        // Before the record is written and before the backend is built: both
-        // of those consume the marker, and they must consume the same one.
+        // Stamp before both record persistence and backend construction.
         let mut plan = plan;
         self.stamp_control_plane_ownership(&mut plan);
         let plan = plan;
@@ -3585,11 +2972,7 @@ where
         let transitional_metadata = plan.transitional_metadata().map(|metadata| {
             let mut metadata = metadata.clone();
             metadata.resources = runtime_resources;
-            // 🔴 Only ever `Some` for a backend that did not know its own
-            // sandbox's context and image configs until it started — see
-            // `SandboxRuntimeInfo::resolved_image_facts`. Every other backend
-            // already wrote the right values into `transitional_metadata`
-            // before this point, and leaves this `None`.
+            // Remote backends fill resolution facts after start.
             if let Some(facts) = runtime_info.resolved_image_facts.clone() {
                 metadata.context = facts.context;
                 metadata.image_configs = facts.image_configs;
@@ -3658,9 +3041,7 @@ where
                 std::slice::from_ref(&transitional_state),
                 move |metadata| {
                     metadata.resources = runtime_resources;
-                    // A resume starts from the record the pause left behind,
-                    // which names the run that produced it. This is where the
-                    // record starts naming the run that is about to serve it.
+                    // Resume completion installs the claim's execution id.
                     metadata.execution_id = launch_execution_id;
                     metadata.state = SandboxState::Running;
                     metadata.update_timeout(launch_timeout);
@@ -3792,38 +3173,7 @@ where
             .await;
     }
 
-    /// The half of a launch rollback that survives losing the id.
-    ///
-    /// # 🔴 Why this is not simply the rollback above
-    ///
-    /// When [`detach_launch_runtime_if_current`](Self::detach_launch_runtime_if_current)
-    /// refuses, everything this node keys by sandbox id — the handle, the proxy
-    /// route, the `StartingSandbox` image pin — describes the *replacement*
-    /// launch, and touching any of it would tear down a sandbox somebody else
-    /// is still building. That refusal is correct and stays.
-    ///
-    /// The record is the one thing that is not merely keyed by the id: it is
-    /// stamped with the incarnation that wrote it. So this launch can ask for
-    /// its own record back without being able to touch a replacement's, and
-    /// [`MetadataStore::remove_if_execution`] is where that question is decided
-    /// atomically.
-    ///
-    /// # 🔴 Why it may not be skipped
-    ///
-    /// A create's record is written in `Creating`, and the state machine has no
-    /// edge from `Creating` to `Killing` (`creating_has_no_direct_edge_to_killing`).
-    /// A delete therefore waits for `Creating` to end and gives up with
-    /// `invalid state Creating` — so a create that stops the VM and leaves its
-    /// own record behind leaves one no API call can ever remove. That is the
-    /// record an operator had to delete out of Redis by hand.
-    ///
-    /// A resume is deliberately *not* rescued here. Its record predates the
-    /// launch and belongs to the sandbox rather than to this attempt, its
-    /// rollback is a state change back to `Paused` rather than a removal, and
-    /// the rest of that rollback (the persister's `rollback_resuming`, the
-    /// image pin) is keyed by sandbox id and so is exactly what the refusal
-    /// above is protecting. Answering that needs a fenced state write, not a
-    /// fenced removal.
+    /// Reclaims only the failed launch's own fenced record after its handle was superseded.
     async fn reclaim_superseded_launch_record(
         &self,
         plan: &LaunchPlan,
@@ -3926,12 +3276,7 @@ where
         };
 
         if !Arc::ptr_eq(current_handle, handle) {
-            // 🔴 Names what is being given up, not only that something was.
-            // Everything below is keyed by sandbox id and now describes the
-            // replacement, so none of it may be undone from here; the record
-            // is handled separately, by
-            // [`reclaim_superseded_launch_record`](Self::reclaim_superseded_launch_record),
-            // because it names the incarnation that wrote it.
+            // Runtime cleanup stops when the handle now belongs to a replacement.
             warn!(
                 stage = ?stage,
                 "sandbox handle was replaced during failed launch cleanup; \
@@ -4028,8 +3373,7 @@ where
         let Some(route) = route else {
             return;
         };
-        // Restoring a route puts back the incarnation it was published under:
-        // this path exists for operations that never started a new run.
+        // Restore the route under its original execution.
         self.upsert_proxy_route(sandbox_id, route.target().clone(), route.execution_id())
             .await;
     }
@@ -4052,23 +3396,7 @@ where
         (handle, removed_route)
     }
 
-    /// Logs and counts the one event this half of the fix exists to make
-    /// visible: a handle this process cached is being thrown away because it
-    /// no longer names the run the metadata store says is authoritative.
-    ///
-    /// # 🔴 Why this can happen with every stored record agreeing
-    ///
-    /// A replicated deciding half's handle table is not part of the record
-    /// it caches a stub for. Pause a sandbox on replica B, resume it (also on
-    /// B, or on any replica) — PG, Redis and the node all move to the new
-    /// execution together — and replica A, which never fielded either call,
-    /// still holds the [`RemoteSandboxStub`](crate::node_client::stub) it
-    /// built when *it* created the sandbox, fenced to the run that no longer
-    /// exists. Every store read anyone runs to investigate this will show
-    /// three consistent records and nothing wrong at all; the only place the
-    /// stale value lives is this table, in this process's memory, which is
-    /// exactly why this warning (and the counter behind it) has to exist —
-    /// nothing else will ever say so.
+    /// Logs and counts cached handles discarded after execution supersession.
     fn note_stale_handle_discarded(
         &self,
         sandbox_id: SandboxId,
@@ -4087,31 +3415,8 @@ where
         self.counters.record_stale_handle_discarded();
     }
 
-    /// Looks up the process-local handle for `sandbox_id` without removing
-    /// it, discarding it first if it is stale.
-    ///
-    /// A handle is trusted only when [`SandboxBackend::execution_id`] equals
-    /// `expected_execution_id` — a value the caller must already have read
-    /// from (or established atomically via) the metadata store, since that
-    /// store, not this table, is what "authoritative" means here. A match
-    /// returns the handle untouched, still filed in the table, for callers
-    /// that go on serving the sandbox from it afterwards (a fork's source, an
-    /// in-place network-policy or custom-extension-params update, a running
-    /// snapshot capture).
-    ///
-    /// A mismatch means this table is holding a fencing token for a run the
-    /// authoritative record has already moved past — seconds or days out of
-    /// date, there is no way to tell from here — and handing it to the node
-    /// would only earn a `superseded` refusal no retry on this replica could
-    /// ever clear. The stale entry is removed (only if it is still exactly
-    /// the entry just read — a concurrent operation may have already
-    /// replaced it with something newer, which must not be clobbered) along
-    /// with its paired proxy route when that route was published under the
-    /// same stale execution, logged and counted via
-    /// [`note_stale_handle_discarded`](Self::note_stale_handle_discarded),
-    /// and `None` is returned — exactly what a caller sees when nothing was
-    /// ever cached, so every call site already knows how to fall through to
-    /// [`absent_handle`](Self::absent_handle) from here.
+    /// Returns a cached handle only when it matches the authoritative execution.
+    /// Stale entries and matching routes are discarded before returning `None`.
     async fn cached_handle_for_execution(
         &self,
         sandbox_id: SandboxId,
@@ -4151,24 +3456,7 @@ where
         None
     }
 
-    /// [`detach_sandbox_handle_and_route`](Self::detach_sandbox_handle_and_route),
-    /// with the same staleness check as
-    /// [`cached_handle_for_execution`](Self::cached_handle_for_execution)
-    /// applied to whatever it detached.
-    ///
-    /// For callers — pause, delete — that always take the handle out of the
-    /// table up front and decide afterwards whether they end up driving it or
-    /// an adopted replacement. A detached handle that turns out to be stale
-    /// is reported exactly like [`cached_handle_for_execution`] and then
-    /// dropped from the return value entirely: the caller sees `(None, _)`,
-    /// identical to what it would have seen had the table never held an
-    /// entry for this sandbox, and its existing "fall through to
-    /// `absent_handle`" branch takes care of the rest. The paired route comes
-    /// back untouched unless it was published under the same stale
-    /// execution — routes and handles are always written together, so this
-    /// should be the only case in practice, but a route under some other
-    /// execution is left for the caller to decide about rather than guessed
-    /// away here.
+    /// Detaches a handle and route, discarding a handle stale against the expected execution.
     async fn detach_sandbox_handle_and_route_checked(
         &self,
         sandbox_id: &SandboxId,
@@ -4197,14 +3485,7 @@ where
         const MAX_SHUTDOWN_PASSES: usize = 3;
         let mut last_failures = Vec::new();
 
-        // 🔴 Nothing to preserve when the VMs are not this process's.
-        //
-        // The loop below reads every non-paused record in the store and pauses
-        // it, which is what a machine about to stop running VMs owes the
-        // sandboxes on it. A replicated deciding half's store is the *cluster's*
-        // ledger, so the same loop there pauses — or, before the handle-absence
-        // reading was fixed, deleted the records of — every running sandbox in
-        // the cluster, once per replica rolled.
+        // Remote sandboxes outlive this process and are not paused during shutdown.
         if self.factory.sandboxes_outlive_this_process() {
             info!(
                 "this process runs no sandboxes of its own; leaving the recorded sandboxes to \
@@ -4289,10 +3570,7 @@ where
             )));
         }
 
-        // Whatever the factory set up process-wide for the sandboxes it
-        // builds — on the Firecracker backend, the host network slots — is the
-        // factory's to take down. See
-        // [`SandboxBackendFactory::release_process_wide_resources`].
+        // The backend factory releases its process-wide resources.
         self.factory.release_process_wide_resources();
 
         info!("orchestrator shutdown completed");
@@ -4312,14 +3590,12 @@ where
         Ok(())
     }
 
-    /// Whether this node currently refuses to take on new sandboxes.
+    /// Whether this node refuses new placements.
     pub fn scheduling_disabled(&self) -> bool {
         self.scheduling_disabled.load(Ordering::Acquire)
     }
 
-    /// Isolates this node, or puts it back in rotation. Reports whether the
-    /// call changed anything, so callers can stay idempotent without having to
-    /// read first.
+    /// Changes isolation and reports whether the value changed.
     pub fn set_scheduling_disabled(&self, disabled: bool) -> bool {
         if self.scheduling_disabled.swap(disabled, Ordering::AcqRel) == disabled {
             return false;
@@ -4339,7 +3615,7 @@ where
         true
     }
 
-    /// When isolation last changed, or `None` if it never has.
+    /// Last isolation change, or `None`.
     pub fn scheduling_disabled_changed_at_ms(&self) -> Option<i64> {
         match self
             .scheduling_disabled_changed_at_ms
@@ -4350,13 +3626,7 @@ where
         }
     }
 
-    /// Guards the paths that would put a new sandbox on this node.
-    ///
-    /// Deliberately *not* used by paths that act on sandboxes already here —
-    /// keep-alive, snapshot, pause, delete — nor by `launch_sandbox`, which
-    /// resume shares: a node that is merely isolated must still be able to
-    /// bring back a sandbox it alone can recover (see the resume gate in the
-    /// API layer, which decides that question where the answer is known).
+    /// Guards only paths that place new sandboxes on this node.
     fn ensure_accepting_new_work(&self) -> Result<()> {
         self.ensure_accepting_lifecycle_operations()?;
 
@@ -4450,11 +3720,7 @@ where
         Ok(())
     }
 
-    /// Drops this process's handle for a sandbox, leaving its record alone.
-    ///
-    /// What a replica that never started the sandbox looks like from the
-    /// inside, and the only way to produce that shape without standing up a
-    /// second replica.
+    /// Test helper that drops a process-local handle without removing its record.
     pub async fn forget_sandbox_handle_for_test(&self, sandbox_id: &SandboxId) -> bool {
         self.sandboxes.write().await.remove(sandbox_id).is_some()
     }
@@ -4463,11 +3729,7 @@ where
         let _ = self.proxy_routes.write().await.remove(sandbox_id);
     }
 
-    /// The incarnation the live backend was built with.
-    ///
-    /// 🔴 Read off the backend, not the store. Asserting against the store
-    /// would only prove that the value written there is the value written
-    /// there; this proves the VM was actually started under it.
+    /// Returns the incarnation built into the live backend.
     pub async fn backend_execution_id_for_test(
         &self,
         sandbox_id: &SandboxId,
@@ -4477,8 +3739,7 @@ where
         Some(backend.execution_id())
     }
 
-    /// Seeds a running sandbox whose live incarnation is a chosen value, so the
-    /// data plane's ordered comparison can be driven from both sides.
+    /// Seeds a live backend with a chosen execution for ordered-comparison tests.
     pub async fn set_live_execution_for_test(
         &self,
         sandbox_id: SandboxId,
@@ -4497,15 +3758,7 @@ where
     }
 }
 
-/// Everything a create from a committed snapshot needs beyond the catalog row.
-///
-/// 🔴 A struct rather than ten arguments because it has exactly two callers
-/// and they must not drift: `SandboxLaunchSource::Snapshot` and
-/// `SandboxLaunchSource::SnapshotRecord` differ only in whether this process
-/// resolved the row into local bytes, and everything the sandbox's record says
-/// about itself has to come out the same either way. Adding a field here is
-/// a compile error in both arms; adding one to a per-arm struct literal would
-/// have been a silent divergence in one.
+/// Shared inputs for resolved and unresolved committed-snapshot creates.
 struct SnapshotCreateInputs {
     sandbox_id: SandboxId,
     envd_access_token: Option<EnvdAccessToken>,
@@ -4524,12 +3777,7 @@ struct SnapshotCreateParts {
     transitional_metadata: SandboxMetadata,
 }
 
-/// Turns one committed snapshot's catalog row into the launch config and
-/// transitional record a create from it starts with.
-///
-/// Reads nothing but the row: every value here comes from `record` or from the
-/// caller's request, which is what lets the unresolved arm produce the same
-/// record as the resolved one.
+/// Builds launch config and transitional metadata directly from a committed row.
 fn snapshot_create_parts(
     record: &crate::snapshot::SnapshotRecord,
     inputs: SnapshotCreateInputs,
@@ -4547,12 +3795,7 @@ fn snapshot_create_parts(
         control_plane_config,
     } = inputs;
 
-    // 🔴 Refused rather than unwrapped. `RunnableSnapshot::committed` may
-    // `expect` here because resolving a row without a committed payload fails
-    // before a `RunnableSnapshot` exists; this function is also reached with a
-    // row nothing has resolved, so the same absence has to be an answer rather
-    // than a panic — and a 400, because a caller naming a template that is
-    // still building is a caller asking for something that cannot be built.
+    // Uncommitted catalog rows are invalid requests, not panics.
     let Some(committed) = record.committed.as_ref() else {
         return Err(OrchestratorError::InvalidRequest(format!(
             "snapshot {} is not ready to launch from: it has no committed artifacts",
@@ -4573,10 +3816,7 @@ fn snapshot_create_parts(
     if !launch_image_configs.is_empty() {
         extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
     };
-    // Effective custom config: a launch-provided value overrides the
-    // one persisted in the source snapshot; otherwise inherit it.
-    // Store the effective value so publishing a snapshot from this
-    // sandbox keeps the inherited config instead of dropping it.
+    // Launch params override snapshot params; otherwise inherit them.
     let effective_custom_extension_params =
         custom_extension_params.or_else(|| committed.custom_extension_params.clone());
     let launch_config = SandboxLaunchConfig {
@@ -4587,8 +3827,7 @@ fn snapshot_create_parts(
         extra_mmds,
         custom_extension_params: effective_custom_extension_params.clone(),
         envd_access_token,
-        // Filled in by `stamp_control_plane_ownership` once the
-        // record this marker encodes is complete; see there.
+        // Stamped after the encoded record is complete.
         control_plane_config: None,
     };
 

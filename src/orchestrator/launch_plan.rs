@@ -10,77 +10,27 @@ use crate::sandbox::{
 use crate::snapshot::SnapshotRecord;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-/// A resume claim that has been granted, carrying the incarnation the claim
-/// allocated for it.
-///
-/// 🔴 The field is private and there is no `Default` and no `Clone`, so the
-/// only way to obtain one is [`ClaimedExecution::from_claim`] — which is called
-/// on the resume-arbitration path and nowhere else — and one token starts
-/// exactly one sandbox, because [`LaunchPlan::for_resume`] takes it by value.
-///
-/// This is what keeps "holding a `LaunchPlan` means exactly one new incarnation
-/// was minted for it" a property of the type system after the mint point moved
-/// out of `for_resume` and into the claim. A caller cannot hand `for_resume` a
-/// stale incarnation, because it cannot build a value `for_resume` accepts
-/// without going through a claim first.
+/// A granted resume claim carrying the incarnation allocated by arbitration.
 #[derive(Debug)]
 pub struct ClaimedExecution(ExecutionId);
 
 impl ClaimedExecution {
-    /// Mints the token for a resume decision that has just been made.
-    ///
-    /// 🔴 Call this from the resume arbitration and nowhere else. Both resume
-    /// paths — the cluster claim, and the local decision taken when no registry
-    /// has a say — go through that one point on purpose: a second mint site is
-    /// a second way for a resume to start without anybody deciding it may.
+    /// Mints a token only after resume arbitration grants the claim.
     pub fn from_claim(execution_id: ExecutionId) -> Self {
         Self(execution_id)
     }
 
-    /// Adopts the incarnation an orchestrator in **another process** already
-    /// claimed for this resume.
-    ///
-    /// # 🔴 Not a second mint site, and the distinction is the whole argument
-    ///
-    /// [`from_claim`](Self::from_claim) mints: it turns a decision into an
-    /// incarnation nobody had before. This one mints nothing. It is called on
-    /// the node service, by a machine executing a resume that the orchestrator
-    /// which *owns* the sandbox has already decided on and already written into
-    /// its own record — the same relationship `LaunchPlan::for_create_from_*`'s
-    /// `run_as` argument has with a create.
-    ///
-    /// So "every resume went through an arbitration" stays true; what changes
-    /// is that the arbitration and the machine are no longer the same process.
-    /// The alternative is worse than it looks: a node that minted its own would
-    /// bring the sandbox back under a run the cluster's record of it does not
-    /// name, and fencing — which compares exactly that value — would then
-    /// refuse every command the owner sent about the sandbox it just started.
-    ///
-    /// 🔴 One call site, guarded by
-    /// `the_adopted_claim_token_is_only_taken_where_a_remote_claim_arrives`
-    /// below.
+    /// Adopts an incarnation already claimed by an orchestrator in another process.
     pub fn adopted_from_remote_claim(execution_id: ExecutionId) -> Self {
         Self(execution_id)
     }
 
-    /// A token for tests that drive [`Orchestrator::resume_sandbox`] directly.
-    ///
-    /// 🔴 Never callable from production code, and that is enforced rather
-    /// than asked for: `the_test_only_claim_token_is_never_minted_in_production`
-    /// below fails the build if the name appears anywhere in `src/` outside
-    /// this file. It exists because integration tests live outside the crate
-    /// and so cannot see [`from_claim`](Self::from_claim), which is
-    /// `pub(crate)` precisely so that production code cannot mint a claim
-    /// outside the arbitration.
+    /// Test-only claim token for integration tests.
     pub fn minted_for_test() -> Self {
         Self(ExecutionId::new())
     }
 
-    /// The incarnation this claim allocated.
-    ///
-    /// 🔴 Read it to report the claim, never to re-mint: the value the registry
-    /// wrote alongside `claimed_by_node_id` is the one `mark_running` has to
-    /// quote, and a freshly minted one matches no predicate on the other side.
+    /// Returns the incarnation allocated by this claim.
     pub fn execution_id(&self) -> ExecutionId {
         self.0
     }
@@ -88,10 +38,7 @@ impl ClaimedExecution {
 
 pub struct CreateLaunchPlan {
     pub sandbox_id: SandboxId,
-    /// 🔴 Private: a struct literal with a private field cannot be written
-    /// outside this module, so the `for_*` constructors below are the only way
-    /// to build a plan, and each of them accounts for exactly one
-    /// incarnation.
+    // Private so plans can only be built through incarnation-accounting constructors.
     execution_id: ExecutionId,
     pub source: CreateLaunchSource,
     pub launch_config: SandboxLaunchConfig,
@@ -103,23 +50,14 @@ pub enum CreateLaunchSource {
     Snapshot {
         snapshot: Box<RunnableSnapshot>,
     },
-    /// See `SandboxLaunchSource::SnapshotRecord` for why this is not folded
-    /// into `Snapshot`: `build_sandbox` routes it to
-    /// `SandboxBackendFactory::build_from_snapshot_record` rather than
-    /// `build_from_snapshot`, because the two carry different information (a
-    /// catalog row versus a row plus the local bytes resolving it produced)
-    /// for two different kinds of factory.
+    /// A catalog snapshot resolved by the node-side factory.
     SnapshotRecord {
         record: Box<SnapshotRecord>,
     },
     Fresh {
         build_spec: Box<FreshSandboxBuildSpec>,
     },
-    /// See `SandboxLaunchSource::UnresolvedImage` for why this is not folded
-    /// into `Fresh`: `build_sandbox` routes it to
-    /// `SandboxBackendFactory::build_from_image_ref` rather than `build`,
-    /// because the two carry different information (a reference versus an
-    /// already-resolved local path) for two different kinds of factory.
+    /// An image reference resolved by the node-side factory.
     UnresolvedImage {
         build_spec: Box<UnresolvedImageBuildSpec>,
     },
@@ -127,8 +65,7 @@ pub enum CreateLaunchSource {
 
 pub struct ResumeLaunchPlan {
     pub sandbox_id: SandboxId,
-    /// Private for the same reason as on [`CreateLaunchPlan`]; the value comes
-    /// from the [`ClaimedExecution`] this plan consumed.
+    // Sourced from the consumed claim token.
     execution_id: ExecutionId,
     pub paused_state: Arc<dyn PausedSandboxState>,
     pub timeout: NewTimeout,
@@ -142,22 +79,7 @@ pub enum LaunchPlan {
 }
 
 impl LaunchPlan {
-    /// Builds the plan for a create.
-    ///
-    /// # 🔴 `run_as`, and why it is not a second mint site
-    ///
-    /// `None` mints here, which is what every user-facing create does. `Some`
-    /// runs under an incarnation the caller already minted, and there is
-    /// exactly one caller that may do that: a node executing a create on behalf
-    /// of the orchestrator that owns the sandbox. In the split, that
-    /// orchestrator is a different process — but it is still *the* orchestrator,
-    /// it minted the incarnation in this same constructor, and it has already
-    /// written that value into its own record of the sandbox.
-    ///
-    /// The alternative is worse than it looks: if the node minted its own, the
-    /// two records of one sandbox would name two different runs, and fencing —
-    /// which compares exactly that value — would refuse writes from the sandbox
-    /// that is actually running.
+    /// Builds a create plan, minting an incarnation unless `run_as` supplies one.
     pub fn for_create_from_snapshot(
         sandbox_id: SandboxId,
         snapshot: Box<RunnableSnapshot>,
@@ -166,13 +88,9 @@ impl LaunchPlan {
         timeout: NewTimeout,
         run_as: Option<ExecutionId>,
     ) -> Self {
-        // Creating from a snapshot is a create, not a resume. The backend below
-        // it boots through `LaunchMode::Resume`, which is why the decision is
-        // taken on the plan variant here and never on the launch mode or the
-        // hook kind further down.
+        // Snapshot-based construction is still a create, not a resume.
         let execution_id = run_as.unwrap_or_else(ExecutionId::new);
-        // Stamped onto the record here rather than at the call site so the two
-        // cannot drift: the plan and the metadata it carries name one run.
+        // Keep plan and metadata on the same incarnation.
         metadata.execution_id = execution_id;
         Self::Create(Box::new(CreateLaunchPlan {
             sandbox_id,
@@ -184,8 +102,7 @@ impl LaunchPlan {
         }))
     }
 
-    /// The unresolved counterpart of [`Self::for_create_from_snapshot`]; see
-    /// [`CreateLaunchSource::SnapshotRecord`].
+    /// Builds the unresolved counterpart of [`Self::for_create_from_snapshot`].
     pub fn for_create_from_snapshot_record(
         sandbox_id: SandboxId,
         record: Box<SnapshotRecord>,
@@ -228,8 +145,7 @@ impl LaunchPlan {
         }))
     }
 
-    /// The unresolved-image counterpart of [`Self::for_create_fresh`]; see
-    /// [`CreateLaunchSource::UnresolvedImage`].
+    /// Builds the unresolved counterpart of [`Self::for_create_fresh`].
     pub fn for_create_unresolved_image(
         sandbox_id: SandboxId,
         build_spec: UnresolvedImageBuildSpec,
@@ -252,13 +168,7 @@ impl LaunchPlan {
         }))
     }
 
-    /// Builds the plan for a resume that has already been granted.
-    ///
-    /// 🔴 Takes the claim by value and does not mint anything itself. The
-    /// incarnation was allocated when the claim was taken, in the same write
-    /// that named this node as the claimant, and the resume has to run under
-    /// that one — minting a second one here would leave `mark_running` quoting
-    /// a value the row never had.
+    /// Builds a resume plan using the granted claim's incarnation.
     pub fn for_resume(
         sandbox_id: SandboxId,
         claimed: ClaimedExecution,
@@ -323,25 +233,13 @@ impl LaunchPlan {
 
 #[cfg(test)]
 mod tests {
-    /// 🔴 Guards the one hole in the claim token's story.
-    ///
-    /// `ClaimedExecution::from_claim` is `pub(crate)`, so nothing outside this
-    /// crate can mint a claim — but `minted_for_test` is `pub`, because
-    /// integration tests are outside the crate. This walks `src/` and fails if
-    /// that constructor is ever named anywhere but here, which is what keeps
-    /// "every production resume goes through the arbitration" a fact rather
-    /// than a habit.
     #[test]
     fn the_test_only_claim_token_is_never_minted_in_production() {
         fn visit(dir: &std::path::Path, offenders: &mut Vec<String>) {
             for entry in std::fs::read_dir(dir).expect("src is readable") {
                 let path = entry.expect("readable dir entry").path();
                 if path.is_dir() {
-                    // 🔴 A directory called `tests` is test code wherever it
-                    // sits — a crate's integration-test tree, or the module
-                    // `aenv-node` keeps its moved `aenv-core` tests in. Minting
-                    // the token there is what it is for. This is what the scan
-                    // used to get for free by starting at `src/`.
+                    // Test directories may use the test-only constructor.
                     if path.file_name().and_then(|name| name.to_str()) == Some("tests") {
                         continue;
                     }
@@ -361,9 +259,6 @@ mod tests {
             }
         }
 
-        // 🔴 Both trees. `aenv-node` and `aenv-api` are separate crates now,
-        // and a scan that stopped at this one would pass on a tree where the
-        // offending call had simply moved across the boundary.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut offenders = Vec::new();
         visit(&root.join("src"), &mut offenders);
@@ -376,14 +271,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The adopted claim token is taken where a remote claim arrives, and
-    /// nowhere else.
-    ///
-    /// `adopted_from_remote_claim` is the one constructor that produces a
-    /// licence without deciding anything, so its safety is entirely a property
-    /// of *who calls it*: the node service, acting on a decision another
-    /// process already took and already recorded. A second call site would be a
-    /// resume that started because some code had an `ExecutionId` in hand.
     #[test]
     fn the_adopted_claim_token_is_only_taken_where_a_remote_claim_arrives() {
         const TOKEN: &str = "adopted_from_remote_claim";
@@ -393,9 +280,7 @@ mod tests {
             for entry in std::fs::read_dir(dir).expect("src is readable") {
                 let path = entry.expect("readable dir entry").path();
                 if path.is_dir() {
-                    // 🔴 See the sibling scan: a directory called `tests` is
-                    // test code, and the scan used to exclude it by starting
-                    // at `src/`.
+                    // Test directories may use the test-only constructor.
                     if path.file_name().and_then(|name| name.to_str()) == Some("tests") {
                         continue;
                     }
@@ -415,18 +300,11 @@ mod tests {
             }
         }
 
-        // 🔴 Both trees — see the sibling scan above. The one legitimate call
-        // site lives in `aenv-node` now, so a scan of this crate alone would
-        // find nothing and read as "nobody takes an adopted claim".
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut found = Vec::new();
         visit(&root.join("src"), TOKEN, &mut found);
         visit(&root.join("crates"), TOKEN, &mut found);
 
-        // 🔴 The half that gives the scan its resolution. Without it this test
-        // passes on a tree where the constructor was renamed and nothing calls
-        // it any more — a scan that finds nothing looks exactly like a scan
-        // that found only what it was allowed to find.
         assert_eq!(
             found.len(),
             1,

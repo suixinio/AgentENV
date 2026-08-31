@@ -1,20 +1,11 @@
-//! Task's own "D3": the wire-compatible binding record, ported from
-//! `services/shared/routing/record.go`. Byte-compatible with what gateway
-//! already reads out of Redis (`GATEWAY_ROUTING_PROJECTION_READ=on`,
-//! `services/shared/routing.Reader`) — this is a cross-language contract,
-//! not an internal type this build is free to reshape.
-//!
-//! `Record`'s field names (`node`/`execution_id`, and `node.node_id`/
-//! `node.endpoint`/`node.pod_name`) are load-bearing serde output, not
-//! naming taste: gateway's `routing.Record`/`routing.Node` decode exactly
-//! this JSON shape and nothing else.
+//! Cross-language Redis binding record consumed by the gateway.
+//! Field names and key prefixes are wire contracts.
 
 use serde::{Deserialize, Serialize};
 
 use crate::node_registry::types::Node;
 
-/// Mirrors `routing.Node`'s JSON tags exactly (`record.go`): `node_id`,
-/// `endpoint`, `pod_name` (omitted when empty).
+/// Gateway-compatible node JSON.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireNode {
     pub node_id: String,
@@ -43,8 +34,7 @@ impl From<WireNode> for Node {
     }
 }
 
-/// Mirrors `routing.Record` (`record.go`): the JSON value written at
-/// `{prefix}:sandbox:{sandbox_id}`.
+/// JSON value stored at `{prefix}:sandbox:{sandbox_id}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub node: WireNode,
@@ -52,23 +42,17 @@ pub struct Record {
     pub execution_id: String,
 }
 
-/// Ports `routing.MarshalRecord`.
+/// Serializes a gateway-compatible routing record.
 pub fn marshal_record(node: &Node, execution_id: &str) -> String {
     let record = Record {
         node: node.into(),
         execution_id: execution_id.to_string(),
     };
-    // A `Node`/`Record` composed of plain `String` fields cannot fail to
-    // serialize as JSON — `serde_json::to_string` only errors on map keys
-    // that are not strings or on a `Serialize` impl that itself returns an
-    // error, neither of which applies here.
+    // This string-only record shape is infallible to serialize.
     serde_json::to_string(&record).expect("Record serialization is infallible for this shape")
 }
 
-/// Ports `routing.ParseRecord`: `(Record{}, false)` on anything that does
-/// not decode, or decodes to a record naming nowhere (`node_id` or
-/// `endpoint` empty after trimming) — never a decode failure for a missing
-/// `execution_id` (backward compatible with an older writer).
+/// Parses a routing record, rejecting malformed records and missing node coordinates.
 pub fn parse_record(raw: &[u8]) -> Option<Record> {
     let mut record: Record = serde_json::from_slice(raw).ok()?;
     record.node.node_id = record.node.node_id.trim().to_string();
@@ -80,39 +64,25 @@ pub fn parse_record(raw: &[u8]) -> Option<Record> {
     Some(record)
 }
 
-/// Ports `routing.BindingKey`.
+/// Builds a sandbox binding key.
 pub fn binding_key(prefix: &str, sandbox_id: &str) -> String {
     format!("{prefix}:sandbox:{sandbox_id}")
 }
 
-/// Ports `routing.NodeIndexKey`.
+/// Builds a node reverse-index key.
 pub fn node_index_key(prefix: &str, node_id: &str) -> String {
     format!("{prefix}:node:{node_id}")
 }
 
-/// Ports `routing.DefaultKeyPrefix`. 🔴 Deliberately the exact Go value,
-/// not a Rust-flavored rename: this is the key namespace gateway already
-/// reads (`GATEWAY_ROUTING_PROJECTION_READ=on`), and the whole point of
-/// this port is that gateway's read path does not need to change.
+/// Gateway-compatible routing namespace.
 pub const DEFAULT_KEY_PREFIX: &str = "agentenv:scheduler:bindings";
 
-/// Ports `routing.NormalizeExecutionID`: trim, then lower-case. Lexicographic
-/// comparison over UUIDv7 text only sorts in mint order when normalized this
-/// way (`'0'-'9' < 'A'-'F' < 'a'-'f'` in ASCII would reverse it otherwise).
+/// Normalizes execution ids for lexical UUIDv7 comparison.
 pub fn normalize_execution_id(raw: &str) -> String {
     raw.trim().to_lowercase()
 }
 
-/// Ports `services/scheduler/internal/node_registry.go`'s
-/// `normalizeExecutionIDReason`, reusing the same shape check
-/// [`crate::node_registry::registry`] already implements for the roster
-/// path — trims, lower-cases, and checks the canonical-UUID shape, but
-/// (unlike that module's own `normalize_execution_id`) never records a
-/// metric for the drop: this is the event/assignment path, and Go's own
-/// split (`applyProjectionDelete` vs `normalizeExecutionID`, the roster
-/// path) reserves roster-drop counting for the roster path alone —
-/// counting it again here would double-count the same bad value when it
-/// arrives on both.
+/// Normalizes and validates an execution id without recording roster metrics.
 pub fn normalize_execution_id_reason(raw: &str) -> (String, Option<&'static str>) {
     crate::node_registry::registry::normalize_execution_id_reason(raw)
 }
@@ -149,22 +119,6 @@ mod tests {
         );
     }
 
-    /// 🔴 The cross-language pin. These two strings are byte-for-byte the
-    /// literals `services/shared/routing/record_test.go` declares as
-    /// `storedRecordWithPodName` / `storedRecordWithoutPodName` and feeds to
-    /// `ParseRecord` and to the Redis reader — including through a real
-    /// `redis-server` in `TestReaderGetHit`.
-    ///
-    /// Both sides assert against the same literal rather than against each
-    /// other's code, which is the whole point: this function is the only
-    /// writer of these bytes in the cluster, so a Go test that encoded and
-    /// decoded with Go functions of its own would have gone on passing for a
-    /// format nothing writes. Changing either string alone turns one of the
-    /// two suites red — `TestTheStoredLiteralsAreTheOnesRustAssertsToo` reads
-    /// this file and refuses a literal that moved on one side only.
-    ///
-    /// The two shapes are the two a live writer produces: `pod_name` is
-    /// omitted when empty and present otherwise, and nothing else varies.
     #[test]
     fn go_and_rust_agree_on_the_stored_record_bytes() {
         const STORED_RECORD_WITH_POD_NAME: &str = r#"{"node":{"node_id":"node-a","endpoint":"http://node-a","pod_name":"agentenv-node-7f4c2"},"execution_id":"0198b7cc-1111-7000-8000-000000000001"}"#;

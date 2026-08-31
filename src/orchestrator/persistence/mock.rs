@@ -63,25 +63,12 @@ impl RecordingPersister {
         }
     }
 
-    /// Makes this persister answer `paused_artifact_root` with a directory.
-    ///
-    /// 🔴 Off by default, so a test that wants the "there is a path" half has
-    /// to say so and a test that wants the other half gets it without asking.
+    /// Configures the paused capture path returned by this test persister.
     pub fn holds_capture_at(&self, artifact_root: impl Into<PathBuf>) {
         *self.artifact_root.lock().unwrap() = Some(artifact_root.into());
     }
 
-    /// Makes this persister hand a pause a directory to capture into.
-    ///
-    /// 🔴 A separate switch from [`Self::holds_capture_at`], and separate
-    /// because the two answer different questions at different times.
-    /// `allocate_artifact_root` decides, *before* the backend is asked to
-    /// pause, whether the capture lands somewhere that outlives the runtime —
-    /// which is what decides whether there is a publishable capture at all.
-    /// `paused_artifact_root` reports afterwards where a pause that already
-    /// happened put its bytes. A test that wants the second is not asking for
-    /// the first, and folding them together would give every existing caller of
-    /// `holds_capture_at` a publishable capture it never asked for.
+    /// Configures the distinct path allocated before a pause capture.
     pub fn allocates_artifact_root_at(&self, root: impl Into<PathBuf>) {
         *self.allocated_root.lock().unwrap() = Some(root.into());
     }
@@ -90,12 +77,7 @@ impl RecordingPersister {
         self.calls.lock().unwrap().clone()
     }
 
-    /// The records handed to `persist_paused`, in order.
-    ///
-    /// What reaches the persister is not what the in-memory store ends up
-    /// holding — the store reconciles a record on the way in, and the persister
-    /// does not — so a caller that has to get the record right *before* it is
-    /// written can only be checked here.
+    /// Returns records passed to `persist_paused`, in order.
     pub fn persisted(&self) -> Vec<SandboxMetadata> {
         self.persisted.lock().unwrap().clone()
     }
@@ -161,8 +143,7 @@ impl SandboxPersister for RecordingPersister {
         Ok(())
     }
 
-    /// Whatever [`RecordingPersister::holds_capture_at`] was told, and `None`
-    /// otherwise — which is what a persister that allocated no root answers.
+    /// Returns the configured capture path, if any.
     async fn paused_artifact_root(
         &self,
         _sandbox_id: &SandboxId,

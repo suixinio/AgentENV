@@ -1,17 +1,5 @@
-//! Task's own "D1"/"D3": one set of assertions, run against both
-//! [`super::InMemoryBindingStore`] and [`super::RedisBindingStore`] —
-//! directly answering the gap the task called out in Go's own test suite:
-//! *"the Redis backend was tested, but only at the store layer, not the
-//! RPC layer — every `Service` in `projection_service_test.go` used
-//! `NewInMemoryBindingStore`."* This module is the store-layer half (run
-//! by both `in_memory::tests`/`redis::tests` via the macro below);
-//! `src/node_registry/grpc_service.rs`'s `report_sandbox_event` tests are
-//! the RPC-layer half that closes the actual gap, parametrized the same
-//! way over both backends.
-//!
-//! Mirrors `src/orchestrator/store/contract.rs`'s own macro pattern
-//! exactly, per CLAUDE.md's own scar: *"a change made to the in-memory
-//! store and forgotten for Redis is invisible everywhere else."*
+//! Shared assertions run against both binding-store backends.
+//! Any backend change must pass this same suite.
 
 use std::time::{Duration, SystemTime};
 
@@ -69,8 +57,6 @@ pub async fn record_with_no_execution_id_installs_unknown<S: BindingStore>(store
     assert_eq!(decision, BindingDecision::InstalledUnknown);
 }
 
-/// Fenced arbitration (the only rule there is): a lexicographically older
-/// challenger is refused and the existing record is left untouched.
 pub async fn record_rejects_an_older_incarnation<S: BindingStore>(store: &S) {
     store
         .record(
@@ -110,7 +96,6 @@ pub async fn record_rejects_an_older_incarnation<S: BindingStore>(store: &S) {
     );
 }
 
-/// A newer incarnation is accepted and takes over.
 pub async fn record_accepts_a_newer_incarnation<S: BindingStore>(store: &S) {
     store
         .record(
@@ -252,8 +237,6 @@ pub async fn reconcile_node_does_not_touch_another_nodes_binding<S: BindingStore
         .await
         .unwrap();
 
-    // node-a reconciling an empty roster must not delete sbx-1: it belongs
-    // to node-b, not node-a.
     store
         .reconcile_node(node("node-a"), vec![], unix(1))
         .await
@@ -265,8 +248,6 @@ pub async fn reconcile_node_does_not_touch_another_nodes_binding<S: BindingStore
         .expect("still bound to node-b");
     assert_eq!(binding.node.id, "node-b");
 }
-
-// ---- delete: "the guard is the whole point" ----
 
 pub async fn delete_of_an_absent_sandbox_is_a_noop<S: BindingStore>(store: &S) {
     let outcome = store
@@ -310,9 +291,6 @@ pub async fn delete_with_a_stale_incarnation_is_refused_and_the_record_survives<
         .await
         .unwrap();
 
-    // A late PAUSE event for exec-1, but the sandbox has since been resumed
-    // elsewhere under exec-2. This is the actual bug this guard exists to
-    // prevent: without it, a late event would tear down the live record.
     let outcome = store.delete("sbx-1", "exec-1", unix(1)).await.unwrap();
     assert_eq!(outcome, BindingDeleteOutcome::RejectedStale);
 
@@ -330,10 +308,6 @@ pub async fn delete_with_a_stale_incarnation_is_refused_and_the_record_survives<
 pub async fn delete_of_a_record_with_no_known_incarnation_deletes_anyway<S: BindingStore>(
     store: &S,
 ) {
-    // A record that never named an incarnation (an old writer, or one that
-    // simply had none to name) -- an event carrying a known execution id is
-    // stronger evidence than a record that never named one, so this deletes
-    // rather than refusing -- deliberately asymmetric with the write path.
     store
         .record(
             "sbx-1",
@@ -375,21 +349,6 @@ pub async fn delete_with_an_empty_execution_id_is_a_noop_never_an_unguarded_dele
     );
 }
 
-/// 🔴 A write naming no sandbox is dropped before any comparison happens,
-/// and it says so: [`BindingDecision::NotArbitrated`], whose wire spelling is
-/// the empty string.
-///
-/// This is the *surviving* producer of that variant. The other was
-/// `arbitrate_off`, the always-accept rule behind the deleted
-/// `[binding_store].arbitration = "off"` switch; deleting the variant along
-/// with the switch would have silently turned this no-op into something
-/// else. It has to be a contract function rather than a per-backend test
-/// because both backends carry their own copy of the guard
-/// (`InMemoryBindingStore::record`, `RedisBindingStore::record`) — the exact
-/// shape a fix made to one and forgotten for the other hides in.
-///
-/// The `"   "` case is the same guard one step earlier: both backends `trim`
-/// before testing for empty, so a whitespace-only id is an empty one.
 pub async fn record_with_an_empty_sandbox_id_is_a_noop_that_reports_not_arbitrated<
     S: BindingStore,
 >(
@@ -424,9 +383,6 @@ pub async fn record_with_an_empty_sandbox_id_is_a_noop_that_reports_not_arbitrat
         );
     }
 
-    // 🔴 Control: the same call with a real id does write, so "nothing was
-    // stored" above is about the empty id and not about a store that
-    // refuses everything.
     let decision = store
         .record(
             "sbx-1",

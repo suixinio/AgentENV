@@ -1,45 +1,4 @@
-//! Task's own "Stage D remainder": `Schedule`/`LookupNode`'s shared pure
-//! logic, ported from `services/scheduler/internal/{lookup.go,service.go}`.
-//!
-//! Kept out of `src/node_registry/grpc_service.rs` on purpose (the phase's
-//! own suggestion): the three-stage lookup ladder has roughly a dozen
-//! distinct outcomes to get right, and testing each one through a live
-//! gRPC service is both slow and awkward to set up. Everything here takes
-//! borrowed trait objects (`&dyn BindingStore`, `&dyn NodeRegistry`, ...)
-//! instead of the concrete `Arc`-wrapped types `NodeRegistryGrpcService`
-//! holds, so a unit test can hand it a bare in-memory fake for exactly the
-//! one dependency it wants to exercise.
-//!
-//! # Two Rust/Go shape differences, both narrowing the label set
-//!
-//! - Go's `pausedregistry.Reader` distinguishes "disabled" (`ErrDisabled`)
-//!   from "not yet ready to answer" (`!Ready()`) from "configured and
-//!   readable, no row" (`!found`) -- three states behind one `Get` call.
-//!   Rust's [`PausedSandboxRegistry`] has no warm-up/cold-start concept at
-//!   all (it talks to Postgres directly, no local cache to warm) and
-//!   `get()` returns `Ok(None)` uniformly for "no row," whether or not a
-//!   real backend is configured. So there is no Rust counterpart to
-//!   `unavailable_registry_cold`, and "disabled" collapses into the same
-//!   `Ok(None)` path ordinary absence takes -- gated instead on
-//!   [`PausedSandboxRegistry::is_cluster_backed`], see [`lookup_node`]'s
-//!   stage 3.
-//! - Go's `nodePlacer` can be `nil` on a query-only replica, which has no
-//!   discovery and no strategy at all -- hence `lookupResultNoPlacer`.
-//!   `NodeRegistryGrpcService` has no query-only mode: a registry and a
-//!   strategy exist the moment the service does. So there is no Rust
-//!   counterpart to `unavailable_no_placer`, and none to
-//!   `internal_placement_failed` either -- [`select_node`]'s only failure
-//!   mode is [`NoNodesAvailable`], never a second, less-structured error
-//!   Go's `Schedule` falls back to `codes.Internal` for. And `unknown_state`
-//!   has no Rust counterpart for a different reason: [`PausedRegistryState`]
-//!   is a closed Rust enum matched exhaustively below, so there is no "row
-//!   written by a future build" case to refuse at runtime -- the compiler
-//!   already refused it, at whatever call site could construct one.
-//!
-//! `silentExecution` (Go's rollback mode that blanks the two incarnation
-//! fields) has no Rust build to roll back from -- this port only ever
-//! existed with `execution_id`/`execution_authority` populated, so there is
-//! nothing here to gate.
+//! Shared node-selection and lookup logic for `Schedule` and `LookupNode`.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -58,39 +17,20 @@ use crate::orchestrator::{PausedRegistryState, PausedSandboxRegistry};
 use crate::proto::scheduler::{ExecutionAuthority, SandboxLocation, ScheduleRequestHint};
 use crate::types::SandboxId;
 
-/// How long a heartbeat-reported roster entry stays "fresh enough to route
-/// to" -- mirrors Go's `Service.reportTTL`, which defaults to
-/// `defaultObservedReportTTL` (`lookup.go`'s `rosterFresh`) and, in this
-/// codebase, is the same 30s literal `src/bin/aenv-api.rs`'s
-/// `start_native_node_registry` already passes as `AtomicNodeRegistry`'s own
-/// `observed_ttl`.
+/// Maximum age of a heartbeat roster entry eligible for routing.
 pub use crate::node_registry::registry::DEFAULT_OBSERVED_REPORT_TTL as ROSTER_FRESH_TTL;
 
-/// Everything [`select_node`] needs. Shared between `Schedule` (bare
-/// preference) and [`lookup_node`]'s `Paused` branch (origin-node
-/// preference) -- Go's `Service.place` is exactly this reuse.
-///
-/// 🔴 `strategy` is a borrow of one shared [`RoundRobinStrategy`], never a
-/// fresh one per call: the round-robin cursor is that instance's atomic,
-/// so two `ScheduleDeps` pointing at two instances would silently give
-/// `Schedule` and [`lookup_node`]'s `Paused` branch independent rotations.
+/// Dependencies shared by schedule and paused-lookup placement.
+/// All callers must use the same round-robin strategy instance.
 #[derive(Clone, Copy)]
 pub struct ScheduleDeps<'a> {
     pub node_registry: &'a dyn NodeRegistry,
     pub strategy: &'a RoundRobinStrategy,
-    /// The shadow scorer, holding the sampling width and the metric handles
-    /// its construction resolved once.
-    ///
-    /// 🔴 Deliberately *not* where the [`ShadowSource`] lives. Both call
-    /// paths share one of these — that sharing is the point for `strategy`
-    /// — so a source stored here would be whatever the last caller set it
-    /// to. It is a `select_node` argument instead, supplied by each of the
-    /// two real call sites.
+    /// Shadow scorer shared by both placement paths.
     pub shadow: &'a ShadowPlacement,
 }
 
-/// One selection, with the candidate counts it was taken over -- mirrors
-/// Go's `placement` struct.
+/// A selected node and the candidate counts considered.
 #[derive(Debug, Clone)]
 pub struct Placement {
     pub node: Node,
@@ -98,32 +38,8 @@ pub struct Placement {
     pub eligible: usize,
 }
 
-/// Ports `Service.selectNode` (`service.go:366-427`). `prefer_node_id`
-/// empty is `Schedule`'s own call; non-empty is `place`'s (the `Paused`
-/// branch below).
-///
-/// The preference is applied after filtering, never before: a preference
-/// that could bring back a node the filters removed would let an isolated
-/// or overloaded node be selected by the one path that never asked the
-/// strategy.
-///
-/// # The shadow scorer sits at the end, and only at the end
-///
-/// [`crate::node_registry::placement`] runs *after* `strategy.select` has
-/// already produced the answer this function returns, over the same
-/// candidate slice, and its result is dropped. Three consequences that are
-/// correctness properties rather than style:
-///
-/// - The `prefer_node_id` hit above returns before the strategy is ever
-///   asked, so it does not score either. Scoring it would file a
-///   deliberate origin affinity as a shadow disagreement and poison the
-///   very evidence the shadow exists to collect.
-/// - The strategy is asked exactly once. A second `select` — including one
-///   "just for the shadow" — would advance the shared round-robin cursor a
-///   second time and change real placement.
-/// - `now` is captured by the caller and used for both the freshness
-///   verdicts and the classification, so one selection cannot straddle two
-///   clocks.
+/// Selects an eligible node, honoring preference before shared round-robin.
+/// Shadow scoring runs only after real selection using the same registry reads.
 pub fn select_node(
     deps: &ScheduleDeps<'_>,
     hint: Option<&ScheduleRequestHint>,
@@ -133,12 +49,7 @@ pub fn select_node(
 ) -> Result<Placement, NoNodesAvailable> {
     let discovered = deps.node_registry.snapshot(/* allow_lingering */ false);
     let candidates = discovered.len();
-    // One registry read per node, answering both questions. `snapshot` is
-    // byte-for-byte what `peek_observed` returned before the scorer existed,
-    // so the candidate list the filter and the strategy see is unchanged;
-    // the freshness half rides alongside in `freshness_by_id` and is never
-    // written back into a `RichNode` (deriving `UNHEALTHY` here and feeding
-    // it to `filter_unschedulable` would change the real candidate set).
+    // Preserve one snapshot/freshness read per node and the existing candidate set.
     let mut freshness_by_id: HashMap<String, Option<SnapshotFreshness>> =
         HashMap::with_capacity(candidates);
     let rich: Vec<RichNode> = discovered
@@ -179,11 +90,7 @@ pub fn select_node(
     let shadow_candidates: Vec<ShadowCandidate<'_>> = eligible_nodes
         .iter()
         .map(|rich| ShadowCandidate {
-            // The invariant `freshness.is_none()` iff `snapshot.is_none()`
-            // holds because both halves came out of the single
-            // `peek_observed_with_freshness` call above. A node that
-            // somehow is not in the map at all reads as "no snapshot",
-            // which is the same conclusion its absent snapshot would give.
+            // Snapshot and freshness come from the same combined registry read.
             freshness: freshness_by_id
                 .get(&rich.node.id)
                 .copied()
@@ -194,9 +101,7 @@ pub fn select_node(
         .collect();
     let request = match source {
         ShadowSource::Schedule => request_from_hint(hint),
-        // K-3: the paused-restore path is told what it is, never inferred
-        // from its `hint = None`. It has no request size to read and that
-        // is not a caller omission, so it does not count as missing.
+        // Paused lookup has no request size to classify.
         ShadowSource::PausedLookup => ShadowRequest::PAUSED_LOOKUP,
     };
     deps.shadow
@@ -209,8 +114,7 @@ pub fn select_node(
     })
 }
 
-/// The closed label set for `agentenv_api_lookup_node_total{result}`. See
-/// the module doc for the four Go labels with no Rust counterpart.
+/// Metric label for a lookup outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupResultLabel {
     BoundBinding,
@@ -250,7 +154,7 @@ impl LookupResultLabel {
     }
 }
 
-/// A successful lookup answer -- ports `lookupDeps.answer`'s parameters.
+/// Successful lookup result.
 #[derive(Debug, Clone)]
 pub struct LookupAnswer {
     pub node: Node,
@@ -261,9 +165,7 @@ pub struct LookupAnswer {
     pub label: LookupResultLabel,
 }
 
-/// Every way [`lookup_node`] may end. Mirrors the `codes.*` Go returns:
-/// `Answer` -> `OK`, `NotFound` -> `codes.NotFound`, `Unavailable` ->
-/// `codes.Unavailable`, `FailedPrecondition` -> `codes.FailedPrecondition`.
+/// Lookup result mapped by the caller to its transport status.
 #[derive(Debug, Clone)]
 pub enum LookupOutcome {
     Answer(LookupAnswer),
@@ -282,16 +184,11 @@ impl LookupOutcome {
     }
 }
 
-/// Everything [`lookup_node`] may consult.
+/// Dependencies used by [`lookup_node`].
 pub struct LookupDeps<'a> {
     pub place: ScheduleDeps<'a>,
     pub binding_store: &'a dyn BindingStore,
-    /// `None` here (never wired via `NodeRegistryGrpcService::with_paused_registry`)
-    /// is treated exactly like Go's disabled reader: stage 3 is skipped and
-    /// every lookup that gets this far answers from [`lookup_absent`]. So is
-    /// `Some(registry)` whose `is_cluster_backed()` is `false` -- a registry
-    /// that cannot speak for the whole cluster has nothing stage 3 may trust
-    /// an absence from.
+    /// Only a cluster-backed registry may authorize stage-three absence.
     pub paused_registry: Option<&'a dyn PausedSandboxRegistry>,
     pub warmup: &'a WarmupGate,
 }
@@ -304,19 +201,14 @@ fn authority_for(execution_id: &str) -> ExecutionAuthority {
     }
 }
 
-/// Ports `Service.rosterFresh` (`lookup.go:566-574`).
 fn roster_fresh(last_seen: SystemTime, now: SystemTime) -> bool {
     match now.duration_since(last_seen) {
         Ok(age) => age <= ROSTER_FRESH_TTL,
-        // `last_seen` is after `now` -- clock skew between two calls to
-        // `SystemTime::now()` a few lines apart, never a real staleness
-        // signal. Go's signed `time.Duration` subtraction takes the same
-        // branch here (a negative duration is always `<= ttl`).
+        // Small clock skew must not make a fresh roster stale.
         Err(_) => true,
     }
 }
 
-/// Ports `Service.liveNode` (`lookup.go:507-516`).
 fn live_node(node_registry: &dyn NodeRegistry, node_id: &str, now: SystemTime) -> Option<Node> {
     let node = node_registry.resolve(node_id.trim())?;
     let (_entries, last_seen) = node_registry.roster_of(&node.id)?;
@@ -326,14 +218,12 @@ fn live_node(node_registry: &dyn NodeRegistry, node_id: &str, now: SystemTime) -
     Some(node)
 }
 
-/// Ports `nodeSchedulability` (`lookup.go:57-70`).
 enum NodeSchedulability {
     Schedulable(Node),
     NotReporting,
     NotAcceptingWork,
 }
 
-/// Ports `Service.schedulableNode` (`lookup.go:529-540`).
 fn schedulable_node(
     node_registry: &dyn NodeRegistry,
     node_id: &str,
@@ -353,9 +243,6 @@ fn schedulable_node(
     NodeSchedulability::Schedulable(node)
 }
 
-/// Ports `Service.rosterPrefers` (`lookup.go:487-501`) verbatim, including
-/// the plain-string comparison in the last arm (execution ids are UUIDv7
-/// strings, so this is chronological by construction).
 fn roster_prefers(
     execution: &str,
     last_seen: SystemTime,
@@ -374,7 +261,6 @@ fn roster_prefers(
     execution > best_execution
 }
 
-/// Ports `Service.rosterHolder` (`lookup.go:452-479`).
 fn roster_holder(
     node_registry: &dyn NodeRegistry,
     sandbox_id: &str,
@@ -408,7 +294,6 @@ fn roster_holder(
     best.map(|(node, execution, _)| (node, execution))
 }
 
-/// Ports `lookupAbsent` (`lookup.go:377-396`).
 fn lookup_absent(warm: bool) -> LookupOutcome {
     if warm {
         LookupOutcome::NotFound
@@ -420,17 +305,12 @@ fn lookup_absent(warm: bool) -> LookupOutcome {
     }
 }
 
-/// Ports `lookupNode` (`lookup.go:134-373`). `sandbox_id` must already be
-/// non-empty -- the caller's `InvalidArgument` check runs before this, the
-/// same layering `RecordAssignment`'s own validation already uses in
-/// `src/node_registry/grpc_service.rs`.
+/// Resolves a non-empty sandbox id through binding, roster, then paused registry.
 pub async fn lookup_node(
     deps: &LookupDeps<'_>,
     sandbox_id: &str,
     now: SystemTime,
 ) -> LookupOutcome {
-    // 1. The binding. This is the hot path -- every proxied request lands
-    // here -- so nothing below it may run on a hit.
     match deps.binding_store.get(sandbox_id, now).await {
         Err(_err) => {
             return LookupOutcome::Unavailable(
@@ -451,8 +331,6 @@ pub async fn lookup_node(
         Ok(None) => {}
     }
 
-    // 2. The roster. A binding expires on its own TTL while the roster that
-    // wrote it stays as the node last reported it.
     if let Some((holder, execution_id)) = roster_holder(deps.place.node_registry, sandbox_id, now) {
         return LookupOutcome::Answer(LookupAnswer {
             node: holder,
@@ -464,18 +342,10 @@ pub async fn lookup_node(
         });
     }
 
-    // Evaluated only now, matching Go: a roster hit above costs nothing.
     let warm = deps.warmup.warmed_up(now);
 
-    // 3. The registry -- see the module doc and `LookupDeps::paused_registry`
-    // for why `None` and "not cluster-backed" both fall straight through to
-    // `lookup_absent`, exactly like Go's disabled reader does.
     let entry = match deps.paused_registry {
         Some(registry) if registry.is_cluster_backed() => {
-            // A sandbox id that is not a UUID at all cannot have a registry
-            // row (the table's primary key is one) -- the same "nothing to
-            // find" answer a valid-but-absent id gets, not a validation
-            // error stages 1 and 2 above never imposed either.
             match SandboxId::parse_str(sandbox_id) {
                 Ok(id) => match registry.get(&id).await {
                     Ok(entry) => entry,
@@ -498,9 +368,7 @@ pub async fn lookup_node(
 
     match entry.state {
         PausedRegistryState::Paused => {
-            // The snapshot is published, so any node can rebuild it. Origin
-            // is only a preference, applied through the exact same pipeline
-            // `Schedule` runs.
+            // Published snapshots may be placed anywhere; origin is only preferred.
             match select_node(
                 &deps.place,
                 None,
@@ -516,9 +384,7 @@ pub async fn lookup_node(
                     node: placement.node,
                     location: SandboxLocation::Placed,
                     origin_node_id: entry.origin_node_id,
-                    // PENDING with an empty incarnation, hard-coded rather
-                    // than let flow from the row: a `paused` row names none
-                    // by construction, and the node is about to mint one.
+                    // The node about to resume will mint the new incarnation.
                     execution_id: String::new(),
                     execution_authority: ExecutionAuthority::Pending,
                     label: LookupResultLabel::Placed,
@@ -526,8 +392,7 @@ pub async fn lookup_node(
             }
         }
         PausedRegistryState::Publishing | PausedRegistryState::LocalOnly => {
-            // No snapshot in shared storage: the only copy is on origin's
-            // disk, so this is that node or nothing.
+            // Unpublished state is pinned to the origin node.
             match schedulable_node(deps.place.node_registry, &entry.origin_node_id, now) {
                 NodeSchedulability::NotReporting => LookupOutcome::FailedPrecondition(
                     LookupResultLabel::OriginNotReporting,
@@ -549,10 +414,7 @@ pub async fn lookup_node(
                     node,
                     location: SandboxLocation::Pinned,
                     origin_node_id: entry.origin_node_id,
-                    // PENDING here too, and this half has to be hard-coded
-                    // rather than inferred: `local_only` names no
-                    // incarnation, but `publishing` names one that belongs
-                    // to a VM stopped before the upload began.
+                    // The stopped incarnation must not be reused.
                     execution_id: String::new(),
                     execution_authority: ExecutionAuthority::Pending,
                     label: LookupResultLabel::Pinned,
@@ -560,9 +422,7 @@ pub async fn lookup_node(
             }
         }
         PausedRegistryState::Running | PausedRegistryState::Resuming => {
-            // Holder() (== origin_node_id): the real machine, never
-            // claimed_by_node_id -- see `PausedSandboxEntry::origin_node_id`'s
-            // own doc comment.
+            // The holder is always the origin node, never the claimant.
             let holder_id = entry.origin_node_id.clone();
             match live_node(deps.place.node_registry, &holder_id, now) {
                 None if !warm => LookupOutcome::Unavailable(
@@ -608,11 +468,6 @@ mod tests {
         HeartbeatRequest, NodeSnapshot, NodeStatus, ObservedNode, P2pPeer,
     };
 
-    /// An [`AtomicNodeRegistry`] with a tally on the two snapshot accessors.
-    ///
-    /// 🔴 It delegates rather than fakes: the point of the assertion below
-    /// is the *number of reads a real placement performs*, and a hand-rolled
-    /// fake would let the count be whatever the fake happened to make easy.
     struct CountingRegistry {
         inner: AtomicNodeRegistry,
         peeks: AtomicUsize,
@@ -736,21 +591,6 @@ mod tests {
         }
     }
 
-    /// 🔴 One registry read per candidate, for the whole selection —
-    /// candidate construction *and* scoring.
-    ///
-    /// The obvious way to add a scorer is to let it ask the registry for
-    /// each candidate's freshness while it scores. That doubles the number
-    /// of `RwLock` acquisitions on a path that runs on every sandbox
-    /// create, and worse, the second read can land on the other side of a
-    /// heartbeat — so a candidate could be scored against a freshness
-    /// verdict belonging to a snapshot it was not built from. Both are
-    /// prevented by reading once, and this is what fails if that stops
-    /// being true.
-    ///
-    /// The count is also *exactly* one per node, not "at most": a scorer
-    /// that skipped the accessor entirely and hardcoded `Fresh` would pass
-    /// an upper bound.
     #[test]
     fn a_selection_reads_each_candidate_from_the_registry_exactly_once() {
         let registry = CountingRegistry::new(vec![node("node-a"), node("node-b"), node("node-c")]);
@@ -788,10 +628,6 @@ mod tests {
         );
     }
 
-    /// The `prefer_node_id` hit returns before the strategy is asked, so it
-    /// must not advance the round-robin cursor either — the cursor is the
-    /// one piece of placement state a shadow-adjacent change could move
-    /// invisibly.
     #[test]
     fn a_preferred_node_neither_asks_the_strategy_nor_moves_its_cursor() {
         let registry = CountingRegistry::new(vec![node("node-a"), node("node-b")]);
@@ -810,10 +646,7 @@ mod tests {
             shadow: &shadow,
         };
 
-        // Two preferred selections in a row, then a bare one. If either
-        // preferred call had advanced the cursor, the bare call would
-        // answer `node-a` only by coincidence — so the bare call is made
-        // three times and the full rotation is asserted.
+        // Repeated bare selections expose any cursor movement by preferred calls.
         for _ in 0..2 {
             let placement = select_node(&deps, None, "node-b", ShadowSource::PausedLookup, now)
                 .expect("node-b is a candidate");

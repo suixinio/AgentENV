@@ -1,41 +1,6 @@
-//! The Redis-backed metadata store: the cluster's authoritative active state.
-//!
-//! # What carries correctness here
-//!
-//! > The lock buys throughput and the guarantee that a caller's callback runs
-//! > exactly once. Correctness is carried by the `rev` and `execution_id`
-//! > predicates inside the write scripts. Turn the lock off and this store
-//! > still cannot write bad data — it will simply return `ConcurrentUpdate`
-//! > under contention.
-//!
-//! That sentence is the design. Everything else in this module follows from it,
-//! including why the lock's TTL is short, why there is no watchdog renewing it,
-//! and why a slow callback is an error rather than something to retry.
-//!
-//! # Crash recovery
-//!
-//! Not the lock. A lock is released before any wait, so it never spans a whole
-//! operation. What spans an operation is the transition key, and its TTL only
-//! lets the *next* operation start — it does not repair the state a dead
-//! replica left behind.
-//!
-//! e2b closes that gap with a branch in its expiry sweep that lets a sandbox
-//! stuck in a transitional state through to eviction after a stale cutoff.
-//! 🔴 That branch cannot close it for us: our `expires_at` is optional, and a
-//! sandbox with `timeout = None` is not in the expiry index at all. Such a
-//! sandbox, stuck in `Pausing` because the replica that was pausing it died,
-//! is in no index any process ever reads. A user sees a sandbox that cannot be
-//! deleted. Hence the fourth piece e2b does not have: a transition index and a
-//! reaper over it, in [`transition`].
-//!
-//! # 🔴 Nothing constructs this store yet
-//!
-//! It is exercised only by its own tests. Code that nothing drives is code that
-//! has not been shown to be right — three methods delivered ahead of their
-//! driver earlier in this programme passed review as harmless and turned out to
-//! hold three real defects the moment something called them. Treat everything
-//! here as unverified until the assembly point exists, and see the audit list
-//! in the design document before wiring it up.
+//! Redis-backed authoritative metadata store.
+//! Revision and execution predicates carry write correctness; locks manage contention.
+//! Transition indexes and reapers recover operations whose owning replica dies.
 
 mod config;
 mod crud;
@@ -69,22 +34,13 @@ use keys::KeySpace;
 use lock::LockManager;
 use notify::Notifier;
 
-/// A sampled listing, and the instant it was sampled at.
-///
-/// 🔴 The instant travels with the sample on purpose. Without it an operator
-/// comparing two replicas' readings has no way to know they are comparing two
-/// different moments, and will read the difference as drift.
+// Cached aggregate listing paired with its sampling instant.
 struct ListingSample {
     sampled_at: Instant,
     records: Arc<Vec<SandboxMetadata>>,
 }
 
-/// Whether a background round may run.
-///
-/// 🔴 Three answers, and each is reported separately. "This round did nothing"
-/// reads identically whether the task is switched off, still warming up, or ran
-/// and found nothing to do — and those are three very different facts to be
-/// looking at during an incident.
+/// Readiness of a background repair round.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoundReadiness {
     Disabled,
@@ -92,16 +48,7 @@ pub enum RoundReadiness {
     Ready,
 }
 
-/// Holds a background task down for its first interval.
-///
-/// 🔴 A restart makes every clock in the store look stale at once — not because
-/// anything stopped, but because nobody was listening. A reaper with no warm-up
-/// reads that as "everything is stuck" and acts on all of it in one round. The
-/// healer's `heal_grace` does not cover this: that one is per *record*, and the
-/// hazard here is per *process*.
-///
-/// The window is re-armed when the kill switch goes off and back on, because
-/// switching a task back on has exactly the same shape as starting it.
+// Holds repair tasks through their first interval and after re-enabling.
 struct WarmUp {
     window: Duration,
     armed_at: Mutex<Instant>,
@@ -142,20 +89,18 @@ pub struct StoreInner {
     config: RedisStoreConfig,
     locks: LockManager,
     notifier: Notifier,
-    /// Memo for the aggregate listing path only. See
-    /// [`RedisMetadataStore::last_listing_sample_at`].
     listing_memo: RwLock<Option<ListingSample>>,
     healer_warmup: WarmUp,
     reaper_warmup: WarmUp,
 }
 
-/// The cluster's active-state store.
+/// Cluster authoritative active-state store.
 pub struct RedisMetadataStore {
     inner: Arc<StoreInner>,
 }
 
 impl RedisMetadataStore {
-    /// Connects and validates the configuration.
+    /// Validates configuration and connects.
     pub async fn connect(config: RedisStoreConfig) -> Result<Self> {
         config.validate().map_err(|source| StoreError::Backend {
             source: anyhow::Error::from(source),
@@ -191,13 +136,7 @@ impl RedisMetadataStore {
         })
     }
 
-    /// When the memoised listing was last refreshed.
-    ///
-    /// 🔴 A sample, not a point-in-time truth. `metrics_snapshot` runs on every
-    /// Prometheus scrape of every replica, and answering it honestly would mean
-    /// `SMEMBERS` plus an `MGET` of the entire keyspace per scrape per replica.
-    /// The memo makes that affordable and makes the answer approximate, and the
-    /// second half of that sentence is not optional to report.
+    /// Returns when the aggregate listing sample was refreshed.
     pub async fn last_listing_sample_at(&self) -> Option<Instant> {
         self.inner
             .listing_memo
@@ -211,7 +150,7 @@ impl RedisMetadataStore {
         &self.inner
     }
 
-    /// Deletes every key this store owns. Test support only.
+    /// Deletes this test store's namespace.
     #[cfg(test)]
     pub async fn flush_namespace(&self) -> Result<()> {
         let mut connection = self.inner.connection.clone();
@@ -245,8 +184,7 @@ impl StoreInner {
         &self.config
     }
 
-    /// The write script, or its predicate-free control in test builds that have
-    /// asked for it.
+    /// Selects the real or test-only predicate-free update script.
     pub fn update_script(&self) -> &'static redis::Script {
         #[cfg(test)]
         if !self.config.cas_predicates_enabled() {
@@ -330,11 +268,7 @@ impl StoreInner {
     }
 }
 
-/// Wraps a Redis transport failure.
-///
-/// 🔴 Always an error, never an absence. A store this call could not reach has
-/// not told us that a sandbox does not exist; it has told us nothing. Callers
-/// answer absence by deleting local artifacts and tearing down running VMs.
+/// Maps Redis transport failure to a backend error, never absence.
 pub fn backend(source: redis::RedisError) -> StoreError {
     StoreError::Backend {
         source: anyhow::Error::from(source),

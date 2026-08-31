@@ -1,27 +1,6 @@
-//! Task's own "D4": ports `services/scheduler/internal/sweep.go` (383
-//! lines) — the heartbeat-timeout binding sweep. A node that stops
-//! heartbeating has its rosters *evicted from discovery* within roughly
-//! `KubernetesDiscovery`'s own re-list cadence (`AtomicNodeRegistry::set`'s
-//! stale-cleanup pass), but the binding store does not react to that on its
-//! own — a binding is a Redis (or in-memory) key with its own TTL, wholly
-//! independent of node-registry state. Left alone, gateway keeps routing to
-//! a dead node's sandboxes until each binding's own TTL finally lapses
-//! (`binding_ttl`, ordinarily tens of seconds — short, but not zero). This
-//! sweep exists to shorten that window explicitly, the same way Go's does.
-//!
-//! # Why this keeps its own shadow copy of the roster, not just the live one
-//!
-//! `AtomicNodeRegistry::set`'s stale-cleanup drops a node's roster from the
-//! registry itself well before any silence threshold this sweep would
-//! apply — a `KubernetesDiscovery` re-list happens on a much shorter cadence
-//! than `binding_sweep_silence` (minutes, not the discovery loop's usual
-//! seconds). By the time this sweep would notice a node missing from
-//! [`crate::node_registry::registry::NodeRegistry::rosters_in_cluster`], the
-//! registry's own copy of that node's roster is already gone — there would
-//! be nothing left to retire. So [`BindingSweeper`] keeps its own
-//! `last_known` copy, refreshed every round from whatever
-//! `rosters_in_cluster` currently reports, and reacts when a node it once
-//! shadowed stops showing up there at all.
+//! Retires bindings for nodes that disappear and remain silent.
+//! The sweeper retains its own last-known roster because discovery drops stale
+//! rosters before the binding-silence threshold.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -30,9 +9,9 @@ use crate::binding_store::{BindingDeleteOutcome, BindingStore};
 use crate::node_registry::registry::NodeRegistry;
 use crate::node_registry::types::Roster;
 
-/// Mirrors Go's `defaultBindingSweepSilence`.
+/// Default silence threshold before a missing node is swept.
 pub const DEFAULT_SWEEP_SILENCE: Duration = Duration::from_secs(5 * 60);
-/// Mirrors Go's `defaultBindingSweepInterval`.
+/// Default interval between sweep rounds.
 pub const DEFAULT_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// One sweep round's tally, for logging/metrics at the call site.
@@ -47,18 +26,13 @@ pub struct SweepOutcome {
 }
 
 struct Inner {
-    /// This sweeper's own copy of the last roster it saw for a node, kept
-    /// independently of the live registry -- see the module doc.
+    /// Last roster observed independently of the live registry.
     last_known: HashMap<String, Roster>,
-    /// Which `last_seen` timestamp a node has already been swept for, so a
-    /// node that stays silent is retired exactly once rather than every
-    /// round, while a node that comes back and goes silent again *is*
-    /// swept again (a fresh `last_seen` no longer matches the recorded
-    /// one).
+    /// Last `last_seen` value already swept per node.
     swept: HashMap<String, SystemTime>,
 }
 
-/// Ports Go's `bindingSweeper`.
+/// Heartbeat-timeout binding sweeper.
 pub struct BindingSweeper {
     cluster_id: String,
     silence: Duration,
@@ -82,11 +56,7 @@ impl BindingSweeper {
         }
     }
 
-    /// One round: refresh the shadow copy, find nodes that dropped out of
-    /// discovery, retire the silent ones' bindings (unless every candidate
-    /// this round is silent -- see [`SweepOutcome::nodes_suppressed_all_silent`]'s
-    /// doc), and prune bookkeeping for nodes that are both gone and already
-    /// swept.
+    /// Refreshes rosters, retires silent missing nodes, and prunes bookkeeping.
     pub async fn sweep_once(
         &self,
         registry: &dyn NodeRegistry,
@@ -99,18 +69,12 @@ impl BindingSweeper {
             .map(|r| (r.node_id.clone(), r))
             .collect();
 
-        // Candidates: shadowed nodes no longer present in the live roster
-        // list at all. A node still listed there (even with an empty
-        // roster) is not a sweep candidate -- it is still known to
-        // discovery and merely idle.
+        // Only nodes absent from discovery are candidates.
         let mut candidates: Vec<(String, Roster)> = Vec::new();
         {
             let mut inner = self.inner.lock().expect("sweep lock poisoned");
 
-            // Refresh the shadow with every currently-live, ever-reported
-            // roster -- a roster whose `last_seen` is `None` (known to
-            // discovery, never heartbeated) is never shadowed, matching
-            // Go's own rule.
+            // Never shadow nodes that have not heartbeated.
             for (node_id, roster) in &live {
                 if roster.last_seen.is_some() {
                     inner.last_known.insert(node_id.clone(), roster.clone());
@@ -122,9 +86,7 @@ impl BindingSweeper {
                 if live.contains_key(&node_id) {
                     continue;
                 }
-                // A fleet-upgrade rename (the same machine now reports
-                // under a new id) is not a death -- forget the stale shadow
-                // and move on without sweeping it.
+                // Renamed nodes are not dead nodes.
                 if let Some(resolved) = registry.resolve(&node_id) {
                     if resolved.id != node_id {
                         inner.last_known.remove(&node_id);
@@ -157,12 +119,7 @@ impl BindingSweeper {
             })
             .collect();
 
-        // Whole-fleet guard: with more than one candidate, "every one of
-        // them is silent" is much more likely to be a partition or a
-        // control-plane outage than every one of them actually dying at
-        // once -- suppress rather than retire the whole fleet's bindings.
-        // A single-node deployment is exempt: there, "the only candidate is
-        // silent" and "the one node died" are the same sentence.
+        // Suppress whole-fleet retirement, except for a single-node deployment.
         if candidates.len() > 1 && silent.len() == candidates.len() {
             return SweepOutcome {
                 nodes_suppressed_all_silent: candidates.len() as u64,
@@ -179,9 +136,7 @@ impl BindingSweeper {
             let mut complete = true;
             for entry in &roster.entries {
                 if entry.execution_id.is_empty() {
-                    // Unguarded delete is refused on purpose -- such
-                    // records already carry the short binding_ttl and
-                    // expire on their own.
+                    // Unknown incarnations expire by TTL instead of an unguarded delete.
                     outcome.ignored_unknown_execution += 1;
                     continue;
                 }
@@ -196,8 +151,7 @@ impl BindingSweeper {
                         outcome.retired += 1;
                     }
                     Ok(BindingDeleteOutcome::RejectedStale) => {
-                        // The guard doing its job: the sandbox was rescued
-                        // elsewhere under a newer incarnation.
+                        // A newer incarnation has already taken over.
                         outcome.refused_stale += 1;
                     }
                     Ok(BindingDeleteOutcome::Absent) => {}
@@ -212,12 +166,10 @@ impl BindingSweeper {
                 inner.swept.insert(node_id.clone(), last_seen);
                 outcome.nodes_swept += 1;
             }
-            // else: retried next round, matching Go's own "not marked swept
-            // on failure" rule.
+            // Incomplete sweeps retry next round.
         }
 
-        // Prune: a node both gone from discovery and already fully swept
-        // for its current timestamp no longer needs shadow bookkeeping.
+        // Prune fully swept nodes that remain absent.
         {
             let mut inner = self.inner.lock().expect("sweep lock poisoned");
             let stale: Vec<String> = inner
@@ -240,10 +192,7 @@ impl BindingSweeper {
         outcome
     }
 
-    /// Runs [`BindingSweeper::sweep_once`] on `interval`, forever. No
-    /// initial pass on start -- a fresh replica must not conclude a fleet
-    /// it has never spoken to is dead (mirrors Go's own
-    /// `RunBindingSweep`).
+    /// Runs sweep rounds forever, delaying the first pass by one interval.
     pub async fn run(
         self: std::sync::Arc<Self>,
         registry: std::sync::Arc<dyn NodeRegistry>,
@@ -286,9 +235,7 @@ impl BindingSweeper {
     }
 }
 
-/// Ports `agentenv_scheduler_binding_sweep_total{outcome="deleted"}`-shaped
-/// counters, split one metric per outcome rather than a label set, since
-/// `run`'s own increments are already outcome-specific sums.
+// Per-outcome counters avoid a free-form label set.
 const SWEEP_RETIRED_METRIC: &str = "agentenv_api_binding_sweep_retired_total";
 const SWEEP_REFUSED_STALE_METRIC: &str = "agentenv_api_binding_sweep_refused_stale_total";
 const SWEEP_STORE_ERROR_METRIC: &str = "agentenv_api_binding_sweep_store_error_total";
@@ -365,9 +312,6 @@ mod tests {
             .unwrap();
         let sweeper = BindingSweeper::new("cluster-a".to_string(), Duration::from_secs(60));
 
-        // First round shadows node-a; a long time later, node-a is *still*
-        // discoverable (its EndpointSlice entry is unchanged) even though
-        // it never heartbeated again.
         sweeper.sweep_once(&registry, &store, unix(0)).await;
         let outcome = sweeper.sweep_once(&registry, &store, unix(100_000)).await;
 
@@ -399,11 +343,8 @@ mod tests {
             .unwrap();
         let sweeper = BindingSweeper::new("cluster-a".to_string(), Duration::from_secs(60));
 
-        // Round 1, while node-a is still discoverable: shadows it.
         sweeper.sweep_once(&registry, &store, unix(0)).await;
 
-        // node-a's EndpointSlice entry is gone entirely (never renamed,
-        // just gone) -- an empty registry.
         let empty_registry = AtomicNodeRegistry::new(vec![], Duration::from_secs(30));
 
         let outcome = sweeper
@@ -427,9 +368,6 @@ mod tests {
         )
         .await;
         let store = InMemoryBindingStore::new(BindingStoreSettings::default());
-        // The sandbox has since been resumed elsewhere under a newer
-        // incarnation -- the sweep's own delete call must be refused by
-        // the same guard applyProjectionDelete relies on.
         store
             .record(
                 "sbx-1",
@@ -501,8 +439,6 @@ mod tests {
 
         assert_eq!(outcome.ignored_unknown_execution, 1);
         assert_eq!(outcome.retired, 0);
-        // The record still exists -- it will expire on its own short TTL,
-        // not via an unguarded sweep delete.
         assert!(store.get("sbx-1", unix(0)).await.unwrap().is_some());
     }
 
@@ -576,11 +512,8 @@ mod tests {
             .unwrap();
 
         let sweeper = BindingSweeper::new("cluster-a".to_string(), Duration::from_secs(60));
-        // Round 1: shadow node-a-old while it is still the live identity.
         sweeper.sweep_once(&registry, &store, unix(0)).await;
 
-        // A fleet upgrade renames the same machine: node-a-old is now an
-        // alias for the new canonical id node-a-new, not a departed node.
         registry.set(
             vec![Node {
                 id: "node-a-new".to_string(),

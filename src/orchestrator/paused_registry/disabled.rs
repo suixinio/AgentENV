@@ -8,12 +8,7 @@ use super::{
 use crate::snapshot::SnapshotId;
 use crate::types::{ExecutionId, SandboxId};
 
-/// Default registry: records nothing, claims nothing.
-///
-/// With this backend a paused sandbox stays exactly as resumable as it was
-/// before the registry existed — on its own node, through the node-local
-/// persister — and `claim_for_resume` always reports `NotFound`, so the resume
-/// path never leaves the local fast path.
+/// No-op registry that keeps pause and resume node-local.
 #[derive(Default)]
 pub struct DisabledPausedSandboxRegistry;
 
@@ -47,15 +42,7 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         Ok(None)
     }
 
-    /// Covers nothing, rather than covering everything as absent.
-    ///
-    /// 🔴 The difference matters even though `reconcile_local_records` already
-    /// refuses to run against a registry that is not cluster-backed: "every
-    /// sandbox you asked about is gone" is the one answer that must never come
-    /// out of a registry that was never consulted, and saying it here would
-    /// leave that single gate as the only thing between a no-op backend and a
-    /// node tearing down its whole roster. An empty `covered` makes the same
-    /// guarantee structurally, at the type.
+    /// Covers no ids, so callers cannot treat its empty result as absence.
     async fn get_many(&self, _sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
         Ok(PausedRegistryRows::default())
     }
@@ -74,9 +61,6 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         _sandbox_id: &SandboxId,
         _generation: i64,
     ) -> RegistryResult<bool> {
-        // Nothing was ever recorded, so nothing matched. `false` here is the
-        // truth rather than a stub: there is no row this release could have
-        // returned to the cluster.
         Ok(false)
     }
 
@@ -96,8 +80,6 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         _execution_id: ExecutionId,
         _expires_at: Option<std::time::SystemTime>,
     ) -> RegistryResult<MarkRunningOutcome> {
-        // Untracked, not held-elsewhere: this backend has no cluster to hold a
-        // sandbox anywhere else.
         Ok(MarkRunningOutcome::Untracked)
     }
 
@@ -107,8 +89,6 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
         _execution_id: ExecutionId,
         _expires_at: Option<std::time::SystemTime>,
     ) -> RegistryResult<DeadlineRenewalOutcome> {
-        // Not tracked, the same answer mark_running gives: this backend has no
-        // cluster row to write a deadline onto.
         Ok(DeadlineRenewalOutcome::NotTracked)
     }
 
@@ -121,13 +101,6 @@ impl PausedSandboxRegistry for DisabledPausedSandboxRegistry {
     }
 
     async fn list_all(&self) -> RegistryResult<PausedRegistryListing> {
-        // Consistent with every other read above: nothing was ever recorded,
-        // so an empty listing is the truth, not a stub. `is_cluster_backed`
-        // stays `false` (this impl never overrides the trait default), so
-        // `list_registry_sandboxes` never actually reaches this in practice
-        // -- it answers `FailedPrecondition` straight off that guard,
-        // mirroring Go's `ErrDisabled` -- but this must still answer
-        // honestly on its own if ever called directly.
         Ok(PausedRegistryListing {
             sandboxes: Vec::new(),
             now: chrono::Utc::now(),

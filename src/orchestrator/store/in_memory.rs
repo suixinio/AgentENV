@@ -13,21 +13,6 @@ use super::{
 
 /// In-memory metadata store backed by a `RwLock<HashMap>`.
 ///
-/// # 🔴 A node's own ledger, not the cluster's authority
-///
-/// Under `aenv-node` this is the sandbox record for the
-/// machine it runs on. It is **not** a second backend for cluster state, and
-/// `aenv-api` never constructs it. Nothing should ever write to both this and
-/// the Redis store: two authorities for one fact is the arrangement this whole
-/// stage exists to remove.
-///
-/// The four cluster primitives — `start_transition`, `reserve`,
-/// `heal_expiry_index`, `reap_stuck_transitions` — are deliberately left at
-/// their trait defaults here, which refuse or answer trivially. A node's ledger
-/// never arbitrates between replicas, so a weaker imitation of a primitive
-/// would buy nothing and could be mistaken for the real guarantee; an explicit
-/// refusal cannot be.
-///
 /// Each sandbox has an associated `watch` channel that broadcasts its current
 /// `Option<SandboxState>` (where `None` means the sandbox has been removed).
 /// This enables efficient, lock-free waiting for state transitions via
@@ -106,17 +91,7 @@ impl StoreInner {
     }
 }
 
-/// 🔴 Every one of the four methods below that writes a record calls
-/// [`SandboxMetadata::sync_running_clock`] before it publishes the result, and
-/// that is the whole of the lifetime clock's bookkeeping.
-///
-/// The alternative — a hook at each of the eight or so places that assign
-/// `metadata.state` — was rejected for the same reason `_set_timeout` is the
-/// single clamp point: with that many call sites, one of them is eventually
-/// written without the hook, and the symptom is a sandbox that quietly loses
-/// or gains budget. Here the callback in `update_if_state` is free to set
-/// whatever state it likes; the store reconciles the clock afterwards, because
-/// the clock is a function of the state and nothing else.
+/// All record writes reconcile the running-lifetime clock before publication.
 #[async_trait]
 impl MetadataStore for InMemoryMetadataStore {
     async fn add(&self, mut metadata: SandboxMetadata) -> Result<()> {
@@ -275,9 +250,7 @@ impl MetadataStore for InMemoryMetadataStore {
         Ok(removed.map(|record| record.metadata))
     }
 
-    /// One write lock covers the predicate and the removal, so nothing can
-    /// change owner in between — which is the guarantee the Redis backend needs
-    /// a script for.
+    /// Removes under one lock so the execution predicate and delete are atomic.
     async fn remove_if_execution(
         &self,
         sandbox_id: &SandboxId,
@@ -367,12 +340,7 @@ impl MetadataStore for InMemoryMetadataStore {
         self.expired_batch(now, usize::MAX).await
     }
 
-    /// The bounded form, which is what an evictor running on several replicas
-    /// needs: a fixed amount of work per round rather than the whole table.
-    ///
-    /// Three lines here because the expiry index and the records share one
-    /// lock. That is also why `heal_expiry_index` has nothing to do for this
-    /// store — the two cannot drift apart.
+    /// Returns at most `limit` records from the in-lock expiry index.
     async fn expired_batch(&self, now: SystemTime, limit: usize) -> Result<Vec<SandboxMetadata>> {
         let inner = self.inner.read().await;
         let expired = inner
@@ -455,9 +423,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, UNIX_EPOCH};
 
-    /// The shared contract, run against this backend. The Redis backend runs
-    /// the identical list; a change made to one and forgotten for the other
-    /// turns red here.
     mod contract {
         use super::super::InMemoryMetadataStore;
 
@@ -896,14 +861,6 @@ mod tests {
         assert!(matches!(err, StoreError::SandboxAlreadyExists { .. }));
     }
 
-    /// 🔴 The funnel, proved end to end through the store rather than by
-    /// calling `sync_running_clock` directly.
-    ///
-    /// Each of the four writing methods is exercised: `add` opens the clock,
-    /// `update_state_if_state` closes it on the way to `Paused`, `update`
-    /// leaves it closed while paused, and the `update_if_state` callback
-    /// reopens it by setting `Running` — without that callback saying anything
-    /// about the clock, which is the point of putting the reconcile here.
     #[tokio::test]
     async fn the_store_keeps_the_running_clock_in_step_with_the_state() {
         let store = InMemoryMetadataStore::new();
@@ -934,7 +891,6 @@ mod tests {
         let charged = paused.running_elapsed;
         assert!(charged >= Duration::from_millis(15), "{charged:?}");
 
-        // A whole-record write while paused charges nothing further.
         tokio::time::sleep(Duration::from_millis(20)).await;
         store.update(paused).await.unwrap();
         assert_eq!(
@@ -942,7 +898,6 @@ mod tests {
             charged
         );
 
-        // The callback only sets the state; the clock follows on its own.
         store
             .update_if_state(&id, &[SandboxState::Paused], |metadata| {
                 metadata.state = SandboxState::Running;

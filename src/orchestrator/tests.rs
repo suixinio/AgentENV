@@ -40,15 +40,6 @@ fn setup() {
     crate::logging::init_for_tests();
 }
 
-/// 🔴 A recording double, not this machine's real layer cache.
-///
-/// It used to be `local_image_services_from_global_config().runtime_refs`,
-/// which opens the process-wide image-cache RocksDB under `$AENV_HOME` — code
-/// that lives in `aenv-node` now and that the orchestrator, being shared, does
-/// not link. The double answers the same trait the orchestrator drives, and
-/// the one test that needed the *real* cache (GC keeping a paused sandbox's
-/// runtime config alive) moved to `aenv-node` with it — see
-/// `aenv_node::image::cache`'s `pause_uses_runtime_config_when_source_config_was_evicted`.
 fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
     Arc::new(RecordingRuntimeImageRefs::default())
 }
@@ -97,18 +88,8 @@ fn make_orchestrator_without_background_with_factory<
     )
 }
 
-/// What `[orchestrator].default_sandbox_timeout_secs` is worth to a test that
-/// does not care what it is.
-///
-/// 🔴 A test that cares says so with
-/// [`make_orchestrator_without_background_with_default_timeout`], because "the
-/// configured default" is one of the three answers
-/// [`SandboxExpiry`](crate::orchestrator::SandboxExpiry) has and an assertion
-/// about it has to be about a value the test chose.
 const TEST_DEFAULT_SANDBOX_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// An orchestrator whose configured default is short enough for a test to
-/// outlast on purpose.
 fn make_orchestrator_without_background_with_default_timeout(
     default_sandbox_timeout: Duration,
 ) -> Arc<TestOrchestrator> {
@@ -768,19 +749,6 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     Ok(())
 }
 
-/// 🔴 The startup ordering the routing projection's TTL now rests on.
-///
-/// Heartbeat reconciliation deletes every binding a node owns when that node
-/// reports an empty roster — that is what makes a node's disappearance clear
-/// its records instead of leaving them pointing at nothing. It also means a
-/// node that heartbeats *before* it has finished restoring its persisted
-/// sandboxes would wipe its own routing records on every restart, and would do
-/// it quietly: the records come back on the following heartbeat, so all anyone
-/// sees is a few seconds of 404s that look like a cold cache.
-///
-/// The ordering that prevents it is that `Orchestrator::new` finishes the
-/// restore before it returns, and `src/bin/aenv-node.rs` starts the reporter after
-/// that await. Nothing else pins it, so this does.
 #[tokio::test]
 async fn the_roster_is_complete_the_moment_new_returns() -> Result<()> {
     setup();
@@ -797,8 +765,6 @@ async fn the_roster_is_complete_the_moment_new_returns() -> Result<()> {
     )
     .await?;
 
-    // No await in between, and no background task to wait for: whatever the
-    // first heartbeat would carry is already here.
     let roster = orchestrator.list_sandbox_roster().await?;
 
     assert_eq!(
@@ -863,7 +829,6 @@ fn create_launch_plan_with_resources(sandbox_id: SandboxId) -> LaunchPlan {
     )
 }
 
-/// A registered sandbox handle with no behaviour of its own.
 fn mock_sandbox_handle() -> SandboxHandle {
     Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
         Arc::new(MockBehavior::new()),
@@ -871,10 +836,6 @@ fn mock_sandbox_handle() -> SandboxHandle {
     ))))
 }
 
-/// A claim token for tests that drive the orchestrator directly.
-///
-/// Goes through the same constructor the arbitration uses, so these tests
-/// exercise the real shape rather than a test-only door.
 fn test_claim() -> ClaimedExecution {
     ClaimedExecution::from_claim(ExecutionId::new())
 }
@@ -1167,9 +1128,6 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
     )));
     let replacement_target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 42));
 
-    // 🔴 Named rather than left to `Default`: what keeps this record is that it
-    // names a launch other than the one cleaning up, and a premise that only
-    // holds because a fixture happens to mint a fresh id is not a premise.
     let replacement_execution_id = ExecutionId::new();
     assert_ne!(replacement_execution_id, plan.execution_id());
     orchestrator
@@ -1217,28 +1175,10 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
     assert_eq!(untouched.execution_id, replacement_execution_id);
 }
 
-/// A create that fails after its record was written clears that record whether
-/// or not something else has taken over its id — and clears only its own.
-///
-/// # 🔴 What the third sandbox is for
-///
-/// Two of these three ids end with no record, so on their own they cannot tell
-/// a working predicate from a cleanup that deletes whatever it is pointed at.
-/// The third differs in exactly one value — whose incarnation the record under
-/// the id names — and it has to still be there when the run ends.
-///
-/// # 🔴 Why "no record" is the right answer for the middle one
-///
-/// A create's record is written in `Creating`, and the state machine has no
-/// edge from `Creating` to `Killing`, so a delete waits for a transition that
-/// already ended and then answers `invalid state Creating` — forever. Leaving
-/// that record behind is not a smaller failure than deleting the wrong one; it
-/// is a row only a hand-written Redis command can remove.
 #[tokio::test]
 async fn a_failed_create_clears_its_own_creating_record_even_when_its_handle_was_replaced() {
     let orchestrator = make_orchestrator().await;
 
-    // Same failure, same stage, same run. One value differs per sandbox.
     let handle_kept = SandboxId::new();
     let handle_replaced = SandboxId::new();
     let record_is_another_launchs = SandboxId::new();
@@ -1247,7 +1187,6 @@ async fn a_failed_create_clears_its_own_creating_record_even_when_its_handle_was
     let plan_replaced = create_launch_plan_with_resources(handle_replaced);
     let plan_other = create_launch_plan_with_resources(record_is_another_launchs);
 
-    // The first two ids hold the record their own launch wrote ...
     for plan in [&plan_kept, &plan_replaced] {
         orchestrator
             .store
@@ -1259,7 +1198,6 @@ async fn a_failed_create_clears_its_own_creating_record_even_when_its_handle_was
             .await
             .unwrap();
     }
-    // ... and the third holds one written by a launch that is not this one.
     let other_launch = SandboxMetadata {
         id: record_is_another_launchs,
         execution_id: ExecutionId::new(),
@@ -1304,7 +1242,6 @@ async fn a_failed_create_clears_its_own_creating_record_even_when_its_handle_was
         )
         .await;
 
-    // Still holding its own handle: the ordinary rollback, and both go.
     assert!(
         orchestrator
             .store
@@ -1320,8 +1257,6 @@ async fn a_failed_create_clears_its_own_creating_record_even_when_its_handle_was
         .await
         .contains_key(&handle_kept));
 
-    // Handle taken over: the replacement keeps everything keyed by the id, and
-    // the record this launch wrote is still cleared.
     assert!(
         orchestrator
             .store
@@ -1340,7 +1275,6 @@ async fn a_failed_create_clears_its_own_creating_record_even_when_its_handle_was
         .expect("the replacement handle must stay registered");
     assert!(Arc::ptr_eq(&still_registered, &replacement_for_mine));
 
-    // 🔴 The non-empty half: a record that must survive the same cleanup.
     let survivor = orchestrator
         .store
         .get(&record_is_another_launchs)
@@ -1359,15 +1293,6 @@ async fn a_failed_create_clears_its_own_creating_record_even_when_its_handle_was
     assert!(Arc::ptr_eq(&other_registered, &replacement_for_other));
 }
 
-/// A resume that loses its id is deliberately left alone, and this pins that.
-///
-/// 🔴 Not an oversight and not a smaller version of the create case. A resume's
-/// record predates the launch and belongs to the sandbox, its rollback is a
-/// state change back to `Paused` rather than a removal, and the rest of that
-/// rollback — the persister's resume record, the image pin — is keyed by
-/// sandbox id, which is exactly what the refusal is protecting. If that is ever
-/// answered too, it needs a fenced *state write*, and this test is what will
-/// say so.
 #[tokio::test]
 async fn a_failed_resume_whose_handle_was_replaced_still_leaves_its_record_alone() {
     let orchestrator = make_orchestrator().await;
@@ -1375,10 +1300,6 @@ async fn a_failed_resume_whose_handle_was_replaced_still_leaves_its_record_alone
     let plan = resume_launch_plan(sandbox_id);
     let mut resuming = paused_resume_metadata(sandbox_id);
     resuming.state = SandboxState::Resuming;
-    // 🔴 The record names *this* launch's incarnation, so the only thing that
-    // can keep it is the plan-variant check. A fixture whose incarnation
-    // differed would be kept by the fence instead, and this test would pass
-    // with the check deleted.
     resuming.execution_id = plan.execution_id();
     orchestrator.store.add(resuming).await.unwrap();
 
@@ -1426,11 +1347,6 @@ fn create_request(
 
     CreateSandboxRequest {
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
-        // 🔴 `None` here is the *client's* "I did not say", which is what
-        // `AfterConfiguredDefault` spells. It is deliberately not the other
-        // reading the old `Option<Duration>` also carried — see
-        // `SandboxExpiry` — and the tests that want that one say
-        // `SandboxExpiry::NotKeptHere` by name.
         expiry: match timeout_secs {
             Some(secs) => SandboxExpiry::After(Duration::from_secs(secs)),
             None => SandboxExpiry::AfterConfiguredDefault,
@@ -1537,12 +1453,6 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
     Ok(())
 }
 
-/// `replace_sandbox_custom_extension_params` is the node-reachable half of
-/// `patch_sandbox_custom_extension_params` — the assign-then-persist tail
-/// with no hook involved. This exercises it directly, the way
-/// `sandbox_network_policy_is_applied_and_persisted` exercises its sibling:
-/// what the mock backend actually holds afterward — not merely that the call
-/// returned `Ok` — is checked, alongside the metadata store's row.
 #[tokio::test]
 async fn sandbox_custom_extension_params_are_applied_and_persisted() -> Result<()> {
     setup();
@@ -1576,11 +1486,6 @@ async fn sandbox_custom_extension_params_are_applied_and_persisted() -> Result<(
     Ok(())
 }
 
-/// A backend failure during the assignment must not reach the metadata
-/// store: the caller gets an error and `GET` must keep reporting the value
-/// the runtime actually holds, not the one the failed call carried. This is
-/// the exact property the `Unimplemented`-forever node handler broke — the
-/// store updated regardless of whether the runtime ever received the value.
 #[tokio::test]
 async fn a_failed_custom_extension_params_assignment_leaves_the_store_untouched() -> Result<()> {
     setup();
@@ -2035,15 +1940,6 @@ async fn pause_persists_before_publishing_paused_metadata() -> Result<()> {
     Ok(())
 }
 
-/// 🔴 The producer end of the transparent-wake fix, and the reason the guards
-/// in `node_registry/grpc_service.rs` are not testing themselves.
-///
-/// Those guards feed the receiver a synthetic `paused: true` entry. Nothing in
-/// them would notice if this side never set the flag — the receiver would keep
-/// filtering nothing, every paused sandbox would keep its routing projection,
-/// and the gateway would keep answering 410 instead of waking it, with the
-/// whole receiver-side suite still green. This is the test that fails in that
-/// case.
 #[tokio::test]
 async fn the_roster_flags_a_sandbox_as_paused_only_once_it_is_paused() -> Result<()> {
     setup();
@@ -2085,13 +1981,6 @@ async fn the_roster_flags_a_sandbox_as_paused_only_once_it_is_paused() -> Result
     Ok(())
 }
 
-/// 🔴 The run has to be charged *before* the record is written, not merely
-/// before the store sees it.
-///
-/// `running_since` is `#[serde(skip)]`, so the only thing a restarted node can
-/// read back is `running_elapsed`. A pause that left the charging to the store
-/// would persist a record with the last run missing from it, and every node
-/// restart would hand that run back for free.
 #[tokio::test]
 async fn pause_charges_the_run_into_the_record_it_persists() -> Result<()> {
     setup();
@@ -3179,11 +3068,6 @@ async fn keep_alive_uses_latest_metadata_when_deciding_whether_to_shorten() -> R
     Ok(())
 }
 
-/// The ceiling clamps a renewal; it does not refuse one.
-///
-/// 🔴 The direction matters. Refusing an over-long renewal would hand a new 400
-/// to every client that passes a generous timeout — and clients pass generous
-/// timeouts because that is what the API has always accepted.
 #[tokio::test]
 async fn keep_alive_clamps_an_over_long_renewal_to_the_ceiling() -> Result<()> {
     setup();
@@ -3194,8 +3078,6 @@ async fn keep_alive_clamps_an_over_long_renewal_to_the_ceiling() -> Result<()> {
         state: SandboxState::Running,
         created_at,
         max_lifetime: Some(Duration::from_secs(300)),
-        // Running since it was created, so its window is pinned there and this
-        // test can name the instant the ceiling falls on.
         running_since: Some(created_at),
         ..Default::default()
     };
@@ -3215,24 +3097,10 @@ async fn keep_alive_clamps_an_over_long_renewal_to_the_ceiling() -> Result<()> {
         Some(created_at + Duration::from_secs(300)),
         "the deadline may not be pushed past the ceiling"
     );
-    // The request itself succeeded and recorded what was asked for.
     assert_eq!(updated.timeout, Some(Duration::from_secs(3_600)));
     Ok(())
 }
 
-/// The cluster-registry propagation half of the test above: the deadline the
-/// publisher is told about must be the *clamped* one, not the caller's raw
-/// 3600s request.
-///
-/// This is the fix for the bug `POST /timeout` never reached
-/// `paused_sandboxes.sandbox_expires_at` at all: before `keep_alive_for`
-/// called `renew_deadline`, nothing on this path ever reached the cluster
-/// registry a second time after the resume that first wrote it. A test that
-/// only checked "a call was made" could not tell that fix apart from one that
-/// forwarded `valid_timeout` (the caller's raw duration) or `new_expire_time`
-/// straight out of the closure — both unclamped — so this pins the exact
-/// value the same way `keep_alive_clamps_an_over_long_renewal_to_the_ceiling`
-/// pins it for the local record.
 #[tokio::test]
 async fn keep_alive_reports_the_clamped_deadline_to_the_cluster_registry() -> Result<()> {
     setup();
@@ -3284,10 +3152,6 @@ async fn keep_alive_reports_the_clamped_deadline_to_the_cluster_registry() -> Re
     Ok(())
 }
 
-/// The skipped-write control for the test above: `allow_shorter=false`
-/// leaving the local record untouched must also leave the registry
-/// untouched. A publisher called anyway would mislead `ReclaimExpiredHoldings`
-/// into treating a no-op request as a genuine extension.
 #[tokio::test]
 async fn keep_alive_does_not_report_a_skipped_update_to_the_cluster_registry() -> Result<()> {
     setup();
@@ -3318,9 +3182,6 @@ async fn keep_alive_does_not_report_a_skipped_update_to_the_cluster_registry() -
     Ok(())
 }
 
-/// The control face for the test above: the same call on a node with no
-/// ceiling. Without this, "clamped to 300" could just as well be "the ceiling
-/// was never consulted and 300 came from somewhere else".
 #[tokio::test]
 async fn keep_alive_without_a_ceiling_is_not_clamped() -> Result<()> {
     setup();
@@ -3351,13 +3212,6 @@ async fn keep_alive_without_a_ceiling_is_not_clamped() -> Result<()> {
     Ok(())
 }
 
-/// The one refusal the ceiling produces, and the reason `/timeout` and
-/// `/refreshes` grew a 400 they never returned before.
-///
-/// 🔴 Only reachable as a unit test. End to end the window is under a second:
-/// the eviction loop runs every `auto_evict_interval_ms` and tears down a
-/// sandbox the moment it passes `expires_at`, which a clamped sandbox reaches
-/// at the same instant it passes its ceiling.
 #[tokio::test]
 async fn keep_alive_refuses_a_sandbox_that_is_already_past_its_ceiling() {
     setup();
@@ -3368,8 +3222,6 @@ async fn keep_alive_refuses_a_sandbox_that_is_already_past_its_ceiling() {
         state: SandboxState::Running,
         created_at,
         max_lifetime: Some(Duration::from_secs(300)),
-        // 🔴 Running for the whole hour, not merely created an hour ago. That
-        // is what puts it past a five-minute ceiling: paused time would not.
         running_since: Some(created_at),
         ..Default::default()
     };
@@ -3391,20 +3243,6 @@ async fn keep_alive_refuses_a_sandbox_that_is_already_past_its_ceiling() {
     }
 }
 
-/// 🔴 QA F3. A sandbox paused for longer than the ceiling has to resume — and
-/// stay resumed.
-///
-/// The first cut of the ceiling derived the deadline from `created_at` alone,
-/// so this sequence returned a successful 201 and then handed the eviction loop
-/// a Running sandbox whose `expires_at` was already in the past. Within one
-/// `auto_evict_interval_ms` the sandbox was paused again (or deleted, for a
-/// sandbox carrying that timeout action), and the client saw a resume that
-/// worked followed by a sandbox that was dead.
-///
-/// Twenty-five hours of wall clock cannot be waited out in a unit test, and
-/// they do not have to be: `created_at` is the whole of what the old model read
-/// and it is set directly here. The paired control face below shows the ceiling
-/// still bites when the budget is genuinely spent.
 #[tokio::test]
 async fn a_sandbox_paused_past_the_ceiling_resumes_and_survives_the_evictor() -> Result<()> {
     setup();
@@ -3415,7 +3253,6 @@ async fn a_sandbox_paused_past_the_ceiling_resumes_and_survives_the_evictor() ->
     let sandbox_id = created.id;
     assert_proxy_ready(&orchestrator, &sandbox_id).await?;
 
-    // Put the node's default ceiling on it, then pause.
     let mut running = orchestrator
         .get_sandbox(&sandbox_id)
         .await?
@@ -3438,7 +3275,6 @@ async fn a_sandbox_paused_past_the_ceiling_resumes_and_survives_the_evictor() ->
         "a paused sandbox has no run in progress to charge"
     );
 
-    // Twenty-five hours later.
     paused.created_at = SystemTime::now() - Duration::from_secs(90_000);
     orchestrator.store.update(paused).await?;
 
@@ -3458,8 +3294,6 @@ async fn a_sandbox_paused_past_the_ceiling_resumes_and_survives_the_evictor() ->
         "resume handed back a deadline that had already passed"
     );
 
-    // The half that actually kills the sandbox: the eviction loop reads
-    // `expires_at` and state, and would tear this one down within the second.
     let evicted = orchestrator.evict_expired_sandboxes().await?;
     assert!(
         evicted.is_empty(),
@@ -3478,12 +3312,6 @@ async fn a_sandbox_paused_past_the_ceiling_resumes_and_survives_the_evictor() ->
     Ok(())
 }
 
-/// 🔴 The control face for the test above, and the reason it proves anything.
-///
-/// Same sequence, same evictor, one difference: this sandbox really has spent
-/// its running budget. It still resumes — §6.3 clamps rather than refuses — and
-/// the evictor still takes it, which is what says the ceiling was not simply
-/// switched off.
 #[tokio::test]
 async fn a_sandbox_that_has_spent_its_running_budget_is_still_evicted_after_a_resume() -> Result<()>
 {
@@ -3500,7 +3328,6 @@ async fn a_sandbox_that_has_spent_its_running_budget_is_still_evicted_after_a_re
         .await?
         .expect("a running sandbox");
     running.max_lifetime = Some(Duration::from_secs(300));
-    // Five minutes of budget, six minutes already burned by earlier runs.
     running.running_elapsed = Duration::from_secs(360);
     orchestrator.store.update(running).await?;
     orchestrator.pause_sandbox(sandbox_id).await?;
@@ -3538,28 +3365,9 @@ async fn a_sandbox_that_has_spent_its_running_budget_is_still_evicted_after_a_re
     Ok(())
 }
 
-/// One create request, one field different, opposite answers from the evictor.
-///
-/// 🔴 **This is the fault the role split introduced, and the shape of it is
-/// that two intentions used to be one value.** The API half asks a node to run
-/// a sandbox whose record, whose expiry index and whose eviction loop are all
-/// on the API half; a user posting to `POST /sandboxes` without a `timeout`
-/// asks *this* orchestrator to pick one. Both used to arrive as `None`, so the
-/// node applied its own `default_sandbox_timeout_secs` — fifteen seconds on the
-/// cluster this was found on — and paused a VM the API half went on reporting
-/// as running.
-///
-/// 🔴 **The negative half is worthless on its own and is not left on its own.**
-/// "The caller-kept sandbox was not evicted" is satisfied by an evictor that
-/// did nothing at all, so the same pass has to take something: the sandbox that
-/// asked for the configured default is expired and paused in this very run, by
-/// this very call. And the third leg tells the two reasons for *not* being
-/// evicted apart — a deadline in the future is not the same as no deadline.
 #[tokio::test]
 async fn the_evictor_takes_the_deadlines_this_orchestrator_keeps_and_no_others() -> Result<()> {
     setup();
-    // 🔴 Chosen here, and short, so that "after the default has passed" is an
-    // interval this test makes rather than one it hopes three creates took.
     const CONFIGURED_DEFAULT: Duration = Duration::from_millis(20);
     const LONGER_THAN_THE_WHOLE_TEST: Duration = Duration::from_secs(600);
 
@@ -3580,9 +3388,6 @@ async fn the_evictor_takes_the_deadlines_this_orchestrator_keeps_and_no_others()
         .create_sandbox(with(SandboxExpiry::After(LONGER_THAN_THE_WHOLE_TEST)))
         .await?;
 
-    // What each one wrote down. 🔴 The middle assertion names the value this
-    // test configured: an implementation that reached for some other default
-    // would still produce *a* deadline, and only naming the number catches it.
     assert_eq!(caller_kept.timeout, None);
     assert_eq!(
         caller_kept.expires_at, None,
@@ -3591,9 +3396,6 @@ async fn the_evictor_takes_the_deadlines_this_orchestrator_keeps_and_no_others()
     assert_eq!(node_default.timeout, Some(CONFIGURED_DEFAULT));
     assert_eq!(node_named.timeout, Some(LONGER_THAN_THE_WHOLE_TEST));
 
-    // 🔴 The wait is the test's, and it is ten times the deadline it is waiting
-    // out — not "however long the statements above took", which is the version
-    // that passes on a fast machine and fails on a loaded one.
     sleep(CONFIGURED_DEFAULT * 10).await;
 
     let evicted = orchestrator.evict_expired_sandboxes().await?;
@@ -3636,17 +3438,6 @@ async fn the_evictor_takes_the_deadlines_this_orchestrator_keeps_and_no_others()
     Ok(())
 }
 
-/// A fork of a sandbox with no deadline gives its children no deadline.
-///
-/// 🔴 The fork path reaches the node as `timeout_ms: 0`, which it reads as
-/// `NewTimeout::UseExisting` — so whether a fork child inherits a deadline
-/// nobody agreed to is decided entirely by what the *source's* create wrote
-/// down. That is why this is asserted here and not argued about: a create fixed
-/// in isolation would still leak fifteen-second deadlines into every child if
-/// `UseExisting` fell back to the default.
-///
-/// The non-empty half is the second fork, which asks for a deadline by name and
-/// gets one — and is the child the single eviction pass below takes.
 #[tokio::test]
 async fn a_fork_of_a_sandbox_with_no_deadline_gives_its_children_none() -> Result<()> {
     setup();
@@ -3710,12 +3501,6 @@ async fn a_fork_of_a_sandbox_with_no_deadline_gives_its_children_none() -> Resul
     Ok(())
 }
 
-/// Resuming a sandbox with no deadline does not hand it one.
-///
-/// 🔴 Same reasoning as the fork above: a resume driven by the API half sends
-/// `timeout_ms: 0` and the node reads `NewTimeout::UseExisting`, so the answer
-/// is whatever the paused record says. The non-empty half is the second
-/// sandbox, resumed with a deadline it named and evicted in the same pass.
 #[tokio::test]
 async fn resuming_a_sandbox_with_no_deadline_does_not_hand_it_one() -> Result<()> {
     setup();
@@ -3780,8 +3565,6 @@ async fn resuming_a_sandbox_with_no_deadline_does_not_hand_it_one() -> Result<()
     Ok(())
 }
 
-/// The budget is spent by running and only by running, across as many
-/// pause/resume cycles as it takes.
 #[tokio::test]
 async fn running_time_accumulates_across_pause_and_resume_cycles() -> Result<()> {
     setup();
@@ -3799,7 +3582,6 @@ async fn running_time_accumulates_across_pause_and_resume_cycles() -> Result<()>
         .expect("a paused sandbox")
         .running_elapsed;
 
-    // Sitting paused costs nothing, however many times it is read.
     sleep(Duration::from_millis(30)).await;
     assert_eq!(
         orchestrator
@@ -3831,7 +3613,6 @@ async fn running_time_accumulates_across_pause_and_resume_cycles() -> Result<()>
     Ok(())
 }
 
-/// A fork's child starts its budget over, the way it starts `created_at` over.
 #[tokio::test]
 async fn a_forked_child_does_not_inherit_the_parents_spent_budget() -> Result<()> {
     setup();
@@ -3847,8 +3628,6 @@ async fn a_forked_child_does_not_inherit_the_parents_spent_budget() -> Result<()
         .await?
         .expect("a running sandbox");
     parent.max_lifetime = Some(Duration::from_secs(300));
-    // Nearly all of it spent: a child that cloned this would be evicted almost
-    // at once.
     parent.running_elapsed = Duration::from_secs(290);
     orchestrator.store.update(parent).await?;
 
@@ -4882,17 +4661,6 @@ async fn auto_evict_task_does_not_keep_orchestrator_alive() -> anyhow::Result<()
     Ok(())
 }
 
-/// 🔴 Guards `Orchestrator::shutdown`'s call to `persister.close(...)` — the
-/// line that stops this store's RocksDB background compaction/flush ahead of
-/// process exit. Deleting it leaves every test above and below this one
-/// green: nothing here drives a real multi-gigabyte RocksDB store far enough
-/// into background work for its absence to show up as a hang, and
-/// `RecordingPersister`'s `close` is a no-op anyway. `src/bin/aenv-node.rs`'s
-/// `the_shutdown_bounds_are_still_wired` closes the same gap for the other
-/// two RocksDB-store closes and the final `Runtime::shutdown_timeout`
-/// backstop; this is the one call in that trio that lives in this file
-/// instead, so it needs its own copy of the same technique rather than a
-/// cross-file scan of `server.rs`'s unrelated shutdown path.
 #[test]
 fn shutdown_still_closes_the_persister_store() {
     let source = include_str!("service.rs");
@@ -5657,17 +5425,6 @@ async fn create_sandbox_reports_build_failure_and_leaves_store_empty() -> Result
     Ok(())
 }
 
-/// A fork never lets a child inherit its parent's ownership marker.
-///
-/// 🔴 The marker is the control plane's record *of the parent*, and it names
-/// the parent. A child that carried it would report itself to the control
-/// plane under its parent's identity, so the reconcile that reads those
-/// listings would be told the same sandbox is running twice — and the record
-/// it rebuilt from the child would describe the wrong machine.
-///
-/// The control probe is the `Fresh` half: the parent is deliberately given a
-/// marker, so a forwarding that copied the parent's metadata wholesale would
-/// show up here as a child with one.
 #[tokio::test]
 async fn a_forked_child_never_inherits_its_parents_owner() -> Result<()> {
     setup();
@@ -5697,12 +5454,6 @@ async fn a_forked_child_never_inherits_its_parents_owner() -> Result<()> {
     Ok(())
 }
 
-/// An assigned fork gives each child the marker that was assigned to *it*.
-///
-/// 🔴 Position is the whole contract: `SandboxBackend::fork` returns one result
-/// per spec in the same order, and this rides on that. A rotation by one would
-/// still produce the right number of markers and the right set of them, so the
-/// assertion has to pair each child's marker with that child's id.
 #[tokio::test]
 async fn an_assigned_fork_pairs_each_child_with_its_own_owner() -> Result<()> {
     setup();
@@ -5715,8 +5466,6 @@ async fn an_assigned_fork_pairs_each_child_with_its_own_owner() -> Result<()> {
         .create_sandbox(create_request(Some(60), &[("team", "fork-assigned")]))
         .await?;
 
-    // The marker names the child it belongs to, which is the reason the caller
-    // has to decide the child's id: it cannot write this before it knows one.
     let assigned = (0..3)
         .map(|_| {
             let sandbox_id = SandboxId::new();
@@ -5745,8 +5494,6 @@ async fn an_assigned_fork_pairs_each_child_with_its_own_owner() -> Result<()> {
             child.id, wanted.sandbox_id,
             "children came back out of order"
         );
-        // 🔴 The incarnation is the node's to mint, and each child's must be
-        // its own: the record it is cloned from carries the parent's.
         assert_ne!(child.execution_id, source.execution_id);
         assert_eq!(
             child.control_plane_config.as_ref().map(|c| c.as_bytes()),
@@ -5827,21 +5574,6 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     Ok(())
 }
 
-/// A fork child that came back with no address is refused, not registered.
-///
-/// # 🔴 One value apart, and they must not both be a success
-///
-/// A route is where the proxy sends every request for a sandbox. A child
-/// registered without one is a running VM that every request to it misses, with
-/// nothing saying so; refusing it turns that into an answer the caller can act
-/// on. This is also the reason a node's fork answer has to carry each child's
-/// real address: when it did not, this refusal fired on every child of every
-/// fork the API half drove.
-///
-/// The non-empty half is the first fork, on the same source, in the same test —
-/// so this is not a fork that refuses everything. It also pins that the two
-/// children are routed to *different* addresses, which is what separates a
-/// child's own address reaching the route table from the source's being reused.
 #[tokio::test]
 async fn a_fork_child_with_no_address_is_refused_rather_than_registered() -> Result<()> {
     setup();
@@ -5853,7 +5585,6 @@ async fn a_fork_child_with_no_address_is_refused_rather_than_registered() -> Res
         .create_sandbox(create_request(Some(60), &[("team", "fork-addressing")]))
         .await?;
 
-    // Face one: the fork's children come back with addresses.
     let routable = orchestrator
         .fork_sandbox(source.id, ForkChildren::Fresh(2), NewTimeout::UseExisting)
         .await?
@@ -5886,7 +5617,6 @@ async fn a_fork_child_with_no_address_is_refused_rather_than_registered() -> Res
         );
     }
 
-    // Face two: the same fork, on the same source, with the one value moved.
     behavior.set_fork_children_without_address(true);
     let refused = orchestrator
         .fork_sandbox(source.id, ForkChildren::Fresh(2), NewTimeout::UseExisting)
@@ -5900,9 +5630,6 @@ async fn a_fork_child_with_no_address_is_refused_rather_than_registered() -> Res
         );
     }
 
-    // 🔴 And the refusal left nothing behind. The store holds the source and
-    // the two children that were routable, and nothing else — a child that
-    // could not be routed must not survive as a record either.
     let mut recorded = orchestrator
         .list_sandboxes()
         .await?
@@ -6201,8 +5928,6 @@ async fn discard_local_paused_record_drops_a_paused_sandbox() -> Result<()> {
     Ok(())
 }
 
-/// The dangerous direction: reconciliation runs against whatever the registry
-/// reports, so a wrong answer must never be able to take down a live sandbox.
 #[tokio::test]
 async fn discard_local_paused_record_refuses_a_running_sandbox() -> Result<()> {
     let orchestrator = make_orchestrator().await;
@@ -6236,10 +5961,6 @@ async fn discard_local_paused_record_is_a_noop_for_unknown_sandboxes() -> Result
     Ok(())
 }
 
-/// Reconciliation reads "no row" as "this sandbox moved on". A registry that
-/// tracks nothing answers that for every sandbox, so it must never be treated
-/// as cluster-backed — otherwise the first reconciliation pass would discard
-/// every paused sandbox on the node.
 #[test]
 fn disabled_registry_is_not_cluster_backed() {
     use crate::orchestrator::{DisabledPausedSandboxRegistry, PausedSandboxRegistry};
@@ -6247,28 +5968,11 @@ fn disabled_registry_is_not_cluster_backed() {
     assert!(!DisabledPausedSandboxRegistry.is_cluster_backed());
 }
 
-/// Records what the orchestrator asks of the cluster, so tests can assert that
-/// a pause reached it without standing up a registry.
 struct RecordingPublisher {
     published: StdMutex<Vec<(SandboxId, ExecutionId)>>,
-    /// All three facts of the write: "which sandbox", "which run of it", and
-    /// "which machine reported it live" — the third being the one
-    /// `resume_sandbox_inner` has to read off the backend rather than assume.
     marked_running: StdMutex<Vec<(SandboxId, ExecutionId, Option<String>)>>,
-    /// Both facts of the write: "which sandbox", and "which machine this
-    /// delete's own handle reported holding it" — the second being what
-    /// `delete_sandbox_inner` has to read off the handle before it is
-    /// stopped, mirroring `marked_running`'s third field for the
-    /// mirror-image question.
     forgotten: StdMutex<Vec<(SandboxId, Option<String>)>>,
-    /// Every `renew_deadline` call: which sandbox, which incarnation it named,
-    /// and the deadline it carried. The deadline is what a test asserts
-    /// against — it must be `keep_alive_for`'s clamped value, never the raw
-    /// duration a caller asked `POST /timeout` for.
     renewed_deadlines: StdMutex<Vec<(SandboxId, ExecutionId, Option<std::time::SystemTime>)>>,
-    /// What this publisher answers when asked whether it would commit a
-    /// publishable capture. Defaults to yes, matching every cluster-backed
-    /// registry.
     wants_captures: StdMutex<bool>,
 }
 
@@ -6392,18 +6096,6 @@ async fn orchestrator_with_recording_publisher() -> (Arc<TestOrchestrator>, Arc<
     (orchestrator, publisher)
 }
 
-/// A pause tells the backend whether anyone is going to commit what it stages,
-/// and the answer is the publisher's rather than a constant.
-///
-/// 🔴 Both answers in one round, against the same orchestrator and the same
-/// backend. The flag is what stops a node writing a whole snapshot into durable
-/// storage for a publisher that is about to drop it — bytes no read path can
-/// resolve and no sweep in this build collects — and a test that only ever saw
-/// one answer would pass on an implementation that hard-codes either.
-///
-/// 🔴 It is asserted at the *backend*, not at the publisher. The decision has
-/// to arrive where the spending happens; a value computed correctly and then
-/// not passed down is precisely the failure that leaves no trace anywhere else.
 #[tokio::test]
 async fn a_pause_tells_the_backend_whether_anyone_will_commit_its_capture() -> Result<()> {
     let behavior = Arc::new(MockBehavior::new());
@@ -6453,9 +6145,6 @@ async fn an_api_pause_is_published_to_the_cluster() -> Result<()> {
     Ok(())
 }
 
-/// The path that actually pauses most sandboxes. It used to drop the capture on
-/// the floor, so an expired sandbox was resumable only on the node it happened
-/// to expire on — and nobody is watching when that node is later lost.
 #[tokio::test]
 async fn an_expiry_auto_pause_is_published_to_the_cluster() -> Result<()> {
     let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
@@ -6471,9 +6160,6 @@ async fn an_expiry_auto_pause_is_published_to_the_cluster() -> Result<()> {
     Ok(())
 }
 
-/// Shutdown pauses everything still running, and is the one case where the node
-/// may genuinely never come back. Publishing here is the difference between a
-/// decommissioned node's sandboxes surviving and evaporating.
 #[tokio::test]
 async fn a_shutdown_pause_is_published_to_the_cluster() -> Result<()> {
     let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
@@ -6488,8 +6174,6 @@ async fn a_shutdown_pause_is_published_to_the_cluster() -> Result<()> {
     Ok(())
 }
 
-/// A resume repoints the cluster record at this node. Without it the node that
-/// paused the sandbox keeps advertising a copy it no longer owns.
 #[tokio::test]
 async fn a_resume_marks_the_sandbox_running_in_the_cluster() -> Result<()> {
     let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
@@ -6507,9 +6191,6 @@ async fn a_resume_marks_the_sandbox_running_in_the_cluster() -> Result<()> {
     Ok(())
 }
 
-/// The row and its snapshot outlive the paused period on purpose, so the delete
-/// is the only thing that collects them. An expiry-driven delete has no API
-/// call behind it and must clean up just as thoroughly.
 #[tokio::test]
 async fn a_delete_forgets_the_sandbox_in_the_cluster() -> Result<()> {
     let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
@@ -6524,11 +6205,6 @@ async fn a_delete_forgets_the_sandbox_in_the_cluster() -> Result<()> {
     Ok(())
 }
 
-/// 🔴 The mirror of the test above, and the reason the two teardown paths are
-/// distinct at all. Discarding a superseded copy means the sandbox is alive on
-/// another node; `forget_sandbox` would happily clear a row in any parked state
-/// from any node, taking that node's snapshot — the sandbox's only recovery
-/// point — with it.
 #[tokio::test]
 async fn discarding_a_superseded_copy_leaves_the_cluster_record_alone() -> Result<()> {
     let (orchestrator, publisher) = orchestrator_with_recording_publisher().await;
@@ -6550,10 +6226,6 @@ async fn discarding_a_superseded_copy_leaves_the_cluster_record_alone() -> Resul
     Ok(())
 }
 
-/// Isolation is about what arrives next. A node that has been taken out of
-/// rotation must refuse work that would put another sandbox on it, and must
-/// carry on serving everything it already holds — otherwise isolating a node
-/// would be indistinguishable from breaking it.
 #[tokio::test]
 async fn an_isolated_node_refuses_new_sandboxes_and_keeps_serving_its_own() -> Result<()> {
     setup();
@@ -6585,8 +6257,6 @@ async fn an_isolated_node_refuses_new_sandboxes_and_keeps_serving_its_own() -> R
         .expect_err("a fork puts another sandbox on this node, so it is new work");
     assert!(matches!(fork_err, OrchestratorError::NotAcceptingNewWork));
 
-    // Existing sandboxes are untouched: keeping one alive and putting it to
-    // sleep are both things this node still owns.
     orchestrator
         .keep_alive_for(created.id, Some(Duration::from_secs(300)), false)
         .await?
@@ -6605,11 +6275,6 @@ async fn an_isolated_node_refuses_new_sandboxes_and_keeps_serving_its_own() -> R
     Ok(())
 }
 
-/// The orchestrator itself never refuses a resume: a paused sandbox that only
-/// this node can rebuild has nowhere else to go, and refusing it here would
-/// turn "this node is busy leaving" into "your sandbox is gone". Declining a
-/// resume somebody else can serve is a routing decision, and lives in the API
-/// layer where the registry can be consulted.
 #[tokio::test]
 async fn an_isolated_node_still_resumes_a_sandbox_it_alone_holds() -> Result<()> {
     setup();
@@ -6631,15 +6296,6 @@ async fn an_isolated_node_still_resumes_a_sandbox_it_alone_holds() -> Result<()>
     Ok(())
 }
 
-// ── A1: incarnations ─────────────────────────────────────────────────────────
-//
-// Every assertion below reads the incarnation off the mock backend wherever it
-// can, not off the metadata store. Reading the store would only show that the
-// value written there is the value written there; reading the backend shows
-// which incarnation the VM was actually started under.
-
-/// T-A1-1. A pause and resume is a new run of the same machine, so it gets a
-/// new incarnation — and the record says so too.
 #[tokio::test]
 async fn a_resume_runs_under_a_new_execution() -> Result<()> {
     setup();
@@ -6684,10 +6340,6 @@ async fn a_resume_runs_under_a_new_execution() -> Result<()> {
     Ok(())
 }
 
-/// T-A1-2. Creating from a snapshot is a create. The backend below it boots
-/// through `LaunchMode::Resume`, so anything that decided on the launch mode or
-/// on the hook kind would call this a resume and hand out one incarnation for
-/// every sandbox ever launched from that snapshot.
 #[tokio::test]
 async fn a_create_from_a_snapshot_is_a_new_execution_not_a_resume() -> Result<()> {
     setup();
@@ -6720,8 +6372,6 @@ async fn a_create_from_a_snapshot_is_a_new_execution_not_a_resume() -> Result<()
         second.execution_id
     );
 
-    // The other half of the same statement: the plan itself says Create, which
-    // is what the incarnation decision is taken on.
     let plan = create_launch_plan_with_resources(SandboxId::new());
     assert_eq!(plan.transitional_state(), SandboxState::Creating);
 
@@ -6730,8 +6380,6 @@ async fn a_create_from_a_snapshot_is_a_new_execution_not_a_resume() -> Result<()
     Ok(())
 }
 
-/// T-A1-3. A snapshot pauses and resumes the VM in place. Same run, same
-/// incarnation.
 #[tokio::test]
 async fn a_snapshot_does_not_change_the_execution() -> Result<()> {
     setup();
@@ -6766,8 +6414,6 @@ async fn a_snapshot_does_not_change_the_execution() -> Result<()> {
     Ok(())
 }
 
-/// T-A1-4. Forking pauses and resumes the *parent* in place, so the parent is
-/// still the same run.
 #[tokio::test]
 async fn forking_leaves_the_parent_execution_alone() -> Result<()> {
     setup();
@@ -6808,11 +6454,6 @@ async fn forking_leaves_the_parent_execution_alone() -> Result<()> {
     Ok(())
 }
 
-/// T-A1-5. 🔴 Each fork child is a brand-new sandbox and a brand-new run.
-///
-/// The child's record is built by cloning the parent's, so an incarnation that
-/// is merely a field would be inherited — two live VMs under one identity, with
-/// no warning of any kind.
 #[tokio::test]
 async fn every_fork_child_gets_its_own_execution() -> Result<()> {
     setup();
@@ -6861,13 +6502,6 @@ async fn every_fork_child_gets_its_own_execution() -> Result<()> {
     Ok(())
 }
 
-/// T-A1-6. 🔴 What `mark_running` reports must be the incarnation the claim
-/// allocated and the VM actually started under.
-///
-/// The controller's cross-node branch matches on exactly this value. Minting a
-/// fresh one at report time, or reporting the one the record held before the
-/// resume, makes every cross-node resume fail — and it fails silently, because
-/// the write simply matches no row.
 #[tokio::test]
 async fn a_resume_reports_the_execution_it_actually_started() -> Result<()> {
     setup();
@@ -6907,17 +6541,6 @@ async fn a_resume_reports_the_execution_it_actually_started() -> Result<()> {
     Ok(())
 }
 
-/// T-A1-6b. The sibling of the test above: when the backend that just started
-/// *does* know which machine it is running on — the way `RemoteSandboxStub`
-/// does once it has been placed — `mark_running` has to be told, not left to
-/// assume this process is the answer.
-///
-/// 🔴 What this pins: `resume_sandbox_inner` reading
-/// `sandbox_holding_node_id` off the live handle it just started, rather than
-/// leaving the fourth argument `None` and letting `mark_sandbox_running`'s own
-/// fallback quietly supply this process's identity instead. Revert that read
-/// and this is the one test in the file that notices — everything else here
-/// runs on a backend that has nothing to report either way.
 #[tokio::test]
 async fn a_resume_on_a_named_machine_reports_that_machine_not_this_process() -> Result<()> {
     setup();
@@ -6935,9 +6558,6 @@ async fn a_resume_on_a_named_machine_reports_that_machine_not_this_process() -> 
         .await?;
     orchestrator.pause_sandbox(created.id).await?;
 
-    // From here on, every backend this factory builds answers as though it
-    // were placed on `node-203` — the way `RemoteSandboxStub` does once a
-    // resume has actually landed somewhere.
     behavior.set_holding_node_id(Some("node-203"));
 
     let claimed = test_claim();
@@ -6956,20 +6576,6 @@ async fn a_resume_on_a_named_machine_reports_that_machine_not_this_process() -> 
     Ok(())
 }
 
-/// The mirror-image of the test above, for the opposite direction: `forget`
-/// has to be told the real machine `delete_sandbox_inner`'s own handle just
-/// stopped, not left to assume this process is the answer.
-///
-/// 🔴 What this pins: `delete_sandbox_inner` reading `holding_node_id` off
-/// the handle it is about to stop, before that handle is moved into the stop
-/// call, and passing it through to `PausedSandboxPublisher::forget`. This is
-/// the exact dev-cluster regression: on the api half `self.node_id` is the
-/// api Pod's own identity, and comparing a `Running` registry row's real
-/// machine against it (`live_elsewhere` in `paused_coordinator.rs`) was
-/// always false, so every delete of a resumed sandbox leaked its cluster row
-/// and snapshot — silently, because the delete itself still reported
-/// success. Revert the read this test pins and every delete forgets nothing
-/// but the api Pod's own identity, which no row will ever have named.
 #[tokio::test]
 async fn a_delete_on_a_named_machine_reports_that_machine_not_this_process() -> Result<()> {
     setup();
@@ -6986,12 +6592,6 @@ async fn a_delete_on_a_named_machine_reports_that_machine_not_this_process() -> 
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
 
-    // Every backend this factory builds — including the one this sandbox is
-    // already running on — now answers as though it were placed on
-    // `node-203`, the way `RemoteSandboxStub` does once a resume has landed
-    // somewhere. Set after creation, on purpose: it proves the delete path
-    // reads this dynamically off the live handle rather than off a value
-    // captured once at creation.
     behavior.set_holding_node_id(Some("node-203"));
 
     orchestrator.delete_sandbox(created.id).await?;
@@ -7005,8 +6605,6 @@ async fn a_delete_on_a_named_machine_reports_that_machine_not_this_process() -> 
     Ok(())
 }
 
-/// T-A1-7. A paused record names the run that produced it — which is what
-/// `begin_pause` quotes, and therefore what the registry fences the row against.
 #[tokio::test]
 async fn a_paused_record_carries_the_execution_that_produced_it() -> Result<()> {
     setup();
@@ -7036,13 +6634,6 @@ async fn a_paused_record_carries_the_execution_that_produced_it() -> Result<()> 
     Ok(())
 }
 
-/// A factory that answers the ownership-marker question the way a remote one
-/// does, and keeps the launch configs it was handed.
-///
-/// 🔴 A wrapper rather than a change to `MockBackendFactory`: the question this
-/// factory answers differently is the whole subject of the tests below, and a
-/// shared mock that answered it `true` would make every other test in this file
-/// exercise the stamping path without saying so.
 struct StampingFactory {
     inner: MockBackendFactory,
     stamps: bool,
@@ -7109,15 +6700,6 @@ impl SandboxBackendFactory for StampingFactory {
     }
 }
 
-/// The marker the record carries and the marker the backend is handed are the
-/// same bytes, and they decode back to the record they describe.
-///
-/// 🔴 Three separate assertions and not one, because each failure is different
-/// and only one of them is visible from the outside. A record with no marker is
-/// a sandbox the control plane will not recognise as its own; a launch config
-/// with no marker is a *node* that will not report it; and a marker that
-/// decodes to a different sandbox is a rebuild that produces a plausible record
-/// of something else.
 #[tokio::test]
 async fn a_control_plane_orchestrator_stamps_its_own_record_onto_the_create() {
     setup();
@@ -7158,9 +6740,6 @@ async fn a_control_plane_orchestrator_stamps_its_own_record_onto_the_create() {
 
     let decoded = marker.decode_record().expect("the marker decodes");
     assert_eq!(decoded.id, created.id);
-    // 🔴 The incarnation in particular. It is minted below the surface that
-    // decided to create anything, so a marker built any earlier would name a
-    // run that had not been chosen — and fencing compares exactly this value.
     assert_eq!(decoded.execution_id, created.execution_id);
     assert_eq!(
         decoded.user_metadata, created.user_metadata,
@@ -7172,11 +6751,6 @@ async fn a_control_plane_orchestrator_stamps_its_own_record_onto_the_create() {
     );
 }
 
-/// 🔴 The control probe for the test above, and the one that keeps the pre-split single process
-/// honest. Everything is identical except the factory's answer to one question;
-/// if the stamping were unconditional, the test above would still pass and the
-/// user-facing REST surface would start producing sandboxes that claim to
-/// belong to a control plane.
 #[tokio::test]
 async fn a_machine_local_orchestrator_stamps_nothing() {
     setup();
@@ -7210,19 +6784,10 @@ async fn a_machine_local_orchestrator_stamps_nothing() {
         "nothing may reach a backend that would make a node call this sandbox the control \
          plane's"
     );
-    // 🔴 And the evidence that this create happened at all, so the two
-    // emptiness assertions above are not both satisfied by a create that never
-    // ran (§15.4: an assertion that something is empty is only evidence if
-    // something else in the same test is not).
     assert_eq!(launch_config.sandbox_id, created.id);
     assert_eq!(created.state, SandboxState::Running);
 }
 
-/// A marker supplied by a caller is kept, not overwritten.
-///
-/// 🔴 This is the node service's create: the marker arrived from the control
-/// plane and this process is not it. An orchestrator that re-stamped would hand
-/// the control plane back a record it never wrote, under its own sandbox's id.
 #[tokio::test]
 async fn a_marker_the_caller_supplied_survives_the_stamp() {
     setup();
@@ -7265,15 +6830,6 @@ async fn a_marker_the_caller_supplied_survives_the_stamp() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Where a resume gets the capture it reopens
-// ---------------------------------------------------------------------------
-
-/// A paused state that carries a value, so two of them can be told apart.
-///
-/// 🔴 [`MockSnapshot`] encodes to `{}`. Every capture in this file therefore
-/// looks like every other one, and a test built on it cannot distinguish "the
-/// resume was handed the right capture" from "the resume was handed something".
 #[derive(Debug)]
 struct MarkedPausedState {
     marker: String,
@@ -7301,27 +6857,13 @@ impl PausedSandboxState for MarkedPausedState {
     }
 }
 
-/// What a store should answer when asked where a sandbox's capture is.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PausedAnswer {
-    /// The reference the record holds — what a store that writes its records
-    /// out can offer, and all it can offer.
     Reference,
-    /// 🔴 The wrong answer this whole wiring exists to stop being given: a
-    /// paused sandbox reported as never having been paused.
     NotPaused,
-    /// The records could not be read.
     Unreachable,
 }
 
-/// A store that loses `paused_state` the way serde does.
-///
-/// `SandboxMetadata::paused_state` is `#[serde(skip)]`, so every store that
-/// writes a record out and reads it back hands the handle back as `None` —
-/// which is the state `RedisMetadataStore` is in, and the reason
-/// `MetadataStore::paused_handle` exists. This double reproduces exactly that:
-/// the handle does not survive a write, and the encoding travels beside the
-/// record instead.
 struct SerialisingStore {
     inner: InMemoryMetadataStore,
     references: StdMutex<HashMap<SandboxId, PausedStateRef>>,
@@ -7343,8 +6885,6 @@ impl SerialisingStore {
         *self.answer.lock().unwrap() = answer;
     }
 
-    /// Strips the handle off the way a serialising round trip does, keeping its
-    /// encoding beside the record.
     fn serialise(&self, mut metadata: SandboxMetadata) -> StdResult<SandboxMetadata, StoreError> {
         if let Some(state) = metadata.paused_state.take() {
             let encoded = state.encode().map_err(|source| StoreError::Backend {
@@ -7483,7 +7023,6 @@ impl MetadataStore for SerialisingStore {
     }
 }
 
-/// A factory that says what it was handed to decode, and can refuse.
 struct DecodeRecordingFactory {
     inner: MockBackendFactory,
     decoded: Arc<StdMutex<Vec<serde_json::Value>>>,
@@ -7555,8 +7094,6 @@ impl SandboxBackendFactory for DecodeRecordingFactory {
     }
 }
 
-/// Puts a sandbox into the store as paused, carrying a capture nothing else in
-/// this file produces.
 async fn paused_with_capture<S: MetadataStore + 'static, F: SandboxBackendFactory>(
     orchestrator: &Arc<TestOrchestrator<S, F>>,
     marker: &str,
@@ -7565,9 +7102,6 @@ async fn paused_with_capture<S: MetadataStore + 'static, F: SandboxBackendFactor
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
     orchestrator.pause_sandbox(created.id).await?;
-    // The pause wrote the mock backend's capture, which every sandbox in this
-    // file shares. Replace it with one that names this sandbox, through the
-    // store's ordinary write path.
     let mut metadata = orchestrator
         .get_sandbox(&created.id)
         .await?
@@ -7577,17 +7111,6 @@ async fn paused_with_capture<S: MetadataStore + 'static, F: SandboxBackendFactor
     Ok(created.id)
 }
 
-/// 🔴 A resume reads the capture the store kept, not the field a serialising
-/// store always hands back empty.
-///
-/// `SandboxMetadata::paused_state` is `#[serde(skip)]`. Read through `get`, it
-/// is `None` on every store that writes records out — so a resume that read it
-/// failed with "missing paused state" for every sandbox on such a store, and
-/// said so about sandboxes that were paused perfectly well.
-///
-/// The control face is a second sandbox whose stored capture differs in exactly
-/// one value: if the resume were handed a constant, an empty document, or the
-/// capture of whichever sandbox was paused last, the two would agree here.
 #[tokio::test]
 async fn a_resume_reopens_the_capture_the_store_kept_rather_than_the_field_serde_drops(
 ) -> anyhow::Result<()> {
@@ -7603,8 +7126,6 @@ async fn a_resume_reopens_the_capture_the_store_kept_rather_than_the_field_serde
     let alpha = paused_with_capture(&orchestrator, "alpha").await?;
     let beta = paused_with_capture(&orchestrator, "beta").await?;
 
-    // 🔴 The field the old read used really is empty here, so what follows
-    // cannot be coming from it.
     assert!(
         orchestrator
             .get_sandbox(&alpha)
@@ -7630,8 +7151,6 @@ async fn a_resume_reopens_the_capture_the_store_kept_rather_than_the_field_serde
         "the capture the store held did not reach the backend that reopens it"
     );
 
-    // The same call for the other sandbox: one value different, and it has to
-    // move.
     orchestrator
         .resume_sandbox(beta, NewTimeout::None, test_claim())
         .await?;
@@ -7646,13 +7165,6 @@ async fn a_resume_reopens_the_capture_the_store_kept_rather_than_the_field_serde
     Ok(())
 }
 
-/// 🔴 `paused_origin_node_id` exists for exactly this store shape: a resume
-/// claim has to name the machine it will land on *before* it starts, and on
-/// the api half `SandboxMetadata::paused_state` cannot answer that — it is
-/// `#[serde(skip)]`, so a serialising store like this one always hands it back
-/// `None`. `paused_handle`'s `Remote` variant is the question asked the way
-/// this store can actually answer it, and this is the one test that would
-/// notice a caller going back to reading the field serde drops.
 #[tokio::test]
 async fn paused_origin_node_id_reads_the_reference_a_serialising_store_kept() -> anyhow::Result<()>
 {
@@ -7671,8 +7183,6 @@ async fn paused_origin_node_id_reads_the_reference_a_serialising_store_kept() ->
          `RemoteSandboxStub::reopen` will insist on later"
     );
 
-    // The control: a sandbox with no record at all has no machine to name,
-    // and the answer must say so rather than fail or invent one.
     assert_eq!(
         orchestrator.paused_origin_node_id(&SandboxId::new()).await,
         None,
@@ -7682,22 +7192,6 @@ async fn paused_origin_node_id_reads_the_reference_a_serialising_store_kept() ->
     Ok(())
 }
 
-/// 🔴 The three ways a resume can fail to find its capture are three answers,
-/// and none of them leaves the sandbox stranded mid-transition.
-///
-/// - the store could not be read — ask again;
-/// - the record is there and carries no capture — this record cannot reopen the
-///   sandbox;
-/// - the reference is there and this build cannot decode it — the bytes exist
-///   and this process is not the one that can reach them.
-///
-/// Reading the first as either of the others is the "I could not look" / "there
-/// is nothing there" collapse this codebase refuses everywhere else.
-///
-/// The control face for all three is the fourth call: the same sandbox, the
-/// same everything, with the store answering normally — which resumes. Without
-/// it, every assertion here is satisfied by a `resume_sandbox` that always
-/// fails.
 #[tokio::test]
 async fn a_resume_tells_a_capture_it_could_not_read_from_one_that_is_not_there(
 ) -> anyhow::Result<()> {
@@ -7772,8 +7266,6 @@ async fn a_resume_tells_a_capture_it_could_not_read_from_one_that_is_not_there(
     );
     still_paused(Arc::clone(&orchestrator)).await;
 
-    // 🔴 And the same sandbox resumes once nothing is in the way, which is what
-    // makes the three refusals above about their causes.
     refuse.store(false, std::sync::atomic::Ordering::SeqCst);
     let resumed = orchestrator
         .resume_sandbox(sandbox_id, NewTimeout::None, test_claim())
@@ -7782,25 +7274,9 @@ async fn a_resume_tells_a_capture_it_could_not_read_from_one_that_is_not_there(
     Ok(())
 }
 
-/// The artifact root a paused sandbox's capture went into is readable through
-/// the facade, and it is the one the persister holds.
-///
-/// 🔴 Driven through `Arc<dyn SandboxOrchestration>` rather than the concrete
-/// type. The blanket impl forwards by naming `Orchestrator::<S, F, P>::name`,
-/// which resolves back into the trait when no inherent method shadows it — an
-/// infinite recursion that compiles, and that this project has now produced
-/// once for real while writing this method.
-///
-/// The control face is the same call before the persister holds anything: a
-/// forwarding that answered `None` unconditionally would satisfy half of this
-/// and is exactly what a node with persistence disabled legitimately answers.
 #[tokio::test]
 async fn the_artifact_root_a_capture_went_into_is_readable_through_the_facade() -> anyhow::Result<()>
 {
-    // 🔴 Imported inside the function, not at the top of the file. The trait's
-    // methods take `self: Arc<Self>` where the inherent ones take `&Arc<Self>`,
-    // so having it in scope for the whole module changes which method every
-    // other test in this file resolves to.
     use crate::orchestrator::SandboxOrchestration;
 
     setup();
@@ -7825,8 +7301,6 @@ async fn the_artifact_root_a_capture_went_into_is_readable_through_the_facade() 
         Some(PathBuf::from("/var/lib/agentenv/paused/abc/7")),
     );
 
-    // 🔴 And a read that failed is not an absence: the caller stores this and
-    // never asks again.
     persister.fail_next(RecordingCall::PausedArtifactRoot);
     let err = orchestration
         .paused_artifact_root(&sandbox_id)
@@ -7839,46 +7313,6 @@ async fn the_artifact_root_a_capture_went_into_is_readable_through_the_facade() 
     Ok(())
 }
 
-// ── Stale process-local handle vs. the authoritative record ────────────────
-//
-// A replicated deciding half (aenv-api, two-plus replicas, no session
-// affinity) caches a `SandboxHandle` per sandbox the moment it starts or
-// adopts one. That cache can go stale without this process ever finding out:
-// replica A creates a sandbox under execution E1 and files a handle for it;
-// replica B — not A — pauses and resumes it; PG, Redis and the node all move
-// to a new execution E2 together; A's own copy of the record updates too,
-// because it shares the same store. Only A's handle table does not, because
-// nothing in a pause or a resume A never received touches it. The next
-// control-plane call that lands on A used to trust whatever was in that
-// table unconditionally, fence a real node call against E1, and get refused
-// — every store anyone reads to investigate shows E2, consistently, which is
-// exactly what makes this bug invisible from the outside.
-//
-// `MockSandboxBackend` never enforces fencing itself, so a bare
-// success/failure assertion here cannot tell "used the stale handle anyway
-// and the mock did not mind" apart from "discarded it and rebuilt". The
-// tests below use `AdoptingFactory`'s call counter for that instead: it is
-// the only production-shaped way to get a fresh handle for an already
-// -running sandbox (`RemoteSandboxBackendFactory::adopt_running`), so
-// counting calls to it says, unambiguously, whether a rebuild happened. That
-// also closes the other half of the polarity the fix has to get right: an
-// implementation that always discards and rebuilds — the handle table
-// reduced to dead weight — would leave every one of these operations
-// succeeding too, but it would call `adopt_running` even when the cached
-// handle already named the right execution, which the "reuses a matching
-// handle" tests below catch directly.
-
-/// A [`MockBackendFactory`] wrapper that answers `adopt_running` instead of
-/// inheriting the trait's `Ok(None)` default `MockBackendFactory` itself
-/// relies on. `Ok(None)` is correct for a factory whose sandboxes live in the
-/// process that started them, which is what plain `MockBackendFactory`
-/// stands in for — but it makes the "another replica adopts this sandbox"
-/// branch this fix is about untestable. `AdoptingFactory` stands in for the
-/// one production implementation that does answer `Some`,
-/// `RemoteSandboxBackendFactory` (`src/node_client/factory.rs`), by handing
-/// back a fresh `MockSandboxBackend` bound to whatever execution id the
-/// caller names — exactly the value `absent_handle` reads fresh off the
-/// metadata store right before calling this.
 struct AdoptingFactory {
     inner: MockBackendFactory,
     behavior: Arc<MockBehavior>,
@@ -7894,8 +7328,6 @@ impl AdoptingFactory {
         }
     }
 
-    /// A cloned handle to the call counter, taken before the factory is moved
-    /// into `Orchestrator::new`.
     fn adopt_calls_handle(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         Arc::clone(&self.adopt_calls)
     }
@@ -7974,10 +7406,6 @@ async fn make_adopting_orchestrator() -> (
     (orchestrator, adopt_calls)
 }
 
-/// Moves the authoritative record to a freshly minted execution without
-/// touching the process-local handle table — precisely the shape a
-/// pause+resume performed by a different replica leaves behind. Returns the
-/// new execution id so callers can assert against it.
 async fn supersede_execution_without_touching_the_handle(
     orchestrator: &Arc<TestOrchestrator<InMemoryMetadataStore, AdoptingFactory>>,
     sandbox_id: SandboxId,
@@ -8141,10 +7569,6 @@ async fn capture_snapshot_discards_a_stale_handle_and_rebuilds_from_the_record(
 
     let discards_before = orchestrator.stale_handle_discards();
 
-    // Unlike delete/pause, a successful capture leaves the sandbox `Running`
-    // and does not detach the handle it drove — this exercises
-    // `cached_handle_for_execution`'s peek shape rather than
-    // `detach_sandbox_handle_and_route_checked`'s detach-then-check one.
     orchestrator.capture_snapshot(sandbox_id).await?;
 
     assert_eq!(

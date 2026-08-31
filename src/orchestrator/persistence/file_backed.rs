@@ -34,24 +34,10 @@ struct PersistedPausedRecord {
     metadata: SandboxMetadata,
     artifact_root: PathBuf,
     state: Value,
-    /// Whether this paused sandbox was ever announced to a cluster registry.
-    ///
-    /// Reconciliation treats "the registry has no row for this sandbox" as
-    /// "the sandbox moved on", which is only a safe reading for records that
-    /// were announced in the first place. Records written before a cluster
-    /// registry was configured deserialize to `false` and are therefore never
-    /// discarded — which is exactly what makes switching a running node from
-    /// the node-local backend to a cluster one safe.
+    /// Whether the record was announced to a cluster registry.
     #[serde(default)]
     cluster_registered: bool,
-    /// The node identity this record was announced under.
-    ///
-    /// Separate from `cluster_registered` because a node's ID is not
-    /// necessarily stable across restarts — under Kubernetes it is commonly the
-    /// pod name — and the registry row must be compared against the identity
-    /// that wrote it, never against whatever this process happens to be called
-    /// now. Records from before this field existed deserialize to `None`, which
-    /// reconciliation treats as "compare nothing about identity".
+    /// Node identity used when the record was announced.
     #[serde(default)]
     registered_as: Option<String>,
 }
@@ -92,14 +78,7 @@ fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
     Ok(record)
 }
 
-/// Whether a record that would not decode is one written before sandboxes had
-/// incarnations.
-///
-/// 🔴 Told apart from ordinary corruption on purpose. An unreadable record is
-/// discarded, which is right for a record whose bytes are damaged and wrong for
-/// a whole node's worth of records that are merely one field short: the first
-/// costs one sandbox, the second costs every paused sandbox on the machine.
-/// This one is kept and reported instead, with the command to clear it.
+// Pre-incarnation records are retained for explicit operator recovery.
 fn record_predates_executions(bytes: &[u8]) -> bool {
     let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
         return false;
@@ -296,8 +275,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         })?;
         let mut sandboxes = Vec::new();
         let mut retained_artifacts = HashSet::new();
-        // Counted so "some records did not load" is alertable rather than
-        // something an operator has to notice in a log.
+        // Count rejected records for alerting.
         let mut rejected = 0_u64;
 
         for (key, bytes) in records {
@@ -307,11 +285,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             let record = match decode_record(&bytes) {
                 Ok(record) => record,
                 Err(_) if record_predates_executions(&bytes) => {
-                    // 🔴 Loud, actionable, and not silent: the record is left
-                    // where it is, so this repeats on every start until someone
-                    // acts on it. Reporting it as "discarding an invalid
-                    // record" would have made a whole node's paused sandboxes
-                    // disappear behind a warning nobody could act on.
+                    // Retain pre-incarnation records and report actionable recovery.
                     rejected += 1;
                     error!(
                         record_key = %String::from_utf8_lossy(&key),
@@ -442,12 +416,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         result
     }
 
-    /// 🔴 Read straight out of the key rather than through
-    /// [`Self::get_record`], because that helper turns a key that is not there
-    /// into an `InvalidRecord` error — which is the right answer for the calls
-    /// that must have a record and the wrong one here, where "this node holds
-    /// no paused record for that sandbox" is a fact a caller acts on. A record
-    /// that will not *decode* stays an error: that is damage, not absence.
+    /// Returns absence without converting it to an invalid-record error.
     async fn paused_artifact_root(
         &self,
         sandbox_id: &SandboxId,
@@ -516,17 +485,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         Ok(())
     }
 
-    /// Boundedly stops background compaction/flush on the paused-sandbox
-    /// RocksDB store, ahead of process shutdown.
-    ///
-    /// 🔴 Nothing here calls `Drop` on the store, and nothing needs to: this
-    /// only front-loads the wait `LocalKvStore::close` documents — see it for
-    /// why an unbounded version of that wait is what leaves `aenv-node`
-    /// running past `terminationGracePeriodSeconds` after every log line
-    /// the graceful shutdown was ever going to print has already printed. A
-    /// node that never paused anything this run has an uninitialized `db`
-    /// cell and nothing to close, which is also why such nodes were always
-    /// observed to exit immediately.
+    /// Boundedly closes the paused-sandbox local store before shutdown.
     async fn close(&self, timeout: std::time::Duration) {
         let Some(db) = self.db.get() else {
             return;
@@ -854,9 +813,6 @@ mod tests {
         let snapshot_root = temp.path().join("artifacts");
         let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
 
-        // A freshly persisted record has not been announced anywhere, so
-        // reconciliation must not be able to reason about its absence from a
-        // registry.
         assert_eq!(
             persister.cluster_registration(&sandbox_id).await?,
             ClusterRegistration::Never
@@ -866,9 +822,6 @@ mod tests {
             .mark_cluster_registered(&sandbox_id, "node-a")
             .await?;
 
-        // The identity matters as much as the fact: reconciliation compares the
-        // registry row against the name this record was announced under, never
-        // against whatever this process is called when it later reads it back.
         assert_eq!(
             persister.cluster_registration(&sandbox_id).await?,
             ClusterRegistration::As("node-a".to_string())
@@ -877,10 +830,6 @@ mod tests {
         Ok(())
     }
 
-    /// A record announced by a build that did not yet store the identity must
-    /// not be mistaken for one belonging to another node — a node's ID is
-    /// commonly its pod name, so "not ours" would be the reading after any pod
-    /// recreation, and the whole node's paused sandboxes would be discarded.
     #[tokio::test]
     async fn records_registered_before_the_identity_was_stored_load_as_anonymous(
     ) -> anyhow::Result<()> {
@@ -903,10 +852,6 @@ mod tests {
 
     #[tokio::test]
     async fn records_written_before_the_flag_existed_load_as_unregistered() -> anyhow::Result<()> {
-        // Simulates upgrading a node that already holds paused sandboxes: the
-        // stored JSON has no `clusterRegistered` field at all. Reading it as
-        // "registered" would let the first reconciliation pass delete every
-        // sandbox paused before the cluster registry was configured.
         let legacy = serde_json::json!({
             "version": RECORD_VERSION,
             "lifecycle": "paused",
@@ -1074,21 +1019,12 @@ mod tests {
         Ok(())
     }
 
-    /// 🔴 A record from before incarnations existed is kept, not thrown away.
-    ///
-    /// Both halves matter. Discarding it would make a whole node's paused
-    /// sandboxes vanish behind a line that reads like routine cleanup — the
-    /// exact shape of "the sandbox is gone" that costs a user their workspace.
-    /// And loading it with a fresh incarnation would be worse: fencing would
-    /// then be comparing against a value nothing ever ran under.
     #[tokio::test]
     async fn load_all_keeps_and_reports_a_record_that_predates_executions() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
 
-        // A record exactly as an older build wrote it: valid in every way
-        // except that its metadata has no incarnation.
         let mut record = serde_json::to_value(PersistedPausedRecord {
             version: RECORD_VERSION,
             lifecycle: PersistedPausedLifecycle::Paused,
@@ -1149,9 +1085,6 @@ mod tests {
         Ok(())
     }
 
-    /// A persister that never opened its RocksDB store this run — a node that
-    /// paused nothing — has nothing to close and must not open one just to
-    /// close it.
     #[tokio::test]
     async fn close_without_ever_opening_the_store_is_a_no_op() {
         let temp = TempDir::new().expect("tempdir");
@@ -1165,9 +1098,6 @@ mod tests {
         );
     }
 
-    /// The store this persister actually wrote through closes within the
-    /// timeout, exercising the same `SandboxPersister::close` path
-    /// `Orchestrator::shutdown` calls on every real shutdown.
     #[tokio::test]
     async fn close_after_use_reports_closed() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
@@ -1181,7 +1111,6 @@ mod tests {
             crate::local_store::LocalKvCloseOutcome::Closed
         );
 
-        // `close` on the persister itself must reach the same store and agree.
         persister.close(Duration::from_secs(5)).await;
         Ok(())
     }

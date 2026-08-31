@@ -1,7 +1,4 @@
-//! Task's own "D3": ports `services/scheduler/internal/store.go`'s
-//! `InMemoryBindingStore` (lines 195-501) — a single-replica, in-process
-//! binding store. Used directly by a single-node deployment,
-//! and as the cheap half of [`super::contract`]'s dual-backend suite.
+//! In-process binding store used by single-node deployments and contract tests.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
@@ -20,10 +17,6 @@ struct BindingRecord {
     expires_at: SystemTime,
 }
 
-/// Which caller drove a write — governs `keeps_deadline` (only a heartbeat
-/// refresh of the same incarnation may ever preserve an existing deadline).
-/// Mirrors Go's `bindingSourceAssignment`/`bindingSourceHeartbeat` string
-/// constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteSource {
     Assignment,
@@ -35,7 +28,6 @@ struct Inner {
     node_binding: HashMap<String, HashSet<String>>,
 }
 
-/// Ports Go's `InMemoryBindingStore`.
 pub struct InMemoryBindingStore {
     inner: RwLock<Inner>,
     settings: BindingStoreSettings,
@@ -52,10 +44,6 @@ impl InMemoryBindingStore {
         }
     }
 
-    /// Ports `expiryFor`/`keepsDeadline` (`store.go:411-480`): whether a
-    /// write may keep the existing record's deadline (`held` must be true,
-    /// i.e. the existing record has not expired) rather than arm a fresh
-    /// one.
     fn keeps_deadline(
         &self,
         held: bool,
@@ -97,9 +85,6 @@ impl InMemoryBindingStore {
         now + ttl
     }
 
-    /// Ports `upsertLocked` (`store.go:375-409`): the core comparison-and-write
-    /// critical section. A refused challenger changes nothing, not even the
-    /// reverse index.
     fn upsert_locked(
         &self,
         inner: &mut Inner,
@@ -214,8 +199,6 @@ impl BindingStore for InMemoryBindingStore {
         roster: Vec<RosterEntry>,
         now: SystemTime,
     ) -> Result<Vec<(String, BindingDecision)>, BindingStoreError> {
-        // Normalize: trim, drop blanks, dedupe by last-write-wins — mirrors
-        // `ReconcileNode`'s own normalization pass (`store.go:320-361`).
         let mut normalized: HashMap<String, RosterEntry> = HashMap::new();
         for entry in roster {
             let sandbox_id = entry.sandbox_id.trim().to_string();
@@ -316,9 +299,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// The shared contract, run against this backend. The Redis backend
-    /// runs the identical list; a change made to one and forgotten for the
-    /// other turns red here.
     mod contract {
         use super::super::InMemoryBindingStore;
         use crate::binding_store::BindingStoreSettings;
@@ -368,11 +348,6 @@ mod tests {
             .unwrap();
         assert!(store.get("sbx-1", unix(5)).await.unwrap().is_some());
         assert!(store.get("sbx-1", unix(11)).await.unwrap().is_none());
-        // Expiry is a side-effecting delete, provable via the reverse index:
-        // reconciling node-a with the same sandbox after the record expired
-        // should look exactly like a fresh install (Installed, not
-        // Refreshed/Superseded), because upsert_locked no longer sees a
-        // held record.
         let decisions = store
             .reconcile_node(
                 node("node-a"),
@@ -420,10 +395,6 @@ mod tests {
             .await
             .unwrap();
 
-        // node-a's roster no longer includes sbx-1: reconciling an empty
-        // roster for node-a must not delete sbx-1 (it belongs to node-b
-        // now) -- proving the reverse index was actually moved, not just
-        // the primary record.
         let decisions = store
             .reconcile_node(node("node-a"), vec![], unix(2))
             .await

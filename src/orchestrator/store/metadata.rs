@@ -19,56 +19,13 @@ pub enum SandboxTimeoutAction {
     Delete,
 }
 
-/// The control plane's own record of a sandbox, as the node holds it.
-///
-/// # What it is for
-///
-/// It answers one question — *does the control plane own this sandbox?* — and
-/// it answers it by being present. The node gRPC surface reports a sandbox on
-/// [`ListSandboxes`][crate::node_server] only when the sandbox carries one of
-/// these, so a sandbox created by any other path is structurally absent from
-/// the answer the API half reconciles against.
-///
-/// # Why it is a blob
-///
-/// 🔴 **The node never looks inside.** It stores the bytes the API half sent
-/// with the create and returns the same bytes; it does not parse, validate,
-/// re-encode or generate them. That is not laziness about the format — it is
-/// the property that makes the marker safe to change. Whatever the control
-/// plane needs to recognise its own sandbox goes in; a node that understood the
-/// format would be a second place that has to be upgraded in step with it.
-///
-/// So this is a contract between the API half and its *future self*, not a
-/// cross-language wire contract, and nothing on the node may come to depend on
-/// its shape.
-///
-/// 🔴 **It is a marker, not a backup.** Keep it small: what it answers is
-/// *whose is this*. A separate concern — rebuilding a control plane's records
-/// after its store is lost — wants a versioned encoding of the whole sandbox
-/// record, and that is a different object under a different name. Do not let
-/// one field carry both: a blob that contains its own container either recurses
-/// or is quietly a smaller, different thing, and the two have different
-/// lifetimes, different sizes and different readers.
-///
-/// # Empty is not a value
-///
-/// 🔴 There is no empty `ControlPlaneConfig`. The wire type is protobuf
-/// `bytes`, which has no null, so "no marker" arrives as zero bytes — and a
-/// `Some(<zero bytes>)` would be a third state meaning neither *owned* nor
-/// *not owned*. [`ControlPlaneConfig::from_bytes`] collapses it into `None`
-/// instead, at the one boundary where the ambiguity can appear, so that
-/// `Option<ControlPlaneConfig>` has exactly the two states the ownership
-/// question has.
+/// Opaque control-plane ownership marker stored verbatim by nodes.
+/// Empty bytes map to `None`; the control plane alone encodes and decodes it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ControlPlaneConfig(Vec<u8>);
 
 impl ControlPlaneConfig {
-    /// The marker for `bytes`, or `None` when there are none.
-    ///
-    /// 🔴 Fallible on purpose, and the fallible direction is the safe one: an
-    /// empty blob becomes "the control plane does not own this", which keeps
-    /// the sandbox out of the listing rather than putting it in with a marker
-    /// that says nothing.
+    /// Builds a non-empty marker, returning `None` for empty bytes.
     pub fn from_bytes(bytes: impl Into<Vec<u8>>) -> Option<Self> {
         let bytes = bytes.into();
         (!bytes.is_empty()).then_some(Self(bytes))
@@ -86,47 +43,14 @@ impl ControlPlaneConfig {
         self.0.len()
     }
 
-    /// Always `false`; see the type's note on why there is no empty marker.
-    /// Present because `len` without it draws a clippy lint, and answering it
-    /// honestly is better than allowing the lint.
+    /// Always false because empty markers cannot be constructed.
     pub fn is_empty(&self) -> bool {
         false
     }
 
-    /// The marker the control plane attaches to a sandbox it is creating on
-    /// another machine: its own record of that sandbox, encoded.
-    ///
-    /// # 🔴 Why the whole record and not a summary
-    ///
-    /// The first draft of this was seven fields — incarnation, snapshot,
-    /// timeout action, expiry, auto-resume, secure, user metadata — and it is
-    /// not enough. This blob is the only copy of the control plane's record
-    /// that survives the control plane's own store being lost, and rebuilding
-    /// from it means rebuilding `resources`, `created_at`, `max_lifetime`,
-    /// `network_policy`, `custom_extension_params`, `runtime_versions`,
-    /// `image_configs` and `virtualization_mode` as well. A summary that
-    /// covered seven of those and silently defaulted the rest would produce a
-    /// record that looks complete and describes a different sandbox.
-    ///
-    /// # 🔴 Versioned, because it is read by a future build
-    ///
-    /// The writer and the reader are the same component at two points in
-    /// time — a replica writes this today and a replica of some later build
-    /// reads it back after a store loss. serde decodes a document that has
-    /// lost a field it has a default for without complaint, so the version is
-    /// checked on the way in rather than inferred from what parsed.
-    ///
-    /// The node never reads any of this. It stores the bytes and hands the
-    /// same bytes back; see the type's note.
-    ///
-    /// Returns `None` only if the record cannot be encoded at all, which for a
-    /// value made of owned data means a serde impl has been changed to be
-    /// fallible. The caller treats that as "no marker" — fail-closed, the same
-    /// direction as every other absent-marker case.
+    /// Encodes the complete, versioned sandbox record for store-loss recovery.
     pub fn for_record(record: &SandboxMetadata) -> Option<Self> {
-        // `paused_state` and `running_since` are `#[serde(skip)]` on the
-        // record, so what goes in here is already the record minus the two
-        // fields that name live local state rather than the sandbox.
+        // Local live-state fields are skipped by record serialization.
         let envelope = OwnershipMarker {
             version: OWNERSHIP_MARKER_VERSION,
             record,
@@ -147,12 +71,7 @@ impl ControlPlaneConfig {
         }
     }
 
-    /// Reads back what [`for_record`](Self::for_record) wrote.
-    ///
-    /// 🔴 Refuses a version this build does not write, rather than letting
-    /// serde fill in defaults for whatever moved. A record rebuilt from a
-    /// half-understood marker is worse than no rebuild: it is a plausible
-    /// record of a sandbox that does not match the one running.
+    /// Decodes a record only when its marker version matches this build.
     pub fn decode_record(&self) -> anyhow::Result<SandboxMetadata> {
         let envelope: OwnedOwnershipMarker = serde_json::from_slice(&self.0)?;
         anyhow::ensure!(
@@ -165,39 +84,30 @@ impl ControlPlaneConfig {
     }
 }
 
-/// The schema version [`ControlPlaneConfig::for_record`] writes, and the only
-/// one [`ControlPlaneConfig::decode_record`] accepts.
+/// Ownership-marker schema version written and accepted by this build.
 pub const OWNERSHIP_MARKER_VERSION: u32 = 1;
 
-/// The envelope, borrowing on the way out.
 #[derive(Serialize)]
 struct OwnershipMarker<'a> {
     version: u32,
     record: &'a SandboxMetadata,
 }
 
-/// The same envelope, owning on the way in. Two types because the borrowed one
-/// cannot deserialize and a single owned one would mean cloning the record to
-/// encode it.
+// Owned decode envelope avoids cloning the borrowed encode record.
 #[derive(Deserialize)]
 struct OwnedOwnershipMarker {
     version: u32,
     record: SandboxMetadata,
 }
 
-/// Prints the size and not the contents.
-///
-/// 🔴 Deliberate. The contents are the control plane's business and may carry
-/// anything it puts there; a derived `Debug` would print all of it into every
-/// log line that formats [`SandboxMetadata`].
+/// Debug output reports size without exposing marker contents.
 impl std::fmt::Debug for ControlPlaneConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "ControlPlaneConfig({} bytes)", self.0.len())
     }
 }
 
-/// Base64, because the records this rides in are JSON — in Redis and on disk —
-/// and serde renders `Vec<u8>` there as an array of numbers, one per byte.
+/// Serializes marker bytes as base64 for JSON records.
 impl Serialize for ControlPlaneConfig {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -205,11 +115,7 @@ impl Serialize for ControlPlaneConfig {
     }
 }
 
-/// Reads what [`Serialize`] wrote, for a field that is present.
-///
-/// The absent and empty cases are handled by
-/// [`deserialize_optional_control_plane_config`], which is what the field
-/// actually uses; this impl exists so the type round-trips on its own.
+/// Deserializes a present, non-empty marker.
 impl<'de> Deserialize<'de> for ControlPlaneConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let encoded = String::deserialize(deserializer)?;
@@ -229,14 +135,7 @@ fn decode_control_plane_config<'de, D: serde::Deserializer<'de>>(
     Ok(ControlPlaneConfig::from_bytes(bytes))
 }
 
-/// Decodes the ownership marker, mapping both "absent" and "present but empty"
-/// onto `None`.
-///
-/// 🔴 Malformed base64 is still an error. The two failures are not the same
-/// one: a field nobody wrote is a sandbox the control plane does not own, while
-/// a field somebody wrote and got wrong is a corrupt record, and silently
-/// reading the second as the first would let a mangled record pass for an
-/// ordinary unowned sandbox.
+// Absent and empty markers map to `None`; malformed base64 remains an error.
 fn deserialize_optional_control_plane_config<'de, D>(
     deserializer: D,
 ) -> Result<Option<ControlPlaneConfig>, D::Error>
@@ -249,10 +148,6 @@ where
     decode_control_plane_config::<D>(&encoded)
 }
 
-/// The configured slack added to a routing projection's TTL.
-///
-/// Read once: it is a deployment-wide constant, and every response header and
-/// heartbeat roster entry asks for it.
 fn configured_projection_ttl_grace_secs() -> u64 {
     static GRACE_SECS: OnceLock<u64> = OnceLock::new();
 
@@ -263,8 +158,7 @@ fn configured_projection_ttl_grace_secs() -> u64 {
     })
 }
 
-/// The lifetime ceiling this node creates sandboxes under, or `None` when the
-/// ceiling is disabled.
+/// Configured sandbox lifetime ceiling, or `None` when disabled.
 pub fn configured_max_sandbox_lifetime() -> Option<Duration> {
     static MAX_LIFETIME: OnceLock<Option<Duration>> = OnceLock::new();
 
@@ -273,7 +167,7 @@ pub fn configured_max_sandbox_lifetime() -> Option<Duration> {
             .orchestrator
             .max_sandbox_lifetime_secs
         {
-            // 🔴 0 is "no ceiling", not "expire immediately".
+            // Zero disables the ceiling.
             0 => None,
             secs => Some(Duration::from_secs(secs)),
         }
@@ -291,16 +185,7 @@ pub enum NewTimeout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxMetadata {
     pub id: SandboxId,
-    /// The incarnation this record belongs to: the single run of the sandbox
-    /// that produced it.
-    ///
-    /// 🔴 Required, and deliberately without `#[serde(default)]`. A default
-    /// here would be a permanent fail-open path — every record that has no
-    /// incarnation would quietly acquire a fresh one at load time, and fencing
-    /// would then be comparing a value nobody ever ran under. Records written
-    /// before this field existed are refused at load; see
-    /// `FileBackedSandboxPersister` for the message that says so and what to do
-    /// about it.
+    /// Required incarnation fence; older records without it are rejected.
     pub execution_id: ExecutionId,
     pub snapshot_id: String,
     pub snapshot_alias: Option<String>,
@@ -330,75 +215,22 @@ pub struct SandboxMetadata {
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
     pub secure: bool,
-    /// The control plane's own record of this sandbox, stored verbatim.
-    ///
-    /// 🔴 **This is the ownership marker, and it is explicit on purpose.**
-    /// `Some(_)` means the control plane created this sandbox and owns the
-    /// cluster-wide record of it; `None` means it does not. Nothing infers
-    /// ownership from where a create came from, from which port it arrived on,
-    /// or from what else is on the node — those are all inferences that hold
-    /// today and stop holding the first time someone adds a second caller.
-    ///
-    /// 🔴 **Opaque to this node.** The node stores what the API half sent with
-    /// the create and hands the same bytes back on
-    /// [`SandboxOrchestration::list_live_sandboxes`][crate::orchestrator::SandboxOrchestration::list_live_sandboxes].
-    /// It never parses, validates or generates one. See [`ControlPlaneConfig`].
-    ///
-    /// 🔴 `#[serde(default)]`, unlike `execution_id` above, and in the opposite
-    /// direction: a record from before this field existed — or one written by a
-    /// path that does not set it — decodes to `None`, which reads as *not owned
-    /// by the control plane*. That is fail-closed. The consumer of this field
-    /// filters sandboxes **out** of a listing when it is absent, and a listing
-    /// that omits a sandbox costs nothing, while a listing that includes one it
-    /// should not is how something else comes to delete a live VM.
+    /// Opaque ownership marker stored and returned verbatim by the node.
+    /// Absence means the control plane does not own this sandbox.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "deserialize_optional_control_plane_config"
     )]
     pub control_plane_config: Option<ControlPlaneConfig>,
-    /// The lifetime ceiling this sandbox was created under, or `None` when the
-    /// node had no ceiling configured.
-    ///
-    /// 🔴 A budget of *running* time, not a wall-clock window from
-    /// `created_at`. It is spent by `running_elapsed` below and by the run in
-    /// progress, and a sandbox that sits paused spends none of it. See
-    /// [`SandboxState::spends_lifetime`] for why paused time is free.
-    ///
-    /// Stored as the budget rather than as an absolute deadline on purpose: a
-    /// fork restarts the clock and so gets a whole fresh window, while a resume
-    /// picks the same one back up where it was left. Neither needs a line of
-    /// clamping code at the call site.
-    ///
-    /// 🔴 `#[serde(default)]` is load-bearing here, unlike on `execution_id`
-    /// above: `persister.load_all` runs inside `Orchestrator::new`, so a
-    /// required field would mean a node that cannot start after an upgrade,
-    /// because every paused record written by an earlier build is missing it.
-    /// Do not copy the neighbour.
+    /// Running-time lifetime budget; paused time does not consume it.
+    /// Defaults to `None` so older paused records remain readable.
     #[serde(default)]
     pub max_lifetime: Option<Duration>,
-    /// Running time already spent, summed over the runs that have finished.
-    /// The run in progress is not in here — `running_since` holds its start.
-    ///
-    /// 🔴 `#[serde(default)]` for the same reason as `max_lifetime`: a paused
-    /// record written before this field existed has to decode, or the node
-    /// stops starting. Decoding to zero is also the right answer for such a
-    /// record — the build that wrote it had no way to spend the budget.
+    /// Running time spent by completed runs; defaults to zero for older records.
     #[serde(default)]
     pub running_elapsed: Duration,
-    /// When the run in progress started, or `None` while the sandbox is paused.
-    ///
-    /// 🔴 Deliberately not persisted. This names an interval inside *one
-    /// process's* run of the sandbox, and a record only ever leaves this
-    /// process at pause, by which point `pause_sandbox_inner` has already
-    /// charged the interval into `running_elapsed`. Persisting it would buy
-    /// nothing and introduce exactly one new failure mode: a record whose open
-    /// interval spans a node outage, charging the downtime as running time —
-    /// which is the bug this whole field exists to prevent.
-    ///
-    /// The invariant `running_since.is_some() == state.spends_lifetime()` is
-    /// maintained by [`SandboxMetadata::sync_running_clock`], which the
-    /// metadata store calls after every mutation it performs.
+    /// Start of the current running interval; synchronized from `state` and not persisted.
     #[serde(skip)]
     pub running_since: Option<SystemTime>,
     /// Paused state produced by the sandbox backend during `pause`.
@@ -411,9 +243,7 @@ impl Default for SandboxMetadata {
     fn default() -> Self {
         Self {
             id: SandboxId::new(),
-            // A `Default` record never stands for a run that happened — it is a
-            // test fixture — so minting here names nothing that could be
-            // confused with a real incarnation.
+            // Default metadata is a fixture, not a real execution.
             execution_id: ExecutionId::new(),
             snapshot_id: "unknown".to_string(),
             snapshot_alias: None,
@@ -438,9 +268,7 @@ impl Default for SandboxMetadata {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             secure: false,
-            // 🔴 Not owned by the control plane. A `Default` record is a test
-            // fixture, and a fixture that arrived pre-owned would make every
-            // ownership test pass for the wrong reason.
+            // Default fixtures are not control-plane owned.
             control_plane_config: None,
             max_lifetime: None,
             running_elapsed: Duration::ZERO,
@@ -455,24 +283,11 @@ impl SandboxMetadata {
         self._set_timeout(timeout, SystemTime::now());
     }
 
-    /// The instant this sandbox runs out of lifetime budget. `None` means it
-    /// has no ceiling.
-    ///
-    /// 🔴 Two anchors, one formula. While the sandbox is running the window is
-    /// pinned to the start of the run, so the answer is fixed for the duration
-    /// of that run and may already be in the past — which is exactly what
-    /// `keep_alive_for` reports as `SandboxLifetimeExceeded`. While it is
-    /// paused nothing is being spent, so the window is anchored at `now` and
-    /// the deadline recedes with it: a sandbox paused for a week resumes with
-    /// the budget it went away with, instead of resuming into a deadline that
-    /// expired while it was gone.
+    /// Returns the deadline for remaining running-time budget.
     pub fn lifetime_deadline(&self, now: SystemTime) -> Option<SystemTime> {
         let remaining = self.max_lifetime?.saturating_sub(self.running_elapsed);
         let anchor = match self.running_since {
-            // The state is consulted as well as the timestamp, so a record that
-            // somehow carries a stale start — one that never went through
-            // `sync_running_clock` — degrades to "the clock is not running"
-            // rather than to "the budget has been draining since then".
+            // Ignore a stale start timestamp when the state is not running.
             Some(since) if self.state.spends_lifetime() => since,
             _ => now,
         };
@@ -480,15 +295,7 @@ impl SandboxMetadata {
         anchor.checked_add(remaining)
     }
 
-    /// Brings the running clock in step with `state`, charging a run that has
-    /// just ended and starting one that has just begun.
-    ///
-    /// Idempotent, and driven by nothing but `state`. That is what lets the
-    /// metadata store call it after *every* mutation it performs — including
-    /// the ones whose callback sets `state` directly — and still lets a caller
-    /// that needs the exact instant call it early. `pause_sandbox_inner` does
-    /// exactly that: it has to charge the run before the record is persisted,
-    /// because the persisted copy is the one a restarted node reads back.
+    /// Synchronizes the running clock with state, charging completed intervals once.
     pub fn sync_running_clock(&mut self, now: SystemTime) {
         match (self.state.spends_lifetime(), self.running_since) {
             (true, None) => self.running_since = Some(now),
@@ -502,31 +309,13 @@ impl SandboxMetadata {
         }
     }
 
-    /// Gives this record a whole fresh lifetime window.
-    ///
-    /// Only a fork's child gets one: it is a new sandbox that happens to have
-    /// been built from a running one, so it starts its budget at zero the same
-    /// way it starts `created_at` at `now`. A resume is the other case, and it
-    /// deliberately does not call this — the sandbox coming back is the same
-    /// sandbox, and it picks its budget up where it left it.
+    /// Restarts the lifetime budget for a newly forked child.
     pub fn restart_lifetime_clock(&mut self, now: SystemTime) {
         self.running_elapsed = Duration::ZERO;
         self.running_since = self.state.spends_lifetime().then_some(now);
     }
 
-    /// How long this sandbox's routing projection should live, in whole
-    /// seconds, or `0` when there is no ceiling to derive it from.
-    ///
-    /// Derived from the *remaining running budget*, so a paused sandbox reports
-    /// the whole of what it has left rather than a window that has been
-    /// draining while it sat still. The worst-case leak the ceiling bounds is
-    /// unchanged by that: a record still cannot outlive `max_lifetime` plus the
-    /// grace without a heartbeat to renew it.
-    ///
-    /// 🔴 `0` is the only non-positive value that may ever leave here, and it
-    /// means "use the receiver's default TTL". It must never be read as "never
-    /// expires": a projection that outlives every path able to delete it is a
-    /// route pointing at a sandbox nobody can reach.
+    /// Returns remaining lifetime plus routing grace, or `0` for receiver default.
     pub fn projection_ttl_secs(&self, now: SystemTime) -> u32 {
         self._projection_ttl_secs(now, configured_projection_ttl_grace_secs())
     }
@@ -536,10 +325,7 @@ impl SandboxMetadata {
             return 0;
         };
         let remaining = cap.duration_since(now).unwrap_or(Duration::ZERO);
-        // 🔴 Ceil, not truncate, and floored at 1. Truncating whole units is
-        // how a projection comes to expire before the sandbox it points at;
-        // flooring at 1 is how a sub-unit remainder avoids collapsing into a
-        // zero that the receiver would have to interpret.
+        // Round up and floor at one so projections never expire early or become unbounded.
         let secs = remaining
             .as_secs()
             .saturating_add(u64::from(remaining.subsec_nanos() > 0));
@@ -550,10 +336,7 @@ impl SandboxMetadata {
     fn _set_timeout(&mut self, timeout: Option<Duration>, from: SystemTime) {
         self.timeout = timeout;
         let deadline = timeout.and_then(|ttl| from.checked_add(ttl));
-        // Every path that sets an expiry — create, resume, fork, connect,
-        // auto-resume, keep-alive — funnels through here, which is why the
-        // ceiling is applied here and at no call site: there are six of them
-        // and clamping them one by one would miss one.
+        // All expiry-setting paths apply the lifetime ceiling here.
         self.expires_at = match (deadline, self.lifetime_deadline(from)) {
             (Some(deadline), Some(cap)) => Some(deadline.min(cap)),
             (deadline, _) => deadline,
@@ -587,11 +370,6 @@ mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
 
-    /// The ownership marker, on its own.
-    ///
-    /// 🔴 These are the tests that decide whether a sandbox appears in the
-    /// answer `node_reclaim`'s counterpart reconciles against, so each one
-    /// states which direction its failure goes.
     mod ownership_marker {
         use serde_json::Value;
 
@@ -608,10 +386,6 @@ mod tests {
 
         #[test]
         fn zero_bytes_is_not_a_marker() {
-            // 🔴 The wire type is protobuf `bytes`, which cannot distinguish
-            // "no marker" from "an empty one". Collapsing them here is what
-            // stops `Some(<zero bytes>)` existing as a third answer to a
-            // two-valued question.
             assert_eq!(ControlPlaneConfig::from_bytes(Vec::new()), None);
             assert_eq!(ControlPlaneConfig::from_bytes(""), None);
             assert!(ControlPlaneConfig::from_bytes(vec![0u8]).is_some());
@@ -619,9 +393,6 @@ mod tests {
 
         #[test]
         fn the_bytes_come_back_exactly_as_they_went_in() {
-            // The node stores what it was sent. Anything that normalises,
-            // re-encodes or trims would break the only consumer there is: a
-            // control plane decoding its own record.
             for bytes in [vec![0u8], vec![0xff, 0x00, 0xff], b"{}".to_vec()] {
                 let marker = ControlPlaneConfig::from_bytes(bytes.clone()).expect("non-empty");
                 assert_eq!(marker.as_bytes(), &bytes[..]);
@@ -652,14 +423,9 @@ mod tests {
 
         #[test]
         fn an_absent_or_null_or_empty_field_means_unowned() {
-            // 🔴 All three are fail-closed: the sandbox is left out of the
-            // control plane's listing, which costs nothing, rather than put
-            // into it carrying a marker that says nothing.
             for field in [
                 Value::Null,
                 Value::String(String::new()),
-                // base64 of zero bytes is also the empty string, so this is
-                // the same case reached the other way.
                 Value::String("".to_string()),
             ] {
                 let decoded: SandboxMetadata =
@@ -678,11 +444,6 @@ mod tests {
 
         #[test]
         fn a_mangled_marker_is_an_error_and_not_an_absence() {
-            // 🔴 The opposite direction from the test above, and deliberately
-            // so. A field nobody wrote is a sandbox nobody owns; a field
-            // somebody wrote and got wrong is a corrupt record, and reading
-            // the second as the first would let corruption pass for an
-            // ordinary unowned sandbox.
             let err = serde_json::from_value::<SandboxMetadata>(record_with(Value::String(
                 "not base64!!".to_string(),
             )))
@@ -695,8 +456,6 @@ mod tests {
 
         #[test]
         fn debug_prints_the_size_and_not_the_contents() {
-            // The contents belong to the control plane and may carry anything,
-            // and `SandboxMetadata` is formatted into logs.
             let marker =
                 ControlPlaneConfig::from_bytes(b"secret-workspace".to_vec()).expect("non-empty");
             let rendered = format!("{marker:?}");
@@ -757,9 +516,6 @@ mod tests {
         assert_eq!(metadata.expires_at, None);
     }
 
-    /// A record with no ceiling behaves exactly as it did before the ceiling
-    /// existed. This is the control for every test below it: without it,
-    /// "clamped to 300" could just as well be "the timeout was 300 all along".
     fn uncapped(base: SystemTime) -> SandboxMetadata {
         SandboxMetadata {
             created_at: base,
@@ -769,9 +525,6 @@ mod tests {
         }
     }
 
-    /// A sandbox that has been running since `base` and has spent none of its
-    /// budget yet. `running_since` is set explicitly rather than left to the
-    /// store, so every deadline below is a fixed instant these tests can name.
     fn capped(base: SystemTime, lifetime_secs: u64) -> SandboxMetadata {
         SandboxMetadata {
             created_at: base,
@@ -791,8 +544,6 @@ mod tests {
             Some(base + Duration::from_secs(300))
         );
 
-        // Half the budget already spent by earlier runs: the window that is
-        // left is half as long, and it still starts at this run's start.
         let mut resumed = capped(base, 300);
         resumed.running_elapsed = Duration::from_secs(150);
         assert_eq!(
@@ -800,17 +551,12 @@ mod tests {
             Some(base + Duration::from_secs(150))
         );
 
-        // 🔴 And it does not move while the run is under way: the deadline read
-        // 100 seconds in is the same instant, not 100 seconds later.
         assert_eq!(
             resumed.lifetime_deadline(base + Duration::from_secs(100)),
             Some(base + Duration::from_secs(150))
         );
     }
 
-    /// 🔴 The defect this model exists to fix. A paused sandbox is not running,
-    /// so its clock is stopped: the deadline is measured from whenever it comes
-    /// back, however long it has been away.
     #[test]
     fn a_paused_sandbox_carries_its_budget_forward_instead_of_burning_it() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
@@ -823,8 +569,6 @@ mod tests {
             ..Default::default()
         };
 
-        // Twenty-five hours later — past the point where a deadline derived
-        // from `created_at` alone would already have expired.
         let much_later = base + Duration::from_secs(90_000);
         assert_eq!(
             paused.lifetime_deadline(much_later),
@@ -833,9 +577,6 @@ mod tests {
         );
     }
 
-    /// The clock is driven by `state` and by nothing else, and running it twice
-    /// costs nothing — which is what lets the store call it after every write
-    /// while `pause_sandbox_inner` also calls it early, at the instant it needs.
     #[test]
     fn the_running_clock_charges_a_run_once_and_only_once() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
@@ -848,8 +589,6 @@ mod tests {
 
         metadata.sync_running_clock(base);
         assert_eq!(metadata.running_since, Some(base));
-        // Still Running: a second sync must not restart the run and throw the
-        // elapsed time away.
         metadata.sync_running_clock(base + Duration::from_secs(30));
         assert_eq!(metadata.running_since, Some(base));
         assert_eq!(metadata.running_elapsed, Duration::ZERO);
@@ -858,12 +597,9 @@ mod tests {
         metadata.sync_running_clock(base + Duration::from_secs(60));
         assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
         assert_eq!(metadata.running_since, None);
-        // And a second sync while paused charges nothing further, however much
-        // wall-clock time goes by.
         metadata.sync_running_clock(base + Duration::from_secs(90_000));
         assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
 
-        // Resuming picks the same budget back up rather than starting over.
         metadata.state = SandboxState::Running;
         metadata.sync_running_clock(base + Duration::from_secs(90_000));
         assert_eq!(
@@ -873,8 +609,6 @@ mod tests {
         assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
     }
 
-    /// A fork's child is a new sandbox, so it starts the budget over. A resume
-    /// is the same sandbox, so it does not — the contrast is the test.
     #[test]
     fn restarting_the_clock_clears_the_spent_budget() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
@@ -905,13 +639,9 @@ mod tests {
 
         metadata._set_timeout(Some(Duration::from_secs(3600)), base);
         assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(300)));
-        // 🔴 The requested timeout is kept as requested; only the deadline is
-        // clamped. A caller that reads `timeout` back is told what it asked
-        // for, and the ceiling is a property of the deadline.
         assert_eq!(metadata.timeout, Some(Duration::from_secs(3600)));
     }
 
-    /// The control face for the test above.
     #[test]
     fn set_timeout_without_a_ceiling_is_not_clamped() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
@@ -930,8 +660,6 @@ mod tests {
         assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(60)));
     }
 
-    /// Renewal is where the ceiling earns its keep: a keep-alive issued halfway
-    /// through the window may not push the deadline past the end of it.
     #[test]
     fn a_later_renewal_cannot_push_the_deadline_past_the_ceiling() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
@@ -950,15 +678,9 @@ mod tests {
         metadata._set_timeout(Some(Duration::from_secs(60)), base);
 
         metadata._set_timeout(None, base);
-        // No timeout means no expiry, and the ceiling does not invent one: the
-        // eviction loop reads `expires_at` and nothing else, so writing the cap
-        // in here would start deleting sandboxes that asked never to expire.
         assert_eq!(metadata.expires_at, None);
     }
 
-    /// A fork's child gets a whole fresh window. The parent, 280 seconds into
-    /// a 300-second budget, is 20 seconds from its own ceiling at that moment —
-    /// so a child that merely cloned the record would be too.
     #[test]
     fn a_forked_child_gets_a_fresh_window_because_the_clock_restarted() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
@@ -982,8 +704,6 @@ mod tests {
     fn projection_ttl_is_zero_without_a_ceiling() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
 
-        // 🔴 0 is the handoff to the receiver's default, and the only
-        // non-positive value that may ever be emitted.
         assert_eq!(uncapped(base)._projection_ttl_secs(base, 60), 0);
     }
 
@@ -1000,25 +720,17 @@ mod tests {
         assert_eq!(metadata._projection_ttl_secs(base, 0), 300);
     }
 
-    /// 🔴 Ceil, not truncate. Truncation is the bug that makes a projection
-    /// expire before the sandbox it points at, and it only shows up on a
-    /// remainder — which a whole-numbered fixture would never produce.
     #[test]
     fn projection_ttl_rounds_a_partial_second_up() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
         let metadata = capped(base, 300);
 
-        // Exactly on a second boundary: ceil is not "+1".
         assert_eq!(metadata._projection_ttl_secs(base, 0), 300);
-        // Half a second in, 299.5s left. Rounding up gives the sandbox's own
-        // last second back; truncating to 299 is what retires the projection
-        // while the sandbox it points at is still answering.
         assert_eq!(
             metadata._projection_ttl_secs(base + Duration::new(0, 500_000_000), 0),
             300
         );
 
-        // A budget that is not itself a whole number of seconds.
         let ragged = SandboxMetadata {
             created_at: base,
             max_lifetime: Some(Duration::new(300, 1)),
@@ -1028,10 +740,6 @@ mod tests {
         assert_eq!(ragged._projection_ttl_secs(base, 0), 301);
     }
 
-    /// 🔴 The second, worse half of the bug this formula replaces: a budget
-    /// smaller than one unit truncating to 0, and 0 being read downstream as
-    /// "no expiry at all". Nothing here may emit a non-positive value once a
-    /// ceiling exists.
     #[test]
     fn projection_ttl_floors_at_one_second_and_never_at_zero() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
@@ -1044,8 +752,6 @@ mod tests {
 
         assert_eq!(metadata._projection_ttl_secs(base, 0), 1);
 
-        // Already past the deadline: still 1, still not 0. An expired sandbox
-        // asks for a short-lived record, not for an immortal one.
         let expired = capped(base, 300);
         assert_eq!(
             expired._projection_ttl_secs(base + Duration::from_secs(9_000), 0),
@@ -1061,8 +767,6 @@ mod tests {
         assert_eq!(metadata._projection_ttl_secs(base, 3600), u32::MAX);
     }
 
-    /// 🔴 N2. `load_all` runs inside `Orchestrator::new`, so a record written
-    /// before this field existed has to decode or the node does not start.
     #[test]
     fn a_record_written_before_the_ceiling_existed_still_decodes() {
         let mut document = serde_json::to_value(&SandboxMetadata {
@@ -1082,8 +786,6 @@ mod tests {
 
         assert_eq!(decoded.max_lifetime, None);
         assert_eq!(decoded.lifetime_deadline(SystemTime::now()), None);
-        // And an uncapped record keeps behaving as it did before the ceiling
-        // existed, rather than being retro-fitted with this node's ceiling.
         assert_eq!(decoded.projection_ttl_secs(SystemTime::now()), 0);
     }
 
@@ -1102,10 +804,6 @@ mod tests {
         assert_eq!(decoded.max_lifetime, Some(Duration::from_secs(86_400)));
     }
 
-    /// 🔴 N2 again, for the field the ceiling is actually spent through. A node
-    /// upgraded onto this build reads paused records that predate
-    /// `running_elapsed`, and `load_all` runs inside `Orchestrator::new` — so a
-    /// record that does not decode is a node that does not start.
     #[test]
     fn a_record_written_before_the_running_clock_existed_still_decodes() {
         let mut document = serde_json::to_value(SandboxMetadata {
@@ -1125,8 +823,6 @@ mod tests {
         let decoded: SandboxMetadata =
             serde_json::from_value(document).expect("an older record must still load");
 
-        // Nothing spent, which is the truthful reading: the build that wrote
-        // the record had no way to spend the budget.
         assert_eq!(decoded.running_elapsed, Duration::ZERO);
         assert_eq!(decoded.running_since, None);
 
@@ -1139,8 +835,6 @@ mod tests {
         );
     }
 
-    /// The spent budget is the half of the model that has to survive a restart,
-    /// and it does — while the open interval deliberately does not.
     #[test]
     fn the_spent_budget_survives_a_round_trip_and_the_open_interval_does_not() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
@@ -1158,19 +852,9 @@ mod tests {
                 .expect("deserialize");
 
         assert_eq!(decoded.running_elapsed, Duration::from_secs(3_600));
-        // 🔴 Dropped on purpose. A persisted record is a paused record, and the
-        // only way an open interval could reach the wire is a run this process
-        // never closed — reading it back would charge the whole outage.
         assert_eq!(decoded.running_since, None);
     }
 
-    /// The marker is the record, and reading it back gives the record.
-    ///
-    /// 🔴 Field by field rather than by comparing two encodings. A round trip
-    /// that only checks `to_vec(decode(bytes)) == bytes` passes for a schema
-    /// that dropped a field on both sides at once, which is the exact failure
-    /// this marker exists to prevent: it is the only copy of the control
-    /// plane's record that survives the control plane's store being lost.
     #[test]
     fn the_marker_carries_the_record_and_not_a_summary() {
         let mut record = SandboxMetadata {
@@ -1197,20 +881,10 @@ mod tests {
         assert_eq!(decoded.user_metadata, record.user_metadata);
         assert_eq!(decoded.state, record.state);
 
-        // 🔴 The two fields that are `#[serde(skip)]` on the record name live
-        // local state rather than the sandbox, and must not be in here — the
-        // machine that would own them is not the machine reading this back.
         assert!(decoded.paused_state.is_none());
         assert!(decoded.running_since.is_none());
     }
 
-    /// A marker from a schema this build does not write is refused.
-    ///
-    /// 🔴 The refusal is the point. serde fills in defaults for whatever moved
-    /// without complaining, so a marker read across a schema change would
-    /// decode into a record that looks complete and describes a different
-    /// sandbox — and the caller reading it is a rebuild after a store loss,
-    /// which has nothing to compare it against.
     #[test]
     fn a_marker_from_another_schema_is_refused_rather_than_defaulted() {
         let marker =
@@ -1232,29 +906,11 @@ mod tests {
             .to_string();
         assert!(err.contains("version"), "{err}");
 
-        // 🔴 The control: the untouched marker decodes, so the refusal above is
-        // about the version rather than about `decode_record` refusing
-        // everything.
         assert!(marker.decode_record().is_ok());
     }
 }
 
-/// Cross-language golden fixtures for the `metadata` JSONB column.
-///
-/// 🔴 Why these files exist. The registry stores this struct as JSONB, and the
-/// control plane is about to start carrying that column between processes. The
-/// struct has no `deny_unknown_fields`, four `#[serde(default)]` fields, two
-/// `skip_serializing_if` fields (so the key set is not even fixed), and two
-/// camelCase keys buried in an otherwise snake_case document. Anything that
-/// round-trips this JSON through a hand-written schema on the other side drops
-/// what it does not recognise, and drops it **silently**.
-///
-/// Ten of the fields are not optional: if one of them goes missing the row
-/// stops decoding, and every read path — `get`, `get_many`, `claim_for_resume`
-/// — shares that decoder, so the sandbox becomes both unreadable and
-/// unclaimable at once. It surfaces at the next resume, which may be days
-/// later. These fixtures are the shared truth that both sides check themselves
-/// against; the Go side reads the very same files.
+/// Cross-language golden fixtures for the metadata JSONB contract.
 #[cfg(test)]
 mod golden {
     use std::collections::HashMap;
@@ -1268,14 +924,10 @@ mod golden {
     use crate::snapshot::CommandContext;
     use crate::types::ImageConfigs;
 
-    /// Fields with neither `Option` nor `#[serde(default)]`. Losing any one of
-    /// them makes the row permanently undecodable.
+    // Fields without `Option` or serde defaults.
     const REQUIRED_FIELDS: [&str; 11] = [
         "id",
-        // 🔴 Required, and deliberately so. A record without it is refused at
-        // load rather than given a fresh incarnation, because a fresh one would
-        // be a value nothing ever ran under — which is exactly what fencing
-        // cannot detect.
+        // Incarnation is required for fencing.
         "execution_id",
         "snapshot_id",
         "state",
@@ -1288,20 +940,15 @@ mod golden {
         "network_policy",
     ];
 
-    /// Fields written only when they carry something, so a valid document may
-    /// or may not have them. Both shapes have a fixture.
+    // Fields omitted when empty.
     const OMISSIBLE_FIELDS: [&str; 3] = [
         "image_configs",
         "custom_extension_params",
-        // 🔴 Absent means "the control plane does not own this sandbox", which
-        // is why it belongs here and not among the required fields: the whole
-        // point of the marker is that a record without one is still a valid
-        // record, describing a sandbox nobody claims.
+        // An absent ownership marker is a valid unowned record.
         "control_plane_config",
     ];
 
-    /// The file REQUIRED_FIELDS is published in, so the other side can check
-    /// itself against the list rather than against a restatement of it.
+    // Shared fixture publishing the required field set.
     const REQUIRED_FIELDS_FIXTURE: &str = "sandbox_metadata_required_fields.json";
 
     fn fixture_path(name: &str) -> PathBuf {
@@ -1310,16 +957,7 @@ mod golden {
             .join(name)
     }
 
-    /// Renders the metadata with every object's keys in sorted order.
-    ///
-    /// 🔴 The sort is not cosmetic. `storage/overlaybd` turns on serde_json's
-    /// `preserve_order`, and Cargo unifies features across the workspace, so
-    /// `serde_json::Map` is insertion-ordered here — which means the iteration
-    /// order of the `HashMap` fields leaks straight into the output and differs
-    /// on every process. A fixture rendered without this could never be pinned.
-    ///
-    /// Key order is not part of the contract either way: PostgreSQL's `jsonb`
-    /// reorders keys on its own, so both sides compare key sets and values.
+    // Sort keys because JSON object order is not contractual or deterministic.
     fn canonical(metadata: &SandboxMetadata) -> String {
         let value = serde_json::to_value(metadata).expect("serialize sandbox metadata");
         let mut text = serde_json::to_string_pretty(&sort_keys(value)).expect("render metadata");
@@ -1346,8 +984,7 @@ mod golden {
         }
     }
 
-    /// Every optional field populated, so both `skip_serializing_if` fields are
-    /// present and the camelCase keys inside `image_configs` are exercised.
+    // Populates every optional field.
     fn full_metadata() -> SandboxMetadata {
         let mut image_configs = ImageConfigs::new();
         image_configs.add(
@@ -1421,35 +1058,30 @@ mod golden {
             ),
             custom_extension_params: Some(custom_extension_params),
             secure: true,
-            // The bytes are nonsense on purpose: the node stores whatever the
-            // control plane sent, so a fixture that held valid JSON would
-            // invite someone to start reading it.
+            // Opaque non-JSON bytes ensure the node never interprets this field.
             control_plane_config: ControlPlaneConfig::from_bytes(vec![
                 0x00, 0x01, 0xfe, 0xff, b'o', b'w', b'n', b'e', b'd',
             ]),
             max_lifetime: Some(Duration::new(86_400, 0)),
             running_elapsed: Duration::new(5_400, 0),
-            // Not written: `#[serde(skip)]`, and this record is paused anyway.
+            // Skipped from serialization.
             running_since: None,
             paused_state: None,
         }
     }
 
-    /// The other shape: nothing optional set, so both omissible fields are
-    /// absent from the document entirely.
+    // Leaves all omissible fields absent.
     fn minimal_metadata() -> SandboxMetadata {
         SandboxMetadata {
             id: SandboxId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c08").unwrap(),
-            // Pinned, like the id above: `Default` mints a fresh incarnation,
-            // and a fixture that changes on every run can never be a fixture.
+            // Pin the generated default incarnation for a stable fixture.
             execution_id: ExecutionId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c09").unwrap(),
             created_at: UNIX_EPOCH + Duration::new(1_755_561_600, 0),
             ..SandboxMetadata::default()
         }
     }
 
-    /// Compares against the checked-in file, or rewrites it when
-    /// `UPDATE_METADATA_GOLDEN=1` is set.
+    // Compares with or regenerates the checked-in fixture.
     fn assert_matches_fixture(name: &str, metadata: &SandboxMetadata) -> Value {
         let path = fixture_path(name);
         let rendered = canonical(metadata);
@@ -1485,8 +1117,6 @@ mod golden {
             assert!(object.contains_key(*field), "fixture is missing {field}");
         }
 
-        // 🔴 The only two camelCase keys in the whole document. A Go tag policy
-        // that snake-cases or camel-cases wholesale gets exactly these wrong.
         let entries = object["image_configs"].as_array().expect("an array");
         assert!(entries.iter().any(|entry| entry
             .as_object()
@@ -1512,8 +1142,6 @@ mod golden {
         }
     }
 
-    /// Both fixtures survive a decode and re-encode unchanged, which is what
-    /// the registry does to them on every read.
     #[test]
     fn both_fixtures_round_trip_through_the_struct() {
         for name in [
@@ -1528,9 +1156,6 @@ mod golden {
         }
     }
 
-    /// 🔴 Proves the fixture actually exercises the constraint it is here to
-    /// protect: drop any one required field and the row stops decoding. Without
-    /// this the fixture could be missing a field and still look healthy.
     #[test]
     fn dropping_any_required_field_makes_the_record_undecodable() {
         let full: Value = serde_json::from_str(
@@ -1555,23 +1180,6 @@ mod golden {
         }
     }
 
-    /// 🔴 Publishes REQUIRED_FIELDS as a file of its own, which is what lets
-    /// the other side be *wrong about the list* rather than merely wrong about
-    /// a document.
-    ///
-    /// Until now the Go side restated these names in its own source and checked
-    /// that each of them was present in the two metadata fixtures. That had
-    /// teeth in one direction only: the fixtures carry more keys than the list
-    /// names, so adding a name this side does not require failed over there,
-    /// while dropping one this side does require passed. `execution_id` went
-    /// missing exactly that way — it was made required here, the fixtures were
-    /// regenerated, and the Go list stayed green while naming one field fewer.
-    ///
-    /// With the list itself in a file, both sides read the same bytes and the
-    /// comparison over there is set equality, so a name added here and a name
-    /// dropped there each fail. Order is not part of the contract — the other
-    /// side compares sets — but the rendering is declaration order, because a
-    /// fixture whose contents move on their own is not a fixture.
     #[test]
     fn the_required_field_list_is_published_for_the_other_side() {
         let path = fixture_path(REQUIRED_FIELDS_FIXTURE);
@@ -1599,9 +1207,6 @@ mod golden {
         );
     }
 
-    /// The other half of the boundary. These are genuinely optional, and a
-    /// document without them is valid — so a reader must not treat "fewer keys"
-    /// as damage.
     #[test]
     fn dropping_an_optional_field_still_decodes() {
         let full: Value = serde_json::from_str(
@@ -1616,10 +1221,7 @@ mod golden {
             "expires_at",
             "startup",
             "user_metadata",
-            // 🔴 The two whose absence a node actually meets in production:
-            // every paused record written before the lifetime ceiling existed
-            // is missing them, and `load_all` runs inside `Orchestrator::new`,
-            // so a decode failure here is a node that will not start.
+            // Older paused records legitimately lack lifetime fields.
             "max_lifetime",
             "running_elapsed",
         ] {

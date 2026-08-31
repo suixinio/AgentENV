@@ -1,4 +1,4 @@
-//! The twelve original [`MetadataStore`] methods, on Redis.
+//! Core Redis implementation of the metadata-store contract.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -18,41 +18,22 @@ use super::{backend, backend_msg, scripts, RedisMetadataStore, StoreInner};
 use crate::orchestrator::SandboxState;
 use crate::types::{ExecutionId, SandboxId};
 
-/// How a write decides what happens to the record key's TTL.
+/// Record-key TTL update policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TtlMode {
-    /// Leave whatever TTL the key already has.
-    ///
-    /// Used where a write deliberately must not touch the lifetime budget —
-    /// the mid-operation state stamp in `start_transition` is the only one.
+    /// Preserve the existing TTL for state-only transition stamps.
     Keep,
-    /// Derive the TTL again from the record being written.
-    ///
-    /// 🔴 A deliberate departure from e2b, which uses `KEEPTTL` everywhere.
-    /// e2b can: its sandbox keys have no TTL at all, so its `KEEPTTL` preserves
-    /// nothing and is pure defence against a stray `SET`. Ours is a pure
-    /// function of the record — `lifetime_deadline` plus a grace — so deriving
-    /// it again is idempotent for a running sandbox and *necessary* for a
-    /// paused one: paused time is free, so a paused sandbox's deadline recedes
-    /// with the clock, and a TTL frozen at creation would delete the record of
-    /// a sandbox that is still perfectly alive on somebody's disk.
-    ///
-    /// The failure `KEEPTTL` guards against is still guarded against: the mode
-    /// is a required argument of the script, so no write path can reach a bare
-    /// `SET` by omission.
+    /// Recompute TTL from the record's remaining running-time budget.
     Recompute,
 }
 
 impl TtlMode {
-    /// The literal the scripts take. 🔴 Every write names one; there is no
-    /// default, because both wrong answers are silent.
+    /// Resolves the script's mandatory TTL argument.
     pub fn resolve(self, record: &StoredSandboxRecord, grace: Duration) -> String {
         match self {
             TtlMode::Keep => "keep".to_string(),
             TtlMode::Recompute => match record.record_ttl(SystemTime::now(), grace) {
                 Some(ttl) => ttl.as_millis().to_string(),
-                // No configured ceiling means no leak bound to enforce, and an
-                // unbounded key, exactly as e2b has.
                 None => "keep".to_string(),
             },
         }
@@ -68,22 +49,13 @@ struct Rescore {
 }
 
 impl Rescore {
-    /// 🔴 The incarnation is part of the trigger, not just the expiry.
-    ///
-    /// e2b only compares end times, because its `Update` never changes an
-    /// incarnation — a new incarnation there arrives through `Add`. Ours does:
-    /// the finishing write of a resume installs a new one through this very
-    /// path. Compare only the expiry and that write leaves the previous
-    /// incarnation's member in the index and never inserts the live one, so the
-    /// sandbox silently stops being able to expire.
+    // Rescore whenever expiry or incarnation changes.
     fn between(previous: &SandboxMetadata, current: &SandboxMetadata) -> Self {
         let needed = previous.expires_at != current.expires_at
             || previous.execution_id != current.execution_id;
         Self {
             needed,
-            // Always removed when rescoring, whether or not the previous record
-            // carried an expiry: the healer indexes expiry-less records too, at
-            // their lifetime deadline, and that member is stale now as well.
+            // Remove any healer-created member for the prior incarnation.
             old_member: ExpiryMember::new(previous.id, previous.execution_id).encode(),
             new_member: ExpiryMember::new(current.id, current.execution_id).encode(),
             new_score: current.expires_at.map(to_unix_millis),
@@ -92,10 +64,7 @@ impl Rescore {
 }
 
 impl StoreInner {
-    /// The single write path. Every predicate this store has is applied here.
-    ///
-    /// Returns `Err(ConcurrentUpdate)` when the revision moved and
-    /// `Err(ExecutionSuperseded)` when the incarnation did.
+    /// Writes one record under revision and optional execution predicates.
     pub async fn write_record(
         &self,
         previous: &SandboxMetadata,
@@ -172,11 +141,7 @@ impl StoreInner {
         }
     }
 
-    /// Compare-and-set on state alone.
-    ///
-    /// An optimistic retry is safe here — unlike in `update_if_state` there is
-    /// no caller-supplied callback, so re-running costs nothing and observes
-    /// nothing.
+    /// Compare-and-set state with safe optimistic retries.
     pub async fn compare_and_set_state(
         &self,
         sandbox_id: &SandboxId,
@@ -222,7 +187,7 @@ impl StoreInner {
         })
     }
 
-    /// Deletes a record and everything that indexes it.
+    /// Deletes a record and all index entries.
     pub async fn remove_record(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>> {
         let mut connection = self.connection();
         let removed: Option<Vec<u8>> = scripts::remove()
@@ -245,7 +210,7 @@ impl StoreInner {
             .map(|record| record.map(StoredSandboxRecord::into_metadata))
     }
 
-    /// Reads the membership set, dropping members that no longer parse.
+    /// Reads parseable ids from the membership set.
     async fn member_ids(&self) -> Result<Vec<SandboxId>> {
         let mut connection = self.connection();
         let raw: Vec<String> = redis::cmd("SMEMBERS")
@@ -259,8 +224,7 @@ impl StoreInner {
             match SandboxId::parse_str(&member) {
                 Ok(id) => ids.push(id),
                 Err(_) => {
-                    // 🔴 Garbage, not a sandbox. Swept rather than reported, so
-                    // that it can never be mistaken for a record that is gone.
+                    // Invalid members are garbage, not absent sandboxes.
                     warn!(member = %member, "dropping an unparseable membership entry");
                     let _: redis::RedisResult<i64> = redis::cmd("SREM")
                         .arg(self.keys().index())
@@ -273,12 +237,7 @@ impl StoreInner {
         Ok(ids)
     }
 
-    /// Reads every record in the membership set.
-    ///
-    /// 🔴 All or nothing. A chunk that fails aborts the whole call rather than
-    /// returning a shorter list, because a shorter list is indistinguishable
-    /// from "those sandboxes are gone" — and the caller's answer to *that* is
-    /// to tear things down.
+    /// Reads all member records, failing the whole call if any chunk errors.
     async fn read_all_records(&self) -> Result<Vec<SandboxMetadata>> {
         let ids = self.member_ids().await?;
         let mut records = Vec::with_capacity(ids.len());
@@ -295,9 +254,7 @@ impl StoreInner {
             for (id, raw) in chunk.iter().zip(raws) {
                 match raw {
                     Some(raw) => records.push(StoredSandboxRecord::decode(&raw)?.into_metadata()),
-                    // The record key's TTL is the only thing that removes a
-                    // record without going through `remove`, so a member with
-                    // no record is a leak backstop having fired.
+                    // Expired record keys leave stale membership entries.
                     None => self.sweep_index_member(id).await?,
                 }
             }
@@ -305,11 +262,7 @@ impl StoreInner {
         Ok(records)
     }
 
-    /// Drops a membership entry whose record is gone.
-    ///
-    /// 🔴 The existence check is inside the script. Checking here and removing
-    /// afterwards would let a lockless `add` land in between and have its
-    /// brand-new sandbox removed from the membership set.
+    /// Atomically drops a membership entry only when its record is absent.
     pub async fn sweep_index_member(&self, sandbox_id: &SandboxId) -> Result<()> {
         let mut connection = self.connection();
         let removed: i64 = scripts::sweep_index_member()
@@ -326,11 +279,7 @@ impl StoreInner {
     }
 }
 
-/// Waits for a wake-up or for the poll interval, whichever comes first.
-///
-/// 🔴 A closed channel must fall back to sleeping. `recv` on a closed broadcast
-/// returns immediately and for ever, so selecting on it without this would turn
-/// every wait in the module into a busy loop the moment the notifier stopped.
+/// Waits for a notification or poll interval; closed channels fall back to sleep.
 pub async fn wake_or_poll(wake: &mut broadcast::Receiver<()>, poll: Duration) {
     tokio::select! {
         received = wake.recv() => {
@@ -400,17 +349,7 @@ impl MetadataStore for RedisMetadataStore {
         Ok(())
     }
 
-    /// A full, unpredicated overwrite in the trait — but not on the wire.
-    ///
-    /// 🔴 The incarnation check in step one is new semantics, and it is what
-    /// closes the window this method has always had: the pause path reads a
-    /// record, writes hundreds of milliseconds' worth of bytes to disk, and
-    /// only then writes the record back. In one process a transitional state
-    /// kept concurrent writers out of that window. Across replicas it still
-    /// keeps out concurrent `update_if_state` calls — but not `add`, which is
-    /// lockless, and which `restore_sandbox` performs under a caller-supplied
-    /// id. Without this check that `add`'s brand-new incarnation would be
-    /// overwritten by a record read before it existed.
+    /// Full-record update fenced by the currently stored execution and revision.
     async fn update(&self, mut metadata: SandboxMetadata) -> Result<()> {
         let inner = self.inner();
         let sandbox_id = metadata.id;
@@ -454,13 +393,7 @@ impl MetadataStore for RedisMetadataStore {
         Err(StoreError::ConcurrentUpdate { sandbox_id })
     }
 
-    /// 🔴 Deliberately does not take the lock.
-    ///
-    /// Read, compare and write are one script, so the lock would buy only two
-    /// extra round trips. And nine of this method's fourteen call sites are
-    /// rollback paths: making a rollback queue behind a lock another replica
-    /// may hold for fifteen seconds is injecting a failure into the remedy for
-    /// a failure.
+    /// State CAS is already atomic and does not take the distributed lock.
     async fn update_state_if_state(
         &self,
         sandbox_id: &SandboxId,
@@ -472,23 +405,8 @@ impl MetadataStore for RedisMetadataStore {
             .await
     }
 
-    /// The closure contract, kept word for word, with its scope widened from
-    /// this process to the cluster.
-    ///
-    /// Three layers stop a slow callback from doing damage, and only the third
-    /// carries weight:
-    ///
-    /// 1. The callback mutates a **local copy**, so a callback that overruns
-    ///    its budget can be discarded losslessly. It is not retried: `FnOnce`
-    ///    forbids it, and `keep_alive`'s callback sets a flag declared outside
-    ///    itself that the caller reads afterwards, so a second run would set it
-    ///    a second time within one logical operation.
-    /// 2. Before writing, the lock's remaining lifetime is checked against the
-    ///    write's budget. This catches the things a callback timer cannot: a GC
-    ///    pause, scheduler starvation, a stalled Redis.
-    /// 3. The write itself carries `rev` and `execution_id` predicates. If both
-    ///    layers above leak, the write still cannot overwrite a newer
-    ///    incarnation — it fails loudly instead.
+    /// Executes the callback once on a local copy, then writes under lock-lifetime,
+    /// revision, and execution predicates.
     async fn update_if_state<F>(
         &self,
         sandbox_id: &SandboxId,
@@ -517,9 +435,7 @@ impl MetadataStore for RedisMetadataStore {
             .update_if_state_locked(sandbox_id, expected_states, update, lock.as_ref())
             .await;
 
-        // 🔴 Released whether the update succeeded or failed, and the waiters
-        // are woken either way: a lock held through a failure is a sandbox
-        // nobody else can touch for the rest of its TTL.
+        // Release and notify on both success and failure.
         if let Some(lock) = lock {
             if let Err(error) = inner.locks().release(lock).await {
                 debug!(%sandbox_id, %error, "failed to release the sandbox lock; it will expire");
@@ -558,8 +474,7 @@ impl MetadataStore for RedisMetadataStore {
             .key(inner.keys().pending())
             .arg(sandbox_id.to_string())
             .arg(expected_execution_id.to_string());
-        // Variadic, and the script scans from the fixed argument count onwards.
-        // Keep the two in step.
+        // Variadic states begin after fixed script arguments.
         for state in expected_states {
             invocation.arg(state_token(*state));
         }
@@ -577,10 +492,7 @@ impl MetadataStore for RedisMetadataStore {
             }
             scripts::FENCED_REMOVE_ABSENT => Ok(FencedRemoval::Absent),
             scripts::FENCED_REMOVE_SUPERSEDED => {
-                // 🔴 Both details have to parse. A record whose state or
-                // incarnation this build cannot read is one this caller cannot
-                // prove is not its own, and reporting it as somebody else's
-                // would be a guess dressed as a refusal.
+                // Refuse unreadable superseding details rather than guessing ownership.
                 let (Some(state), Ok(execution_id)) =
                     (state_from_token(&state), ExecutionId::parse_str(&execution))
                 else {
@@ -607,19 +519,7 @@ impl MetadataStore for RedisMetadataStore {
         self.inner().read_all_records().await
     }
 
-    /// 🔴 The one aggregate path, and the one that is memoised.
-    ///
-    /// Its only caller is `metrics_snapshot`, which is on the `/metrics` scrape
-    /// path and on the node API. In one process it was a read lock and a walk;
-    /// on Redis it is a `SMEMBERS` plus an `MGET` of the entire keyspace, and
-    /// N replicas times a scrape interval times the whole keyspace is a load
-    /// nobody designed.
-    ///
-    /// So this returns a **sample**, not a point-in-time truth, and
-    /// [`RedisMetadataStore::last_listing_sample_at`] says when it was taken.
-    /// The other listing methods deliberately do not use the memo: this one is
-    /// an aggregate over everything, and a caller asking about *particular*
-    /// sandboxes is asking a different question.
+    /// Visits a memoized aggregate sample; targeted listings remain live reads.
     async fn list_with_callback<F>(&self, mut callback: F) -> Result<()>
     where
         F: FnMut(&SandboxMetadata) + Send,
@@ -638,19 +538,7 @@ impl MetadataStore for RedisMetadataStore {
         Ok(())
     }
 
-    /// 🔴 Filtering happens here, not in Redis, and the reason is not only
-    /// cost.
-    ///
-    /// A secondary index per state would put a predicate *inside the store*,
-    /// and a predicate baked into a backend answers every question asked of
-    /// that backend — including the questions it was not written for. That is
-    /// how a catalog whose entire read face was pinned to "ready" came to
-    /// return 404 for every template and, more expensively, to treat "the row
-    /// is there but not yet ready" as "the row is gone". A read scope belongs
-    /// to a *face*, and `list_filtered` has several.
-    ///
-    /// The cost — one full read per call — is the same one the memo above
-    /// records, and is accepted knowingly.
+    /// Applies filters after an authoritative full read.
     async fn list_filtered(&self, filter: SandboxListFilter) -> Result<Vec<SandboxMetadata>> {
         let records = self.inner().read_all_records().await?;
         Ok(records
@@ -675,13 +563,7 @@ impl MetadataStore for RedisMetadataStore {
         self.expired_batch(now, usize::MAX).await
     }
 
-    /// 🔴 Reads the membership set, never `SCAN`.
-    ///
-    /// `SCAN` gives a best-effort view of a keyspace that is changing under it;
-    /// membership is a fact the write paths maintain atomically. Members whose
-    /// record has expired out from under them are dropped here rather than
-    /// reported, because a roster entry with no record is what makes a live VM
-    /// look like an orphan.
+    /// Lists ids from the maintained membership set, never a best-effort key scan.
     async fn list_ids(&self) -> Result<Vec<SandboxId>> {
         let inner = self.inner();
         let ids = inner.member_ids().await?;
@@ -708,22 +590,14 @@ impl MetadataStore for RedisMetadataStore {
         Ok(alive)
     }
 
-    /// Waits for a state, not for a transition id.
-    ///
-    /// 🔴 Contract unchanged: `Ok(None)` still means only "the record is gone".
-    /// In particular a record still in a transitional state whose transition
-    /// key has expired is **not** an error here — reporting one would turn a
-    /// perfectly ordinary concurrent pause into a failure for the caller that
-    /// joined it. Deciding what to do about a transition whose owner died is
-    /// the reaper's job, not a waiter's.
+    /// Waits for state settlement; only record absence returns `None`.
     async fn wait_while_in_states(
         &self,
         sandbox_id: &SandboxId,
         transitional_states: &[SandboxState],
     ) -> Result<Option<SandboxMetadata>> {
         let inner = self.inner();
-        // 🔴 Subscribe first, then read. The other order has a window in which
-        // the state changes after the read and before the subscription.
+        // Subscribe before reading to avoid a lost-wake window.
         let mut wake = inner.subscribe(&routing::record(sandbox_id));
 
         loop {
@@ -742,14 +616,7 @@ impl MetadataStore for RedisMetadataStore {
         super::expiry::expired_batch(self.inner(), now, limit).await
     }
 
-    /// 🔴 Chunked, and every chunk must succeed.
-    ///
-    /// `MGET` is atomic, but the chunking is not, and the result crosses a gRPC
-    /// hop after this one where truncation is a live possibility. `covered`
-    /// makes the guarantee checkable at the far end. e2b's equivalent guard is
-    /// worth naming too: when its reconciliation pipeline errors it skips the
-    /// entire round rather than acting on the part that came back — "skip
-    /// entirely to avoid mass kills".
+    /// Reads in chunks and reports coverage only after every chunk succeeds.
     async fn get_many(&self, ids: &[SandboxId]) -> Result<MetadataRows> {
         if ids.is_empty() {
             return Ok(MetadataRows::default());
@@ -786,14 +653,7 @@ impl MetadataStore for RedisMetadataStore {
         super::transition::start_transition(self.inner(), sandbox_id, request).await
     }
 
-    /// 🔴 Never `NotPaused` for a record that carries a reference.
-    ///
-    /// This store cannot produce a handle at all — the bytes are on the node
-    /// that paused the sandbox and only its factory can decode them — so the
-    /// honest answer is `Remote`, carrying the reference and the node it means.
-    /// Answering `NotPaused` instead would let a caller conclude the sandbox
-    /// was never paused, which is the reading that turns a resume into a 500
-    /// describing a state the sandbox is not in.
+    /// Returns a remote handle for stored paused references, never false absence.
     async fn paused_handle(&self, sandbox_id: &SandboxId) -> Result<PausedHandle> {
         let record = self.inner().require_record(sandbox_id).await?;
         Ok(match record.paused_state_ref {
@@ -863,8 +723,7 @@ impl RedisMetadataStore {
         let elapsed = started.elapsed();
         mutated.sync_running_clock(SystemTime::now());
 
-        // Layer one: the callback ran long, so its result is discarded. Nothing
-        // in Redis has been touched, so discarding is lossless.
+        // Discard over-budget callback results before touching Redis.
         if elapsed > config.closure_budget {
             metrics::counter!("agentenv_store_closure_budget_exceeded_total").increment(1);
             warn!(
@@ -880,7 +739,7 @@ impl RedisMetadataStore {
             });
         }
 
-        // Layer two: the lock has to outlive the write we are about to attempt.
+        // Require enough remaining lock lifetime for the write.
         if let Some(lock) = lock {
             if lock.remaining() <= config.write_budget {
                 metrics::counter!("agentenv_store_lock_lapsed_total").increment(1);
@@ -899,9 +758,7 @@ impl RedisMetadataStore {
         let mut next = StoredSandboxRecord::new(&mutated, current.rev.saturating_add(1))?;
         next.inherit_placement_from(&current);
 
-        // Layer three: the predicates. Note the incarnation compared is the one
-        // that was *read*, so a resume that installed a new one in the meantime
-        // is refused rather than overwritten.
+        // Final revision and execution predicates reject superseding writes.
         inner
             .write_record(
                 &previous,

@@ -1,38 +1,5 @@
-//! The orchestrator surface everything outside `src/orchestrator/` uses.
-//!
-//! # Why this exists
-//!
-//! [`Orchestrator`] is generic over three parameters — the metadata store, the
-//! backend factory and the paused-sandbox persister — and the split gives the
-//! two halves *different* instantiations of it: the node keeps the in-memory
-//! store, the Firecracker factory and the file-backed persister, while the API
-//! half gets a cluster store, a factory that drives sandboxes over the wire, and
-//! no persister at all. Two roles, two concrete types, one `ApiImpl`.
-//!
-//! 🔴 **The obvious fix does not compile.** [`MetadataStore`] and
-//! [`SandboxPersister`] both have generic methods —
-//! `MetadataStore::update_if_state<F>`, `MetadataStore::list_with_callback<F>`,
-//! `SandboxPersister::load_all<F>` — which makes both traits object-unsafe, so
-//! `Box<dyn MetadataStore>` and `Box<dyn SandboxPersister>` are not types that
-//! exist. Only `F` could be boxed. That rules out selecting the backend one
-//! type parameter at a time and leaves exactly one place where the two
-//! assemblies can meet: above all three of them, here.
-//!
-//! The alternative — making `ApiImpl` generic over the same three parameters —
-//! spreads them through every `impl apis::*` block, every free function in
-//! `src/api/proxy.rs`, the router's trait bounds and the observability service,
-//! and monomorphises all of it twice. This trait costs one vtable jump and one
-//! boxed future per call, against operations whose *cheapest* member takes a
-//! lock and whose most expensive boots a virtual machine.
-//!
-//! # Keeping it honest
-//!
-//! Both the declaration and the forwarding body are generated from a single
-//! list by [`orchestration_surface!`], so a method's name is written once. That
-//! is deliberate: hand-written forwarding is thirty chances to route
-//! `pause_sandbox` into `delete_sandbox`, and nothing about the resulting code
-//! would look wrong. Adding a method to `Orchestrator` that callers outside the
-//! module need means adding one line to the list below.
+//! Object-safe orchestration facade over role-specific generic orchestrators.
+//! A single macro defines both the trait and forwarding implementation.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -63,17 +30,11 @@ use super::types::{
 };
 use super::{Result, SandboxForkOutcome};
 
-/// Declares [`SandboxOrchestration`] and the blanket forwarding impl from one
-/// list of signatures.
-///
-/// The list is split by receiver, because the receiver is the one thing that
-/// cannot be inferred from a signature: the methods in `owned` are the ones
-/// `Orchestrator` declares as `self: &Arc<Self>` — they hand a clone of the
-/// orchestrator to a spawned task — and a trait cannot dispatch dynamically on
-/// `&Arc<Self>`. They become `self: Arc<Self>`, which it can.
+/// Declares the facade and forwarding implementation from one signature list.
+/// Owned methods translate `&Arc<Self>` receivers to object-safe `Arc<Self>`.
 macro_rules! orchestration_surface {
     (
-        // `async fn (self: &Arc<Self>)` on `Orchestrator`.
+        // Methods taking `self: &Arc<Self>`.
         owned {
             $(
                 $(#[$owned_meta:meta])*
@@ -81,7 +42,7 @@ macro_rules! orchestration_surface {
                     $( -> $owned_ret:ty )? ;
             )*
         }
-        // `async fn (&self)` on `Orchestrator`.
+        // Methods taking `&self`.
         borrowed {
             $(
                 $(#[$borrowed_meta:meta])*
@@ -89,7 +50,7 @@ macro_rules! orchestration_surface {
                     $( -> $borrowed_ret:ty )? ;
             )*
         }
-        // `fn (&self)` on `Orchestrator`.
+        // Synchronous methods taking `&self`.
         sync {
             $(
                 $(#[$sync_meta:meta])*
@@ -98,10 +59,7 @@ macro_rules! orchestration_surface {
             )*
         }
     ) => {
-        /// Everything outside `src/orchestrator/` may ask of the orchestrator.
-        ///
-        /// 🔴 Object-safe on purpose; see the module documentation for what
-        /// stops the type parameters from being swapped one at a time.
+        /// Object-safe orchestration surface used outside this module.
         #[async_trait]
         pub trait SandboxOrchestration: Send + Sync + 'static {
             $(
@@ -132,10 +90,7 @@ macro_rules! orchestration_surface {
                 async fn $owned_name(self: Arc<Self> $(, $owned_arg: $owned_ty )* )
                     $( -> $owned_ret )?
                 {
-                    // Fully qualified, and to the inherent method: `Self::` here
-                    // would be free to resolve back into this trait, and the
-                    // failure that produces is an unbounded recursion rather
-                    // than a compile error.
+                    // Fully qualify the inherent method to avoid trait recursion.
                     Orchestrator::<S, F, P>::$owned_name(&self $(, $owned_arg )* ).await
                 }
             )*
@@ -167,11 +122,7 @@ orchestration_surface! {
             sandbox_id: SandboxId,
             request: CreateSandboxRequest,
         ) -> Result<SandboxMetadata>;
-        /// Forks one running sandbox into running children.
-        ///
-        /// One outcome per requested child, in order. `children` decides both
-        /// how many and — when the caller is the control plane — their
-        /// identities and ownership; none of that is inherited from the source.
+        /// Forks into one result per requested child, preserving request order.
         fn fork_sandbox(
             source_sandbox_id: SandboxId,
             children: ForkChildren,
@@ -206,21 +157,12 @@ orchestration_surface! {
             sandbox_id: SandboxId,
             network_policy: SandboxNetworkPolicy,
         ) -> Result<()>;
-        /// Applies an extension-defined patch to a sandbox's custom extension
-        /// parameters.
+        /// Applies an extension-defined custom-parameter patch.
         fn patch_sandbox_custom_extension_params(
             sandbox_id: SandboxId,
             patch: serde_json::Map<String, serde_json::Value>,
         ) -> Result<Option<CustomExtensionParams>>;
-        /// Assigns an already-approved custom extension params value to a
-        /// running sandbox, with no hook involved.
-        ///
-        /// The node-reachable half of
-        /// [`patch_sandbox_custom_extension_params`][Self::patch_sandbox_custom_extension_params]:
-        /// the deciding half runs the patch-params hook and then calls this to
-        /// apply what the hook approved; a node's RPC handler calls this
-        /// directly, because by the time a request reaches it the hook has
-        /// already run once, on the caller's side.
+        /// Applies already-approved custom extension parameters without invoking hooks.
         fn replace_sandbox_custom_extension_params(
             sandbox_id: SandboxId,
             params: Option<CustomExtensionParams>,
@@ -234,12 +176,7 @@ orchestration_surface! {
         fn list_sandboxes() -> Result<Vec<SandboxMetadata>>;
         /// The ids of every sandbox this orchestrator has a record of.
         fn list_sandbox_ids() -> Result<Vec<SandboxId>>;
-        /// The sandboxes this node is *running*, from its live handles rather
-        /// than from its records.
-        ///
-        /// 🔴 Not filtered by ownership. Which sandboxes a caller may see is a
-        /// property of the surface it is being served through, not of this
-        /// list — see [`LiveSandbox::control_plane_config`].
+        /// Lists locally live handles without applying ownership filtering.
         fn list_live_sandboxes() -> Result<Vec<LiveSandbox>>;
         /// The heartbeat roster: what this node claims to be holding.
         fn list_sandbox_roster() -> Result<Vec<SandboxRosterEntry>>;
@@ -273,10 +210,7 @@ orchestration_surface! {
         /// Runtime counters and derived resource totals, sampled now.
         fn metrics_snapshot() -> Result<OrchestratorMetrics>;
 
-        // The seeding helpers the data-plane tests drive the proxy with. They
-        // are on the facade rather than reached around it because the tests
-        // hold an `ApiImpl`, and an `ApiImpl` no longer knows which concrete
-        // orchestrator is behind it — which is the point of the facade.
+        // Test-only facade seed helpers.
         #[cfg(test)]
         fn set_proxy_target_for_test(
             sandbox_id: SandboxId,
@@ -325,14 +259,6 @@ mod tests {
     use super::*;
     use crate::orchestrator::OrchestratorError;
 
-    /// Drives the facade through `Arc<dyn SandboxOrchestration>` rather than
-    /// asserting that it compiles.
-    ///
-    /// 🔴 Two failures this rules out, both of which type-check: forwarding a
-    /// method into a different one, and forwarding it into *itself* — the
-    /// blanket impl calls `Orchestrator::<S, F, P>::name`, and an inherent
-    /// method that stopped shadowing the trait one would recurse until the
-    /// stack ran out.
     #[tokio::test]
     async fn the_facade_answers_from_the_orchestrator_behind_it() {
         let concrete =
@@ -342,26 +268,12 @@ mod tests {
 
         assert!(!orchestration.scheduling_disabled());
         assert!(orchestration.set_scheduling_disabled(true));
-        // Read back through the facade, and through the concrete type: both
-        // have to see the write, or the trait is talking to something else.
         assert!(orchestration.scheduling_disabled());
         assert!(concrete.scheduling_disabled());
         assert!(orchestration.scheduling_disabled_changed_at_ms().is_some());
 
-        // A second write of the same value changes nothing, which is how the
-        // shutdown path tells "I isolated the node" from "it already was".
         assert!(!orchestration.set_scheduling_disabled(true));
 
-        // 🔴 Seed a record before asking anything about the lists.
-        //
-        // This test used to assert that the four list-shaped answers were
-        // empty, which they were — because nothing had happened yet. A
-        // forwarding that answered every one of them with
-        // `Default::default()` satisfies that perfectly, so the assertions
-        // were about the shape of the return type and not about where the
-        // answer came from. The node lane hit the same trap from the other
-        // side: a handle-table read and a store read agree exactly when the
-        // node is empty, so an empty node cannot tell them apart.
         let seeded = SandboxId::new();
         orchestration
             .set_metadata_state_for_test(seeded, SandboxState::Running)
@@ -378,12 +290,8 @@ mod tests {
         assert_eq!(orchestration.list_sandbox_roster().await.unwrap().len(), 1);
         let metrics = orchestration.metrics_snapshot().await.unwrap();
         assert_eq!(metrics.running_sandbox_count, 1);
-        // Seeding a record is not a create, and the counter knows the
-        // difference — which is what makes the 1 above mean something.
         assert_eq!(metrics.create_successes, 0);
 
-        // The contrast, so the answers above are about *this* sandbox rather
-        // than about anything the orchestrator would say to any question.
         let unknown = SandboxId::new();
         assert!(orchestration.get_sandbox(&seeded).await.unwrap().is_some());
         assert!(orchestration.get_sandbox(&unknown).await.unwrap().is_none());
@@ -391,22 +299,6 @@ mod tests {
         assert!(!orchestration.validate_envd_access_token(unknown, "nonsense"));
     }
 
-    /// Every method the concrete orchestrator takes by `Arc`, driven once
-    /// through `dyn`.
-    ///
-    /// 🔴 This exists because of what a control probe measured. Breaking the
-    /// forwarding for this whole group of methods — create, pause, resume,
-    /// delete, fork, snapshot — turns only *three* of the crate's twelve
-    /// hundred unit tests red, and the orchestrator integration tests do not
-    /// close the gap: they hold a concrete `Orchestrator` and never cross this
-    /// layer at all. "The existing tests are green" is therefore not, by
-    /// itself, evidence about these twelve methods.
-    ///
-    /// `create_sandbox`, `restore_sandbox` and `fork_sandbox` want a live
-    /// sandbox to work from, and `shutdown` stops process-global runtime
-    /// managers and would take the rest of the test binary with it. The rest
-    /// answer here for a sandbox that does not exist, which is enough to show
-    /// that each one arrives somewhere and comes back.
     #[tokio::test]
     async fn every_by_arc_method_reaches_the_orchestrator_through_dyn() {
         let orchestration: Arc<dyn SandboxOrchestration> =
@@ -473,12 +365,6 @@ mod tests {
                 .resume_sandbox(
                     unknown,
                     NewTimeout::UseExisting,
-                    // 🔴 The in-crate constructor, not the `pub` one meant for
-                    // tests outside the crate: a guard in `launch_plan.rs`
-                    // fails the build if that one is so much as named under
-                    // `src/`, which is what keeps every production resume
-                    // going through the resume arbitration. Using this one
-                    // from a test adds no production path to a claim.
                     ClaimedExecution::from_claim(ExecutionId::new()),
                 )
                 .await,
@@ -492,9 +378,6 @@ mod tests {
                 .await,
         );
 
-        // The one exception, and it is deliberate: asking whether there is a
-        // local paused record to drop is a question, and "there was not one"
-        // is an answer to it rather than a failure.
         assert!(
             !Arc::clone(&orchestration)
                 .discard_local_paused_record(unknown)

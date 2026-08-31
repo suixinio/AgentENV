@@ -1,42 +1,9 @@
-//! Task's own "D3": the Lua scripts `RedisBindingStore` runs, ported
-//! verbatim from `services/scheduler/internal/redis_store.go`'s own
-//! constants (`redisArbitrationFenced`,
-//! `redisKeepsDeadlineAuthoritative`/`Ephemeral`,
-//! `redisRecordBindingScriptBody`, `redisReconcileNodeScriptBody`,
-//! `redisDeleteBindingScriptBody`). Predicates live in Lua for the same
-//! reason `src/orchestrator/store/redis/scripts.rs` gives for its own
-//! scripts: a lockless Rust-side read-modify-write would race a concurrent
-//! write between the read and the write.
-//!
-//! 🔴 [`ARBITRATION_FENCED`] is the only arbitration prelude, and it is not
-//! selected — it is concatenated. Two others existed: `ARBITRATION_OBSERVING`
-//! through the rollout that proved `Fenced` was safe to turn on everywhere,
-//! and `ARBITRATION_OFF` (`accepts` returning `true, ""` unconditionally) as
-//! that rollout's rollback target. Both are gone, along with the
-//! `ArbitrationMode` enum that picked between them and the
-//! `[binding_store].arbitration` knob that set it — see
-//! `super::super::arbitration`'s module doc.
-//!
-//! # 🔴 The KEEPTTL fix ("阶段 1 第 5 点")
-//!
-//! [`reconcile_script`]'s deadline prelude is *not* unconditional `KEEPTTL`
-//! gated only by a Go-side TTL value, the way an earlier shipped version
-//! read. `keeps_deadline` is picked by `projection_authoritative`, the one
-//! `BindingStoreSettings` switch these scripts still read: when it is `false`
-//! (ephemeral/rollback mode), every heartbeat write always re-arms a fresh
-//! deadline (`PX`), even for the same incarnation. Only when it is `true`
-//! does a same-incarnation refresh keep the existing deadline — and even
-//! then, only when the key already carries a positive TTL (`PTTL > 0`);
-//! `KEEPTTL` on a key with no TTL at all would otherwise leave it
-//! permanently without one.
+//! Atomic Lua predicates for Redis binding writes.
+//! Authoritative heartbeat refreshes keep an existing positive TTL; other writes re-arm it.
 
 use std::sync::OnceLock;
 
 use redis::Script;
-
-// ---------------------------------------------------------------------------
-// Shared parse helper, prefixed onto every script below.
-// ---------------------------------------------------------------------------
 
 const PARSE_BINDING: &str = r#"
 local function parse_binding(raw)
@@ -55,10 +22,6 @@ local function parse_binding(raw)
 end
 "#;
 
-// ---------------------------------------------------------------------------
-// Arbitration prelude: defines `accepts(raw, challenger)`.
-// ---------------------------------------------------------------------------
-
 const ARBITRATION_FENCED: &str = r#"
 local function accepts(raw, challenger)
   local _, incumbent = parse_binding(raw)
@@ -72,10 +35,6 @@ local function accepts(raw, challenger)
   return false, "rejected_older"
 end
 "#;
-
-// ---------------------------------------------------------------------------
-// Deadline preludes: each defines `keeps_deadline(incumbent, challenger, budget_ms)`.
-// ---------------------------------------------------------------------------
 
 const KEEPS_DEADLINE_AUTHORITATIVE: &str = r#"
 local function keeps_deadline(incumbent, challenger, budget_ms)
@@ -100,18 +59,8 @@ fn deadline_prelude(projection_authoritative: bool) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// record: the RecordAssignment write.
-// ---------------------------------------------------------------------------
-
-/// `KEYS = [binding_key, node_index_key]`
-///
-/// `ARGV = [value_json, target_node_id, sandbox_id, binding_ttl_ms,
-///          key_prefix, node_index_ttl_ms, challenger_execution_id,
-///          projection_ttl_ms]`
-///
-/// Always `SET ... PX` — an assignment write never `KEEPTTL`; only a
-/// heartbeat refresh of the same incarnation may (`reconcile_script`).
+// KEYS: binding, node index. ARGV: value, node, sandbox, TTLs, prefix, execution.
+// Assignment writes always set a fresh TTL.
 const RECORD_BODY: &str = r#"
 local raw = redis.call("GET", KEYS[1])
 local accept, decision = accepts(raw, ARGV[7])
@@ -138,18 +87,7 @@ pub fn record_script() -> &'static Script {
     S.get_or_init(|| Script::new(&format!("{PARSE_BINDING}{ARBITRATION_FENCED}{RECORD_BODY}")))
 }
 
-// ---------------------------------------------------------------------------
-// reconcile: the Heartbeat roster write.
-// ---------------------------------------------------------------------------
-
-/// `KEYS = [node_index_key]`
-///
-/// `ARGV = [node_id, node_json, binding_ttl_ms, key_prefix,
-///          node_index_ttl_ms, desired_count,
-///          <desired_count sandbox ids>, <desired_count execution ids>,
-///          <desired_count projection ttls ms>]` — three parallel arrays,
-/// not interleaved triples (Go's own comment: "one indexing mistake away
-/// from binding every sandbox to its neighbour's incarnation").
+// KEYS: node index. ARGV carries node metadata and three parallel roster arrays.
 const RECONCILE_BODY: &str = r#"
 local node_key = KEYS[1]
 local node_id = ARGV[1]
@@ -248,16 +186,7 @@ pub fn reconcile_script(projection_authoritative: bool) -> &'static Script {
     }
 }
 
-// ---------------------------------------------------------------------------
-// delete: the guarded ReportSandboxEvent/sweep removal. No arbitration
-// prelude -- deleting and writing are opposite decisions in the
-// unknown-incumbent case (an unknown incumbent accepts a write but a
-// present-but-unknown record still deletes on this path).
-// ---------------------------------------------------------------------------
-
-/// `KEYS = [binding_key]`
-///
-/// `ARGV = [sandbox_id, execution_id, key_prefix]`
+// KEYS: binding. ARGV: sandbox id, execution id, key prefix.
 const DELETE_BODY: &str = r#"
 local raw = redis.call("GET", KEYS[1])
 if not raw then
@@ -289,9 +218,6 @@ pub fn delete_script() -> &'static Script {
 mod tests {
     use super::*;
 
-    /// A minimal shape check that catches an unbalanced quote/concat error
-    /// without needing a live Redis: the script must produce a stable,
-    /// non-empty SHA and must be memoized rather than rebuilt per call.
     #[test]
     fn the_record_script_is_stable_and_memoized() {
         let a = record_script();

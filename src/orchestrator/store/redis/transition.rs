@@ -1,23 +1,5 @@
-//! The transition key, its result, its guard — and the fourth piece e2b does
-//! not have.
-//!
-//! # 🔴 Why a fourth piece
-//!
-//! e2b's crash recovery is three things acting together, and only the first is
-//! usually named: the transition key's TTL lets the *next* operation start; the
-//! allowed-transition table permits leaving a transitional state; and its
-//! expiry sweep has a stale-cutoff branch that puts a sandbox stuck in a
-//! transitional state onto the eviction list. The third is the actual exit.
-//!
-//! That exit has a hole for us. Every e2b sandbox has an end time. Ours has
-//! `Option<SystemTime>`, and a sandbox with no timeout is **not in the expiry
-//! index at all**. So a replica that dies half way through pausing such a
-//! sandbox leaves a record in `Pausing` that no index anywhere will ever be
-//! read for. Resume refuses it, delete compare-and-sets against `[Running,
-//! Paused]`, misses, waits sixty seconds and fails. What the user sees is a
-//! sandbox that cannot be deleted, for ever.
-//!
-//! Hence the transition index and the reaper below.
+//! Fenced transition lifecycle and crash-recovery index.
+//! The reaper makes ownerless transitions evictable even without sandbox expiry.
 
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -39,7 +21,6 @@ use super::{
 use crate::orchestrator::SandboxState;
 use crate::types::{ExecutionId, SandboxId};
 
-/// How many index members one reaper round looks at.
 const REAP_BATCH: usize = 128;
 
 pub async fn start_transition(
@@ -51,19 +32,11 @@ pub async fn start_transition(
     let mut attempts = 0u32;
 
     loop {
-        // 🔴 Re-read on every attempt rather than reusing what was read before
-        // the wait. e2b's own comment on this retry says the parameter it
-        // matters most for is the expected incarnation, "because the waiting
-        // window is exactly the stretch in which the sandbox may be replaced".
+        // Re-read after every wait because the execution may have changed.
         let current = inner.require_record(sandbox_id).await?;
         let from_state = current.metadata.state;
 
-        // 🔴 The record already sitting in the state being asked for is not an
-        // illegal edge — the transition script parks the record in its target
-        // *before* it publishes the transition key, so "already there" is what
-        // an in-flight transition towards the same state looks like from
-        // outside. Checking legality first turned every join into
-        // `InvalidTransition { from: Pausing, to: Pausing }`.
+        // Same target state denotes a joinable in-flight transition.
         if from_state == request.target_state {
             let mut connection = inner.connection();
             let inflight: Option<String> = redis::cmd("GET")
@@ -79,8 +52,7 @@ pub async fn start_transition(
                 );
                 return Ok(TransitionOutcome::InFlight { transition_id });
             }
-            // Nobody is transitioning; somebody has simply already arrived.
-            // That is being a step late, not asking for something impossible.
+            // The state settled before the transition key was observed.
             return Err(StoreError::StateConflict {
                 sandbox_id: *sandbox_id,
                 expected_states: request.expected_states.clone(),
@@ -127,12 +99,9 @@ pub async fn start_transition(
             .arg(deadline_ms)
             .arg(if request.eviction { "1" } else { "0" })
             .arg(now_millis(now))
-            // 🔴 A mid-operation state stamp must not touch the lifetime
-            // budget: the sandbox is still running, and this write says only
-            // that somebody has started doing something to it.
+            // A transition stamp must preserve the record lifetime.
             .arg(TtlMode::Keep.resolve(&next, config.record_ttl_grace));
-        // The expected states are variadic, and the script scans from the fixed
-        // argument count onwards. Keep the two in step.
+        // Variadic expected states follow fixed script arguments.
         for state in &request.expected_states {
             invocation.arg(state_token(*state));
         }
@@ -196,22 +165,17 @@ pub async fn start_transition(
                     actual_state: from_state,
                 })
             }
-            // 🔴 Not an error. A `keep_alive` landing between the expiry scan
-            // and this script is the system working.
+            // Keep-alive winning the expiry race is not an error.
             "not_expired" => return Ok(TransitionOutcome::NotExpired),
             "in_flight" => {
-                // Branch one, as a backstop: the state can have changed between
-                // the read above and this script. The common case is handled
-                // before the script runs.
+                // Handle a state change between the initial read and script.
                 if from_state == request.target_state {
                     return Ok(TransitionOutcome::InFlight {
                         transition_id: detail,
                     });
                 }
 
-                // Branch two: a different transition is in flight and the edge
-                // out of it to ours is legal. Wait for it, then retry the whole
-                // request.
+                // Wait for compatible in-flight work, then retry from a fresh read.
                 attempts += 1;
                 if attempts > config.max_transition_retries {
                     warn!(
@@ -243,8 +207,7 @@ pub async fn start_transition(
     }
 }
 
-/// Waits for the record to leave `state`, bounded so a caller cannot be parked
-/// for ever inside a single attempt.
+// Waits boundedly for the record to leave one state.
 async fn wait_for_state_to_settle(
     inner: &Arc<StoreInner>,
     sandbox_id: &SandboxId,
@@ -268,13 +231,8 @@ async fn wait_for_state_to_settle(
 struct RedisTransitionCompleter {
     inner: Arc<StoreInner>,
     sandbox_id: SandboxId,
-    /// Where the record came from, and where a failure puts it back.
     from_state: SandboxState,
-    /// Where the record is parked while the transition runs.
-    ///
-    /// 🔴 Held explicitly rather than derived from `effect`: `Transient` and
-    /// `Terminal` both park in the caller's target state and differ only in
-    /// where they go afterwards, so deriving it would need the target anyway.
+    // Explicit target state is not derivable from every settlement effect.
     transitional_state: SandboxState,
     effect: TransitionEffect,
     member: TransitionMember,
@@ -291,8 +249,7 @@ impl TransitionCompleter for RedisTransitionCompleter {
         let sandbox_id = self.sandbox_id;
         let transitional = self.transitional_state;
 
-        // Step one: settle the record, in the order e2b settles it — state
-        // first, then the result, then the key.
+        // Settle the record before publishing the result and releasing the key.
         let settle = match (&self.effect, outcome.is_ok()) {
             (TransitionEffect::Transient, _) => Settle::State(self.from_state),
             (TransitionEffect::Terminal(state), true) => Settle::State(*state),
@@ -310,10 +267,7 @@ impl TransitionCompleter for RedisTransitionCompleter {
         };
 
         if let Err(error) = &settled {
-            // 🔴 Reported, then carried on with. Leaving the transition key
-            // behind because the settling write failed would wedge the sandbox
-            // until the TTL expired *and* leave nothing in the result key for a
-            // waiter to read.
+            // Publish the failure result even when record settlement fails.
             warn!(
                 %sandbox_id,
                 %error,
@@ -368,22 +322,12 @@ enum Settle {
     Remove,
 }
 
-/// One reaper round.
-///
-/// 🔴 The recovery action is **not** "put it back to `Running`". A replica that
-/// died mid-pause may or may not have already stopped the VM, and an `api`
-/// replica cannot know which — the only process that knows is the node, whose
-/// `ListSandboxes` either has that VM or does not. Guessing `Running` is
-/// guessing. Instead the record is made eligible for eviction and handed to the
-/// evictor, which goes down the full pause/delete path, which asks the node.
-/// Hand the question to whoever can answer it.
+/// Makes ownerless transitions evictable without guessing runtime state.
 pub async fn reap_stuck_transitions(
     inner: &Arc<StoreInner>,
     now: SystemTime,
 ) -> Result<Vec<SandboxId>> {
-    // 🔴 Re-read every round, so it works as a kill switch without a redeploy.
-    // And a warm-up, so that the first round after a restart does not read
-    // "nobody has been listening for the last minute" as "everything is stuck".
+    // Re-evaluate kill switch and warm-up every round.
     match inner.reaper_readiness() {
         RoundReadiness::Disabled => {
             debug!("transition reaper is switched off");
@@ -437,8 +381,7 @@ pub async fn reap_stuck_transitions(
             .await
             .map_err(backend)?;
         if live.as_deref() == Some(member.transition_id.to_string().as_str()) {
-            // The key has not expired yet; the deadline in the index was simply
-            // computed a little early. Leave it alone.
+            // Transition key is still live; leave its index entry.
             continue;
         }
 
@@ -477,22 +420,20 @@ async fn drop_member(inner: &Arc<StoreInner>, member: &str) -> Result<()> {
     Ok(())
 }
 
-/// Gives a stuck record a coordinate the evictor can find it by.
+// Gives a stuck record a coordinate in the expiry index.
 async fn make_evictable(
     inner: &Arc<StoreInner>,
     record: &StoredSandboxRecord,
     now: SystemTime,
 ) -> Result<bool> {
     if record.metadata.expires_at.is_some_and(|at| at <= now) {
-        // Already in the evictor's reach.
+        // Already visible to the evictor.
         return Ok(false);
     }
 
     let previous = record.metadata.clone();
     let mut metadata = record.metadata.clone();
-    // 🔴 `expires_at` is set directly rather than through `set_timeout`: the
-    // sandbox's configured timeout has not changed and must not appear to have.
-    // What has changed is that this record now needs somebody to look at it.
+    // Set expiry directly without changing the configured timeout.
     metadata.expires_at = Some(now);
 
     let mut next = StoredSandboxRecord::new(&metadata, record.rev.saturating_add(1))?;
@@ -509,7 +450,7 @@ async fn make_evictable(
         .await
     {
         Ok(()) => Ok(true),
-        // Somebody else got there first, which is the desired outcome anyway.
+        // A concurrent winner already achieved the desired recovery.
         Err(StoreError::ConcurrentUpdate { .. }) | Err(StoreError::ExecutionSuperseded { .. }) => {
             Ok(false)
         }

@@ -1,23 +1,6 @@
-//! One set of assertions, run against every backend.
-//!
-//! # 🔴 What this is for
-//!
-//! `CLAUDE.md` records the scar in one sentence: *"a change made to the
-//! in-memory store and forgotten for Redis is invisible everywhere else."* This
-//! module is the direct answer. Each function below is an assertion about the
-//! **shared** contract of [`MetadataStore`]; both backends run all of them, so
-//! changing one and forgetting the other turns red.
-//!
-//! # 🔴 What it deliberately does not cover
-//!
-//! The four cluster primitives — `start_transition`, `reserve`,
-//! `heal_expiry_index`, `reap_stuck_transitions` — are **not** here, and their
-//! absence is not an oversight. They mean something on a store several replicas
-//! share and nothing on a node's private ledger, so the two backends are not
-//! equivalent on them and never should be. Asserting equivalence would either
-//! force a meaningless imitation into the in-memory store or weaken the
-//! assertion until it proved nothing. They are covered in the Redis suite
-//! alone.
+//! Shared metadata-store assertions run against both backends.
+//! Any backend change must pass this same suite; cluster-only primitives remain
+//! covered by Redis-specific tests.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -58,19 +41,10 @@ pub async fn add_get_remove_round_trip<S: MetadataStore>(store: &S) {
     let removed = store.remove(&id).await.unwrap().expect("remove returns it");
     assert_eq!(removed.id, id);
     assert!(store.get(&id).await.unwrap().is_none());
-    // 🔴 A second removal is `None`, not an error: "there was nothing here" is
-    // an answer, and callers rely on it being idempotent.
     assert!(store.remove(&id).await.unwrap().is_none());
     assert!(store.list_ids().await.unwrap().is_empty());
 }
 
-/// A fenced removal takes back the record its own incarnation wrote and
-/// refuses every other one.
-///
-/// 🔴 Four records, one run, differing in one value each, because the assertion
-/// that matters is "this one went and that one stayed". A suite in which
-/// everything is expected to vanish cannot tell a working predicate from a
-/// backend that simply deletes whatever it is handed.
 pub async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(store: &S) {
     let mine = ExecutionId::new();
     let theirs = ExecutionId::new();
@@ -81,14 +55,9 @@ pub async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(s
         state: SandboxState::Creating,
         ..Default::default()
     };
-
-    // The record this incarnation wrote.
     let own = SandboxId::new();
-    // Same state, another incarnation: the id was taken over.
     let other_incarnation = SandboxId::new();
-    // Same incarnation, a state it has already left.
     let other_state = SandboxId::new();
-    // Nothing at all.
     let absent = SandboxId::new();
 
     store.add(creating(own, mine)).await.unwrap();
@@ -135,10 +104,6 @@ pub async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(s
         FencedRemoval::Absent
     );
 
-    // 🔴 The non-empty half. One record went; the other two are still readable
-    // and still in the membership index, which is what says the predicate did
-    // the work rather than the removal being a no-op that happened to look
-    // right.
     assert!(store.get(&own).await.unwrap().is_none());
     assert_eq!(
         store.get(&other_incarnation).await.unwrap().unwrap().state,
@@ -154,7 +119,6 @@ pub async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(s
     assert!(ids.contains(&other_state), "{ids:?}");
     assert!(!ids.contains(&own), "{ids:?}");
 
-    // Removing what is already gone is an answer, not an error.
     assert_eq!(
         store
             .remove_if_execution(&own, mine, &[SandboxState::Creating])
@@ -226,9 +190,6 @@ pub async fn update_if_state_runs_the_callback_exactly_once<S: MetadataStore>(st
     let id = SandboxId::new();
     store.add(running(id)).await.unwrap();
 
-    // 🔴 The callback writes a variable outside itself, exactly as `keep_alive`
-    // does. If any backend ever turned this into a retry loop, this counter
-    // would exceed one for a single logical update.
     let mut calls = 0u32;
     let result = store
         .update_if_state(&id, &[SandboxState::Running], |metadata| {
@@ -255,9 +216,6 @@ pub async fn update_if_state_refuses_the_wrong_state<S: MetadataStore>(store: &S
         .update_if_state(&id, &[SandboxState::Paused], |_| called = true)
         .await
         .unwrap_err();
-    // 🔴 The callback must not run when the guard fails: a caller's callback
-    // may have side effects, and running one for an update that is then refused
-    // reports work that did not happen.
     assert!(!called);
     assert!(
         matches!(error, StoreError::StateConflict { .. }),
@@ -326,7 +284,6 @@ pub async fn filters_match_states_and_metadata<S: MetadataStore>(store: &S) {
     assert_eq!(dev.len(), 1);
     assert_eq!(dev[0].id, paused_id);
 
-    // A record with no user metadata at all matches nothing that requires some.
     let plain = SandboxId::new();
     store.add(running(plain)).await.unwrap();
     let dev = store
@@ -361,12 +318,10 @@ pub async fn expiry_listing_is_bounded_and_ordered<S: MetadataStore>(store: &S) 
     for offset in 1..=3u64 {
         let id = SandboxId::new();
         let mut metadata = running(id);
-        // Already expired, by a widening margin.
         metadata.expires_at = Some(now - Duration::from_secs(offset * 10));
         store.add(metadata).await.unwrap();
         ids.push(id);
     }
-    // One that is not due yet.
     let live = SandboxId::new();
     let mut metadata = running(live);
     metadata.expires_at = Some(now + Duration::from_secs(3600));
@@ -376,8 +331,6 @@ pub async fn expiry_listing_is_bounded_and_ordered<S: MetadataStore>(store: &S) 
     assert_eq!(all.len(), 3, "the live sandbox must not be listed");
     assert!(all.iter().all(|record| record.id != live));
 
-    // 🔴 The bound is the whole point of the batched form: an evictor running
-    // on several replicas must do a fixed amount of work per round.
     let batch = store.expired_batch(now, 2).await.unwrap();
     assert_eq!(batch.len(), 2);
 }
@@ -390,13 +343,9 @@ pub async fn get_many_reports_what_it_covered<S: MetadataStore>(store: &S) {
     let rows = store.get_many(&[present, absent]).await.unwrap();
     assert!(rows.entries.contains_key(&present));
     assert!(!rows.entries.contains_key(&absent));
-    // 🔴 `covered` lists both, present and absent alike. A caller deletes local
-    // artifacts on the strength of an absence, so it has to be able to tell
-    // "asked, and there is no record" from "never asked".
     assert_eq!(rows.covered.len(), 2);
     assert!(rows.covers(&[present, absent]));
 
-    // 🔴 An empty batch asks nothing and covers nothing.
     let rows = store.get_many(&[]).await.unwrap();
     assert!(rows.entries.is_empty());
     assert!(rows.covered.is_empty());
@@ -471,10 +420,6 @@ pub async fn waiting_returns_none_when_the_record_is_removed<S: MetadataStore>(s
     assert!(settled.unwrap().is_none());
 }
 
-/// 🔴 The lifetime clock is reconciled by the store after every mutation, and
-/// it is a shared contract rather than an in-memory implementation detail.
-/// Getting it wrong on one backend means sandboxes that gain or lose budget
-/// depending on which role wrote them.
 pub async fn the_lifetime_clock_is_reconciled_after_every_write<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     let mut metadata = running(id);
@@ -482,14 +427,12 @@ pub async fn the_lifetime_clock_is_reconciled_after_every_write<S: MetadataStore
     metadata.running_since = None;
     store.add(metadata).await.unwrap();
 
-    // Adding a running record starts the clock.
     let got = store.get(&id).await.unwrap().unwrap();
     assert!(
         got.running_since.is_some(),
         "a running record must have its clock started"
     );
 
-    // Pausing charges the run and stops the clock.
     store
         .update_state_if_state(&id, SandboxState::Paused, &[SandboxState::Running])
         .await
@@ -500,7 +443,6 @@ pub async fn the_lifetime_clock_is_reconciled_after_every_write<S: MetadataStore
         "a paused record spends nothing"
     );
 
-    // And a callback that sets the state directly is reconciled just the same.
     store
         .update_if_state(&id, &[SandboxState::Paused], |metadata| {
             metadata.state = SandboxState::Running;
@@ -511,22 +453,6 @@ pub async fn the_lifetime_clock_is_reconciled_after_every_write<S: MetadataStore
     assert!(resumed.running_since.is_some());
 }
 
-/// 🔴 The one thing both backends must agree on about paused state, even
-/// though they answer it with different variants.
-///
-/// The two answers differ — an in-process store hands back the handle, a shared
-/// store hands back a reference to the node that holds the bytes — but neither
-/// may say `NotPaused` about a sandbox that is paused. That confusion is what
-/// makes a resume fail with a message describing a state the sandbox is not in,
-/// and it is the same shape as a read that conflated "not yet" with "never".
-///
-/// 🔴 And the handle has to be *this sandbox's*. `resume_sandbox` takes what
-/// comes back here and hands it to the factory that rebuilds the sandbox, so a
-/// store that answered with some other record's capture would reopen the wrong
-/// sandbox's work under this sandbox's identity — a failure with no error in it
-/// anywhere. Two sandboxes paused with captures differing in one value are what
-/// gives the assertion its resolution: without them, "the answer is not
-/// `NotPaused`" is satisfied by a store that returns a constant.
 pub async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: &S) {
     #[derive(Debug)]
     struct FakePausedState(&'static str);
@@ -541,7 +467,6 @@ pub async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: 
         }
     }
 
-    /// The capture a handle points at, whichever variant carries it.
     fn capture(handle: &PausedHandle) -> serde_json::Value {
         match handle {
             PausedHandle::Local(state) => state.encode().expect("a capture encodes"),
@@ -571,10 +496,6 @@ pub async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: 
         "the handle points at something other than this sandbox's capture"
     );
 
-    // 🔴 The same call for a second sandbox, whose capture differs in one
-    // value. A store answering from a constant, from the last record written,
-    // or from any record at all agrees with the assertion above and disagrees
-    // with this one.
     let other = pause(store, "two").await;
     assert_eq!(
         capture(&store.paused_handle(&other).await.unwrap()),
@@ -586,7 +507,6 @@ pub async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: 
         "the first sandbox's capture changed when a second one was paused"
     );
 
-    // The control: a running sandbox really has none, and says so.
     let live = SandboxId::new();
     store.add(running(live)).await.unwrap();
     assert!(matches!(
@@ -594,7 +514,6 @@ pub async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: 
         PausedHandle::NotPaused
     ));
 
-    // And a sandbox that is not there at all is neither of those.
     let error = store.paused_handle(&SandboxId::new()).await.unwrap_err();
     assert!(
         matches!(error, StoreError::SandboxNotFound { .. }),
@@ -602,8 +521,6 @@ pub async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: 
     );
 }
 
-/// Names every contract assertion, so a backend's suite is one line per test
-/// and a new assertion cannot be added to one backend only.
 macro_rules! metadata_store_contract_suite {
     ($($name:ident),* $(,)?) => {
         $(
@@ -618,7 +535,6 @@ macro_rules! metadata_store_contract_suite {
     };
 }
 
-/// The list itself, so both backends run the same one.
 macro_rules! metadata_store_contract {
     () => {
         crate::orchestrator::store::contract::metadata_store_contract_suite!(

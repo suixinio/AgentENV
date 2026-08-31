@@ -22,12 +22,6 @@ pub struct ProxyRoute {
     target: ProxyTarget,
     version: u64,
     updated_at: SystemTime,
-    /// The incarnation serving this route.
-    ///
-    /// Kept here rather than looked up from the metadata store because this
-    /// table is what the data plane already reads on every request, and it is
-    /// also the exact notion of "alive on this node": a route exists from the
-    /// moment a VM is reachable until the moment it stops being.
     execution_id: ExecutionId,
 }
 

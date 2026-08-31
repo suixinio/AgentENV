@@ -54,21 +54,12 @@ impl SandboxPersistenceError {
     }
 }
 
-/// Whether a paused record was ever announced to a cluster registry, and under
-/// which node identity.
-///
-/// The identity matters because it, not the node's *current* identity, is what
-/// a registry row must be compared against. A node's ID is only as stable as
-/// whatever supplies it — under Kubernetes it is commonly the pod name, which
-/// changes every time the pod is recreated — and a node that mistook its own
-/// rows for another node's would discard every paused sandbox it holds.
+/// Whether and under which identity a paused record reached a cluster registry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClusterRegistration {
-    /// Never announced. The local copy is the only copy, so nothing the
-    /// registry says (including saying nothing) may be acted on.
+    /// Never announced; registry absence cannot be acted on.
     Never,
-    /// Announced by a build that did not record the identity it used. Only
-    /// facts that hold regardless of identity may be acted on.
+    /// Announced without a recorded node identity.
     Anonymous,
     /// Announced under this identity.
     As(String),
@@ -99,24 +90,7 @@ pub trait SandboxPersister: Send + Sync {
         paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()>;
 
-    /// The directory this persister wrote a paused sandbox's capture into.
-    ///
-    /// # 🔴 Three answers, and the two that are not a path mean opposite
-    /// things
-    ///
-    /// - `Ok(Some(path))` — the capture is there;
-    /// - `Ok(None)` — there is no paused record here. For
-    ///   [`DisabledSandboxPersister`] that is the permanent answer: it writes
-    ///   nothing, so the backend kept the capture in temporaries it manages
-    ///   itself and there is no directory to name.
-    /// - `Err(..)` — the records could not be read. A caller that took this for
-    ///   `None` would report a sandbox as having no capture on the strength of
-    ///   a disk it could not reach.
-    ///
-    /// Read from the record rather than returned by `pause_sandbox`, because
-    /// the question is *where did this sandbox's capture go* and not *what did
-    /// this call do*: a second pause of an already-paused sandbox does no work
-    /// and must still be able to say where the bytes are.
+    /// Returns a persisted capture path, confirmed absence, or a read error.
     async fn paused_artifact_root(
         &self,
         sandbox_id: &SandboxId,
@@ -125,19 +99,14 @@ pub trait SandboxPersister: Send + Sync {
     /// Mark a paused sandbox as resuming.
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
-    /// Record that this paused sandbox has been announced to a cluster registry
-    /// under `node_id`.
+    /// Records the node identity used for cluster registration.
     async fn mark_cluster_registered(
         &self,
         sandbox_id: &SandboxId,
         node_id: &str,
     ) -> PersistenceResult<()>;
 
-    /// Whether this paused sandbox was ever announced to a cluster registry.
-    ///
-    /// Records that never were must be left alone by reconciliation: for them
-    /// the local copy is the only copy, so "absent from the registry" carries
-    /// no information at all.
+    /// Returns this record's cluster-registration state.
     async fn cluster_registration(
         &self,
         sandbox_id: &SandboxId,
@@ -152,14 +121,7 @@ pub trait SandboxPersister: Send + Sync {
     /// Delete the persistence record and all associated artifacts.
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
-    /// Boundedly close any durable local store this persister owns, ahead of
-    /// process shutdown.
-    ///
-    /// The default no-op is correct for persisters — [`DisabledSandboxPersister`]
-    /// included — that hold nothing durable to close. `FileBackedSandboxPersister`
-    /// is the one implementation that overrides this: see its `close` for why
-    /// a RocksDB-backed persister cannot rely on its own `Drop` to do this in
-    /// bounded time.
+    /// Boundedly closes any durable local store owned by the persister.
     async fn close(&self, _timeout: std::time::Duration) {}
 }
 
@@ -191,9 +153,7 @@ impl SandboxPersister for DisabledSandboxPersister {
         Ok(())
     }
 
-    /// 🔴 `None`, and it is a fact rather than a shrug: this persister
-    /// allocates no artifact root, so no capture it was told about was written
-    /// into one.
+    /// Always absent because this persister allocates no artifact root.
     async fn paused_artifact_root(
         &self,
         _sandbox_id: &SandboxId,

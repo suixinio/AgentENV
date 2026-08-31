@@ -35,27 +35,14 @@ pub struct MetadataUpdateResult {
     pub current: SandboxMetadata,
 }
 
-/// What a removal fenced on an incarnation found under the id.
-///
-/// # 🔴 Three answers, because the middle one is the whole point
-///
-/// A plain `remove` answers "was anything there". The caller this exists for —
-/// a launch rolling its own record back after somebody else has taken over the
-/// id — needs to tell "I took my record back" from "the record under this id is
-/// not mine", and *silence* is what made a stuck record unattributable in
-/// production: the sandbox was left in `Creating`, no delete could take it out
-/// of `Creating` (`creating_has_no_direct_edge_to_killing`), and the only log
-/// line was a warning that a rollback had been skipped without saying what it
-/// had skipped.
+/// Result of removing a record under an execution and state fence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FencedRemoval {
     /// The record was still the one this incarnation wrote, and is gone.
     Removed,
     /// There was no record under this id.
     Absent,
-    /// A record is there and it is not the one the caller wrote — a different
-    /// incarnation, or the same one that has since moved on. Whoever wrote it
-    /// owns it, and the caller must leave it alone.
+    /// A different incarnation or later state owns the record.
     Superseded {
         state: SandboxState,
         execution_id: ExecutionId,
@@ -81,13 +68,7 @@ pub enum StoreError {
         expected_states: Vec<SandboxState>,
         actual_state: SandboxState,
     },
-    /// The record in the store belongs to a different run of the sandbox than
-    /// the caller was writing for.
-    ///
-    /// 🔴 Distinct from [`StoreError::ConcurrentUpdate`] on purpose. That one
-    /// means "somebody else changed this record while you were thinking"; this
-    /// one means "the machine you were writing about has been replaced", and
-    /// the operation must not be retried against the new incarnation.
+    /// The stored record belongs to a superseding execution; never retry this write.
     #[error(
         "sandbox {sandbox_id} incarnation superseded: wrote for {expected}, store holds {actual:?}"
     )]
@@ -99,49 +80,32 @@ pub enum StoreError {
     /// The compare-and-set at the end of a read-modify-write lost.
     #[error("sandbox {sandbox_id} was modified concurrently")]
     ConcurrentUpdate { sandbox_id: SandboxId },
-    /// The synchronous update callback ran for longer than its budget, so the
-    /// result was thrown away rather than written.
-    ///
-    /// 🔴 Terminal, never retried: `update_if_state` takes `FnOnce`, and at
-    /// least one caller's callback writes a variable outside itself
-    /// (`keep_alive`'s `timeout_updated`), so running it twice would corrupt
-    /// the caller's own bookkeeping even if the type system allowed it.
+    /// A synchronous callback exceeded its budget and was not written.
     #[error("sandbox {sandbox_id} update callback exceeded its budget after {elapsed:?}")]
     ClosureBudgetExceeded {
         sandbox_id: SandboxId,
         elapsed: Duration,
     },
-    /// The distributed lock's remaining lifetime was too short to cover the
-    /// write, so the write was abandoned before it was attempted.
+    /// The lock lacked enough remaining lifetime to attempt the write.
     #[error("sandbox {sandbox_id} lock lapsed after being held for {held_for:?}")]
     LockLapsed {
         sandbox_id: SandboxId,
         held_for: Duration,
     },
-    /// Another replica is already running a transition on this sandbox, and it
-    /// is not one this caller can wait for.
+    /// Another replica owns an incompatible transition.
     #[error("sandbox {sandbox_id} already has a transition in flight towards {target}")]
     TransitionInProgress {
         sandbox_id: SandboxId,
         target: SandboxState,
     },
-    /// The requested transition is not one the state machine has an edge for.
-    ///
-    /// 🔴 Not a [`StoreError::StateConflict`]. That means "you were a step too
-    /// late"; this means "the thing you asked for does not exist", and a
-    /// caller that retries on it will retry forever.
+    /// The requested state-machine edge does not exist.
     #[error("sandbox {sandbox_id} cannot transition from {from} to {to}")]
     InvalidTransition {
         sandbox_id: SandboxId,
         from: SandboxState,
         to: SandboxState,
     },
-    /// This store does not implement the requested primitive.
-    ///
-    /// 🔴 An explicit refusal rather than a silent weaker behaviour. The four
-    /// cluster primitives only mean anything on a store that several replicas
-    /// share; a test double that quietly pretended to run one would be
-    /// answering a question it cannot answer.
+    /// This backend cannot provide the requested cluster primitive.
     #[error("{method} is not supported by this metadata store")]
     UnsupportedByBackend { method: &'static str },
 }
@@ -157,23 +121,8 @@ pub struct SandboxListFilter {
     pub user_metadata: Option<HashMap<String, String>>,
 }
 
-/// The result of a batched read, carrying what the batch actually looked at.
-///
-/// 🔴 A sandbox missing from `entries` has no record, and the caller acts on
-/// that absence by deleting local artifacts and tearing down running VMs. A
-/// map that came back short for any other reason — a failed chunk, a truncated
-/// response, a partial answer from a store that could not be reached — looks
-/// exactly like that answer. `covered` is the guarantee made checkable: it
-/// lists every id this call actually asked about, present and absent alike, so
-/// a caller can assert `covered.len() == ids.len()` before treating absence as
-/// authorisation to destroy anything.
-///
-/// [`PausedRegistryRows`](crate::orchestrator::PausedRegistryRows) is the same
-/// shape on the paused-registry side, for the same reason and with the same
-/// rule: a caller that destroys on absence checks coverage first. (Both
-/// descend from `registry.Rows.Covered` in the Go scheduler, which is
-/// deleted; this is now the older of the two copies, not a port of a live
-/// one.)
+/// Batched records plus the ids authoritatively covered by the read.
+/// Destructive callers may act on absence only after verifying full coverage.
 #[derive(Debug, Default)]
 pub struct MetadataRows {
     pub entries: HashMap<SandboxId, SandboxMetadata>,
@@ -187,28 +136,18 @@ impl MetadataRows {
     }
 }
 
-/// What a caller wants to start doing to a sandbox.
+/// Request to start a fenced state transition.
 #[derive(Clone, Debug)]
 pub struct TransitionRequest {
-    /// The transitional (or terminal) state to move into now.
+    /// State entered while the transition runs.
     pub target_state: SandboxState,
-    /// States the record may currently be in.
+    /// States accepted as its source.
     pub expected_states: Vec<SandboxState>,
-    /// The incarnation the caller believes it is operating on, if it has one.
-    ///
-    /// 🔴 Compared inside the script, never before it. A lockless `add` — which
-    /// is what `restore_sandbox` performs — can install a new incarnation
-    /// between a check made here and the write that follows it.
+    /// Optional incarnation predicate evaluated atomically by the store.
     pub expected_execution_id: Option<ExecutionId>,
-    /// What completion should settle the record on.
+    /// Settlement applied when the operation completes.
     pub effect: TransitionEffect,
-    /// Whether this transition is an eviction, in which case expiry is
-    /// re-validated atomically with the state write.
-    ///
-    /// 🔴 Today's evictor checks expiry, then compare-and-sets on *state*. A
-    /// `keep_alive` that lands in between pushes `expires_at` out and the
-    /// eviction pauses the sandbox anyway. Setting this makes the expiry part
-    /// of the same atomic step.
+    /// Whether expiry must be revalidated atomically with the transition.
     pub eviction: bool,
 }
 
@@ -239,10 +178,7 @@ impl TransitionRequest {
     }
 }
 
-/// How a started transition is finished.
-///
-/// Implemented by the store; callers only ever see it through
-/// [`TransitionGuard`].
+/// Store-side transition completion contract.
 #[async_trait]
 pub trait TransitionCompleter: Send + Sync {
     async fn complete(
@@ -252,13 +188,7 @@ pub trait TransitionCompleter: Send + Sync {
     ) -> Result<()>;
 }
 
-/// A transition this caller owns and must finish.
-///
-/// 🔴 Not `Clone`, and it warns on drop. e2b's equivalent is a bare closure the
-/// caller is trusted to invoke; forgetting it there wedges the sandbox until
-/// the transition key's TTL expires. This cannot make forgetting harmless —
-/// the TTL is still the backstop — but it makes forgetting *visible*, which is
-/// the difference between a bug that is found and one that is not.
+/// Owned transition that must be completed.
 pub struct TransitionGuard {
     sandbox_id: SandboxId,
     transition_id: String,
@@ -299,7 +229,7 @@ impl TransitionGuard {
         self.target_state
     }
 
-    /// Settles the transition, applying its effect and releasing the key.
+    /// Settles the transition and releases its key.
     pub async fn complete(mut self, outcome: std::result::Result<(), String>) -> Result<()> {
         let Some(completer) = self.completer.take() else {
             return Ok(());
@@ -320,7 +250,7 @@ impl Drop for TransitionGuard {
             "transition guard dropped without completing; marking it failed best-effort"
         );
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            // Nothing to spawn onto. The transition key's TTL is the backstop.
+            // The transition TTL is the fallback when no runtime is available.
             return;
         };
         let transition_id = self.transition_id.clone();
@@ -332,39 +262,17 @@ impl Drop for TransitionGuard {
     }
 }
 
-/// Where a paused sandbox's runtime state can be got from.
-///
-/// # 🔴 Three answers, because two of them look identical as `None`
-///
-/// `SandboxMetadata::paused_state` is `#[serde(skip)]`, so any store that
-/// serialises a record hands it back empty. Read through `get`, that empty
-/// value means two different things — *this sandbox is not paused* and *this
-/// store cannot give you handles, the bytes are on another machine* — and a
-/// `resume_sandbox` that read it answered the first by failing with "missing
-/// paused state" for every sandbox on such a store, which is a 500 describing a
-/// state the sandbox is not in.
-///
-/// 🔴 `Orchestrator::paused_state_for_resume` is the one caller, and it is the
-/// only path a resume takes to its capture.
-///
-/// So the question is asked separately, and the answer has the three states the
-/// question has. A store may not answer [`PausedHandle::NotPaused`] for a
-/// record that carries a reference.
+/// Source of paused runtime state: local handle, remote reference, or confirmed absence.
 pub enum PausedHandle {
-    /// This store is holding the handle in this process. Pass it to the
-    /// backend factory directly.
+    /// Process-local paused-state handle.
     Local(Arc<dyn crate::sandbox::PausedSandboxState>),
-    /// The bytes are on `origin_node_id`'s disk and the reference decodes
-    /// there. An `api` replica forwards this; a node decodes it with its own
-    /// factory.
+    /// Remote paused-state reference and the node whose path it names.
     Remote {
         reference: PausedStateRef,
-        /// 🔴 `PausedStateRef::artifact_root` is a path on one particular
-        /// machine, so without this a caller holds a path and no idea whose.
+        /// Node whose local path `reference` names.
         origin_node_id: Option<String>,
     },
-    /// The sandbox has no paused state, and that is a fact rather than a
-    /// limitation of the store that was asked.
+    /// Confirmed absence of paused state.
     NotPaused,
 }
 
@@ -381,13 +289,7 @@ impl std::fmt::Debug for PausedHandle {
     }
 }
 
-/// What a joiner learns about a transition it did not start.
-///
-/// 🔴 Three answers, not two. "The transition key is gone and no result was
-/// left behind" is **not** success — it is the owner having died — and a joiner
-/// that reads it as success reports an operation complete that never happened.
-/// Absence is not an outcome, and a store that cannot be reached produces an
-/// error rather than any of these.
+/// Settlement observed by a transition joiner.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TransitionSettlement {
     /// Still running.
@@ -398,52 +300,31 @@ pub enum TransitionSettlement {
     OwnerVanished,
 }
 
-/// What happened when a caller asked to start a transition.
+/// Outcome of trying to start a transition.
 #[derive(Debug)]
 pub enum TransitionOutcome {
     /// The caller owns the transition and must finish the guard.
     Started(TransitionGuard),
-    /// Another replica is already running a transition on this sandbox.
-    ///
-    /// The caller decides whether to wait for it (its target is the same as
-    /// theirs), retry after it (a legal edge follows it) or refuse.
+    /// Another replica owns the named in-flight transition.
     InFlight { transition_id: String },
     /// An eviction found the sandbox no longer expired.
-    ///
-    /// 🔴 Not an error. A `keep_alive` that lands between the expiry index scan
-    /// and the transition is the system working, not failing.
     NotExpired,
 }
 
-/// The three answers a reservation can give.
-///
-/// 🔴 Three, not four. e2b's fourth — `limitExceeded` — counts a tenant's
-/// sandboxes against that tenant's quota, and AgentENV has no tenant model:
-/// `team_id` appears only in the generated E2B-compatible schema, and
-/// `api/impls/auth.rs` describes itself as checking "presence, not validity".
-/// There is no subject to count against, so the variant is a documented stub
-/// (see [`Reservation::LimitExceeded`]) rather than a branch that can be
-/// reached.
+/// Outcome of reserving a sandbox id for creation.
 #[derive(Debug)]
 pub enum Reservation {
     /// This caller owns the creation window and must finish the guard.
     Reserved(ReservationGuard),
     /// The sandbox already exists.
     AlreadyInStorage,
-    /// Somebody else is creating it. Wait for their result rather than
-    /// returning a conflict — from the caller's point of view the sandbox is
-    /// coming up either way.
+    /// Another creator owns the pending window.
     AlreadyPending(WaitForStart),
-    /// 🔴 Intentionally unreachable in this phase. Reserved so that adding a
-    /// tenant model later is a change to the middle of one Lua script, rather
-    /// than a change to this enum and to every `match` that names it. Matches
-    /// on this variant must say `unreachable!`, never `_ => {}`: when the
-    /// tenant model arrives the compiler has to be able to point at every site
-    /// that forgot it.
+    /// Reserved for a future tenant quota model and unreachable today.
     LimitExceeded { subject: String, limit: u64 },
 }
 
-/// How a reservation is settled.
+/// Store-side reservation settlement contract.
 #[async_trait]
 pub trait ReservationFinisher: Send + Sync {
     async fn finish(
@@ -453,7 +334,7 @@ pub trait ReservationFinisher: Send + Sync {
     ) -> Result<()>;
 }
 
-/// A creation window this caller owns and must close.
+/// Owned creation reservation that must be finished.
 pub struct ReservationGuard {
     sandbox_id: SandboxId,
     finisher: Option<Arc<dyn ReservationFinisher>>,
@@ -504,7 +385,7 @@ impl Drop for ReservationGuard {
     }
 }
 
-/// Waits for whoever holds the creation window to publish its result.
+/// Waits for the owner of a creation window to publish its result.
 #[async_trait]
 pub trait StartWaiter: Send + Sync {
     async fn wait(&self, sandbox_id: &SandboxId) -> Result<SandboxMetadata>;
@@ -528,9 +409,7 @@ impl WaitForStart {
         Self { sandbox_id, waiter }
     }
 
-    /// 🔴 Sets no deadline of its own. The store does not know how patient the
-    /// caller is; an HTTP handler must give this a budget shorter than the
-    /// reverse proxy's timeout, or a stuck creation becomes a hung connection.
+    /// Waits without imposing a caller deadline.
     pub async fn wait(self) -> Result<SandboxMetadata> {
         self.waiter.wait(&self.sandbox_id).await
     }
@@ -554,12 +433,7 @@ pub trait MetadataStore: Send + Sync {
     /// The update callback is synchronous by design: store implementations may
     /// run it while holding their metadata lock, so callers must not perform
     /// async work inside the callback.
-    ///
-    /// 🔴 The callback runs exactly once, and the signature says so. A
-    /// distributed implementation may not turn this into an optimistic retry
-    /// loop: `FnOnce` forbids it, and `keep_alive`'s callback sets a variable
-    /// declared outside itself, which a second run would set a second time.
-    /// Implementations that cannot write may only fail, never re-run.
+    /// Runs the synchronous callback exactly once; implementations may fail but never retry it.
     async fn update_if_state<F>(
         &self,
         sandbox_id: &SandboxId,
@@ -570,21 +444,8 @@ pub trait MetadataStore: Send + Sync {
         F: FnOnce(&mut SandboxMetadata) + Send;
     async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
     async fn remove(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
-    /// Removes the record only while it is still the one `expected_execution_id`
-    /// wrote, and only from one of `expected_states`.
-    ///
-    /// # 🔴 Required, and not one of the cluster primitives below
-    ///
-    /// Those have defaults because they mean nothing on a node's private
-    /// ledger. This one is on the rollback path of every failed launch on every
-    /// backend, so a default would have to answer for real — and the only
-    /// default available is a read followed by a removal, which is exactly the
-    /// check-then-write this store spent a file of Lua avoiding.
-    /// `restore_sandbox` takes a caller-supplied id and `add` is lockless, so
-    /// the record under an id genuinely can change owner in that gap.
-    ///
-    /// Idempotent: removing something that is not there is [`FencedRemoval::Absent`],
-    /// not an error, exactly as `remove` returning `None` is not an error.
+    /// Removes only the expected execution in one of the expected states.
+    /// Absence is idempotent and returns [`FencedRemoval::Absent`].
     async fn remove_if_execution(
         &self,
         sandbox_id: &SandboxId,
@@ -610,33 +471,16 @@ pub trait MetadataStore: Send + Sync {
         transitional_states: &[SandboxState],
     ) -> Result<Option<SandboxMetadata>>;
 
-    // ---------------------------------------------------------------------
-    // Cluster primitives.
-    //
-    // 🔴 Every one of these has a default so that the four scripted test
-    // doubles in `orchestrator/tests.rs` — which assert nothing about any of
-    // them — do not each grow six forwarding methods with no assertion value.
-    // The defaults are honest: they either compute the answer from the
-    // required methods, or they refuse.
-    // ---------------------------------------------------------------------
-
-    /// Expired sandboxes, at most `limit` of them.
-    ///
-    /// The bound is what lets an evictor that runs on N replicas do a bounded
-    /// amount of work per round instead of pulling the whole table.
+    /// Returns at most `limit` expired sandboxes.
     async fn expired_batch(&self, now: SystemTime, limit: usize) -> Result<Vec<SandboxMetadata>> {
         let mut expired = self.list_expired(now).await?;
         expired.truncate(limit);
         Ok(expired)
     }
 
-    /// Reads several records, reporting which ids the read actually covered.
-    ///
-    /// The default answers from `get`, one id at a time: correct for any store,
-    /// and any error at all propagates rather than shortening the map.
+    /// Reads records and reports every id authoritatively covered.
     async fn get_many(&self, ids: &[SandboxId]) -> Result<MetadataRows> {
-        // 🔴 An empty batch issues no request. "I looked at nothing" is a fact
-        // the caller compares against a request for nothing.
+        // An empty request covers nothing.
         if ids.is_empty() {
             return Ok(MetadataRows::default());
         }
@@ -652,7 +496,7 @@ pub trait MetadataStore: Send + Sync {
         })
     }
 
-    /// Claims the right to run a state transition on this sandbox.
+    /// Claims a state transition.
     async fn start_transition(
         &self,
         _sandbox_id: &SandboxId,
@@ -663,12 +507,7 @@ pub trait MetadataStore: Send + Sync {
         })
     }
 
-    /// Where this sandbox's paused runtime state can be got from.
-    ///
-    /// The default reads it out of the record, which is the true answer for a
-    /// store that keeps handles in process. A store that serialises records
-    /// must override it — returning `NotPaused` for a record that has a
-    /// reference would be the ambiguity this method exists to remove.
+    /// Returns local, remote, or absent paused runtime state.
     async fn paused_handle(&self, sandbox_id: &SandboxId) -> Result<PausedHandle> {
         let metadata = self
             .get(sandbox_id)
@@ -682,11 +521,7 @@ pub trait MetadataStore: Send + Sync {
         })
     }
 
-    /// Asks how a transition somebody else started has ended, if it has.
-    ///
-    /// The counterpart to [`TransitionOutcome::InFlight`]: without it a caller
-    /// that finds a transition already in flight has been told to wait and
-    /// given nothing to wait on.
+    /// Reads the outcome of an in-flight transition.
     async fn transition_settlement(
         &self,
         _sandbox_id: &SandboxId,
@@ -697,25 +532,17 @@ pub trait MetadataStore: Send + Sync {
         })
     }
 
-    /// Claims the right to create this sandbox id.
+    /// Claims a sandbox id for creation.
     async fn reserve(&self, _sandbox_id: &SandboxId) -> Result<Reservation> {
         Err(StoreError::UnsupportedByBackend { method: "reserve" })
     }
 
-    /// Repairs expiry-index entries that exist as records but not as index
-    /// members. Returns how many were repaired.
-    ///
-    /// The default is `0`, which is the true answer for any store whose index
-    /// and records live under one lock: they cannot drift apart.
+    /// Repairs missing expiry-index entries; in-lock stores return zero.
     async fn heal_expiry_index(&self) -> Result<usize> {
         Ok(0)
     }
 
-    /// Finds transitions whose owner died and pushes their sandboxes towards a
-    /// path that can settle them. Returns the sandboxes it acted on.
-    ///
-    /// The default is empty, which is the true answer for a store whose
-    /// transitions cannot outlive the process that started them.
+    /// Makes ownerless transitions recoverable; process-local stores return none.
     async fn reap_stuck_transitions(&self, _now: SystemTime) -> Result<Vec<SandboxId>> {
         Ok(Vec::new())
     }

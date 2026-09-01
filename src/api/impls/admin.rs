@@ -98,6 +98,21 @@ fn cluster_filter(cluster_id: Option<uuid::Uuid>) -> String {
     cluster_id.map(|id| id.to_string()).unwrap_or_default()
 }
 
+/// Maps a requested node status to the scheduling override it names.
+///
+/// Only `ready` and `draining` are operator-settable; every other status is
+/// derived by the scheduler and refused.
+fn scheduling_override(status: models::NodeStatus) -> Result<bool, NodesNodeIdPostResponse> {
+    match status {
+        models::NodeStatus::NodeStatusDraining => Ok(true),
+        models::NodeStatus::NodeStatusReady => Ok(false),
+        status => Err(NodesNodeIdPostResponse::Status409_Conflict(ApiImpl::error(
+            409,
+            format!("node status {status} is derived by the scheduler and cannot be set"),
+        ))),
+    }
+}
+
 /// Maps a scheduler-observed status to its REST spelling.
 ///
 /// The gateway spells the same statuses out of the same RPC
@@ -387,7 +402,11 @@ impl Admin<()> for ApiImpl {
         Ok(NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(detail))
     }
 
-    /// Sets this node to `ready` or `draining`; scheduler-derived statuses return 409.
+    /// Sets a node to `ready` or `draining`; scheduler-derived statuses return 409.
+    ///
+    /// A cluster-observed node is set over its node service. The reply carries
+    /// no status: the observed one catches up on that node's next heartbeat,
+    /// so a read immediately after this call may still see the old value.
     async fn nodes_node_id_post(
         &self,
         _method: &Method,
@@ -398,6 +417,35 @@ impl Admin<()> for ApiImpl {
         query_params: &models::NodesNodeIdPostQueryParams,
         body: &models::NodeStatusChange,
     ) -> Result<NodesNodeIdPostResponse, ()> {
+        let cluster_id = cluster_filter(query_params.cluster_id.or(body.cluster_id));
+        match self
+            .node_fleet()
+            .get(&path_params.node_id, &cluster_id, SystemTime::now())
+        {
+            FleetNode::Observed(observed) => {
+                let disabled = match scheduling_override(body.status) {
+                    Ok(disabled) => disabled,
+                    Err(refused) => return Ok(refused),
+                };
+                if let Err(err) =
+                    crate::node_client::override_node_status(&observed.endpoint, disabled).await
+                {
+                    return Ok(NodesNodeIdPostResponse::Status500_ServerError(Self::error(
+                        500,
+                        format!("{err:#}"),
+                    )));
+                }
+                return Ok(NodesNodeIdPostResponse::Status204_TheNodeStatusWasChangedSuccessfully);
+            }
+            FleetNode::Absent => {
+                return Ok(NodesNodeIdPostResponse::Status404_NotFound(Self::error(
+                    404,
+                    format!("node {} not found", path_params.node_id),
+                )));
+            }
+            FleetNode::SelfReport => {}
+        }
+
         let Some(observability) = self.observability() else {
             return Ok(NodesNodeIdPostResponse::Status404_NotFound(Self::error(
                 404,
@@ -418,15 +466,9 @@ impl Admin<()> for ApiImpl {
             )));
         }
 
-        let disabled = match body.status {
-            models::NodeStatus::NodeStatusDraining => true,
-            models::NodeStatus::NodeStatusReady => false,
-            status => {
-                return Ok(NodesNodeIdPostResponse::Status409_Conflict(Self::error(
-                    409,
-                    format!("node status {status} is derived by the scheduler and cannot be set",),
-                )));
-            }
+        let disabled = match scheduling_override(body.status) {
+            Ok(disabled) => disabled,
+            Err(refused) => return Ok(refused),
         };
 
         self.orchestrator().set_scheduling_disabled(disabled);
@@ -1682,5 +1724,94 @@ mod fleet_node_tests {
             detail(&api, "node-z").await,
             NodesNodeIdGetResponse::Status404_NotFound(_)
         ));
+    }
+
+    async fn set_status(
+        api: &ApiImpl,
+        node_id: &str,
+        status: models::NodeStatus,
+    ) -> NodesNodeIdPostResponse {
+        api.nodes_node_id_post(
+            &Method::POST,
+            &Host::from(http::uri::Authority::from_static("localhost")),
+            &CookieJar::new(),
+            &super::super::Claims,
+            &models::NodesNodeIdPostPathParams {
+                node_id: node_id.to_string(),
+            },
+            &models::NodesNodeIdPostQueryParams { cluster_id: None },
+            &models::NodeStatusChange {
+                cluster_id: None,
+                status,
+            },
+        )
+        .await
+        .expect("the handler answers")
+    }
+
+    #[tokio::test]
+    async fn a_status_change_for_an_unobserved_node_is_a_404() {
+        let api = api(Some(observing(&["node-a"]))).await;
+
+        assert!(matches!(
+            set_status(&api, "node-z", models::NodeStatus::NodeStatusDraining).await,
+            NodesNodeIdPostResponse::Status404_NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_scheduler_derived_status_is_refused_before_the_node_is_dialed() {
+        // The fixture endpoints resolve nowhere; answering 409 rather than a
+        // dial failure proves the refusal happens without a dial.
+        let api = api(Some(observing(&["node-a"]))).await;
+
+        assert!(matches!(
+            set_status(&api, "node-a", models::NodeStatus::NodeStatusUnhealthy).await,
+            NodesNodeIdPostResponse::Status409_Conflict(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_observed_node_surfaces_as_a_500_not_a_local_flip() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![DiscoveredNode {
+                id: "node-a".to_string(),
+                // Nothing listens on port 1: the dial must fail, and the
+                // failure must surface instead of flipping this process.
+                endpoint: "http://127.0.0.1:1".to_string(),
+                pod_name: "node-a".to_string(),
+            }],
+            Duration::from_secs(30),
+        ));
+        registry
+            .heartbeat(
+                &scheduler_proto::HeartbeatRequest {
+                    node_id: "node-a".to_string(),
+                    service_instance_id: "svc-node-a".to_string(),
+                    snapshot: Some(scheduler_proto::NodeSnapshot {
+                        status: scheduler_proto::NodeStatus::Ready as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                SystemTime::now(),
+            )
+            .expect("the heartbeat lands");
+        let api = api(Some(registry)).await;
+
+        assert!(matches!(
+            set_status(&api, "node-a", models::NodeStatus::NodeStatusDraining).await,
+            NodesNodeIdPostResponse::Status500_ServerError(_)
+        ));
+    }
+
+    #[test]
+    fn only_ready_and_draining_are_operator_settable() {
+        use super::scheduling_override;
+
+        assert!(!scheduling_override(models::NodeStatus::NodeStatusReady).expect("settable"));
+        assert!(scheduling_override(models::NodeStatus::NodeStatusDraining).expect("settable"));
+        assert!(scheduling_override(models::NodeStatus::NodeStatusUnhealthy).is_err());
+        assert!(scheduling_override(models::NodeStatus::NodeStatusConnecting).is_err());
     }
 }

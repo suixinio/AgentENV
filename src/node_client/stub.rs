@@ -148,14 +148,15 @@ impl RemoteSandboxStub {
             .place_existing(sandbox_id)
             .await
             .with_context(|| format!("locate the machine running sandbox {sandbox_id}"))?
-            // Attach has no safe node fallback when placement has no sandbox record.
+            // A complete lookup that finds nothing is a verdict, not a gap: an
+            // assignment is reserved before the node is asked to start anything and
+            // is refreshed by the node's roster for as long as it runs, so nothing
+            // this answer could be about is still running anywhere.
             .ok_or_else(|| {
-                anyhow!(
-                    "the placement source has no record of sandbox {sandbox_id}, so there is no \
-                     machine to drive it on: a create records the assignment as soon as the node \
-                     acknowledges it, and the node's heartbeat roster re-seeds it every interval, \
-                     so this is a retry rather than a verdict"
-                )
+                RuntimeConfirmedGone(anyhow!(
+                    "the placement source has a complete view and no record of sandbox \
+                     {sandbox_id}, so no machine is running it"
+                ))
             })?;
         let mut client = match Self::connect(&node.endpoint).await {
             Ok(client) => client,

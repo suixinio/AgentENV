@@ -3817,13 +3817,16 @@ async fn a_resume_tells_the_cluster_the_sandbox_is_live_again() {
     );
 }
 
+/// Both sides of the invariant a create-time reservation establishes: a sandbox
+/// nothing in a warm cluster names has no runtime left to protect and is reaped,
+/// while one a reservation names has a runtime on the way and is not.
 #[tokio::test]
-async fn a_sandbox_can_be_deleted_before_the_cluster_has_heard_of_it() {
+async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
     let node = real_node().await;
     let on_the_node = node.orchestration.as_ref().expect("a real node").clone();
     let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
 
-    // Face 1: the write this change adds. No heartbeat anywhere in this face.
+    // Face 1: the create records where the sandbox is. No heartbeat in this face.
     let told = ClusterPlacement::recording(node.endpoint.clone());
     let replica = api_replica_on(Arc::clone(&told), &ledger).await;
     let sandbox = Arc::clone(&replica)
@@ -3860,57 +3863,132 @@ async fn a_sandbox_can_be_deleted_before_the_cluster_has_heard_of_it() {
         "the delete answered success without telling the machine"
     );
 
-    // Face 2: the same three calls against a cluster nothing tells. This is
-    // exactly what shipped, and it must still refuse.
-    let untold = ClusterPlacement::silent(node.endpoint.clone());
-    let replica = api_replica_on(Arc::clone(&untold), &ledger).await;
-    let stranded = Arc::clone(&replica)
+    // Face 2: a cluster that cannot record refuses to start a runtime at all, so
+    // the shape the old face guarded — a live sandbox nothing in the cluster names
+    // — has no way to come into being. This is the half that licenses face 3.
+    let unrecordable = ClusterPlacement::refusing_reservations(node.endpoint.clone());
+    let replica = api_replica_on(Arc::clone(&unrecordable), &ledger).await;
+    let refused = Arc::clone(&replica)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect_err("a runtime must not be started that the cluster has no record of");
+    assert!(
+        format!("{refused:#}").contains("reserve a routing record"),
+        "the refusal did not name the reservation: {refused:#}"
+    );
+    assert_eq!(
+        on_the_node
+            .list_sandboxes()
+            .await
+            .expect("the node's own records")
+            .len(),
+        0,
+        "the node is running a sandbox the cluster refused to record"
+    );
+
+    // Face 3: the orphan the old face refused to reap. Nothing names this sandbox
+    // — no binding, no reservation, no registry row — and the lookup is warm, so
+    // that is a verdict and the delete must clear the record rather than 500.
+    let told2 = ClusterPlacement::recording(node.endpoint.clone());
+    let replica = api_replica_on(Arc::clone(&told2), &ledger).await;
+    let orphan = Arc::clone(&replica)
         .create_sandbox(cluster_create_request())
         .await
         .expect("create on the node");
-    assert!(
-        !untold.is_bound(stranded.id),
-        "the silent face bound the sandbox anyway, so it is not the control it claims to be"
-    );
     Arc::clone(&replica)
-        .pause_sandbox(stranded.id)
+        .pause_sandbox(orphan.id)
         .await
         .expect("pause");
-    let err = Arc::clone(&replica)
-        .delete_sandbox(stranded.id)
+    // What a pause that never reached the registry, plus an expired reservation,
+    // leaves behind.
+    told2.forget(orphan.id);
+    Arc::clone(&replica)
+        .delete_sandbox(orphan.id)
         .await
-        .expect_err("a delete completed against a cluster that could not name the machine");
+        .expect("an orphan nothing in a warm cluster names must be reapable");
     assert!(
-        format!("{err}").contains("could not be reached") || format!("{err}").contains("no record"),
-        "the refusal did not say why: {err}"
-    );
-    assert_eq!(
         ledger
             .0
-            .get(&stranded.id)
+            .get(&orphan.id)
             .await
             .expect("read the ledger")
-            .expect("🔴 a delete that reached no machine forgot the sandbox anyway")
-            .state,
-        crate::orchestrator::SandboxState::Paused,
-        "a refused delete left the record somewhere other than where it found it"
+            .is_none(),
+        "the orphan's record survived its own delete, so it keeps answering GET"
     );
 
-    // Face 3: one heartbeat later, nothing else changed. The same delete on the
-    // same sandbox through the same replica now succeeds — which is what says
-    // face 2 failed over the missing binding and not over the sandbox.
-    untold.heartbeat(&[stranded.id]);
-    Arc::clone(&replica)
-        .delete_sandbox(stranded.id)
+    // Face 4: the other side of the same verdict. A reservation is in flight for
+    // this sandbox — another replica is starting it — and the delete must not
+    // read that as the absence face 3 reaps on.
+    let racing = ClusterPlacement::recording(node.endpoint.clone());
+    let replica = api_replica_on(Arc::clone(&racing), &ledger).await;
+    let contested = Arc::clone(&replica)
+        .create_sandbox(cluster_create_request())
         .await
-        .expect("a heartbeat landed and the delete still could not reach the machine");
+        .expect("create on the node");
+    Arc::clone(&replica)
+        .pause_sandbox(contested.id)
+        .await
+        .expect("pause");
+    racing.forget(contested.id);
+    racing.reserve_elsewhere(contested.id);
+    Arc::clone(&replica)
+        .delete_sandbox(contested.id)
+        .await
+        .expect_err("a delete reaped a sandbox another replica was in the middle of starting");
+    assert!(
+        ledger
+            .0
+            .get(&contested.id)
+            .await
+            .expect("read the ledger")
+            .is_some(),
+        "the refused delete forgot the sandbox anyway"
+    );
+}
+
+/// The counterfactual face 3 rests on: reaping on a warm absence is only safe
+/// because a create reserves first. A build that skips the reservation reaches
+/// the same absence with a runtime still on the machine, and reaps it.
+#[tokio::test]
+async fn without_the_create_time_reservation_the_delete_verdict_reaps_a_live_sandbox() {
+    let node = real_node().await;
+    let on_the_node = node.orchestration.as_ref().expect("a real node").clone();
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+
+    let no_reservations = ClusterPlacement::never_reserving(node.endpoint.clone());
+    let replica = api_replica_on(Arc::clone(&no_reservations), &ledger).await;
+    let sandbox = Arc::clone(&replica)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("a build without reservations still creates");
+    Arc::clone(&replica)
+        .pause_sandbox(sandbox.id)
+        .await
+        .expect("pause");
+    // The window a reservation exists to cover: the cluster's record of this
+    // sandbox is gone while the machine still holds it.
+    no_reservations.forget(sandbox.id);
+
+    Arc::clone(&replica)
+        .delete_sandbox(sandbox.id)
+        .await
+        .expect("the warm absence reads as a verdict");
+    assert!(
+        ledger
+            .0
+            .get(&sandbox.id)
+            .await
+            .expect("read the ledger")
+            .is_none(),
+        "control: this face only means something if the delete actually reaped the record"
+    );
     assert!(
         on_the_node
-            .get_sandbox(&stranded.id)
+            .get_sandbox(&sandbox.id)
             .await
             .expect("the node's own record")
-            .is_none(),
-        "the delete answered success without telling the machine"
+            .is_some(),
+        "the machine was told after all, which would make the reservation unnecessary"
     );
 }
 

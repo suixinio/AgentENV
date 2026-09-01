@@ -237,7 +237,10 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         .with_node_placement(placement)
         // This half observes the cluster, so `/nodes` reports the fleet rather
         // than the one replica answering the request.
-        .with_node_fleet(Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>),
+        .with_node_fleet(
+            Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>,
+            config.cluster.node_service_port,
+        ),
     );
 
     // Replica identities must be unique because stale-release is identity-scoped.

@@ -118,8 +118,12 @@ impl ApiImpl {
     /// Without it the endpoints answer this process's own observability report,
     /// which is what a node's self-report surface is for.
     #[must_use]
-    pub fn with_node_fleet(mut self, registry: Arc<dyn NodeRegistry>) -> Self {
-        self.node_fleet = NodeFleetView::cluster(registry);
+    pub fn with_node_fleet(
+        mut self,
+        registry: Arc<dyn NodeRegistry>,
+        node_service_port: u16,
+    ) -> Self {
+        self.node_fleet = NodeFleetView::cluster(registry, node_service_port);
         self
     }
 

@@ -353,10 +353,10 @@ impl Admin<()> for ApiImpl {
             .node_fleet()
             .get(&path_params.node_id, &cluster_id, SystemTime::now())
         {
-            FleetNode::Observed(observed) => {
+            FleetNode::Observed { node, .. } => {
                 return Ok(
                     NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(
-                        observed_node_detail(*observed),
+                        observed_node_detail(*node),
                     ),
                 );
             }
@@ -437,13 +437,20 @@ impl Admin<()> for ApiImpl {
             .node_fleet()
             .get(&path_params.node_id, &cluster_id, SystemTime::now())
         {
-            FleetNode::Observed(observed) => {
+            FleetNode::Observed {
+                node,
+                node_service_port,
+            } => {
                 let disabled = match scheduling_override(body.status) {
                     Ok(disabled) => disabled,
                     Err(refused) => return Ok(refused),
                 };
-                if let Err(err) =
-                    crate::node_client::override_node_status(&observed.endpoint, disabled).await
+                if let Err(err) = crate::node_client::override_node_status(
+                    &node.endpoint,
+                    node_service_port,
+                    disabled,
+                )
+                .await
                 {
                     return Ok(NodesNodeIdPostResponse::Status500_ServerError(Self::error(
                         500,
@@ -1637,6 +1644,14 @@ mod fleet_node_tests {
     }
 
     async fn api(fleet: Option<Arc<AtomicNodeRegistry>>) -> ApiImpl {
+        // Port 1 answers nothing, so any test that reaches a dial fails fast.
+        api_with_node_service_port(fleet, 1).await
+    }
+
+    async fn api_with_node_service_port(
+        fleet: Option<Arc<AtomicNodeRegistry>>,
+        node_service_port: u16,
+    ) -> ApiImpl {
         let root = tempfile::tempdir().expect("a temp dir");
         let orchestrator = Orchestrator::new(
             crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
@@ -1664,7 +1679,9 @@ mod fleet_node_tests {
             crate::api::ResumeWiring::node_local(identity.id.clone()),
         );
         match fleet {
-            Some(registry) => api.with_node_fleet(registry as Arc<dyn NodeRegistry>),
+            Some(registry) => {
+                api.with_node_fleet(registry as Arc<dyn NodeRegistry>, node_service_port)
+            }
             None => api,
         }
     }
@@ -1820,6 +1837,173 @@ mod fleet_node_tests {
             set_status(&api, "node-a", models::NodeStatus::NodeStatusDraining).await,
             NodesNodeIdPostResponse::Status500_ServerError(_)
         ));
+    }
+
+    /// A node service that answers only status overrides, recording each one.
+    struct OverrideOnlyNode {
+        seen: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::proto::node::node_sandbox_service_server::NodeSandboxService for OverrideOnlyNode {
+        async fn override_status(
+            &self,
+            request: tonic::Request<crate::proto::node::NodeStatusOverrideRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::NodeStatusOverrideResponse>, tonic::Status>
+        {
+            self.seen
+                .lock()
+                .expect("seen")
+                .push(request.into_inner().scheduling_disabled);
+            Ok(tonic::Response::new(
+                crate::proto::node::NodeStatusOverrideResponse {},
+            ))
+        }
+
+        async fn create(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxCreateRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxCreateResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn delete(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxDeleteRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxDeleteResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn pause(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxPauseRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxPauseResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn checkpoint(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxCheckpointRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxCheckpointResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn resume(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxResumeRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxResumeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn fork(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxForkRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxForkResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn update_network(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxNetworkRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxNetworkResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn update_params(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxParamsRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxParamsResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn describe(
+            &self,
+            _request: tonic::Request<crate::proto::node::SandboxDescribeRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxDescribeResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn list_sandboxes(
+            &self,
+            _request: tonic::Request<crate::proto::node::ListSandboxesRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::SandboxListResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+        async fn build_template(
+            &self,
+            _request: tonic::Request<crate::proto::node::TemplateBuildRequest>,
+        ) -> Result<tonic::Response<crate::proto::node::TemplateBuildResponse>, tonic::Status>
+        {
+            Err(tonic::Status::unimplemented("override only"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_drain_dials_the_node_service_port_not_the_advertised_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a port");
+        let node_service_port = listener.local_addr().expect("the bound address").port();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
+        let service = OverrideOnlyNode {
+            seen: Arc::clone(&seen),
+        };
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(
+                    crate::proto::node::node_sandbox_service_server::NodeSandboxServiceServer::new(
+                        service,
+                    ),
+                )
+                .serve_with_incoming_shutdown(
+                    tonic::transport::server::TcpIncoming::from(listener),
+                    async {
+                        let _ = rx.await;
+                    },
+                )
+                .await;
+        });
+
+        // The registry advertises the node by its user-facing address, whose
+        // port answers nothing here — the request can only succeed through the
+        // node-service port rewrite. This is the axis the cluster caught when
+        // the fixtures all handed the client a directly dialable address.
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![DiscoveredNode {
+                id: "node-a".to_string(),
+                endpoint: "http://127.0.0.1:1".to_string(),
+                pod_name: "node-a".to_string(),
+            }],
+            Duration::from_secs(30),
+        ));
+        registry
+            .heartbeat(
+                &scheduler_proto::HeartbeatRequest {
+                    node_id: "node-a".to_string(),
+                    service_instance_id: "svc-node-a".to_string(),
+                    snapshot: Some(scheduler_proto::NodeSnapshot {
+                        status: scheduler_proto::NodeStatus::Ready as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                SystemTime::now(),
+            )
+            .expect("the heartbeat lands");
+        let api = api_with_node_service_port(Some(registry), node_service_port).await;
+
+        assert!(matches!(
+            set_status(&api, "node-a", models::NodeStatus::NodeStatusDraining).await,
+            NodesNodeIdPostResponse::Status204_TheNodeStatusWasChangedSuccessfully
+        ));
+        assert_eq!(
+            seen.lock().expect("seen").as_slice(),
+            &[true],
+            "the drain must land on the node service, once"
+        );
+        drop(shutdown);
     }
 
     #[test]

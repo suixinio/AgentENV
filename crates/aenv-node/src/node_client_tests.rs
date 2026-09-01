@@ -462,7 +462,19 @@ async fn a_status_override_lands_on_the_nodes_own_scheduling_switch() {
     let orchestration = node.orchestration.as_ref().expect("a real node");
     assert!(!orchestration.scheduling_disabled());
 
-    crate::node_client::override_node_status(&node.endpoint.endpoint, true)
+    // The caller holds the registry-advertised address, whose port answers
+    // nothing — reaching the node at all proves the service-port rewrite.
+    let node_service_port: u16 = node
+        .endpoint
+        .endpoint
+        .rsplit(':')
+        .next()
+        .expect("the endpoint carries a port")
+        .parse()
+        .expect("the port is numeric");
+    let advertised = "http://127.0.0.1:1";
+
+    crate::node_client::override_node_status(advertised, node_service_port, true)
         .await
         .expect("drain the node");
     assert!(
@@ -470,7 +482,7 @@ async fn a_status_override_lands_on_the_nodes_own_scheduling_switch() {
         "the drain must reach the node's own scheduling switch"
     );
 
-    crate::node_client::override_node_status(&node.endpoint.endpoint, false)
+    crate::node_client::override_node_status(advertised, node_service_port, false)
         .await
         .expect("ready the node");
     assert!(

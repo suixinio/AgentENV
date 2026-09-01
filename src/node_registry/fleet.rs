@@ -43,6 +43,11 @@ pub fn observed_node(
 #[derive(Clone)]
 pub struct NodeFleetView {
     registry: Option<Arc<dyn NodeRegistry>>,
+    /// The port this process dials a cluster peer's node service on. The
+    /// registry advertises each node by its user-facing HTTP address, so a
+    /// dialing caller must substitute this port rather than use that address
+    /// as handed out. Meaningful only alongside a registry.
+    node_service_port: u16,
 }
 
 /// The answer to a fleet-wide node list.
@@ -55,8 +60,13 @@ pub enum FleetNodes {
 
 /// The answer to a single-node read.
 pub enum FleetNode {
-    /// The cluster view holds this node.
-    Observed(Box<ObservedNode>),
+    /// The cluster view holds this node. Its address is the registry-advertised
+    /// user-facing one; a caller that dials the node's own service substitutes
+    /// `node_service_port`, which rides along so the two cannot be separated.
+    Observed {
+        node: Box<ObservedNode>,
+        node_service_port: u16,
+    },
     /// The cluster view is authoritative and does not hold this node.
     Absent,
     /// This process observes no cluster, so only its own report exists.
@@ -66,13 +76,18 @@ pub enum FleetNode {
 impl NodeFleetView {
     /// A process that observes no cluster, such as a node reporting itself.
     pub fn self_report() -> Self {
-        Self { registry: None }
+        Self {
+            registry: None,
+            node_service_port: 0,
+        }
     }
 
-    /// A process holding the cluster's node registry.
-    pub fn cluster(registry: Arc<dyn NodeRegistry>) -> Self {
+    /// A process holding the cluster's node registry, dialing each peer's node
+    /// service on `node_service_port`.
+    pub fn cluster(registry: Arc<dyn NodeRegistry>, node_service_port: u16) -> Self {
         Self {
             registry: Some(registry),
+            node_service_port,
         }
     }
 
@@ -92,7 +107,10 @@ impl NodeFleetView {
             return FleetNode::SelfReport;
         };
         match observed_node(registry.as_ref(), node_id, cluster_id, now) {
-            Some(node) => FleetNode::Observed(Box::new(node)),
+            Some(node) => FleetNode::Observed {
+                node: Box::new(node),
+                node_service_port: self.node_service_port,
+            },
             None => FleetNode::Absent,
         }
     }

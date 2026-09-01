@@ -65,7 +65,7 @@
 #                                            address, the gateway, for both)
 #   E2E_K8S_API_LOCAL_PORT                - local port for the api port-forward
 #                                            when the run is split (default:
-#                                            18090)
+#                                            18079, below the node range)
 #   AENV_TEMPLATE_ID                      - skip self-building a base template
 #   SUITE_FILTER                          - glob against suites/*.sh (default: *.sh)
 #   AENV_CONTROL_PLANE_TOKEN              - credential for a REST address that

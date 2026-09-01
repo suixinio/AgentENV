@@ -18,6 +18,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/gateway/internal/cors"
 	"agentenv/services/gateway/internal/resume"
 	"agentenv/services/shared/config"
 
@@ -217,7 +218,7 @@ func (s *Server) Handler() http.Handler {
 			if hasProxyRoutingHeaders(r.Header) {
 				if _, hasSandbox := sandboxIDFromHeaders(r.Header); !hasSandbox {
 					setGatewayRouteSource(w, routeSourceHeader)
-					http.Error(w, "sandbox id header required", http.StatusBadRequest)
+					cors.Error(w, "sandbox id header required", http.StatusBadRequest)
 					return
 				}
 				s.handleProxy(w, r)
@@ -230,7 +231,7 @@ func (s *Server) Handler() http.Handler {
 				// Gateway Prometheus metrics use the separate metrics listener. Keep
 				// this path unavailable on the public HTTP listener unless it is
 				// explicitly routed to a sandbox.
-				http.NotFound(w, r)
+				cors.NotFound(w, r)
 			}
 			return
 		}
@@ -254,7 +255,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			zap.Error(hostRouteErr),
 			zap.Int("status", http.StatusBadRequest),
 		)
-		http.Error(w, hostRouteErr.Error(), http.StatusBadRequest)
+		cors.Error(w, hostRouteErr.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -264,7 +265,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	// to hand this to.
 	if hostRoute == nil && !hasProxyRoutingHeaders(r.Header) {
 		setGatewayRouteSource(w, routeSourceGateway)
-		http.NotFound(w, r)
+		// Nobody upstream can answer the preflight, and a browser drops the
+		// real request unless the preflight gets a 2xx.
+		if cors.HandlePreflight(w, r) {
+			return
+		}
+		cors.NotFound(w, r)
 		return
 	}
 
@@ -436,7 +442,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
 	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
 	if err != nil {
-		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		cors.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
 		return
 	}
 
@@ -534,19 +540,19 @@ func (s *Server) lookupNodeColdPath(ctx context.Context, sandboxID string) (*sch
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 	st, ok := status.FromError(err)
 	if !ok {
-		http.Error(w, "scheduler unavailable", http.StatusBadGateway)
+		cors.Error(w, "scheduler unavailable", http.StatusBadGateway)
 		return
 	}
 	reason := s.schedulerReason(st)
 	switch st.Code() {
 	case codes.InvalidArgument:
-		http.Error(w, reason, http.StatusBadRequest)
+		cors.Error(w, reason, http.StatusBadRequest)
 	case codes.NotFound:
-		http.Error(w, reason, http.StatusNotFound)
+		cors.Error(w, reason, http.StatusNotFound)
 	case codes.Unavailable, codes.FailedPrecondition:
-		http.Error(w, reason, http.StatusServiceUnavailable)
+		cors.Error(w, reason, http.StatusServiceUnavailable)
 	default:
-		http.Error(w, "scheduler error", http.StatusBadGateway)
+		cors.Error(w, "scheduler error", http.StatusBadGateway)
 	}
 }
 
@@ -647,7 +653,7 @@ func (s *Server) proxyRequest(
 ) {
 	upstreamURL, err := url.Parse(target)
 	if err != nil {
-		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		cors.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
 		return
 	}
 
@@ -714,7 +720,7 @@ func (s *Server) proxyRequest(
 					zap.String("path", proxyReq.URL.Path),
 					zap.String("target", upstreamURL.String()),
 				)
-				http.Error(rw, "upstream timeout", http.StatusGatewayTimeout)
+				cors.Error(rw, "upstream timeout", http.StatusGatewayTimeout)
 				return
 			}
 
@@ -730,7 +736,7 @@ func (s *Server) proxyRequest(
 				zap.String("path", proxyReq.URL.Path),
 				zap.String("target", upstreamURL.String()),
 			)
-			http.Error(rw, "upstream unavailable", http.StatusBadGateway)
+			cors.Error(rw, "upstream unavailable", http.StatusBadGateway)
 		},
 	}
 
@@ -764,9 +770,10 @@ type proxyResponseError struct {
 // write emits the error as a response.
 func (e *proxyResponseError) write(rw http.ResponseWriter) {
 	if len(e.body) == 0 {
-		http.Error(rw, e.message, e.statusCode)
+		cors.Error(rw, e.message, e.statusCode)
 		return
 	}
+	cors.SetHeaders(rw)
 	for name, values := range e.headers {
 		for _, value := range values {
 			rw.Header().Add(name, value)
@@ -1436,9 +1443,9 @@ func (s *Server) writeResumeError(w http.ResponseWriter, sandboxID string, resul
 
 	switch code {
 	case codes.NotFound:
-		http.Error(w, reason, http.StatusNotFound)
+		cors.Error(w, reason, http.StatusNotFound)
 	case codes.PermissionDenied:
-		http.Error(w, reason, http.StatusForbidden)
+		cors.Error(w, reason, http.StatusForbidden)
 	case codes.FailedPrecondition, codes.ResourceExhausted:
 		// 🔴 410 and not 503, and this is the one refusal in this switch that
 		// is not a failure. `autoResume: {enabled: false}` is the sandbox's
@@ -1449,7 +1456,7 @@ func (s *Server) writeResumeError(w http.ResponseWriter, sandboxID string, resul
 		// (`src/api/proxy.rs`'s `SandboxUnavailable`), so the flag reads the
 		// same to a client whichever half fields the request.
 		if result.Reason == resumeReasonAutoResumeDisabled {
-			http.Error(w, reason, http.StatusGone)
+			cors.Error(w, reason, http.StatusGone)
 			return
 		}
 		// Retry-After on the transient one only. `transition_in_progress`
@@ -1459,16 +1466,16 @@ func (s *Server) writeResumeError(w http.ResponseWriter, sandboxID string, resul
 		if result.Reason == resumeReasonTransitionInProgress {
 			w.Header().Set("Retry-After", "1")
 		}
-		http.Error(w, reason, http.StatusServiceUnavailable)
+		cors.Error(w, reason, http.StatusServiceUnavailable)
 	case codes.InvalidArgument:
-		http.Error(w, reason, http.StatusBadRequest)
+		cors.Error(w, reason, http.StatusBadRequest)
 	default:
 		// 🔴 Unimplemented lands here, and that is load-bearing: §12 P3's
 		// control C stubs this RPC out with Unimplemented and requires the data
 		// plane to *fail*. If it fell through to the scheduler the probe would
 		// pass while a second wake-up path was quietly doing the work, which is
 		// the exact thing the control is designed to detect.
-		http.Error(w, "sandbox wake-up failed", http.StatusBadGateway)
+		cors.Error(w, "sandbox wake-up failed", http.StatusBadGateway)
 	}
 }
 

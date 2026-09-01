@@ -7,9 +7,10 @@ import (
 )
 
 // The gateway no longer forwards user-facing REST, so it reads no upstream
-// address. The key and the environment variable stay in the deployed manifests
-// for one release, because the digest this one rolls back to requires an
-// upstream that parses — see
+// address, and it no longer calls LookupNode, so it reads no cold-lookup
+// timeout. The keys and the environment variables stay in the deployed
+// manifests for one release, because the digest this one rolls back to
+// requires an upstream that parses and a timeout it can read — see
 // `TestTheGatewayKeepsTheRestUpstreamKeyForTheRollbackWindow`.
 //
 // 🔴 That only holds while this build ignores both harmlessly. A loader that
@@ -19,11 +20,12 @@ import (
 func TestALeftoverRestUpstreamDoesNotStopTheGatewayLoading(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.json")
 	if err := os.WriteFile(path, []byte(
-		`{"gateway":{"scheduler_addr":"agentenv-api:8002","rest_upstream_addr":"http://agentenv-api:8000"}}`,
+		`{"gateway":{"scheduler_addr":"agentenv-api:8002","rest_upstream_addr":"http://agentenv-api:8000","cold_lookup_timeout":"3s"}}`,
 	), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	t.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "http://agentenv-api:8000")
+	t.Setenv("GATEWAY_COLD_LOOKUP_TIMEOUT", "3s")
 
 	cfg, err := Load(path)
 	if err != nil {

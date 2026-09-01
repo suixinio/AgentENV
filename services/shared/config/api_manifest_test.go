@@ -370,7 +370,9 @@ func TestTheGatewayKeepsTheRestUpstreamKeyForTheRollbackWindow(t *testing.T) {
 	decodeManifest(t, filepath.Join(manifestDir, "gateway-deployment.yaml"), &gateway)
 	container := onlyContainer(t, "the gateway Deployment", gateway.Spec.Template.Spec.Containers)
 
-	for _, name := range []string{"GATEWAY_REST_UPSTREAM_ADDR"} {
+	// GATEWAY_COLD_LOOKUP_TIMEOUT is in the same window: this build calls no
+	// LookupNode and reads no timeout for it, the digest before it does both.
+	for _, name := range []string{"GATEWAY_REST_UPSTREAM_ADDR", "GATEWAY_COLD_LOOKUP_TIMEOUT"} {
 		t.Run(name, func(t *testing.T) {
 			declared, ok := envValue(container, name)
 			if !ok {

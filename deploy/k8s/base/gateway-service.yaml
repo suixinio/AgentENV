@@ -1,3 +1,9 @@
+# The sandbox data-plane entry point.
+#
+# 🔴 `http` below is the address a client's `proxy_url` names: Host-routed
+# (`{port}-{sandboxID}.<domain>`) and routing-header
+# (`x-agentenv-sandbox-id` / `x-agentenv-target-port`) traffic. REST belongs to
+# `agentenv-api`, which is the client's `url`.
 apiVersion: v1
 kind: Service
 metadata:

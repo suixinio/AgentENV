@@ -1,4 +1,10 @@
-# The two addresses the gateway knows the api half by.
+# The client REST entry point, and the two addresses the gateway knows the api
+# half by.
+#
+# 🔴 `http` below is the address a client's `url` names: every user-facing REST
+# call — sandboxes, snapshots, templates, `/nodes`, `/registry/sandboxes` —
+# is answered here. Sandbox data-plane traffic goes to `agentenv-gateway`
+# instead; that is the client's `proxy_url`.
 #
 # 🔴 A ClusterIP with a stable name, not the headless Service the nodes have.
 # `agentenv-nodes` is headless because the scheduler names individual machines

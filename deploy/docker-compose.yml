@@ -217,13 +217,16 @@ services:
           "$$POSTGRES_USER" "$$POSTGRES_PASSWORD" "$$POSTGRES_DB" \
           > /tmp/agentenv-pg/pg-dsn.toml
         exec /aenv-api
-    # 🔴 Also published directly on 8010 for convenience, but the gateway
-    # (`GATEWAY_REST_UPSTREAM_ADDR` below, matching `deploy/k8s/base`'s
-    # `api-upstream-config`, and `GATEWAY_SCHEDULER_ADDR`, which carries the
-    # wake-up RPC) now sends user-facing REST
-    # and paused-sandbox wake-ups here too — point a client at the gateway's
-    # own port (8000) for `/sandboxes`, `/snapshots` and `/templates` the same
-    # way a k8s deployment would.
+    # 🔴 8010 is the client REST entry point of this stack: `/sandboxes`,
+    # `/snapshots`, `/templates`, `/nodes` and `/registry/sandboxes` are all
+    # answered by this process. Sandbox traffic goes to the gateway's 8000
+    # instead; the two addresses are the `url` and `proxy_url` an `aenv` client
+    # is configured with.
+    #
+    # The gateway also still forwards REST here (`GATEWAY_REST_UPSTREAM_ADDR`
+    # below, matching `deploy/k8s/base`'s `api-upstream-config`;
+    # `GATEWAY_SCHEDULER_ADDR` carries the wake-up RPC), so a client that names
+    # only 8000 keeps working while it moves.
     #
     # 🔴 This stack runs PostgreSQL (`postgres` above), which `agentenv-api`
     # requires; the note on `AENV_CONFIG_OVERLAY_PATH` above says how `[pg]`
@@ -271,6 +274,9 @@ services:
       # `deploy/k8s/base/kustomization.yaml`'s `api-upstream-config` uses.
       GATEWAY_REST_UPSTREAM_ADDR: http://agentenv-api:8000
       GATEWAY_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
+    # 🔴 8000 is the sandbox data-plane entry point: Host-routed
+    # (`{port}-{sandboxID}.<domain>`) and routing-header
+    # (`x-agentenv-sandbox-id` / `x-agentenv-target-port`) traffic.
     ports:
       - "8000:8080"
     restart: unless-stopped

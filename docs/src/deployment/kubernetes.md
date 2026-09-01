@@ -14,7 +14,8 @@ into itself over the shared `[pg]` pool instead of dialling a scheduler
 process; the gateway's own `scheduler_addr` points at `agentenv-api:8002`
 instead of `agentenv-scheduler:9090` for the same reason, including for
 `ListRegistrySandboxes` (`services/gateway/internal/registry_list.go`'s
-debug endpoint), which `aenv-api` now answers too — see `services/README.md`
+debug endpoint), which `aenv-api` now answers too — and also serves directly as
+`GET /registry/sandboxes` on its own REST surface — see `services/README.md`
 for the current status. The rest of this page describes the architecture as
 it runs today; where it still names "the scheduler" or "the Scheduler
 protocol" generically, that is describing the `services/api/proto/scheduler.proto`
@@ -29,6 +30,26 @@ separate Go process.
 | `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, and (阶段四) node discovery/placement/paused-registry — the Go scheduler's former job, folded in, unconditionally |
 | `agentenv-node` | DaemonSet (privileged) | One runtime Pod per Kubernetes node |
 | `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery, by `agentenv-api`'s own `src/node_registry/kubernetes_discovery.rs` |
+
+### Two Client Addresses
+
+A client talks to two addresses, not one:
+
+| Address | Service | Carries |
+|---------|---------|---------|
+| REST entry point | `agentenv-api:8000` | every user-facing REST call — sandboxes, snapshots, templates, `/nodes`, `/registry/sandboxes` |
+| Data-plane entry point | `agentenv-gateway:8080` | sandbox traffic, addressed by Host (`{port}-{sandboxID}.<domain>`) or by the `x-agentenv-sandbox-id` / `x-agentenv-target-port` headers |
+
+The repository does not presume how these map to names outside the cluster.
+Both Services are ClusterIP; an Ingress, a LoadBalancer or a port-forward per
+address is a deployment decision, and the only requirement is that each address
+is reachable in full.
+
+The `aenv` client names them as `url` and `proxy_url` in its credentials file.
+`proxy_url` is optional and falls back to `url`, so a client configured with a
+single address that points at the gateway keeps working unchanged: the gateway
+still forwards REST to `agentenv-api` (`GATEWAY_REST_UPSTREAM_ADDR`, below).
+Point new configuration at both addresses; that forwarding is transitional.
 
 ### Why a DaemonSet for Runtime Nodes
 
@@ -108,7 +129,7 @@ substitutions verify themselves and fail the render if they did not take —
 without them the symptom is `ImagePullBackOff` on every Pod, one step away from
 its cause.
 
-The default overlay is `deploy/k8s/overlays/default`, targeting the `agentenv-system` namespace. The gateway is exposed as ClusterIP by default. Add your own Ingress or LoadBalancer for external access.
+The default overlay is `deploy/k8s/overlays/default`, targeting the `agentenv-system` namespace. Both client-facing Services — `agentenv-api` for REST and `agentenv-gateway` for sandbox traffic — are ClusterIP by default. Add your own Ingress or LoadBalancer for external access to each.
 
 The make targets build a temporary Kustomize context so runtime Pods mount the repository's `config/default.toml` rather than a separate checked-in copy.
 
@@ -149,15 +170,18 @@ report the same label. Two replicas each configured with a *different* non-empty
 seed pass every startup check there is, so comparing this label across the
 replicas is the only place that divergence shows up.
 
-Bringing the Deployment up does not move any traffic. One switch does, and the
-gateway reads it:
+A client that names the REST address directly reaches this Deployment without
+any gateway involvement. One switch decides where REST arriving at the *gateway*
+is sent instead, and the gateway reads it:
 
 | Switch | Read by | Flipping it costs |
 |--------|---------|-------------------|
 | `GATEWAY_REST_UPSTREAM_ADDR` (`api-upstream-config`) | the gateway | a gateway roll, seconds |
 
 Point the gateway at `http://agentenv-api:8000`. It rides one gateway roll, so
-there is no ordering to get right and no preparatory step to take first.
+there is no ordering to get right and no preparatory step to take first. It
+exists so a client that still names one address keeps working; a client
+configured with both addresses never uses it.
 
 🔴 This used to be a pair: `GATEWAY_RESUME_ADDR` sat beside it in the same
 ConfigMap, naming the api half's gRPC wake-up surface at `agentenv-api:8002`.
@@ -194,6 +218,11 @@ losing `api-upstream-config` would then fall back to a real address in the
 file instead of the fail-fast refusal that emptying it is meant to produce.
 Keep the file's values empty and drive both switches from `api-upstream-config`
 or `kubectl set env`.
+
+For `GATEWAY_REST_UPSTREAM_ADDR` this holds only while the gateway forwards
+REST at all: the key goes away once clients name the REST address themselves.
+The rule stands for `GATEWAY_SCHEDULER_ADDR`, which carries the wake-up RPC and
+is part of the gateway's permanent surface.
 
 The API half reaches a node's gRPC service by substituting
 `AENV_NODE_SERVICE_PORT` into the address the scheduler gives it, which is the

@@ -87,7 +87,8 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 
 ## 5. 分阶段实施
 
-四个阶段 + 一个可选项，每阶段可独立合入、独立回滚（镜像 digest 回退，与 D3 的回滚口径一致）。
+四个阶段 + 一个可选项，每阶段可独立合入、独立回滚（镜像 digest 回退，与 D3 的回滚口径一致；
+**P3 例外**——它删配置也删门禁，纯镜像回退不完整，回滚口径见 P3 部署段的回滚窗口约定）。
 顺序约束：P1 与 P2 互相独立；**P3 必须在 P2 之后**（客户端先搬家，转发再断）；
 **P4 必须在 P3 上线稳定且 reconciler 落地之后**。
 
@@ -104,12 +105,21 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   `GET|POST /nodes/{id}`（其余生成路由一律拒），所以本地快照语义是 node 的自报面，必须留着；
   形态由句柄决定——持 registry 答集群、不持答自身。REST 渲染与 `ListObservedNodes` 走
   `node_registry::fleet` 同一读取路径，字段级 parity 测试钉住 `nodeListItem` 的 JSON 标签与
-  `nodeStatusToString` 的拼写（含 `lingering`）。`nodes_node_id_post` 语义不动。
+  `nodeStatusToString` 的拼写（含 `lingering`）。
+- `nodes_node_id_post` 同走 fleet 视图：命中集群观测节点时经 `node.proto` 的
+  `OverrideStatus` RPC 直达该节点（e2b 同形——api 对节点的 orchestrator 打 gRPC
+  `ServiceStatusOverride`，不 HTTP 代理、不写共享状态），SelfReport 形态保留本地路径。
+  两处 e2b 同款语义一并保留：draining 只挡新放置不动存量；观测状态在该节点下一次
+  心跳才刷新，POST 后立读可能仍见旧值。缺此一刀，直连 api 能列出节点却 drain 不了
+  任何一个，P3 删掉 `node_list.go` 的代理后维护面就断了。
 - `openapi.yml` 新增 `GET /registry/sandboxes` → `make agentenv-server` → 实现在
   `src/api/impls/admin.rs`，直读 paused registry（与 `grpc_service.rs` 同数据源）。
   保留 `registry_list.go` 已经论证过的两条语义：lease 的 NULL 必须渲染为 JSON null
   （NULL lease=已过期、NULL deadline=永不过期，压成 0 都是错的）；`executionID` 只读、
-  不可作过滤参数（closed set）。
+  不可作过滤参数。gateway 版对未声明查询参数的主动 400 **不迁**：e2b 的 api 全面上
+  spec 校验（已声明参数坏值 400、缺必填 400），但没有任何 HTTP 端点拒绝未声明参数——
+  api 版与 e2b 同策，声明集内从严、集外忽略，契约文本按此措辞。畸形 `nextToken`
+  （非 sandbox id）按 e2b 键集分页形制显式 400（文案泛化），绝不静默答空终页。
 - 本阶段 gateway 的拦截先不动（直连 api 地址即可验证新端点），拆除并入 P3。
 
 ### P2 — 客户端双地址与参考部署
@@ -126,7 +136,15 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 - e2e 套件切到双地址（REST 打 api、数据面打 gateway），在 pve-mf 全量跑过（基线 109+8）
   之后才允许进入 P3。
 
-### P3 — 拆除 gateway 控制面（一批 gateway 手术 + 一个收尾提交）
+### P3 — 拆除 gateway 控制面（两拍 + 一个收尾提交）
+
+拍序（先开新路，再拆旧路——armed 集群上普通客户端在门禁退役前**无法**直连 REST，
+所以门禁必须先走，客户端迁移窗口从第一拍开始）：
+
+1. **第一拍：退役 api 侧门禁**（下方裁决），直连 REST 即刻可用；
+2. **观测排空**：`agentenv_gateway_rest_upstream_total` 持续归零，残余走转发的调用方
+   在旧路还活着时被找出来迁走，而不是删完之后靠 404 发现；
+3. **第二拍：按下方删除清单拆转发。**
 
 删除清单（Go 侧）：
 
@@ -150,10 +168,12 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 - 新增 gateway 内小型 cors 帮助包，**只**作用于 gateway 自己合成的响应（404 兜底、resume
   错误、scheduler/fencing 拒绝）：`Access-Control-Allow-Origin: *`、无 `Vary: Origin`、
   无 credentials；preflight 只在无上游可答处应答（`IsPreflight` = OPTIONS +
-  `Access-Control-Request-Method`，`Allow-Headers` 回显请求值，`Max-Age: 86400`）。
+  `Access-Control-Request-Method`；应答 204，带 `Allow-Methods: *`、`Allow-Headers`
+  回显请求值、`Max-Age: 86400`——与 e2b `HandlePreflight` 逐头一致，缺 `Allow-Methods`
+  的 preflight 会让浏览器拒发非安全清单方法的正式请求）。
   **活沙箱的响应一律不碰**——CORS 属于 envd 或用户自己的服务器（e2b 的注释原文如此）。
 
-裁决：**api 侧控制面 REST 门禁随转发一并退役**。
+裁决：**api 侧控制面 REST 门禁随转发一并退役**（按上方拍序，它走在删转发之前）。
 
 - 对象是 `src/api/server.rs:141` `assemble` 里加在生成路由上的 `require_control_plane`
   （`ControlPlaneGate`，头 `x-agentenv-control-plane`）。它的前提是「用户 REST 只经 gateway
@@ -163,7 +183,10 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 - **node 侧的 gate token 不动**：node 进程的 `role_gate` 与其凭据是另一件事，
   它挡的不是用户 REST。
 - 连带删除：e2e 的 `AENV_CONTROL_PLANE_TOKEN` 注入（`lib/helpers.sh` 的
-  `_e2e_control_plane_args` 及各调用点、`run_dev_cluster.sh` 的 preflight）。
+  `_e2e_control_plane_args` 及各调用点、`run_dev_cluster.sh` 的 preflight、
+  `runtime.sh` 就绪轮询里的同款注入）。
+- e2e 同批：`E2E_SPLIT_ADDRESSES` 默认翻为 1——转发删除后非 split 路径不复存在，
+  开关与 `test-e2e-*-split` 目标随后收敛掉。
 - 本轮（P1）**不动**任何门禁代码，只落这条裁决。
 
 凭据轴迁移注记（消费方要改头，写进变更说明）：
@@ -178,16 +201,21 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 
 部署与文档（同批）：
 
-- `deploy/k8s/base/config/gateway.json` 删 `rest_upstream_addr` 键；
-  `kustomization.yaml` 的 `api-upstream-config` 收窄到只剩 resume/scheduler 地址；
-  `GATEWAY_REST_UPSTREAM_ADDR` 从 compose（:272）与 k8s 移除，
-  并按惯例录入 `docs/src/configuration/env-vars.md` 的 removed 清单（今日效果：被忽略）；
+- **回滚窗口**：`deploy/k8s/base/config/gateway.json` 的 `rest_upstream_addr` 键与
+  compose（:272）/k8s 的 `GATEWAY_REST_UPSTREAM_ADDR` 本批**保留不删**——旧 gateway
+  把 rest_upstream 当必填校验（`TestTheRestUpstreamIsAlwaysSet…`），键在则 gateway 的
+  纯镜像 digest 回退仍然成立（新二进制忽略不认识的键）；删除挪到收尾提交，并在
+  收尾时录入 `docs/src/configuration/env-vars.md` 的 removed 清单（今日效果：被忽略）。
+  api 半边同批把门禁的武装配置（control-plane token 注入 Deployment 的那份）撤下：
+  回退 api 镜像时旧门在场但未武装，已迁走的直连客户端不会集体 403（实施时验证
+  武装机制确为配置驱动）。P3 的完整回滚因此是「镜像 + 本批未删的配置」成对回退。
 - `services/README.md`、`CLAUDE.md` gateway 段、`docs/src/deployment/kubernetes.md` 改写；
 - `2026-08-31-residue-decisions.md` D2 加一行「被本方案取代」。
 
-收尾提交（gateway 不再调用后单独一个提交）：`scheduler.proto` 删
+收尾提交（gateway 不再调用、回滚窗口关闭后单独一个提交）：`scheduler.proto` 删
 `ListObservedNodes`/`ListRegistrySandboxes` 两个 RPC，连同 `grpc_service.rs` 的实现、
-`reporter.rs` 的测试桩、两侧生成码（`make -C services`、`build.rs`）。
+`reporter.rs` 的测试桩、两侧生成码（`make -C services`、`build.rs`）；
+`rest_upstream_addr` 键与 `GATEWAY_REST_UPSTREAM_ADDR` 至此才删。
 
 ### P4 — 连边折叠：gateway 掉线 scheduler.v1（前置：P3 上线稳定 + reconciler 落地）
 
@@ -198,12 +226,14 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   决定 wake 或拒绝。响应继续用现有 `SandboxResumeResponse`（`node_address` + `execution_id`
   已是 e2b 形状）。**两趟读、门控不同的语义必须原样保住**：autoResume:false + running 可
   路由，autoResume:false + paused 拒绝——这正是当年 autoResume 静默失效修复的形状，
-  折叠进一个 RPC 不许把它折没。wake 成功时 api 自写投影（它拥有 Redis 写权），
-  取代 gateway 的 RecordAssignment。
+  折叠进一个 RPC 不许把它折没（e2b 此处更弱：政策非 Any 时 miss 连 running 都答
+  NotFound/502，我们不跟，这是有据的既证偏离）。wake 成功与 running-miss 修复时
+  api 都自写投影（它拥有 Redis 写权），取代 gateway 的 RecordAssignment——e2b 的
+  edge 不回写、每次 miss 重发 RPC，回写是我们对命中率的既定改良。
 - **gateway 侧删除**：`lookupNodeColdPath`（:558）与 VerdictUndecided 的第三级回落——
   Undecided 收窄为纯传输失败 → 请求失败（e2b 形状：api 不可答则数据面冷路径失败；
-  PG 降级窗口内 running 沙箱的冷路由损失是接受的代价，缓解靠 reconciler 保持投影新鲜，
-  冷路径命中率列为监控项）；`recordAssignmentFromResponse` 两腿（response_header /
+  PG 降级窗口内 running 沙箱的冷路由损失是接受的代价，冷路径命中率列为监控项）；
+  `recordAssignmentFromResponse` 两腿（response_header /
   response_body；**实施时先验证 response_body 腿在 HEAD 是否已不可达**——fork REST 在
   回落分支删除后不再经 gateway 到 node）；`projectionTTLToRecord` 的 gateway 半边；
   对 scheduler.v1 的拨号与 `gateway.scheduler_addr` 配置、`GATEWAY_COLD_LOOKUP_TIMEOUT`。
@@ -211,6 +241,15 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   （它消费的本就是响应类型而非 RPC，此处是删一个来源，不是重设计）。
 - **指标**：`recordGatewaySchedulerRPC` 全系、`gatewayColdLookupTimeout`、
   route_resolution 的 scheduler 来源值消失；变更说明列全。
+- **验收（对照 e2b 后修订）**：e2b 的 catalog 没有反熵重发布——一次写入、TTL 覆盖
+  沙箱最大寿命，miss 的正确性来自 api 侧按请求修复（`autoresume.go` 的 StateRunning
+  分支）。折叠后我们同形，投影缺失/陈旧不再是正确性问题，只是命中率。硬验收三条：
+  (a) **投影丢失演练**——人为删除一个 running 沙箱的投影，请求必须经
+  `resume_for_data_plane` 照常路由，且 api 回写投影恢复命中；(b) autoResume 双门控
+  断言原样保住（上方 api 侧）；(c) 冷路径命中率与「api 不可达时 miss 即失败」的
+  影响面进看板。reconciler 据此定性为**命中率优化 + 孤儿方向清理**（e2b 的
+  `Store.Reconcile` 只做杀孤儿），不是折叠的正确性前提；是否维持「reconciler 落地」
+  作为 P4 硬前置，留单独裁决。
 - **收尾提交**：`scheduler.proto` 删 `LookupNode`、`RecordAssignment`，连同
   `grpc_service.rs` 实现与生成码。scheduler.v1 至此只剩 node↔api 面。
 

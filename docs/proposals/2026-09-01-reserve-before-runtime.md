@@ -126,11 +126,30 @@ api 进程内，`record_assignment` 只是 `NodeRegistryGrpcService` 上的一�
 
 ### 刻意未复用的既有机制
 
-`src/orchestrator/store/redis/reserve.rs` 已有一套 e2b 形状的预留实现
+`src/orchestrator/store/redis/reserve.rs` 曾有一套 e2b 形状的预留实现
 （`Reservation::Reserved/AlreadyPending/AlreadyInStorage` + `ReservationGuard`
 + `WaitForStart`），生产路径无调用方。它写在编排器元数据键空间（`agentenv:api`），
 而 DELETE 的 500 出自绑定视图查询，元数据侧的预留改变不了 `absent_handle` 的
-判断，故未复用。该残留的去留是独立裁决项。
+判断，故未复用。该残留已裁决删除（`chore/e2b-adjudication-closeout`）。
+
+### 窗口内 DELETE 得 404：接受语义
+
+集群实测：占位已写、节点尚未确认时对该 id 发 DELETE，得 404，而该沙箱随后
+仍正常出现。**裁决为接受语义，不是缺陷。**
+
+e2b 同位相同。`packages/api/internal/sandbox/store.go` 的 `Get` 只读 storage，
+不读 reservations；kill 撞不存在的沙箱走 `delete_instance.go` 的 `ErrNotFound`
+臂，记 "Sandbox not found, already removed" 并返回 `ErrSandboxNotFound`（404）。
+占位期的沙箱在 storage 里尚不存在，所以 e2b 的 DELETE 对同一时刻同样答 404。
+
+窗口有界，约等于一次 create 的时长：`announce_placement` 把占位翻正之后，
+DELETE 立刻按正常绑定走。窗口内 DELETE 未能取消的那个 runtime 由沙箱超时回收
+兜底，与任何其他未被显式删除的沙箱同路。
+
+代价是这段窗口里 404 有两种含义（"没有这个沙箱"与"这个沙箱还没造出来"），
+调用方无从区分。使其可区分需要 DELETE 读占位态并另答一个状态码——那正是
+e2b 拒绝建的东西，它让 storage 成为删除路径的唯一判据，也是"NotFound 全链是
+判决"这条不变量的前提。两者不能同时要。
 
 ### 不变量核实（W2）
 

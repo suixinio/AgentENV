@@ -30,7 +30,9 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   : "${E2E_K8S_GATEWAY_LOCAL_PORT:=18080}"
   : "${E2E_K8S_NODE_LOCAL_PORT_BASE:=18081}"
   : "${E2E_K8S_API_SERVICE:=agentenv-api}"
-  : "${E2E_K8S_API_LOCAL_PORT:=18090}"
+  # Below the node range: node forwards grow upward from the base, so a port
+  # above it collides with the Nth node and the newer forward kills the older.
+  : "${E2E_K8S_API_LOCAL_PORT:=18079}"
   : "${E2E_SPLIT_ADDRESSES:=0}"
 
   _K8S_PORT_FORWARD_PIDS=()
@@ -263,7 +265,9 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
 
     log "Waiting for scheduler to observe ${expected_count} ready node(s) via ${AENV_URL}/nodes (timeout ${timeout}s) ..."
     for ((i = 1; i <= timeout; i++)); do
-      response=$(curl -s \
+      # An armed deployment refuses the poll without the control-plane header.
+      _e2e_control_plane_args "${AENV_URL}/nodes"
+      response=$(curl -s "${_E2E_CP_ARGS[@]}" \
         -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
         -w $'\n%{http_code}' \
         "${AENV_URL}/nodes" 2>/dev/null || true)
@@ -449,15 +453,25 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     _k8s_wait_for_rollout "ds/agentenv-node" "${timeout}" ||
       die "agentenv-node rollout failed in namespace ${E2E_K8S_NAMESPACE}"
 
-    _start_k8s_port_forward "svc/${E2E_K8S_GATEWAY_SERVICE}" "${E2E_K8S_GATEWAY_LOCAL_PORT}" 8080 "gateway" ||
-      die "Failed to port-forward gateway service"
+    # A forward exists to back a default local address; an endpoint override
+    # makes it unnecessary, and starting one anyway would kill whatever else
+    # holds that local port.
     if e2e_addresses_are_split; then
-      _start_k8s_port_forward "svc/${E2E_K8S_API_SERVICE}" "${E2E_K8S_API_LOCAL_PORT}" 8000 "api" ||
-        die "Failed to port-forward api service"
-      # Named explicitly: a split run must not let the data plane follow the
-      # REST address, which is the whole point of splitting them.
-      export AENV_DATA_PLANE_URL="${AENV_DATA_PLANE_URL:-http://127.0.0.1:${E2E_K8S_GATEWAY_LOCAL_PORT}}"
-      export AENV_REST_URL="${AENV_REST_URL:-http://127.0.0.1:${E2E_K8S_API_LOCAL_PORT}}"
+      if [[ -z "${AENV_DATA_PLANE_URL:-}" ]]; then
+        _start_k8s_port_forward "svc/${E2E_K8S_GATEWAY_SERVICE}" "${E2E_K8S_GATEWAY_LOCAL_PORT}" 8080 "gateway" ||
+          die "Failed to port-forward gateway service"
+        # Named explicitly: a split run must not let the data plane follow the
+        # REST address, which is the whole point of splitting them.
+        export AENV_DATA_PLANE_URL="http://127.0.0.1:${E2E_K8S_GATEWAY_LOCAL_PORT}"
+      fi
+      if [[ -z "${AENV_REST_URL:-}" ]]; then
+        _start_k8s_port_forward "svc/${E2E_K8S_API_SERVICE}" "${E2E_K8S_API_LOCAL_PORT}" 8000 "api" ||
+          die "Failed to port-forward api service"
+        export AENV_REST_URL="http://127.0.0.1:${E2E_K8S_API_LOCAL_PORT}"
+      fi
+    elif [[ -z "${AENV_REST_URL:-}" ]]; then
+      _start_k8s_port_forward "svc/${E2E_K8S_GATEWAY_SERVICE}" "${E2E_K8S_GATEWAY_LOCAL_PORT}" 8080 "gateway" ||
+        die "Failed to port-forward gateway service"
     fi
     _export_k8s_node_endpoints
     configure_runtime_endpoints

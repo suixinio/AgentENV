@@ -61,7 +61,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	fmt clippy check-crate-boundaries \
 	mutants coverage \
 	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
-	test-e2e-compose test-e2e-k8s test-e2e-all \
+	test-e2e-compose test-e2e-k8s test-e2e-compose-split test-e2e-k8s-split test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store bench-placement-shadow \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
@@ -343,6 +343,13 @@ test-e2e-compose:
 
 test-e2e-k8s:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=k8s bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
+
+# Split-address runs: REST at the api half, the data plane at the gateway.
+test-e2e-compose-split:
+	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=compose E2E_SPLIT_ADDRESSES=1 bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
+
+test-e2e-k8s-split:
+	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=k8s E2E_SPLIT_ADDRESSES=1 bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
 
 test-e2e-all: test-e2e-compose test-e2e-k8s
 

@@ -227,6 +227,8 @@ orchestration_surface! {
         #[cfg(test)]
         fn set_secure_for_test(sandbox_id: &SandboxId, secure: bool) -> Result<()>;
         #[cfg(test)]
+        fn set_max_lifetime_for_test(sandbox_id: &SandboxId, max_lifetime: Duration) -> Result<()>;
+        #[cfg(test)]
         fn remove_proxy_route_for_test(sandbox_id: &SandboxId);
         #[cfg(test)]
         fn set_live_execution_for_test(

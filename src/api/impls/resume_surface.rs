@@ -1,17 +1,22 @@
 //! Data-plane wake-up decisions for paused sandboxes.
 //!
 //! The API half arbitrates and starts sandboxes; nodes only forward data.
-//! Published snapshots may prefer an origin, while unpublished captures are
-//! pinned to their sole machine. Placement therefore consumes the fully wired
-//! in-process `LookupNode` service rather than reimplementing its policy.
+//! A sandbox the cluster already has running is answered as it stands, before
+//! any wake-up policy; published snapshots may prefer an origin, while
+//! unpublished captures are pinned to their sole machine. Placement therefore
+//! consumes the fully wired in-process `LookupNode` service rather than
+//! reimplementing its policy, and the api half writes the routing projection
+//! itself on every wake and on every running answer the projection missed.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use tracing::{debug, warn};
 
 use super::paused_recovery::{CrossNodeResume, MissingLocalResume};
 use super::{ApiImpl, ResumeArbitration};
+use crate::binding_store::lookup::LookupResultLabel;
 use crate::cfg::ConfigManager;
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::orchestrator::{
@@ -19,8 +24,6 @@ use crate::orchestrator::{
     SandboxState,
 };
 use crate::proto::scheduler;
-// Import the generated trait to call `lookup_node` in process.
-use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::types::{ExecutionId, SandboxId};
 
 /// A node the placement source named.
@@ -37,6 +40,15 @@ pub(in crate::api) struct PlacedNode {
 /// Cluster constraint on where a paused sandbox may wake.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::api) enum ResumePlacement {
+    /// The sandbox is running on `node` right now under `execution_id`, an
+    /// incarnation the placement source vouches for. Nothing to wake.
+    Running {
+        node: PlacedNode,
+        execution_id: ExecutionId,
+        /// The answer came from the routing projection itself, so writing it
+        /// back would only churn the record.
+        from_projection: bool,
+    },
     /// The only copy of the bytes is on this node. Wake it there or not at all.
     Pinned { node: PlacedNode },
     /// The snapshot is in shared storage, so any node can rebuild it. `node` is
@@ -103,6 +115,21 @@ pub(in crate::api) trait ResumePlacementSource: Send + Sync {
     async fn locate(&self, sandbox_id: SandboxId) -> Result<ResumePlacement, PlacementRefusal>;
 }
 
+/// Writes the routing projection the data plane reads first.
+///
+/// Best effort: a failed write costs the next request a resume RPC, and the
+/// node's next heartbeat repairs the record.
+#[async_trait]
+pub(in crate::api) trait RoutingProjectionWriter: Send + Sync {
+    async fn record_running(
+        &self,
+        sandbox_id: SandboxId,
+        node: &PlacedNode,
+        execution_id: ExecutionId,
+        projection_ttl_secs: u32,
+    ) -> Result<(), String>;
+}
+
 /// Whether this process wakes sandboxes on its own machine, and which machine
 /// that is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +145,9 @@ pub(in crate::api) enum WakeSite {
 #[derive(Clone)]
 pub struct ResumeWiring {
     placement: Option<Arc<dyn ResumePlacementSource>>,
+    /// `None` where this process holds no projection to write: the node half,
+    /// and test wirings that only inject a placement answer.
+    projection: Option<Arc<dyn RoutingProjectionWriter>>,
     wake_site: WakeSite,
 }
 
@@ -130,6 +160,7 @@ impl ResumeWiring {
     ) -> Self {
         Self {
             placement,
+            projection: None,
             wake_site,
         }
     }
@@ -144,6 +175,7 @@ impl ResumeWiring {
     pub fn node_local(node_id: impl Into<String>) -> Self {
         Self {
             placement: None,
+            projection: None,
             wake_site: WakeSite::Local(node_id.into()),
         }
     }
@@ -153,16 +185,20 @@ impl ResumeWiring {
     pub fn api_half_for_test() -> Self {
         Self {
             placement: None,
+            projection: None,
             wake_site: WakeSite::Remote,
         }
     }
 
     /// API-half wiring using the fully configured in-process `LookupNode` service.
     ///
-    /// The remote orchestration surface honors any returned pin.
+    /// The remote orchestration surface honors any returned pin, and the same
+    /// service writes the projection back.
     pub fn cluster_in_process(local: NodeRegistryGrpcService) -> Self {
+        let source = Arc::new(NativePlacementSource { local });
         Self {
-            placement: Some(Arc::new(NativePlacementSource { local })),
+            placement: Some(Arc::clone(&source) as Arc<dyn ResumePlacementSource>),
+            projection: Some(source),
             // Remote orchestration honors the selected machine.
             wake_site: WakeSite::Remote,
         }
@@ -177,26 +213,49 @@ struct NativePlacementSource {
 #[async_trait]
 impl ResumePlacementSource for NativePlacementSource {
     async fn locate(&self, sandbox_id: SandboxId) -> Result<ResumePlacement, PlacementRefusal> {
-        match self
-            .local
-            .lookup_node(tonic::Request::new(scheduler::LookupNodeRequest {
-                sandbox_id: sandbox_id.to_string(),
-            }))
-            .await
-        {
-            Ok(response) => placement_from_lookup(response.into_inner()),
+        match self.local.lookup_sandbox(&sandbox_id.to_string()).await {
+            Ok(lookup) => placement_from_lookup(
+                lookup.response,
+                lookup.label == LookupResultLabel::BoundBinding,
+            ),
             Err(status) => Err(refusal_from_status(&status)),
         }
     }
 }
 
+#[async_trait]
+impl RoutingProjectionWriter for NativePlacementSource {
+    async fn record_running(
+        &self,
+        sandbox_id: SandboxId,
+        node: &PlacedNode,
+        execution_id: ExecutionId,
+        projection_ttl_secs: u32,
+    ) -> Result<(), String> {
+        self.local
+            .record_running(
+                &sandbox_id.to_string(),
+                &node.node_id,
+                &execution_id.to_string(),
+                projection_ttl_secs,
+            )
+            .await
+            .map_err(|status| status.to_string())
+    }
+}
+
 /// Converts a `LookupNode` response into wake-up placement.
 ///
-/// `BOUND` is a preference, not an unpublished-data pin.
+/// `BOUND` under registry authority is a sandbox running right now; any other
+/// `BOUND` is a preference, not an unpublished-data pin. `answered_by_binding`
+/// says the response came from the routing projection rather than the roster
+/// or the paused registry.
 fn placement_from_lookup(
     response: scheduler::LookupNodeResponse,
+    answered_by_binding: bool,
 ) -> Result<ResumePlacement, PlacementRefusal> {
     let location = response.location();
+    let authority = response.execution_authority();
     let node = response.node.map(|node| PlacedNode {
         node_id: node.node_id,
         address: node.endpoint,
@@ -210,6 +269,32 @@ fn placement_from_lookup(
 
     match location {
         scheduler::SandboxLocation::Pinned => Ok(ResumePlacement::Pinned { node }),
+        scheduler::SandboxLocation::Bound
+            if authority == scheduler::ExecutionAuthority::Registry =>
+        {
+            match ExecutionId::parse_str(&response.execution_id) {
+                Ok(execution_id) => Ok(ResumePlacement::Running {
+                    node,
+                    execution_id,
+                    from_projection: answered_by_binding,
+                }),
+                Err(err) => {
+                    // Registry authority never carries an unusable id; treat the
+                    // answer as the preference it would have been before the
+                    // incarnation was recorded.
+                    warn!(
+                        execution_id = %response.execution_id,
+                        error = %err,
+                        "the placement source vouched for an incarnation it cannot spell; \
+                         taking the bound node as a preference instead"
+                    );
+                    Ok(ResumePlacement::Preferred {
+                        node,
+                        origin_node_id: response.origin_node_id,
+                    })
+                }
+            }
+        }
         scheduler::SandboxLocation::Placed
         | scheduler::SandboxLocation::Bound
         | scheduler::SandboxLocation::Unspecified => Ok(ResumePlacement::Preferred {
@@ -348,7 +433,10 @@ impl EnvdAuthorization {
 impl ApiImpl {
     /// Wakes a paused sandbox for data-plane traffic.
     ///
-    /// Placement and pin checks precede authorization and shared resume arbitration.
+    /// A sandbox already running is answered as it stands, before
+    /// authorization and the auto-resume gate: the same answer a projection hit
+    /// gives, and envd enforces the access token on the node. Placement and pin
+    /// checks precede authorization and shared resume arbitration for the rest.
     pub(in crate::api) async fn resume_for_data_plane(
         &self,
         request: DataPlaneResumeRequest,
@@ -359,6 +447,32 @@ impl ApiImpl {
             Ok(placement) => placement,
             Err(refusal) => return refusal.into(),
         };
+        if let ResumePlacement::Running {
+            node,
+            execution_id,
+            from_projection,
+        } = &placement
+        {
+            if !from_projection {
+                // The projection missed a running sandbox: repair it now so the
+                // next request is a hit, budgeted from the sandbox's own record.
+                let projection_ttl_secs = self
+                    .orchestrator
+                    .get_sandbox(&sandbox_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|metadata| metadata.projection_ttl_secs(SystemTime::now()))
+                    .unwrap_or(0);
+                self.project_running(sandbox_id, node, *execution_id, projection_ttl_secs)
+                    .await;
+            }
+            return DataPlaneResume::Woken {
+                node_id: node.node_id.clone(),
+                node_address: node.address.clone(),
+                execution_id: *execution_id,
+            };
+        }
         if let Some(refused) = self.refuse_unhonourable_pin(sandbox_id, &placement) {
             return refused;
         }
@@ -486,7 +600,7 @@ impl ApiImpl {
                         )
                         .await;
                 }
-                self.woken(metadata, placement)
+                self.woken(metadata, placement).await
             }
             Err(OrchestratorError::SandboxNotFound(_)) => {
                 // With a claim row, rebuild from its snapshot; otherwise settle absence.
@@ -497,7 +611,7 @@ impl ApiImpl {
                     .restore_claimed_sandbox(*entry, Self::wake_timeout())
                     .await;
 
-                self.woken_from_rebuild(rebuilt, placement)
+                self.woken_from_rebuild(rebuilt, placement).await
             }
             Err(err) => {
                 // The origin cannot serve this reopen, and the row names a snapshot.
@@ -506,7 +620,7 @@ impl ApiImpl {
                         .rebuild_instead_of_reopening(entry, Self::wake_timeout())
                         .await;
 
-                    return self.woken_from_rebuild(rebuilt, placement);
+                    return self.woken_from_rebuild(rebuilt, placement).await;
                 }
 
                 warn!(%sandbox_id, error = %err, "waking a sandbox for the data plane failed");
@@ -523,13 +637,13 @@ impl ApiImpl {
         NewTimeout::EnsureMinimum(auto_resume_min_sandbox_timeout())
     }
 
-    fn woken_from_rebuild(
+    async fn woken_from_rebuild(
         &self,
         rebuilt: CrossNodeResume,
         placement: &ResumePlacement,
     ) -> DataPlaneResume {
         match rebuilt {
-            CrossNodeResume::Restored(metadata) => self.woken(*metadata, placement),
+            CrossNodeResume::Restored(metadata) => self.woken(*metadata, placement).await,
             CrossNodeResume::NotFound => DataPlaneResume::NotFound,
             CrossNodeResume::Failed(reason) => DataPlaneResume::Failed(reason),
         }
@@ -546,23 +660,30 @@ impl ApiImpl {
             .await
         {
             MissingLocalResume::Unknown => DataPlaneResume::NotFound,
-            MissingLocalResume::Resumed(metadata) => self.woken(*metadata, placement),
+            MissingLocalResume::Resumed(metadata) => self.woken(*metadata, placement).await,
             MissingLocalResume::Busy { holder } => DataPlaneResume::TransitionInProgress { holder },
             MissingLocalResume::Undecided(reason) => DataPlaneResume::Undecided(reason),
             MissingLocalResume::Failed(reason) => DataPlaneResume::Failed(reason),
         }
     }
 
-    /// Returns the actual node and incarnation now serving the sandbox.
+    /// Returns the actual node and incarnation now serving the sandbox, and
+    /// writes that answer into the routing projection before it is returned.
     ///
     /// Local wake-ups report this process; remote orchestration reports its placement.
-    fn woken(&self, metadata: SandboxMetadata, placement: &ResumePlacement) -> DataPlaneResume {
+    async fn woken(
+        &self,
+        metadata: SandboxMetadata,
+        placement: &ResumePlacement,
+    ) -> DataPlaneResume {
         let (node_id, node_address) = match &self.resume_wiring.wake_site {
             WakeSite::Local(here) => {
                 // Reuse a placement address only when it names this machine; otherwise
                 // leave it empty for the gateway to resolve.
                 let address = match placement {
-                    ResumePlacement::Pinned { node } | ResumePlacement::Preferred { node, .. }
+                    ResumePlacement::Running { node, .. }
+                    | ResumePlacement::Pinned { node }
+                    | ResumePlacement::Preferred { node, .. }
                         if node.node_id == *here =>
                     {
                         node.address.clone()
@@ -572,7 +693,9 @@ impl ApiImpl {
                 (here.clone(), address)
             }
             WakeSite::Remote => match placement {
-                ResumePlacement::Pinned { node } | ResumePlacement::Preferred { node, .. } => {
+                ResumePlacement::Running { node, .. }
+                | ResumePlacement::Pinned { node }
+                | ResumePlacement::Preferred { node, .. } => {
                     (node.node_id.clone(), node.address.clone())
                 }
                 ResumePlacement::Unconstrained => {
@@ -581,10 +704,51 @@ impl ApiImpl {
             },
         };
 
-        DataPlaneResume::Woken {
+        let node = PlacedNode {
             node_id,
-            node_address,
+            address: node_address,
+        };
+        self.project_running(
+            metadata.id,
+            &node,
+            metadata.execution_id,
+            metadata.projection_ttl_secs(SystemTime::now()),
+        )
+        .await;
+
+        DataPlaneResume::Woken {
+            node_id: node.node_id,
+            node_address: node.address,
             execution_id: metadata.execution_id,
+        }
+    }
+
+    /// Records where a sandbox is running, when this process holds the projection.
+    ///
+    /// Never fails the caller: the answer still names the node, and the node's
+    /// next heartbeat rewrites the record.
+    async fn project_running(
+        &self,
+        sandbox_id: SandboxId,
+        node: &PlacedNode,
+        execution_id: ExecutionId,
+        projection_ttl_secs: u32,
+    ) {
+        let Some(writer) = self.resume_wiring.projection.as_ref() else {
+            return;
+        };
+        if let Err(error) = writer
+            .record_running(sandbox_id, node, execution_id, projection_ttl_secs)
+            .await
+        {
+            warn!(
+                %sandbox_id,
+                node_id = %node.node_id,
+                %execution_id,
+                error = %error,
+                "could not write the routing projection for a running sandbox; the next \
+                 request pays a resume RPC until the node's heartbeat repairs it"
+            );
         }
     }
 
@@ -699,6 +863,7 @@ fn auto_resume_min_sandbox_timeout() -> std::time::Duration {
 mod tests {
     use super::*;
 
+    use crate::binding_store::BindingStore as _;
     use crate::orchestrator::PausedRegistryState;
 
     fn scheduler_not_reporting(state: &str, node: &str) -> String {
@@ -727,11 +892,14 @@ mod tests {
 
     #[test]
     fn only_a_pinned_location_pins_and_the_other_three_are_preferences() {
-        let pinned = placement_from_lookup(response(
-            Some(("origin", "http://origin:8000")),
-            scheduler::SandboxLocation::Pinned,
-            "origin",
-        ))
+        let pinned = placement_from_lookup(
+            response(
+                Some(("origin", "http://origin:8000")),
+                scheduler::SandboxLocation::Pinned,
+                "origin",
+            ),
+            false,
+        )
         .expect("a pinned answer names a node");
         assert_eq!(
             pinned,
@@ -749,11 +917,10 @@ mod tests {
             scheduler::SandboxLocation::Bound,
             scheduler::SandboxLocation::Unspecified,
         ] {
-            let placement = placement_from_lookup(response(
-                Some(("chosen", "http://chosen:8000")),
-                location,
-                "origin",
-            ))
+            let placement = placement_from_lookup(
+                response(Some(("chosen", "http://chosen:8000")), location, "origin"),
+                false,
+            )
             .expect("a non-pinned answer still names a node");
             assert_eq!(
                 placement,
@@ -771,9 +938,11 @@ mod tests {
 
     #[test]
     fn an_answer_with_no_node_is_unavailable_rather_than_a_placement_on_nobody() {
-        let nameless =
-            placement_from_lookup(response(None, scheduler::SandboxLocation::Placed, "origin"))
-                .expect_err("half an answer is not an address");
+        let nameless = placement_from_lookup(
+            response(None, scheduler::SandboxLocation::Placed, "origin"),
+            false,
+        )
+        .expect_err("half an answer is not an address");
         assert!(
             matches!(nameless, PlacementRefusal::Unavailable(_)),
             "a resume placed on a node called \"\" fails in a way that looks like \
@@ -781,11 +950,14 @@ mod tests {
         );
 
         assert!(
-            placement_from_lookup(response(
-                Some(("chosen", "")),
-                scheduler::SandboxLocation::Placed,
-                "origin",
-            ))
+            placement_from_lookup(
+                response(
+                    Some(("chosen", "")),
+                    scheduler::SandboxLocation::Placed,
+                    "origin",
+                ),
+                false,
+            )
             .is_ok(),
             "an empty *address* is fine — the gateway resolves the node itself. \
              It is a missing node that is not an answer"
@@ -1144,12 +1316,13 @@ mod tests {
         // The same sandbox id, now with a live binding — stage 1 of the same
         // call, which answers BOUND.
         let binding_store = empty_binding_store();
+        let execution_id = ExecutionId::new();
         binding_store
             .record(
                 &sandbox_id.to_string(),
                 crate::binding_store::Binding {
                     node: discovered("node-a", "http://10.0.0.1:8000"),
-                    execution_id: ExecutionId::new().to_string(),
+                    execution_id: execution_id.to_string(),
                     projection_ttl: std::time::Duration::ZERO,
                     state: crate::binding_store::BindingState::Confirmed,
                 },
@@ -1169,12 +1342,13 @@ mod tests {
         .expect("a binding names a node");
         assert_eq!(
             bound,
-            ResumePlacement::Preferred {
+            ResumePlacement::Running {
                 node: PlacedNode {
                     node_id: "node-a".to_string(),
                     address: "http://10.0.0.1:8000".to_string(),
                 },
-                origin_node_id: String::new(),
+                execution_id,
+                from_projection: true,
             },
             "🔴 BOUND is a hint about where the layers are, not a claim that the \
              bytes exist nowhere else; reading it as a pin refuses ordinary \
@@ -1273,9 +1447,7 @@ mod tests {
         );
 
         let status = service
-            .lookup_node(tonic::Request::new(scheduler::LookupNodeRequest {
-                sandbox_id: "   ".to_string(),
-            }))
+            .lookup_sandbox("   ")
             .await
             .expect_err("a blank sandbox id is not a lookup");
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
@@ -1382,5 +1554,508 @@ mod tests {
             "a zero floor raises nothing, so a sandbox woken at the end of its \
              life would be evicted again immediately"
         );
+    }
+
+    /// A binding store that counts writes and can be told to refuse them, so a
+    /// test can tell "answered without writing" from "wrote the same thing".
+    struct CountingBindingStore {
+        inner: Arc<dyn crate::binding_store::BindingStore>,
+        writes: std::sync::atomic::AtomicUsize,
+        refuse_writes: bool,
+    }
+
+    impl CountingBindingStore {
+        fn over(
+            inner: Arc<dyn crate::binding_store::BindingStore>,
+            refuse_writes: bool,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+                refuse_writes,
+            })
+        }
+
+        fn writes(&self) -> usize {
+            self.writes.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl crate::binding_store::BindingStore for CountingBindingStore {
+        async fn get(
+            &self,
+            sandbox_id: &str,
+            now: std::time::SystemTime,
+        ) -> Result<Option<crate::binding_store::Binding>, crate::binding_store::BindingStoreError>
+        {
+            self.inner.get(sandbox_id, now).await
+        }
+
+        async fn record(
+            &self,
+            sandbox_id: &str,
+            binding: crate::binding_store::Binding,
+            now: std::time::SystemTime,
+        ) -> Result<crate::binding_store::BindingDecision, crate::binding_store::BindingStoreError>
+        {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.refuse_writes {
+                return Err(crate::binding_store::BindingStoreError::new(
+                    "redis is away",
+                ));
+            }
+            self.inner.record(sandbox_id, binding, now).await
+        }
+
+        async fn reconcile_node(
+            &self,
+            node: crate::node_registry::types::Node,
+            roster: Vec<crate::node_registry::types::RosterEntry>,
+            now: std::time::SystemTime,
+        ) -> Result<
+            Vec<(String, crate::binding_store::BindingDecision)>,
+            crate::binding_store::BindingStoreError,
+        > {
+            self.inner.reconcile_node(node, roster, now).await
+        }
+
+        async fn delete(
+            &self,
+            sandbox_id: &str,
+            execution_id: &str,
+            now: std::time::SystemTime,
+        ) -> Result<
+            crate::binding_store::BindingDeleteOutcome,
+            crate::binding_store::BindingStoreError,
+        > {
+            self.inner.delete(sandbox_id, execution_id, now).await
+        }
+
+        async fn release_reservation(
+            &self,
+            sandbox_id: &str,
+            execution_id: &str,
+            now: std::time::SystemTime,
+        ) -> Result<
+            crate::binding_store::BindingDeleteOutcome,
+            crate::binding_store::BindingStoreError,
+        > {
+            self.inner
+                .release_reservation(sandbox_id, execution_id, now)
+                .await
+        }
+    }
+
+    const NODE_A: &str = "node-a";
+    const NODE_A_ADDRESS: &str = "http://10.0.0.1:8000";
+
+    /// A registry with node-a discovered and reporting, the way every cluster
+    /// test in this module starts.
+    fn registry_with_node_a() -> Arc<crate::node_registry::registry::AtomicNodeRegistry> {
+        let registry = Arc::new(crate::node_registry::registry::AtomicNodeRegistry::new(
+            vec![discovered(NODE_A, NODE_A_ADDRESS)],
+            std::time::Duration::from_secs(30),
+        ));
+        crate::node_registry::registry::NodeRegistry::heartbeat(
+            registry.as_ref(),
+            &a_heartbeat(NODE_A, scheduler::NodeStatus::Ready),
+            std::time::SystemTime::now(),
+        )
+        .expect("node-a is in discovery");
+        registry
+    }
+
+    /// `wired_service` with the projection made authoritative, so the TTL a
+    /// write carries is the one the store keeps.
+    fn wired_authoritative_service(
+        registry: &Arc<crate::node_registry::registry::AtomicNodeRegistry>,
+        binding_store: Arc<dyn crate::binding_store::BindingStore>,
+        paused: Arc<dyn crate::orchestrator::PausedSandboxRegistry>,
+    ) -> NodeRegistryGrpcService {
+        NodeRegistryGrpcService::new(Arc::clone(registry), warm_gate(registry))
+            .with_binding_store(binding_store, true, std::time::Duration::ZERO)
+            .with_artifact_store(Arc::new(
+                crate::binding_store::artifact_index::InMemoryArtifactStore::new(8),
+            ))
+            .with_paused_registry(paused)
+    }
+
+    /// The api half over an in-memory orchestrator, wired the way `aenv-api`
+    /// wires it: the placement source and the projection writer are the one
+    /// in-process registry service.
+    async fn api_half_over(service: NodeRegistryGrpcService) -> Arc<ApiImpl> {
+        let orchestrator = crate::orchestrator::Orchestrator::new(
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+            crate::orchestrator::InMemoryMetadataStore::new(),
+            crate::sandbox::mock::MockBackendFactory::new(),
+            crate::orchestrator::DisabledSandboxPersister,
+            crate::image::DisabledRuntimeImageRefs::shared(),
+        )
+        .await
+        .expect("an in-memory orchestrator");
+        let snapshot_manager = Arc::new(crate::snapshot::mock::mock_snapshot_manager());
+        Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry),
+                snapshot_manager,
+                &crate::identity::NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+            ResumeWiring::cluster_in_process(service),
+        ))
+    }
+
+    fn data_plane_request(sandbox_id: SandboxId) -> DataPlaneResumeRequest {
+        DataPlaneResumeRequest {
+            sandbox_id,
+            target_port: None,
+            envd_access_token: String::new(),
+        }
+    }
+
+    async fn seed_paused(api: &ApiImpl, sandbox_id: SandboxId, auto_resume: bool) {
+        api.orchestrator()
+            .set_metadata_state_for_test(sandbox_id, SandboxState::Paused)
+            .await
+            .expect("seed a paused sandbox");
+        api.orchestrator()
+            .set_auto_resume_for_test(&sandbox_id, auto_resume)
+            .await
+            .expect("set the flag");
+    }
+
+    async fn bind_running(
+        store: &dyn crate::binding_store::BindingStore,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) {
+        store
+            .record(
+                &sandbox_id.to_string(),
+                crate::binding_store::Binding {
+                    node: discovered(NODE_A, NODE_A_ADDRESS),
+                    execution_id: execution_id.to_string(),
+                    projection_ttl: std::time::Duration::ZERO,
+                    state: crate::binding_store::BindingState::Confirmed,
+                },
+                std::time::SystemTime::now(),
+            )
+            .await
+            .expect("install the binding");
+    }
+
+    fn paused_row_registry(
+        sandbox_id: SandboxId,
+    ) -> Arc<dyn crate::orchestrator::PausedSandboxRegistry> {
+        Arc::new(OneRowRegistry {
+            entry: registry_row(sandbox_id, PausedRegistryState::Paused, NODE_A, None),
+        })
+    }
+
+    #[test]
+    fn a_bound_answer_under_registry_authority_is_running_and_says_where_it_came_from() {
+        let execution_id = ExecutionId::new();
+        let running = |answered_by_binding: bool| {
+            placement_from_lookup(
+                scheduler::LookupNodeResponse {
+                    execution_id: execution_id.to_string(),
+                    execution_authority: scheduler::ExecutionAuthority::Registry as i32,
+                    ..response(
+                        Some((NODE_A, NODE_A_ADDRESS)),
+                        scheduler::SandboxLocation::Bound,
+                        "",
+                    )
+                },
+                answered_by_binding,
+            )
+            .expect("a bound answer names a node")
+        };
+        for from_projection in [true, false] {
+            assert_eq!(
+                running(from_projection),
+                ResumePlacement::Running {
+                    node: PlacedNode {
+                        node_id: NODE_A.to_string(),
+                        address: NODE_A_ADDRESS.to_string(),
+                    },
+                    execution_id,
+                    from_projection,
+                }
+            );
+        }
+
+        // Registry authority with an id that is not an incarnation is the
+        // preference it would have been before incarnations were recorded.
+        let unspellable = placement_from_lookup(
+            scheduler::LookupNodeResponse {
+                execution_id: "not-a-uuid".to_string(),
+                execution_authority: scheduler::ExecutionAuthority::Registry as i32,
+                ..response(
+                    Some((NODE_A, NODE_A_ADDRESS)),
+                    scheduler::SandboxLocation::Bound,
+                    "",
+                )
+            },
+            true,
+        )
+        .expect("still names a node");
+        assert!(
+            matches!(unspellable, ResumePlacement::Preferred { .. }),
+            "{unspellable:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_the_projection_says_is_running_is_answered_before_the_auto_resume_gate() {
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        let registry = registry_with_node_a();
+        let store = CountingBindingStore::over(empty_binding_store(), false);
+        bind_running(store.as_ref(), sandbox_id, execution_id).await;
+        let writes_before = store.writes();
+        let api = api_half_over(wired_service(
+            &registry,
+            Arc::clone(&store) as Arc<dyn crate::binding_store::BindingStore>,
+            paused_row_registry(sandbox_id),
+        ))
+        .await;
+        // The record this process holds says paused with the flag off, which
+        // is what refuses the wake-up below; the binding says the cluster has
+        // it running, and running wins.
+        seed_paused(&api, sandbox_id, false).await;
+
+        let outcome = api
+            .resume_for_data_plane(data_plane_request(sandbox_id))
+            .await;
+
+        assert_eq!(
+            outcome,
+            DataPlaneResume::Woken {
+                node_id: NODE_A.to_string(),
+                node_address: NODE_A_ADDRESS.to_string(),
+                execution_id,
+            },
+            "🔴 autoResume governs starting a sandbox, never routing to one that is \
+             running; a refusal here is the flag silently breaking the data plane"
+        );
+        assert_eq!(
+            store.writes(),
+            writes_before,
+            "the binding answered, so writing it back would only churn the record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_running_only_in_the_heartbeat_ledger_is_answered_and_projected() {
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        let registry = registry_with_node_a();
+        crate::node_registry::registry::NodeRegistry::heartbeat(
+            registry.as_ref(),
+            &scheduler::HeartbeatRequest {
+                roster: vec![scheduler::SandboxRosterEntry {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: execution_id.to_string(),
+                    projection_ttl_secs: 0,
+                    paused: false,
+                }],
+                ..a_heartbeat(NODE_A, scheduler::NodeStatus::Ready)
+            },
+            std::time::SystemTime::now(),
+        )
+        .expect("node-a reports the sandbox");
+        let store = CountingBindingStore::over(empty_binding_store(), false);
+        let api = api_half_over(wired_service(
+            &registry,
+            Arc::clone(&store) as Arc<dyn crate::binding_store::BindingStore>,
+            paused_row_registry(sandbox_id),
+        ))
+        .await;
+        seed_paused(&api, sandbox_id, false).await;
+
+        let outcome = api
+            .resume_for_data_plane(data_plane_request(sandbox_id))
+            .await;
+
+        assert_eq!(
+            outcome,
+            DataPlaneResume::Woken {
+                node_id: NODE_A.to_string(),
+                node_address: NODE_A_ADDRESS.to_string(),
+                execution_id,
+            }
+        );
+        assert_eq!(store.writes(), 1, "a running miss is repaired on the spot");
+        let binding = store
+            .get(&sandbox_id.to_string(), std::time::SystemTime::now())
+            .await
+            .expect("the store answers")
+            .expect("the projection now names the node");
+        assert_eq!(binding.node.id, NODE_A);
+        assert_eq!(binding.execution_id, execution_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn a_paused_sandbox_with_auto_resume_off_is_refused_and_with_it_on_reaches_the_wake_path()
+    {
+        let refused_id = SandboxId::new();
+        let registry = registry_with_node_a();
+        let api = api_half_over(wired_service(
+            &registry,
+            empty_binding_store(),
+            paused_row_registry(refused_id),
+        ))
+        .await;
+        seed_paused(&api, refused_id, false).await;
+
+        assert_eq!(
+            api.resume_for_data_plane(data_plane_request(refused_id))
+                .await,
+            DataPlaneResume::AutoResumeDisabled,
+            "🔴 the sandbox exists and still resumes through the REST route; \
+             anything else here either wakes it against its owner's word or \
+             tells the platform it is gone"
+        );
+
+        let woken_id = SandboxId::new();
+        let registry = registry_with_node_a();
+        let api = api_half_over(wired_service(
+            &registry,
+            empty_binding_store(),
+            paused_row_registry(woken_id),
+        ))
+        .await;
+        seed_paused(&api, woken_id, true).await;
+
+        let outcome = api
+            .resume_for_data_plane(data_plane_request(woken_id))
+            .await;
+        assert_ne!(
+            outcome,
+            DataPlaneResume::AutoResumeDisabled,
+            "🔴 with the flag on the same path must get past the gate and fail, \
+             if at all, on the wake-up itself; sharing an outcome with the \
+             refused case would let a build that refuses everything pass above"
+        );
+        assert!(
+            !matches!(outcome, DataPlaneResume::Woken { .. }),
+            "the mock backend cannot bring a paused sandbox up: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wake_up_writes_the_projection_with_the_sandbox_s_own_budget() {
+        let sandbox_id = SandboxId::new();
+        let registry = registry_with_node_a();
+        let store = CountingBindingStore::over(
+            Arc::new(crate::binding_store::InMemoryBindingStore::new(
+                crate::binding_store::BindingStoreSettings {
+                    binding_ttl: std::time::Duration::from_secs(30),
+                    projection_authoritative: true,
+                },
+            )),
+            false,
+        );
+        let api = api_half_over(wired_authoritative_service(
+            &registry,
+            Arc::clone(&store) as Arc<dyn crate::binding_store::BindingStore>,
+            paused_row_registry(sandbox_id),
+        ))
+        .await;
+        // Running already, so the wake-up is the idempotent success; the row
+        // above keeps the lookup from answering it as running outright.
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                sandbox_id,
+                crate::orchestrator::ProxyTarget::new(std::net::Ipv4Addr::LOCALHOST),
+                SandboxState::Running,
+            )
+            .await;
+        api.orchestrator()
+            .set_max_lifetime_for_test(&sandbox_id, std::time::Duration::from_secs(600))
+            .await
+            .expect("cap the lifetime");
+        let started = std::time::SystemTime::now();
+
+        let outcome = api
+            .resume_for_data_plane(data_plane_request(sandbox_id))
+            .await;
+
+        let DataPlaneResume::Woken {
+            node_id,
+            execution_id,
+            ..
+        } = outcome
+        else {
+            panic!("a running sandbox is a successful wake-up: {outcome:?}");
+        };
+        assert_eq!(node_id, NODE_A);
+        assert_eq!(store.writes(), 1, "the wake-up wrote the projection once");
+        let key = sandbox_id.to_string();
+        let binding = store
+            .get(&key, started)
+            .await
+            .expect("the store answers")
+            .expect("the projection names the node the sandbox woke on");
+        assert_eq!(binding.node.id, NODE_A);
+        assert_eq!(binding.execution_id, execution_id.to_string());
+        // 🔴 The budget is the sandbox's remaining lifetime, not the store's
+        // 30 s default: a projection that expires before the sandbox does
+        // costs a resume RPC on every request after its first half minute.
+        assert!(
+            store
+                .get(&key, started + std::time::Duration::from_secs(300))
+                .await
+                .expect("the store answers")
+                .is_some(),
+            "the projection expired on the store's default TTL"
+        );
+        assert!(
+            store
+                .get(
+                    &key,
+                    started + std::time::Duration::from_secs(600 + 86_400 + 1)
+                )
+                .await
+                .expect("the store answers")
+                .is_none(),
+            "the projection outlives every lifetime the sandbox could have"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_projection_write_that_fails_does_not_fail_the_wake_up() {
+        let sandbox_id = SandboxId::new();
+        let registry = registry_with_node_a();
+        let store = CountingBindingStore::over(empty_binding_store(), true);
+        let api = api_half_over(wired_service(
+            &registry,
+            Arc::clone(&store) as Arc<dyn crate::binding_store::BindingStore>,
+            paused_row_registry(sandbox_id),
+        ))
+        .await;
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                sandbox_id,
+                crate::orchestrator::ProxyTarget::new(std::net::Ipv4Addr::LOCALHOST),
+                SandboxState::Running,
+            )
+            .await;
+
+        let outcome = api
+            .resume_for_data_plane(data_plane_request(sandbox_id))
+            .await;
+
+        assert!(
+            matches!(outcome, DataPlaneResume::Woken { ref node_id, .. } if node_id == NODE_A),
+            "🔴 the answer still names the node; the store being away costs the \
+             next request a resume RPC, not this one its sandbox: {outcome:?}"
+        );
+        assert_eq!(store.writes(), 1, "the write was attempted");
     }
 }

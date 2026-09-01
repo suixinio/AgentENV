@@ -61,6 +61,13 @@ pub struct NodeRegistryGrpcService {
     shadow: Arc<ShadowPlacement>,
 }
 
+/// A `LookupNode` answer together with which of the three sources produced it.
+#[derive(Debug, Clone)]
+pub struct SandboxLookup {
+    pub response: LookupNodeResponse,
+    pub label: LookupResultLabel,
+}
+
 impl NodeRegistryGrpcService {
     pub fn new(registry: Arc<AtomicNodeRegistry>, warmup: Arc<WarmupGate>) -> Self {
         Self {
@@ -117,6 +124,148 @@ impl NodeRegistryGrpcService {
         self.projection_authoritative = projection_authoritative;
         self.max_projection_ttl = max_projection_ttl;
         self
+    }
+
+    /// Resolves a sandbox through the binding store, the heartbeat roster and
+    /// the paused registry, in that order, naming which of the three answered.
+    ///
+    /// The in-process form of `LookupNode`; the gRPC method is a thin wrapper.
+    pub async fn lookup_sandbox(&self, sandbox_id: &str) -> Result<SandboxLookup, Status> {
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "LookupNode needs a binding store, and this deployment has none wired: \
+                 {NOT_WIRED}"
+            )));
+        };
+        let sandbox_id = sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            Self::record_lookup_node(LookupResultLabel::InvalidArgument);
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+
+        let deps = LookupDeps {
+            place: ScheduleDeps {
+                node_registry: self.registry.as_ref(),
+                strategy: self.strategy.as_ref(),
+                shadow: self.shadow.as_ref(),
+            },
+            binding_store: binding_store.as_ref(),
+            paused_registry: self.paused_registry.as_deref(),
+            warmup: self.warmup.as_ref(),
+        };
+        let outcome = lookup_logic::lookup_node(&deps, sandbox_id, SystemTime::now()).await;
+        Self::record_lookup_node(outcome.label());
+        match outcome {
+            LookupOutcome::Answer(answer) => {
+                Self::record_lookup_execution_authority(answer.execution_authority);
+                Ok(SandboxLookup {
+                    response: LookupNodeResponse {
+                        node: Some(scheduler::Node {
+                            node_id: answer.node.id,
+                            endpoint: answer.node.endpoint,
+                        }),
+                        location: answer.location as i32,
+                        origin_node_id: answer.origin_node_id,
+                        execution_id: answer.execution_id,
+                        execution_authority: answer.execution_authority as i32,
+                    },
+                    label: answer.label,
+                })
+            }
+            LookupOutcome::NotFound => Err(Status::not_found("sandbox assignment not found")),
+            LookupOutcome::Unavailable(_label, message) => Err(Status::unavailable(message)),
+            LookupOutcome::FailedPrecondition(_label, message) => {
+                Err(Status::failed_precondition(message))
+            }
+        }
+    }
+
+    /// Writes the routing projection for a sandbox running under `execution_id`
+    /// on `node_id`, from this process's own resume surface.
+    ///
+    /// Same normalisation, TTL gate and cap as `RecordAssignment`; the caller
+    /// treats an error as a missed hit, never as a failed wake-up.
+    pub async fn record_running(
+        &self,
+        sandbox_id: &str,
+        node_id: &str,
+        execution_id: &str,
+        projection_ttl_secs: u32,
+    ) -> Result<(), Status> {
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "recording a running sandbox needs a binding store, and this deployment \
+                 has none wired: {NOT_WIRED}"
+            )));
+        };
+        let sandbox_id = sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        let node_id = node_id.trim();
+        if node_id.is_empty() {
+            return Err(Status::invalid_argument("node_id is required"));
+        }
+        self.write_binding(
+            &binding_store,
+            sandbox_id,
+            node_id,
+            execution_id,
+            projection_ttl_secs,
+            "resume",
+        )
+        .await
+    }
+
+    async fn write_binding(
+        &self,
+        binding_store: &Arc<dyn BindingStore>,
+        sandbox_id: &str,
+        node_id: &str,
+        execution_id: &str,
+        projection_ttl_secs: u32,
+        source: &'static str,
+    ) -> Result<(), Status> {
+        let Some(node) = self.registry.resolve(node_id) else {
+            return Err(Status::invalid_argument(
+                "node is not in scheduler node list",
+            ));
+        };
+
+        let (execution, _reason) =
+            crate::binding_store::record::normalize_execution_id_reason(execution_id);
+        let (projection_ttl, ttl_source) =
+            self.resolve_projection_ttl(projection_ttl_from_secs(projection_ttl_secs));
+        Self::record_projection_ttl_source(ttl_source);
+
+        let now = SystemTime::now();
+        match binding_store
+            .record(
+                sandbox_id,
+                crate::binding_store::Binding {
+                    node,
+                    execution_id: execution,
+                    projection_ttl,
+                    state: BindingState::Confirmed,
+                },
+                now,
+            )
+            .await
+        {
+            Err(err) => {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    source,
+                    "binding write failed"
+                );
+                Err(Status::unavailable("binding store unavailable"))
+            }
+            Ok(decision) => {
+                Self::record_binding_execution(source, decision);
+                Ok(())
+            }
+        }
     }
 
     // The judgement belongs here and is named explicitly rather than left for the
@@ -670,51 +819,10 @@ impl Scheduler for NodeRegistryGrpcService {
         &self,
         request: Request<LookupNodeRequest>,
     ) -> Result<Response<LookupNodeResponse>, Status> {
-        let Some(binding_store) = self.binding_store.clone() else {
-            return Err(Status::unimplemented(format!(
-                "LookupNode needs a binding store, and this deployment has none wired: \
-                 {NOT_WIRED}"
-            )));
-        };
         let req = request.into_inner();
-        let sandbox_id = req.sandbox_id.trim();
-        if sandbox_id.is_empty() {
-            Self::record_lookup_node(LookupResultLabel::InvalidArgument);
-            return Err(Status::invalid_argument("sandbox_id is required"));
-        }
-
-        let deps = LookupDeps {
-            place: ScheduleDeps {
-                node_registry: self.registry.as_ref(),
-                strategy: self.strategy.as_ref(),
-                shadow: self.shadow.as_ref(),
-            },
-            binding_store: binding_store.as_ref(),
-            paused_registry: self.paused_registry.as_deref(),
-            warmup: self.warmup.as_ref(),
-        };
-        let outcome = lookup_logic::lookup_node(&deps, sandbox_id, SystemTime::now()).await;
-        Self::record_lookup_node(outcome.label());
-        match outcome {
-            LookupOutcome::Answer(answer) => {
-                Self::record_lookup_execution_authority(answer.execution_authority);
-                Ok(Response::new(LookupNodeResponse {
-                    node: Some(scheduler::Node {
-                        node_id: answer.node.id,
-                        endpoint: answer.node.endpoint,
-                    }),
-                    location: answer.location as i32,
-                    origin_node_id: answer.origin_node_id,
-                    execution_id: answer.execution_id,
-                    execution_authority: answer.execution_authority as i32,
-                }))
-            }
-            LookupOutcome::NotFound => Err(Status::not_found("sandbox assignment not found")),
-            LookupOutcome::Unavailable(_label, message) => Err(Status::unavailable(message)),
-            LookupOutcome::FailedPrecondition(_label, message) => {
-                Err(Status::failed_precondition(message))
-            }
-        }
+        self.lookup_sandbox(&req.sandbox_id)
+            .await
+            .map(|lookup| Response::new(lookup.response))
     }
 
     /// Records an assignment after identity, execution-id, and projection-TTL normalization.
@@ -742,45 +850,16 @@ impl Scheduler for NodeRegistryGrpcService {
                 "node.node_id and node.endpoint are required",
             ));
         }
-        let Some(node) = self.registry.resolve(requested_id) else {
-            return Err(Status::invalid_argument(
-                "node is not in scheduler node list",
-            ));
-        };
-
-        let (execution, _reason) =
-            crate::binding_store::record::normalize_execution_id_reason(&req.execution_id);
-        let (projection_ttl, ttl_source) =
-            self.resolve_projection_ttl(projection_ttl_from_secs(req.projection_ttl_secs));
-        Self::record_projection_ttl_source(ttl_source);
-
-        let now = SystemTime::now();
-        match binding_store
-            .record(
-                sandbox_id,
-                crate::binding_store::Binding {
-                    node,
-                    execution_id: execution,
-                    projection_ttl,
-                    state: BindingState::Confirmed,
-                },
-                now,
-            )
-            .await
-        {
-            Err(err) => {
-                tracing::warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %err,
-                    "scheduler record_assignment binding write failed"
-                );
-                Err(Status::unavailable("binding store unavailable"))
-            }
-            Ok(decision) => {
-                Self::record_binding_execution("assignment", decision);
-                Ok(Response::new(RecordAssignmentResponse {}))
-            }
-        }
+        self.write_binding(
+            &binding_store,
+            sandbox_id,
+            requested_id,
+            &req.execution_id,
+            req.projection_ttl_secs,
+            "assignment",
+        )
+        .await
+        .map(|()| Response::new(RecordAssignmentResponse {}))
     }
 
     /// Applies best-effort PAUSE/DELETE projection removal and observes other events.

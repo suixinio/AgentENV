@@ -42,10 +42,31 @@ func TestParseRecordCases(t *testing.T) {
 
 			wantExecID: "abc",
 		},
+		{
+			name:     "an explicit confirmed state routes like an absent one",
+			raw:      `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1","state":"confirmed"}`,
+			wantOK:   true,
+			wantNode: Node{ID: "node-a", Endpoint: "http://node-a"},
+			// The writer omits the field instead of spelling this out, but its
+			// own decoder accepts it, so this one does too.
+			wantExecID: "exec-1",
+		},
 		{name: "no node id names nowhere", raw: `{"node":{"endpoint":"http://node-a"}}`, wantOK: false},
 		{name: "no endpoint names nowhere", raw: `{"node":{"node_id":"node-a"}}`, wantOK: false},
 		{name: "not json", raw: `not-json`, wantOK: false},
 		{name: "empty object", raw: `{}`, wantOK: false},
+		{
+			name: "a reservation names an assignment, not a place to forward to",
+			raw:  `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1","state":"` + stateStarting + `"}`,
+			// A complete record, naming a real node — refused on its state
+			// alone, which is the only thing separating it from the first case.
+			wantOK: false,
+		},
+		{
+			name:   "a state this build does not know is not routable either",
+			raw:    `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"state":"draining"}`,
+			wantOK: false,
+		},
 	}
 
 	for _, tc := range cases {
@@ -104,6 +125,14 @@ const (
 	storedRecordWithPodName = `{"node":{"node_id":"node-a","endpoint":"http://node-a","pod_name":"agentenv-node-7f4c2"},"execution_id":"0198b7cc-1111-7000-8000-000000000001"}`
 	// Without one — the ordinary shape, since `pod_name` is omitted when empty.
 	storedRecordWithoutPodName = `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"0198b7cc-1111-7000-8000-000000000001"}`
+	// A reservation, as the writer emits it while a create is in flight: the
+	// same shape with the state spelled out. 🔴 Its confirmed twin — the same
+	// node, the same incarnation, no state — is `storedReservationConfirmed`,
+	// and the pair is what makes the state the only difference between a record
+	// this package routes and one it refuses.
+	storedReservationRecord = `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1","state":"starting"}`
+	// The confirmation of that same reservation.
+	storedReservationConfirmed = `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1"}`
 )
 
 // storedRecordExecutionID is the incarnation both literals above carry.
@@ -150,6 +179,35 @@ func TestTheStoredRecordShapesParse(t *testing.T) {
 	}
 }
 
+// TestAReservationIsNotRoutableAndItsConfirmationIs decodes the exact pair of
+// strings the live writer produces for one create, either side of the node
+// acknowledging the sandbox.
+//
+// 🔴 The confirmed half is the control, and it is what makes this test about
+// the state field rather than about parsing. Both literals name the same node
+// and the same incarnation; a change that made ParseRecord refuse everything,
+// or accept everything, fails on one half or the other.
+//
+// A refused reservation is a projection miss, not an error and not an absence:
+// the request goes on to the api half, whose `lookup_node` refuses the same
+// record as `unavailable_starting`. The gateway never decides this itself.
+func TestAReservationIsNotRoutableAndItsConfirmationIs(t *testing.T) {
+	if _, ok := ParseRecord([]byte(storedReservationRecord)); ok {
+		t.Fatalf("a reservation was routed: %s", storedReservationRecord)
+	}
+
+	got, ok := ParseRecord([]byte(storedReservationConfirmed))
+	if !ok {
+		t.Fatalf("the confirmation of that reservation did not parse: %s", storedReservationConfirmed)
+	}
+	if got.Node != (Node{ID: "node-a", Endpoint: "http://node-a"}) {
+		t.Fatalf("node = %+v", got.Node)
+	}
+	if got.ExecutionID != "exec-1" {
+		t.Fatalf("execution id = %q, want %q", got.ExecutionID, "exec-1")
+	}
+}
+
 // rustWriterSource is the file holding the only writer of these bytes in the
 // cluster: `aenv-api`'s `marshal_record`.
 const rustWriterSource = "../../../src/binding_store/record.rs"
@@ -177,6 +235,8 @@ func TestTheStoredLiteralsAreTheOnesRustAssertsToo(t *testing.T) {
 	for name, literal := range map[string]string{
 		"storedRecordWithPodName":    storedRecordWithPodName,
 		"storedRecordWithoutPodName": storedRecordWithoutPodName,
+		"storedReservationRecord":    storedReservationRecord,
+		"storedReservationConfirmed": storedReservationConfirmed,
 	} {
 		if !strings.Contains(string(source), literal) {
 			t.Fatalf("%s is not asserted in %s:\n\t%s\n"+

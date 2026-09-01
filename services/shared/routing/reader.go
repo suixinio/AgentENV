@@ -87,7 +87,8 @@ func (r *Reader) Close() error {
 //     scheduler, which is what it did before this reader existed.
 //
 // An undecodable record is a miss. It names nowhere to forward to, and the
-// fallback will produce a real answer.
+// fallback will produce a real answer. So is a record whose create has not
+// finished: see ParseRecord.
 func (r *Reader) Get(ctx context.Context, sandboxID string) (Record, bool, error) {
 	sandboxID = strings.TrimSpace(sandboxID)
 	if sandboxID == "" {

@@ -69,7 +69,21 @@ type Record struct {
 	// ExecutionID is omitted when empty so a record written by this build and
 	// one written before the field existed decode to the same thing: unknown.
 	ExecutionID string `json:"execution_id,omitempty"`
+	// State says whether the record names a runtime its node has acknowledged.
+	// The writer omits it once the node has, so an empty state is confirmed and
+	// is what every record written before the field existed carries.
+	State string `json:"state,omitempty"`
 }
+
+// The states a stored record may name, spelled as `aenv-api`'s BindingState
+// serializes them (src/binding_store/record.rs).
+//
+// A confirmed record is written with the field absent, so stateConfirmed is
+// only ever read, never a value the writer emits.
+const (
+	stateConfirmed = "confirmed"
+	stateStarting  = "starting"
+)
 
 // BindingKey is where a sandbox's record lives. Both sides derive the key from
 // this function rather than from a format string of their own.
@@ -95,9 +109,26 @@ const DefaultKeyPrefix = "agentenv:scheduler:bindings"
 // refusing them would blank the binding table on the first upgrade. A record
 // with no node id is a different matter: it names nowhere, so it is not an
 // answer at all.
+//
+// 🔴 A record that is not confirmed names an assignment, not a runtime. The
+// writer installs a `starting` record when it picks a node for a create and
+// rewrites it once that node acknowledges the sandbox, so forwarding to the
+// node it names would put data-plane traffic at a VM that may not exist yet.
+// Refusing it here is a projection miss, which sends the request to the half
+// that owns the decision — and `lookup_node` refuses the same record there,
+// as `unavailable_starting`. The two ends give one verdict because only one of
+// them decides it.
+//
+// Any other non-empty state is refused for the same reason `aenv-api` refuses
+// it: its state is an enum, so a value this build does not know fails that
+// decode outright, and a gateway that forwarded what the writer's own reader
+// rejects would be the looser of the two.
 func ParseRecord(raw []byte) (Record, bool) {
 	var record Record
 	if err := json.Unmarshal(raw, &record); err != nil {
+		return Record{}, false
+	}
+	if record.State != "" && record.State != stateConfirmed {
 		return Record{}, false
 	}
 	node := Node{
@@ -108,7 +139,11 @@ func ParseRecord(raw []byte) (Record, bool) {
 	if node.ID == "" || node.Endpoint == "" {
 		return Record{}, false
 	}
-	return Record{Node: node, ExecutionID: strings.TrimSpace(record.ExecutionID)}, true
+	return Record{
+		Node:        node,
+		ExecutionID: strings.TrimSpace(record.ExecutionID),
+		State:       record.State,
+	}, true
 }
 
 // 🔴 There is no encoder here, and its absence is the point.

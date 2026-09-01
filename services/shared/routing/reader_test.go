@@ -79,6 +79,19 @@ func TestReaderGetMissIsNotAnError(t *testing.T) {
 		t.Fatalf("a record with no endpoint must be a clean miss, got (%v, %v)", ok, err)
 	}
 
+	// A reservation decodes and names a real node, and is still a miss: the
+	// create that put it there has not finished, so the api half is the only
+	// thing that may answer for this sandbox yet.
+	writeKey(t, client, BindingKey(DefaultKeyPrefix, "reserved"), storedReservationRecord)
+	if got, ok, err := reader.Get(context.Background(), "reserved"); err != nil || ok || got != (Record{}) {
+		t.Fatalf("a reservation must be a clean miss, got (%+v, %v, %v)", got, ok, err)
+	}
+	// The same key once the node has acknowledged the sandbox.
+	writeKey(t, client, BindingKey(DefaultKeyPrefix, "reserved"), storedReservationConfirmed)
+	if got, ok, err := reader.Get(context.Background(), "reserved"); err != nil || !ok || got.Node.ID != "node-a" {
+		t.Fatalf("the confirmation must be a hit, got (%+v, %v, %v)", got, ok, err)
+	}
+
 	if _, ok, err := reader.Get(context.Background(), "   "); err != nil || ok {
 		t.Fatalf("a blank sandbox id must be a clean miss, got (%v, %v)", ok, err)
 	}

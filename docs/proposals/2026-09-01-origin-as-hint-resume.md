@@ -86,6 +86,43 @@ publishing/local_only 收窄为"上传在途"。优雅关闭等待上传预算 +
 staging 双轨。阶段 C 后整个模型与 e2b 同构，origin 权威只剩上传窗口内的一段。
 独立排期，不阻塞 A/B。
 
+## 实施纪要（as-built，A/B 已实施）
+
+三个实施前调研项的结论，以及与上文方向的偏离：
+
+**capture 缺失有两个发现点，方向稿只写了一个。** 方向稿把降级点定位在
+`node_client/wire.rs` 的 capture-missing 错误。实测该错误只在节点**整个不认识**
+这个沙箱时产生（硬死重启：节点内存态为空 → `SandboxNotFound` → NOT_FOUND）。
+另一形态——节点活着、内存态仍是 Paused、只有 `records/<id>.json` 没了
+（discard、磁盘清理）——走的是持久化层：`mark_resuming` 读不到记录，节点
+`orchestrator_status` 把它归到 `other => Status::internal`，api 半边无从分类，
+仍是 500。故 A 阶段新增 `SandboxPersistenceError::RecordAbsent` 把这一缺席变成
+类型，节点将其映射为 NOT_FOUND，判据 `paused_resume_warrants_rebuild` 同时认
+本地与远端两种形状。**未新增任何 scheduler gRPC 面，也未新增 node RPC**：只是
+既有 resume RPC 的一个状态码。
+
+**阶段 B 的前两条在实施前已经成立。** 放置回落：`binding_store/lookup.rs` 对
+`Paused` 行早已用 `select_node(prefer = origin)`，而 `select_node` 只在 origin
+落在可调度集合内才优先，否则回落到 round-robin——即方向稿要的 `node = nil`
+语义。提示自我纠正：`MARK_RUNNING_SQL` 的 `SET origin_node_id = $7`（holder）
+每次 resume 都在改写 origin，契约测试已钉住。`claim_for_resume` 对已发布
+parked 行也无租约门槛，所以"等 90s"从来不在 claim 上。真正残留的锁是
+`node_client/stub.rs::reopen`：placement 选中的机器 ≠ 记录里的 origin 时它
+`bail!` 出一个未分类错误，origin 地址解析不到时同样。B 阶段把这两处改成
+`RemoteResumeFailure::OriginUnavailable`，判据放宽为"origin 无法服务此次
+reopen"（含 `NodeUnreachable`），**排除 `Refused`**——节点对该沙箱有明确意见时
+重建属于推翻判断而非绕过缺席。
+
+**租约缺陷与 B 无交互，且原描述基本被证伪，不修。** `replica_renewal.rs` 有
+10s 心跳驱动的续租回路（roster 驱动，`RENEW_LIVE_LEASE_SQL`），running 行还
+需要"租约过期 AND `sandbox_expires_at` 已过"两个条件才被回收，健康沙箱不会被
+回收。回收路径完全不读 `origin_node_id`，所以改写 origin 不改变可回收性。改写
+origin 唯一的租约后果是**换了哪台机器的心跳在续这一行**（续租 SQL 以
+`origin_node_id = v.node_id` 匹配），而 origin 恒被改写为实际 holder，与心跳
+身份同源，故自洽。两处残留另记：`sandbox_expires_at` 无后台续期，只随离散
+事件更新；`sandbox_expires_at IS NULL` 的 running 行在节点真死后永不回收
+(`NULL < now()` 为 NULL)——这才是"25h 暖位"那个开放问题的真身，独立于 A/B。
+
 ## 刻意不照抄 e2b 的两处
 
 1. **pause 不拆 binding**。e2b 的 `RemoveSandbox` 连路由一起拆，但 AgentENV 的
@@ -128,7 +165,4 @@ B 阶段**单批一次性对齐**，不允许两种语义并行的窗口期。
 1. 本方向依赖 `refactor/node-embedded-db-removal` 先合入 dev（其 records/
    JSON 化是阶段 A 测试注入 capture 缺失的手段，也已把 discard 语义定型）。
 2. A → B 可同分支连续做，C 独立提案排期。
-3. 实施前的调研项：Held 路由与节点侧 wake 的精确分工（api 半边 vs node 半边
-   谁先发现 capture 缺失）；`origin_node_id` 全部读取方清单（身份轴）；
-   paused-registry 租约刷新语义（reclaim 只看时间不看心跳的既有缺陷是否
-   顺带修）。
+3. 三个实施前调研项已结，结论见"实施纪要（as-built）"。

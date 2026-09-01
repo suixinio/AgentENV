@@ -855,10 +855,10 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
             Err(err) => {
-                // The capture is gone but the row's snapshot is not; rebuild instead.
-                if let Some(entry) = entry.filter(|_| err.is_paused_capture_absent()) {
+                // The origin cannot serve this reopen, and the row names a snapshot.
+                if let Some(entry) = entry.filter(|_| err.paused_resume_warrants_rebuild()) {
                     let rebuilt = self
-                        .rebuild_after_absent_capture(
+                        .rebuild_instead_of_reopening(
                             entry,
                             NewTimeout::Set(Duration::from_secs(body.timeout as u64)),
                         )
@@ -1529,10 +1529,10 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
             Err(err) => {
-                // The capture is gone but the row's snapshot is not; rebuild instead.
-                if let Some(entry) = entry.filter(|_| err.is_paused_capture_absent()) {
+                // The origin cannot serve this reopen, and the row names a snapshot.
+                if let Some(entry) = entry.filter(|_| err.paused_resume_warrants_rebuild()) {
                     let rebuilt = self
-                        .rebuild_after_absent_capture(entry, NewTimeout::Set(timeout))
+                        .rebuild_instead_of_reopening(entry, NewTimeout::Set(timeout))
                         .await;
 
                     return Ok(self.rebuilt_resume_response(rebuilt, sandbox_id));

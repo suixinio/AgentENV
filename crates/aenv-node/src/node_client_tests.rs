@@ -3838,9 +3838,14 @@ async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record
         node.endpoint.clone(),
         LookupAnswer::Holder(impostor.clone()),
     );
-    reopen(Arc::clone(&named_elsewhere))
+    let named_elsewhere_err = reopen(Arc::clone(&named_elsewhere))
         .await
         .expect_err("a capture was reopened although the cluster named another holder");
+    assert!(
+        crate::node_client::wire::warrants_rebuild(&named_elsewhere_err),
+        "the machine this capture names is no longer where the cluster puts the sandbox, so a \
+         published row has to rebuild rather than answer 500: {named_elsewhere_err:#}"
+    );
     assert!(
         running_on(&node).await.is_empty(),
         "a refused resume started something anyway"
@@ -3849,9 +3854,14 @@ async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record
     // Face 2: the cluster could not be consulted. Not an absence, so not a
     // fallback — an error.
     let unavailable = ClusterPlacement::answering(node.endpoint.clone(), LookupAnswer::Unavailable);
-    reopen(Arc::clone(&unavailable))
+    let unavailable_err = reopen(Arc::clone(&unavailable))
         .await
         .expect_err("a capture was reopened although the placement source could not be asked");
+    assert!(
+        !crate::node_client::wire::warrants_rebuild(&unavailable_err),
+        "the control: a placement source that could not be asked is not proof the origin is \
+         gone, and rebuilding on it discards a capture that is still there: {unavailable_err:#}"
+    );
     assert_eq!(
         unavailable.resolve_calls(),
         0,
@@ -3861,9 +3871,14 @@ async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record
 
     // Face 3: no record, and the fallback answers about a different machine.
     let misdirected = ClusterPlacement::resolving_to(node.endpoint.clone(), Some(impostor.clone()));
-    reopen(Arc::clone(&misdirected))
+    let misdirected_err = reopen(Arc::clone(&misdirected))
         .await
         .expect_err("a capture was reopened on a machine the fallback misnamed");
+    assert!(
+        crate::node_client::wire::warrants_rebuild(&misdirected_err),
+        "the fallback resolved the origin's name to another machine, which is the origin \
+         being gone under a different face: {misdirected_err:#}"
+    );
     assert_eq!(
         misdirected.resolve_calls(),
         1,

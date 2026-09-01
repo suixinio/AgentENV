@@ -500,10 +500,10 @@ impl ApiImpl {
                 self.woken_from_rebuild(rebuilt, placement)
             }
             Err(err) => {
-                // The capture is gone but the row's snapshot is not; rebuild instead.
-                if let Some(entry) = entry.filter(|_| err.is_paused_capture_absent()) {
+                // The origin cannot serve this reopen, and the row names a snapshot.
+                if let Some(entry) = entry.filter(|_| err.paused_resume_warrants_rebuild()) {
                     let rebuilt = self
-                        .rebuild_after_absent_capture(entry, Self::wake_timeout())
+                        .rebuild_instead_of_reopening(entry, Self::wake_timeout())
                         .await;
 
                     return self.woken_from_rebuild(rebuilt, placement);

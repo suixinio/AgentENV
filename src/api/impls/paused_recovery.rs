@@ -282,11 +282,12 @@ impl ApiImpl {
         }
     }
 
-    /// Rebuilds a claimed sandbox whose holding node no longer has the capture.
+    /// Rebuilds a claimed sandbox whose origin cannot serve its capture.
     ///
-    /// The stale local record is dropped first: it names a capture that is gone,
-    /// and the rebuild writes a new one.
-    pub(in crate::api) async fn rebuild_after_absent_capture(
+    /// The stale local record is dropped first: it names a capture no reopen can
+    /// reach, and the rebuild writes a new one. The held claim is the mutual
+    /// exclusion against the origin coming back and resuming the same sandbox.
+    pub(in crate::api) async fn rebuild_instead_of_reopening(
         &self,
         entry: Box<PausedSandboxEntry>,
         timeout: NewTimeout,
@@ -297,8 +298,8 @@ impl ApiImpl {
         info!(
             %sandbox_id,
             origin_node_id = %entry.origin_node_id,
-            "the node holding this paused sandbox no longer has its capture; rebuilding it \
-             from the published snapshot"
+            "the node this paused sandbox names cannot serve its capture; rebuilding it from \
+             the published snapshot"
         );
 
         match self

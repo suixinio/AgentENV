@@ -69,6 +69,12 @@ pub enum RemoteResumeFailure {
         sandbox_id: SandboxId,
         detail: String,
     },
+    #[error("node {node_id} cannot serve sandbox {sandbox_id}'s capture: {detail}")]
+    OriginUnavailable {
+        node_id: String,
+        sandbox_id: SandboxId,
+        detail: String,
+    },
 }
 
 impl RemoteResumeFailure {
@@ -104,25 +110,39 @@ impl RemoteResumeFailure {
         }
     }
 
-    /// Whether the node answered that the capture this reopen needed is not on it.
+    /// Constructs a failure for an origin that cannot serve the capture it names.
+    pub fn origin_unavailable(node_id: &str, sandbox_id: SandboxId, detail: String) -> Self {
+        Self::OriginUnavailable {
+            node_id: node_id.to_string(),
+            sandbox_id,
+            detail,
+        }
+    }
+
+    /// Whether the origin cannot serve this reopen, leaving a rebuild the only route.
     ///
-    /// A row whose snapshot is published can still be rebuilt from the
-    /// repository, so this classification is a fallback signal rather than a
-    /// verdict about the sandbox.
-    pub fn is_capture_absent(&self) -> bool {
-        matches!(self, Self::CaptureAbsent { .. })
+    /// A refusal is excluded: the node has an opinion about this sandbox, and
+    /// rebuilding over it would overrule a decision rather than route around an
+    /// absence. Whether a rebuild may actually run is the caller's gate, which
+    /// needs a published snapshot and a granted claim.
+    pub fn warrants_rebuild(&self) -> bool {
+        matches!(
+            self,
+            Self::CaptureAbsent { .. }
+                | Self::NodeUnreachable { .. }
+                | Self::OriginUnavailable { .. }
+        )
     }
 }
 
-/// Whether anything in this chain says the capture a reopen needed is not on
-/// the node that was supposed to hold it.
+/// Whether anything in this chain says the origin cannot serve a reopen.
 ///
 /// Walks the chain because callers add context around the reopen failure.
-pub fn capture_absent(error: &anyhow::Error) -> bool {
+pub fn warrants_rebuild(error: &anyhow::Error) -> bool {
     error
         .chain()
         .filter_map(|cause| cause.downcast_ref::<RemoteResumeFailure>())
-        .any(RemoteResumeFailure::is_capture_absent)
+        .any(RemoteResumeFailure::warrants_rebuild)
 }
 
 pub fn serialize<T: serde::Serialize>(value: &T, what: &str) -> Result<pb::SerializedValue> {
@@ -224,6 +244,55 @@ mod tests {
             RemoteResumeFailure::unreachable("node-a", sandbox_id, "connection refused".into()),
             RemoteResumeFailure::NodeUnreachable { .. }
         ));
+    }
+
+    #[test]
+    fn only_a_node_with_an_opinion_stops_a_rebuild() {
+        let sandbox_id = SandboxId::new();
+        let classify = |status| RemoteResumeFailure::from_status("node-a", sandbox_id, status);
+
+        for routed_around in [
+            classify(Status::not_found("no paused capture here")),
+            classify(Status::unavailable("the node is restarting")),
+            classify(Status::deadline_exceeded("the node did not answer")),
+            RemoteResumeFailure::unreachable("node-a", sandbox_id, "connection refused".into()),
+            RemoteResumeFailure::origin_unavailable("node-a", sandbox_id, "it is gone".into()),
+        ] {
+            assert!(
+                routed_around.warrants_rebuild(),
+                "a published row is recoverable from the repository, so nothing here may pin \
+                 the resume to a machine that cannot serve it: {routed_around}"
+            );
+        }
+
+        for refusal in [
+            classify(Status::failed_precondition("that run is not the one here")),
+            classify(Status::internal("something went wrong")),
+        ] {
+            assert!(
+                !refusal.warrants_rebuild(),
+                "the node answered about this sandbox, and a rebuild would overrule it \
+                 rather than route around an absence: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rebuildable_classification_survives_the_context_wrapped_around_it() {
+        let sandbox_id = SandboxId::new();
+        let err = anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
+            "node-a",
+            sandbox_id,
+            "the placement source answered with node node-b".into(),
+        ))
+        .context("locate the machine holding sandbox")
+        .context("resume sandbox");
+
+        assert!(
+            warrants_rebuild(&err),
+            "callers wrap the reopen failure in context, and the classification has to survive \
+             the walk or the resume answers 500 instead of rebuilding"
+        );
     }
 
     #[test]

@@ -1275,6 +1275,94 @@ mod pg {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn many_replicas_racing_to_resume_one_sandbox_start_exactly_one_run() {
+        let pool = isolated_schema_pool_or_skip!(
+            "many_replicas_racing_to_resume_one_sandbox_start_exactly_one_run"
+        );
+        let cluster_id = Uuid::new_v4();
+        let seeder = registry(pool.clone(), cluster_id).await;
+
+        let sandbox_id = SandboxId::new();
+        let began = seeder
+            .begin_pause(&entry(sandbox_id, cluster_id, "node-a", ExecutionId::new()))
+            .await
+            .unwrap();
+        seeder
+            .complete_pause(&sandbox_id, began.generation, &snapshot_id())
+            .await
+            .unwrap();
+
+        const CLAIMANTS: usize = 12;
+        let mut racing = tokio::task::JoinSet::new();
+        for replica in 0..CLAIMANTS {
+            let pool = pool.clone();
+            racing.spawn(async move {
+                let registry =
+                    PostgresPausedSandboxRegistry::new(pool, cluster_id, Duration::from_secs(90));
+                let execution_id = ExecutionId::new();
+                let claim = registry
+                    .claim_for_resume(&sandbox_id, &format!("api-replica-{replica}"), execution_id)
+                    .await;
+                (replica, execution_id, claim)
+            });
+        }
+
+        let mut winners = Vec::new();
+        while let Some(finished) = racing.join_next().await {
+            let (replica, execution_id, claim) = finished.expect("a claimant task");
+            if let Ok(ResumeClaim::Claimed { .. }) = claim {
+                winners.push((replica, execution_id));
+            }
+        }
+
+        assert_eq!(
+            winners.len(),
+            1,
+            "the claim CAS is the only thing standing between {CLAIMANTS} replicas and \
+             {CLAIMANTS} copies of one sandbox, so every run of this must elect one: {winners:?}"
+        );
+
+        // The losers must not be able to start a run behind the winner's back.
+        let (winner, won_execution) = winners[0];
+        let holder = "real-machine-3";
+        for replica in 0..CLAIMANTS {
+            if replica == winner {
+                continue;
+            }
+            let outcome = seeder
+                .mark_running(
+                    &sandbox_id,
+                    &format!("api-replica-{replica}"),
+                    holder,
+                    ExecutionId::new(),
+                    None,
+                )
+                .await
+                .expect("the registry answers");
+            assert_ne!(
+                outcome,
+                MarkRunningOutcome::Adopted,
+                "replica {replica} lost the claim and still started a second run"
+            );
+        }
+
+        assert_eq!(
+            seeder
+                .mark_running(
+                    &sandbox_id,
+                    &format!("api-replica-{winner}"),
+                    holder,
+                    won_execution,
+                    None,
+                )
+                .await
+                .expect("the registry answers"),
+            MarkRunningOutcome::Adopted,
+            "the one claimant that won has to be able to finish its resume"
+        );
+    }
+
     struct SingleRosterRegistry(crate::node_registry::types::Roster);
 
     impl NodeRegistry for SingleRosterRegistry {

@@ -136,12 +136,12 @@ pub enum OrchestratorError {
 }
 
 impl OrchestratorError {
-    /// Whether the capture a resume needed is not on the node that was supposed
-    /// to hold it, found either locally or in a node's answer.
+    /// Whether the origin cannot serve this resume, leaving a rebuild the only
+    /// route: the capture is absent here, or the machine naming it is gone.
     ///
     /// Callers holding a claim on a published row may rebuild from the
     /// repository instead of surfacing this.
-    pub fn is_paused_capture_absent(&self) -> bool {
+    pub fn paused_resume_warrants_rebuild(&self) -> bool {
         let source = match self {
             Self::SandboxPersistenceFailed(SandboxPersistenceError::RecordAbsent { .. }) => {
                 return true
@@ -150,7 +150,7 @@ impl OrchestratorError {
             _ => return false,
         };
 
-        crate::node_client::wire::capture_absent(source)
+        crate::node_client::wire::warrants_rebuild(source)
     }
 }
 

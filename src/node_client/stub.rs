@@ -258,13 +258,16 @@ impl RemoteSandboxStub {
         let node = match placed {
             Some(node) => {
                 if node.node_id != origin_node_id {
-                    bail!(
-                        "sandbox {sandbox_id}'s capture is on node {origin_node_id} and placement \
-                         chose node {}: reopening a capture happens on the machine holding it, \
-                         and rebuilding this sandbox somewhere else is a create from a published \
-                         snapshot rather than this call",
-                        node.node_id
-                    );
+                    return Err(anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
+                        &origin_node_id,
+                        sandbox_id,
+                        format!(
+                            "placement chose node {}: reopening a capture happens on the machine \
+                             holding it, and rebuilding this sandbox somewhere else is a create \
+                             from a published snapshot rather than this call",
+                            node.node_id
+                        ),
+                    )));
                 }
                 node
             }
@@ -279,19 +282,20 @@ impl RemoteSandboxStub {
                     .placement
                     .resolve_node(&origin_node_id)
                     .await
-                    .with_context(|| {
-                        format!(
-                            "find the address of node {origin_node_id}, which holds sandbox \
-                             {sandbox_id}'s capture"
-                        )
+                    .map_err(|err| {
+                        anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
+                            &origin_node_id,
+                            sandbox_id,
+                            format!("its address could not be found: {err:#}"),
+                        ))
                     })?;
                 // Recheck the fallback result before dialing the pinned origin.
                 if node.node_id != origin_node_id {
-                    bail!(
-                        "sandbox {sandbox_id}'s capture is on node {origin_node_id} and the \
-                         placement source answered with node {}",
-                        node.node_id
-                    );
+                    return Err(anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
+                        &origin_node_id,
+                        sandbox_id,
+                        format!("the placement source answered with node {}", node.node_id),
+                    )));
                 }
                 node
             }

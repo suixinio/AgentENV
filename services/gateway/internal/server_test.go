@@ -241,15 +241,8 @@ func TestARoutedHealthRequestReachesTheNode(t *testing.T) {
 
 // TestDebugModeExposesBackendNodeIDOnResponse pins debugMode's
 // ModifyResponse hook (proxyRequest, in server.go) on a data-plane request.
-//
-// 🔴 This used to be incidental coverage on the create path
-// (TestHandleProxyHTTPForwardingAndRecordAssignment/
-// TestHandleProxyColdSandboxCreateRecordsAssignment, both deleted with the
-// create-time Schedule() call they exercised). The debug header is generic —
-// stamped in proxyRequest.ModifyResponse for whatever node served the
-// exchange, not specific to create — so deleting both create tests would
-// otherwise have left it untested. A data-plane request exercises the same
-// ModifyResponse hook every REST forward used to.
+// The debug header is generic — stamped in proxyRequest.ModifyResponse for
+// whatever node served the exchange — and this is its only test.
 func TestDebugModeExposesBackendNodeIDOnResponse(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -449,21 +442,6 @@ func TestJoinUpstreamPreservesRawEscapedPath(t *testing.T) {
 		t.Fatalf("EscapedPath() = %q, want %q", parsed.EscapedPath(), "/base/proxy/sandboxes/a%2Fb/%2525")
 	}
 }
-
-// 🔴 mustListedSandbox, decodeListedSandboxResponse and sandboxIDs, and the five
-// tests that used them — TestHandleProxyAggregatesSandboxListAcrossNodes,
-// TestHandleProxyAggregatesV2SandboxesWithGlobalPagination,
-// TestHandleProxyAggregatesSandboxListDedupsDuplicateSandboxIDs,
-// TestHandleProxyClusterListFailsWhenNodeFails and
-// TestHandleProxyClusterListPropagatesUnauthorized — used to live here, driving
-// GET /sandboxes and GET /v2/sandboxes against an unconfigured (restUpstream=="")
-// fixture to exercise the cluster-list fan-out: merge, global pagination, dedup,
-// and per-node failure propagation. The fan-out is gone (cluster_list.go is
-// deleted; see rest_upstream.go) along with the restUpstream=="" position that
-// was its only trigger — both routes are unconditionally forwarded to the api
-// half now, like any other user-facing REST call, and there is no longer a
-// second code path in this package that builds a listing out of the nodes for
-// these tests to drive.
 
 func equalStrings(got []string, want []string) bool {
 	if len(got) != len(want) {

@@ -276,24 +276,12 @@ func TestHostRoutedDataPlaneIsFencedLikeHeaderRouted(t *testing.T) {
 	}
 }
 
-// 🔴 TestControlPlaneRequestIsNeverRefusedOnExecutionMismatch used to live
-// here: pause and resume routed straight to a node by this gateway (via
-// `newTestServer`'s unconfigured, restUpstream=="" fixture) and asserted that
-// neither was ever stamped or refused. That routing no longer exists —
-// handleProxy's isUserFacingRestRequest branch forwards every control-plane
-// call to the api half before decideFencing is ever reached for it, so the
-// property "the control plane is never refused" is enforced structurally now
-// (no fencing plan is computed for a control-plane call that reaches the api
-// half — see forwardToRestUpstream's own doc comment) rather than by a decision
-// this test needed to pin.
-//
-// 🔴 The note that stood here added "there is no live call site left that
-// resolves a fencingPlaneControl plan through a real request", and that part
-// was wrong. isUserFacingRestRequest bails out on any request carrying a
-// routing header, so a control-plane path sent with x-agentenv-sandbox-id set
-// — which is what a client that stamps the header on everything produces —
-// still reaches decideFencing, with routeSourcePath and therefore
-// fencingPlaneControl. TestControlPlaneRequestsAreCountedUnderTheObservedLabel
+// 🔴 A control-plane path reaches decideFencing only when it also carries a
+// routing header. Without one, handleProxy answers 404 before any plan is
+// made — the gateway forwards no REST. With x-agentenv-sandbox-id set, which
+// is what a client that stamps the header on everything produces, the request
+// is routed by routeSourcePath and therefore planned as fencingPlaneControl,
+// which is never fenced. TestControlPlaneRequestsAreCountedUnderTheObservedLabel
 // at the bottom of this file drives exactly that request and reads the
 // resulting series off /metrics.
 
@@ -775,20 +763,11 @@ func TestFencingOffMatchesLegacyBehaviour(t *testing.T) {
 // missing" would not be a weaker version of this — it would hand any caller the
 // ability to present itself as the control plane by setting one header.
 //
-// 🔴 Converted to a data-plane request. This used to drive a pause (POST
-// /sandboxes/sbx-1/pause) against an unconfigured (restUpstream=="")
-// fixture, which is dead for the reason given throughout this file: pause is
-// a routeSourcePath call and is now always forwarded to the api half before
-// any node is resolved. stampOutboundGatewayHeaders is unconditional and
-// shared by every forwarding path in this package (proxyRequest.Rewrite,
-// used by both data-plane proxying and forwardToRestUpstream), so this table
-// still pins the same three-way behaviour through the one call site left that
-// exercises it via a real LookupNode/proxy round trip.
-// TestASandboxControlPlaneCallGoesToTheApiHalfWithoutResolvingANode
-// (rest_upstream_test.go) additionally pins that the api-bound forward is
-// stamped too, but only for the "configured, no client value" case; this
-// table is what still exercises the forged-value overwrite and the
-// no-token-configured deletion.
+// stampOutboundGatewayHeaders runs unconditionally in proxyRequest.Rewrite,
+// which every forward in this package goes through, so a data-plane request
+// is enough for this table to pin the three-way behaviour — a forged value
+// overwritten, a configured token stamped, the header deleted when no token
+// is configured — through a real proxy round trip.
 func TestGatewayStampsTheControlPlaneTokenOnForwardedRequests(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -968,8 +947,8 @@ func TestControlPlaneRequestsAreCountedUnderTheObservedLabel(t *testing.T) {
 
 	// The emission half, through the exporter Prometheus reads. A control-plane
 	// request reaches decideFencing when it carries a routing header as well as
-	// a control-plane path — the header is what keeps isUserFacingRestRequest
-	// from forwarding it to the api half first.
+	// a control-plane path; without the header handleProxy answers 404 before
+	// any plan is made.
 	stamped := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		stamped <- r.Header.Get(headerExpectExecutionID)

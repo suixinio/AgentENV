@@ -15,6 +15,10 @@
 #   SUITE_FILTER          - Run only suites matching this glob (e.g. "02*")
 #   E2E_MODE              - Runtime mode: compose or k8s (single-node is refused;
 #                           see the check below for why)
+#   E2E_SPLIT_ADDRESSES   - 1 to drive REST at the api half and the data plane
+#                           at the gateway; default 0 sends both to the gateway
+#   AENV_REST_URL         - REST base; defaults per E2E_MODE
+#   AENV_DATA_PLANE_URL   - sandbox data-plane base; defaults to the REST base
 set -Eeuo pipefail
 IFS=$'\n\t'
 

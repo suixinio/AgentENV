@@ -59,6 +59,13 @@
 #   E2E_K8S_GATEWAY_LOCAL_PORT            - local port-forward port if the
 #                                            NodePort path isn't used/reachable
 #                                            (default: 18080)
+#   E2E_SPLIT_ADDRESSES                   - 1 to drive REST at svc/agentenv-api
+#                                            and leave the gateway holding only
+#                                            the data plane (default 0: one
+#                                            address, the gateway, for both)
+#   E2E_K8S_API_LOCAL_PORT                - local port for the api port-forward
+#                                            when the run is split (default:
+#                                            18090)
 #   AENV_TEMPLATE_ID                      - skip self-building a base template
 #   SUITE_FILTER                          - glob against suites/*.sh (default: *.sh)
 #   AENV_API_KEY / AENV_ADMIN_TOKEN       - default to the same e2e-test-key /
@@ -205,6 +212,16 @@ _dev_cluster_use_port_forward() {
   AENV_PROXY_URL="${AENV_URL}"
 }
 
+# A split run moves REST off the gateway onto the api Service and leaves the
+# gateway holding the data plane only.
+_dev_cluster_split_rest_address() {
+  e2e_addresses_are_split || return 0
+  log "Using kubectl port-forward for the api half (svc/${E2E_K8S_API_SERVICE} -> 127.0.0.1:${E2E_K8S_API_LOCAL_PORT})"
+  _start_k8s_port_forward "svc/${E2E_K8S_API_SERVICE}" "${E2E_K8S_API_LOCAL_PORT}" 8000 "api" ||
+    die "Failed to port-forward the api service"
+  AENV_URL="http://127.0.0.1:${E2E_K8S_API_LOCAL_PORT}"
+}
+
 connect_gateway() {
   case "${E2E_DEV_CLUSTER_GATEWAY_MODE}" in
     nodeport)
@@ -226,6 +243,9 @@ connect_gateway() {
       die "Invalid E2E_DEV_CLUSTER_GATEWAY_MODE='${E2E_DEV_CLUSTER_GATEWAY_MODE}' (expected auto|nodeport|port-forward)"
       ;;
   esac
+  # The gateway address is the data plane in both cases above; only the REST
+  # address moves when the run is split.
+  _dev_cluster_split_rest_address
   export AENV_URL AENV_PROXY_URL
 }
 
@@ -279,8 +299,12 @@ preflight() {
   require_pods_ready "agentenv-node" "${E2E_K8S_NODE_SELECTOR}"
 
   connect_gateway
-  _wait_for_health_url "gateway" "${AENV_URL}" "${E2E_DEV_CLUSTER_HEALTH_TIMEOUT}" ||
-    die "Gateway not reachable at ${AENV_URL}/health"
+  _wait_for_health_url "rest" "${AENV_URL}" "${E2E_DEV_CLUSTER_HEALTH_TIMEOUT}" ||
+    die "The REST address is not reachable at ${AENV_URL}/health"
+  if e2e_addresses_are_split; then
+    _wait_for_health_url "gateway" "${AENV_PROXY_URL}" "${E2E_DEV_CLUSTER_HEALTH_TIMEOUT}" ||
+      die "Gateway not reachable at ${AENV_PROXY_URL}/health"
+  fi
 
   connect_nodes
   local node_url label

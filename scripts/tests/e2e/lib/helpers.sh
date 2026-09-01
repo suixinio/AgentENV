@@ -4,11 +4,14 @@
 if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   E2E_HELPERS_SH_LOADED=1
 
+  # AENV_URL is the REST address; AENV_PROXY_URL is the sandbox data-plane one.
+  # An unset data plane follows the REST address, which is a deployment whose
+  # entry points have not been separated.
   : "${AENV_URL:?AENV_URL must be set}"
   : "${AENV_API_KEY:=e2e-test-key}"
   : "${AENV_ADMIN_TOKEN:=e2e-admin-token}"
   : "${AENV_TEMPLATE_ID:=ubuntu}"
-  : "${AENV_PROXY_URL:=${AENV_URL}/proxy}"
+  : "${AENV_PROXY_URL:=${AENV_URL}}"
   : "${E2E_MODE:=single-node}"
   : "${E2E_DEFAULT_USER_IMAGE:=ghcr.io/linuxserver/baseimage-ubuntu:noble}"
   : "${E2E_TEMPLATE_USER_IMAGE:=${E2E_DEFAULT_USER_IMAGE}}"

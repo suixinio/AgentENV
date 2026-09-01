@@ -17,6 +17,7 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   : "${E2E_COMPOSE_OVERRIDE_FILE:=scripts/tests/e2e/docker-compose.e2e.yml}"
   : "${E2E_COMPOSE_START_TIMEOUT:=120}"
   : "${AENV_GATEWAY_PORT:=8000}"
+  : "${AENV_API_PORT:=8010}"
   : "${AENV_NODE_A_PORT:=8001}"
   : "${AENV_NODE_B_PORT:=8002}"
   : "${E2E_K8S_NAMESPACE:=agentenv-system}"
@@ -28,6 +29,9 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   : "${E2E_K8S_START_TIMEOUT:=180}"
   : "${E2E_K8S_GATEWAY_LOCAL_PORT:=18080}"
   : "${E2E_K8S_NODE_LOCAL_PORT_BASE:=18081}"
+  : "${E2E_K8S_API_SERVICE:=agentenv-api}"
+  : "${E2E_K8S_API_LOCAL_PORT:=18090}"
+  : "${E2E_SPLIT_ADDRESSES:=0}"
 
   _K8S_PORT_FORWARD_PIDS=()
   _K8S_PORT_FORWARD_LOGS=()
@@ -35,6 +39,23 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   e2e_mode_is() {
     [[ "${E2E_MODE}" == "$1" ]]
   }
+
+  # Whether this run addresses REST and the sandbox data plane separately.
+  # Off means one address answers both, which is what a deployment that has
+  # not split its entry points still looks like.
+  e2e_addresses_are_split() {
+    [[ "${E2E_SPLIT_ADDRESSES}" == "1" ]]
+  }
+
+  # A compose stack already publishes the api half, so a split run there only
+  # has to name it. k8s needs a port-forward and sets this in
+  # wait_for_k8s_runtime instead.
+  if e2e_addresses_are_split && [[ "${E2E_MODE:-}" == "compose" ]]; then
+    : "${AENV_REST_URL:=http://127.0.0.1:${AENV_API_PORT}}"
+    # Named explicitly: a split run must not let the data plane follow the REST
+    # address, which is the whole point of splitting them.
+    : "${AENV_DATA_PLANE_URL:=http://127.0.0.1:${AENV_GATEWAY_PORT}}"
+  fi
 
   e2e_mode_is_clustered() {
     e2e_mode_is "compose" || e2e_mode_is "k8s"
@@ -168,10 +189,16 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     fi
   }
 
+  # Resolves the two client addresses.
+  #
+  # AENV_URL answers REST and AENV_PROXY_URL carries sandbox traffic. The
+  # overrides are read from separate names because this function overwrites
+  # both and is called more than once per run; reading its own output would
+  # make the second call disagree with the first.
   configure_runtime_endpoints() {
     if e2e_mode_is "compose"; then
-      export AENV_URL="http://127.0.0.1:${AENV_GATEWAY_PORT}"
-      export AENV_PROXY_URL="${AENV_URL}"
+      export AENV_URL="${AENV_REST_URL:-http://127.0.0.1:${AENV_GATEWAY_PORT}}"
+      export AENV_PROXY_URL="${AENV_DATA_PLANE_URL:-${AENV_URL}}"
       export AENV_NODE_A_URL="http://127.0.0.1:${AENV_NODE_A_PORT}"
       export AENV_NODE_B_URL="http://127.0.0.1:${AENV_NODE_B_PORT}"
       export AENV_NODE_A_LABEL="agentenv-a"
@@ -179,8 +206,8 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
       export AENV_NODE_URLS="${AENV_NODE_A_URL} ${AENV_NODE_B_URL}"
       export AENV_NODE_URL_LABEL_MAP="${AENV_NODE_A_URL}=agentenv-a;${AENV_NODE_B_URL}=agentenv-b"
     elif e2e_mode_is "k8s"; then
-      export AENV_URL="http://127.0.0.1:${E2E_K8S_GATEWAY_LOCAL_PORT}"
-      export AENV_PROXY_URL="${AENV_URL}"
+      export AENV_URL="${AENV_REST_URL:-http://127.0.0.1:${E2E_K8S_GATEWAY_LOCAL_PORT}}"
+      export AENV_PROXY_URL="${AENV_DATA_PLANE_URL:-${AENV_URL}}"
       export AENV_NODE_A_URL="${AENV_NODE_A_URL:-}"
       export AENV_NODE_B_URL="${AENV_NODE_B_URL:-}"
       export AENV_NODE_A_LABEL="${AENV_NODE_A_LABEL:-}"
@@ -188,8 +215,8 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
       export AENV_NODE_URLS="${AENV_NODE_URLS:-}"
       export AENV_NODE_URL_LABEL_MAP="${AENV_NODE_URL_LABEL_MAP:-}"
     else
-      export AENV_URL="http://127.0.0.1:${AENV_PORT}"
-      export AENV_PROXY_URL="${AENV_URL}/proxy"
+      export AENV_URL="${AENV_REST_URL:-http://127.0.0.1:${AENV_PORT}}"
+      export AENV_PROXY_URL="${AENV_DATA_PLANE_URL:-${AENV_URL}/proxy}"
       export AENV_NODE_A_URL=""
       export AENV_NODE_B_URL=""
       export AENV_NODE_A_LABEL=""
@@ -391,8 +418,12 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     local timeout="${1:-$E2E_COMPOSE_START_TIMEOUT}"
     local expected_nodes
 
-    _wait_for_health_url "gateway" "${AENV_URL}" "${timeout}" ||
-      die "Gateway failed to become ready within ${timeout}s"
+    _wait_for_health_url "rest" "${AENV_URL}" "${timeout}" ||
+      die "The REST address failed to become ready within ${timeout}s"
+    if e2e_addresses_are_split; then
+      _wait_for_health_url "gateway" "${AENV_PROXY_URL}" "${timeout}" ||
+        die "Gateway failed to become ready within ${timeout}s"
+    fi
     _wait_for_health_url "agentenv-a" "${AENV_NODE_A_URL}" "${timeout}" ||
       die "agentenv-a failed to become ready within ${timeout}s"
     _wait_for_health_url "agentenv-b" "${AENV_NODE_B_URL}" "${timeout}" ||
@@ -420,11 +451,23 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
 
     _start_k8s_port_forward "svc/${E2E_K8S_GATEWAY_SERVICE}" "${E2E_K8S_GATEWAY_LOCAL_PORT}" 8080 "gateway" ||
       die "Failed to port-forward gateway service"
+    if e2e_addresses_are_split; then
+      _start_k8s_port_forward "svc/${E2E_K8S_API_SERVICE}" "${E2E_K8S_API_LOCAL_PORT}" 8000 "api" ||
+        die "Failed to port-forward api service"
+      # Named explicitly: a split run must not let the data plane follow the
+      # REST address, which is the whole point of splitting them.
+      export AENV_DATA_PLANE_URL="${AENV_DATA_PLANE_URL:-http://127.0.0.1:${E2E_K8S_GATEWAY_LOCAL_PORT}}"
+      export AENV_REST_URL="${AENV_REST_URL:-http://127.0.0.1:${E2E_K8S_API_LOCAL_PORT}}"
+    fi
     _export_k8s_node_endpoints
     configure_runtime_endpoints
 
-    _wait_for_health_url "gateway" "${AENV_URL}" "${timeout}" ||
-      die "Gateway failed to become ready within ${timeout}s"
+    _wait_for_health_url "rest" "${AENV_URL}" "${timeout}" ||
+      die "The REST address failed to become ready within ${timeout}s"
+    if e2e_addresses_are_split; then
+      _wait_for_health_url "gateway" "${AENV_PROXY_URL}" "${timeout}" ||
+        die "Gateway failed to become ready within ${timeout}s"
+    fi
 
     local node_url label
     while IFS= read -r node_url; do

@@ -13,6 +13,7 @@ use crate::observability::{DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSna
 use crate::orchestrator::{PausedRegistryListEntry, PausedRegistryState};
 use crate::proto::scheduler as scheduler_proto;
 use crate::snapshot::CatalogReadScope;
+use crate::types::SandboxId;
 use agentenv_http_server::types::Nullable;
 use agentenv_http_server::{apis::admin::*, models};
 
@@ -247,6 +248,20 @@ impl From<&PausedRegistryListEntry> for models::RegistrySandbox {
                 .unwrap_or_default(),
         )
     }
+}
+
+/// Parses the keyset cursor: the sandbox id the previous page ended on.
+///
+/// A token that is not a sandbox id would compare against every row as an
+/// arbitrary string and could silently end pagination early, so it is refused.
+fn parse_page_token(raw: &str) -> Result<Option<SandboxId>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    SandboxId::parse_str(trimmed)
+        .map(Some)
+        .map_err(|_| "invalid nextToken".to_string())
 }
 
 /// Resolves the `state` filter against the registry's own vocabulary.
@@ -521,20 +536,22 @@ impl Admin<()> for ApiImpl {
         // The node filter compares against the holder as the registry stores it;
         // node aliases are resolved by the node registry, which is not on this path.
         let node_filter = query_params.node_id.as_deref().unwrap_or_default().trim();
-        let page_token = query_params
-            .next_token
-            .as_deref()
-            .unwrap_or_default()
-            .trim();
+        let page_token =
+            match parse_page_token(query_params.next_token.as_deref().unwrap_or_default()) {
+                Ok(token) => token,
+                Err(message) => {
+                    return Ok(RegistrySandboxesGetResponse::Status400_BadRequest(
+                        Self::error(400, message),
+                    ));
+                }
+            };
 
         let mut matched: Vec<PausedRegistryListEntry> = listing
             .sandboxes
             .into_iter()
             .filter(|entry| state_filter.is_none_or(|state| entry.state == state))
             .filter(|entry| node_filter.is_empty() || entry.holder() == node_filter)
-            .filter(|entry| {
-                page_token.is_empty() || entry.sandbox_id.to_string().as_str() > page_token
-            })
+            .filter(|entry| page_token.is_none_or(|after| entry.sandbox_id > after))
             .collect();
 
         // Keyset paging needs a total order the backend does not promise.
@@ -1813,5 +1830,31 @@ mod fleet_node_tests {
         assert!(scheduling_override(models::NodeStatus::NodeStatusDraining).expect("settable"));
         assert!(scheduling_override(models::NodeStatus::NodeStatusUnhealthy).is_err());
         assert!(scheduling_override(models::NodeStatus::NodeStatusConnecting).is_err());
+    }
+}
+
+#[cfg(test)]
+mod registry_cursor_tests {
+    use super::parse_page_token;
+    use crate::types::SandboxId;
+
+    #[test]
+    fn an_empty_or_blank_next_token_means_the_first_page() {
+        assert_eq!(parse_page_token("").expect("first page"), None);
+        assert_eq!(parse_page_token("   ").expect("first page"), None);
+    }
+
+    #[test]
+    fn a_sandbox_id_next_token_is_accepted() {
+        let id = SandboxId::new();
+        assert_eq!(
+            parse_page_token(&id.to_string()).expect("a valid cursor"),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn a_token_that_is_not_a_sandbox_id_is_refused_not_an_empty_page() {
+        assert!(parse_page_token("zzzz").is_err());
     }
 }

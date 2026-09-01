@@ -220,6 +220,7 @@ impl NodePlacement for NativeNodePlacement {
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         node: &NodeEndpoint,
+        projection_ttl_secs: u32,
     ) -> Result<()> {
         self.local
             .record_assignment(tonic::Request::new(scheduler::RecordAssignmentRequest {
@@ -229,7 +230,7 @@ impl NodePlacement for NativeNodePlacement {
                     endpoint: node.advertised_endpoint.clone(),
                 }),
                 execution_id: execution_id.to_string(),
-                projection_ttl_secs: 0,
+                projection_ttl_secs,
             }))
             .await
             .map_err(|status| {
@@ -413,7 +414,7 @@ mod tests {
             advertised_endpoint: "http://10.0.0.7:8000".to_string(),
         };
         placement
-            .record_placement(sandbox_id, execution_id, &node_endpoint)
+            .record_placement(sandbox_id, execution_id, &node_endpoint, 0)
             .await
             .expect("node-a is a known node");
 

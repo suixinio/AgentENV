@@ -2123,6 +2123,7 @@ where
                 metadata
                     .secure
                     .then(|| self.access_tokens.generate(metadata.id)),
+                metadata.projection_ttl_secs(SystemTime::now()),
             ))
             .await;
         if let Ok(metadata) = resumed.as_ref() {
@@ -2920,6 +2921,7 @@ where
                 return Err(err);
             }
         };
+        sandbox.set_projection_budget(plan.projection_ttl_secs(SystemTime::now()));
 
         // Protect artifacts before the backend opens them.
         let startup_artifacts = sandbox.startup_artifacts();

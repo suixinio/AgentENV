@@ -60,11 +60,15 @@ pub trait NodePlacement: Send + Sync + 'static {
     async fn node_membership(&self, node_id: &str) -> anyhow::Result<NodeMembership>;
 
     /// Best-effort records a completed placement; heartbeats repair failed writes.
+    ///
+    /// `projection_ttl_secs` is the sandbox's remaining lifetime budget, the
+    /// same one its heartbeats carry; zero delegates to the store's default.
     async fn record_placement(
         &self,
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         node: &NodeEndpoint,
+        projection_ttl_secs: u32,
     ) -> anyhow::Result<()>;
 
     /// Records the chosen node before the runtime is asked for, so that no runtime
@@ -139,6 +143,7 @@ impl NodePlacement for FixedNodePlacement {
         _sandbox_id: SandboxId,
         _execution_id: ExecutionId,
         _node: &NodeEndpoint,
+        _projection_ttl_secs: u32,
     ) -> anyhow::Result<()> {
         Ok(())
     }

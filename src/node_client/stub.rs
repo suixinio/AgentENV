@@ -58,6 +58,9 @@ pub struct RemoteSandboxStub {
     /// Suppresses `Delete` after pause because the node's pause already stopped the VM
     /// and `Delete` would destroy its only capture.
     paused: bool,
+    /// Budget of the routing record `announce_placement` writes; zero until the
+    /// orchestrator sets it from the sandbox's own record.
+    projection_ttl_secs: u32,
 }
 
 struct Placed {
@@ -92,6 +95,7 @@ impl RemoteSandboxStub {
             pending,
             placed: None,
             paused: false,
+            projection_ttl_secs: 0,
         }
     }
 
@@ -111,6 +115,7 @@ impl RemoteSandboxStub {
             placement,
             pending: PendingLaunch::AlreadyStarted,
             paused: false,
+            projection_ttl_secs: 0,
             placed: Some(Placed {
                 node,
                 client,
@@ -388,7 +393,12 @@ impl RemoteSandboxStub {
     async fn announce_placement(&self, node: &NodeEndpoint) {
         if let Err(error) = self
             .placement
-            .record_placement(self.sandbox_id, self.execution_id, node)
+            .record_placement(
+                self.sandbox_id,
+                self.execution_id,
+                node,
+                self.projection_ttl_secs,
+            )
             .await
         {
             // The next heartbeat repairs this transient binding gap.
@@ -1037,6 +1047,10 @@ impl SandboxBackend for RemoteSandboxStub {
         self.placed
             .as_ref()
             .map(|placed| placed.node.node_id.as_str())
+    }
+
+    fn set_projection_budget(&mut self, projection_ttl_secs: u32) {
+        self.projection_ttl_secs = projection_ttl_secs;
     }
 
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {

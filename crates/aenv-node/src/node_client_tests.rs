@@ -881,6 +881,7 @@ impl NodePlacement for ReplacementNodePlacement {
         _sandbox_id: crate::types::SandboxId,
         _execution_id: ExecutionId,
         _node: &NodeEndpoint,
+        _projection_ttl_secs: u32,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -1131,6 +1132,7 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
             _sandbox_id: crate::types::SandboxId,
             _execution_id: ExecutionId,
             _node: &NodeEndpoint,
+            _projection_ttl_secs: u32,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -3364,7 +3366,7 @@ struct ClusterPlacement {
     reserves_at_all: bool,
     lookup: LookupAnswer,
     resolves: Option<NodeEndpoint>,
-    recorded: Mutex<Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint)>>,
+    recorded: Mutex<Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint, u32)>>,
     resolve_calls: Mutex<usize>,
     membership: Mutex<MembershipAnswer>,
 }
@@ -3475,7 +3477,7 @@ impl ClusterPlacement {
         self.reservations.lock().expect("lock").insert(id);
     }
 
-    fn recorded(&self) -> Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint)> {
+    fn recorded(&self) -> Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint, u32)> {
         self.recorded.lock().expect("lock").clone()
     }
 
@@ -3554,11 +3556,14 @@ impl NodePlacement for ClusterPlacement {
         sandbox_id: crate::types::SandboxId,
         execution_id: ExecutionId,
         node: &NodeEndpoint,
+        projection_ttl_secs: u32,
     ) -> anyhow::Result<()> {
-        self.recorded
-            .lock()
-            .expect("lock")
-            .push((sandbox_id, execution_id, node.clone()));
+        self.recorded.lock().expect("lock").push((
+            sandbox_id,
+            execution_id,
+            node.clone(),
+            projection_ttl_secs,
+        ));
         if self.record_fails {
             anyhow::bail!("the scheduler refused an assignment for {sandbox_id}");
         }
@@ -3733,7 +3738,7 @@ async fn a_create_tells_the_cluster_which_machine_the_sandbox_is_on() {
     let recorded = placement.recorded();
     assert_eq!(recorded.len(), 2, "a create told the cluster nothing");
     for (index, (sandbox_id, execution_id)) in started.iter().enumerate() {
-        let (recorded_id, recorded_execution, recorded_node) = &recorded[index];
+        let (recorded_id, recorded_execution, recorded_node, _) = &recorded[index];
         assert_eq!(recorded_id, sandbox_id);
         assert_eq!(
             recorded_execution, execution_id,
@@ -3753,6 +3758,42 @@ async fn a_create_tells_the_cluster_which_machine_the_sandbox_is_on() {
             "the cluster still cannot say where this sandbox is"
         );
     }
+}
+
+#[tokio::test]
+async fn a_create_budgets_the_routing_record_from_the_sandboxs_own_lifetime() {
+    let node = real_node().await;
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let told = ClusterPlacement::recording(node.endpoint.clone());
+    let replica = api_replica_on(Arc::clone(&told), &ledger).await;
+
+    let sandbox = Arc::clone(&replica)
+        .create_sandbox(cluster_create_request())
+        .await
+        .expect("create on the node");
+    let budget = ledger
+        .0
+        .get(&sandbox.id)
+        .await
+        .expect("read the ledger")
+        .expect("the record the create wrote")
+        .projection_ttl_secs(std::time::SystemTime::now());
+    assert!(
+        budget > 0,
+        "the configured lifetime ceiling gives every new sandbox a budget of its own"
+    );
+
+    let recorded = told.recorded();
+    assert_eq!(recorded.len(), 1, "a create told the cluster nothing");
+    let recorded_ttl = recorded[0].3;
+    // 🔴 Zero here is the store's default, a fraction of the sandbox's life:
+    // once it lapses every request pays a resume RPC until the next heartbeat
+    // rewrites the record with the budget the create already knew.
+    assert!(
+        recorded_ttl.abs_diff(budget) <= 2,
+        "the create recorded a {recorded_ttl} s budget for a sandbox whose own record says \
+         {budget} s"
+    );
 }
 
 #[tokio::test]

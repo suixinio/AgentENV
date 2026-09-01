@@ -276,6 +276,11 @@ pub trait SandboxBackend: Send + 'static {
         None
     }
 
+    /// Budgets the routing record this backend announces once the sandbox is
+    /// up: seconds it may live, zero for the store's default. Backends that
+    /// run the sandbox on this machine announce nothing and ignore it.
+    fn set_projection_budget(&mut self, _projection_ttl_secs: u32) {}
+
     /// Local runtime artifacts this sandbox opens on start.
     fn startup_artifacts(&self) -> RuntimeArtifactSet;
 

@@ -399,6 +399,13 @@ e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过
 >   `wait_for_sandbox_state … paused` 之后各等 7 s（超过一次心跳）再探测，disabled 用例
 >   另断言 410 带 `Access-Control-Allow-Origin: *`（gateway 合成的拒绝才有，节点原始 410
 >   没有）。
+> - **create 时投影预算（同批）**：上文「偏离 P4 文本一处」里 `announce_placement` 写的
+>   TTL=0 投影（集群上 create 后 `TTL=29`，首次心跳才改写成 ~86400）现在带沙箱自己的预
+>   算：`launch_sandbox` 在构建后端后用 `LaunchPlan::projection_ttl_secs`（create 取
+>   `metadata.projection_ttl_secs`，resume 由调用方从暂停记录算好放进计划）经
+>   `SandboxBackend::set_projection_budget` 交给远端 stub，`NodePlacement::record_placement`
+>   随之带 `projection_ttl_secs`；0 只剩无记录可算时的回落。wake 路径的两次写因此是同一
+>   预算的两次写。
 
 ### P5（可选，默认不做）— 改名 gateway → client-proxy
 

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use super::store::{NewTimeout, SandboxMetadata};
 use super::types::SandboxState;
@@ -71,6 +72,9 @@ pub struct ResumeLaunchPlan {
     pub timeout: NewTimeout,
     pub resources: SandboxResources,
     pub envd_access_token: Option<EnvdAccessToken>,
+    /// The paused record's remaining lifetime budget for the routing
+    /// projection, read where the record is; zero delegates to the store.
+    pub projection_ttl_secs: u32,
 }
 
 pub enum LaunchPlan {
@@ -176,6 +180,7 @@ impl LaunchPlan {
         timeout: NewTimeout,
         resources: SandboxResources,
         envd_access_token: Option<EnvdAccessToken>,
+        projection_ttl_secs: u32,
     ) -> Self {
         Self::Resume(Box::new(ResumeLaunchPlan {
             sandbox_id,
@@ -184,7 +189,16 @@ impl LaunchPlan {
             timeout,
             resources,
             envd_access_token,
+            projection_ttl_secs,
         }))
+    }
+
+    /// The routing projection budget of the sandbox this plan starts.
+    pub fn projection_ttl_secs(&self, now: SystemTime) -> u32 {
+        match self {
+            Self::Create(plan) => plan.metadata.projection_ttl_secs(now),
+            Self::Resume(plan) => plan.projection_ttl_secs,
+        }
     }
 
     pub fn sandbox_id(&self) -> SandboxId {

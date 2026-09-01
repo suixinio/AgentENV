@@ -112,6 +112,15 @@ service NodeSandboxService {
   // that a sandbox is an orphan.
   rpc ListSandboxes (ListSandboxesRequest) returns (SandboxListResponse);
 
+  // Sets whether this node accepts new placements: draining stops them, ready
+  // resumes them. Sandboxes already running are untouched.
+  //
+  // The api half's `POST /nodes/{id}` lands here when the addressed node is a
+  // cluster peer rather than the serving process. The reply carries no status:
+  // the observed status the fleet reports catches up on this node's next
+  // heartbeat, so a read immediately after this call may still see the old one.
+  rpc OverrideStatus (NodeStatusOverrideRequest) returns (NodeStatusOverrideResponse);
+
   // Runs one template build — a throwaway sandbox driven through RUN/ENV/...
   // steps and captured at the end — entirely on this node, and stages the
   // result for the caller to announce.
@@ -786,6 +795,13 @@ message NodeSandbox {
   // reported with an empty one.
   bytes control_plane_config = 10;
 }
+
+message NodeStatusOverrideRequest {
+  // true stops new placements on this node; false resumes them.
+  bool scheduling_disabled = 1;
+}
+
+message NodeStatusOverrideResponse {}
 
 // ---------------------------------------------------------------------------
 // BuildTemplate

@@ -1092,6 +1092,21 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         Ok(Response::new(pb::SandboxListResponse { sandboxes }))
     }
 
+    async fn override_status(
+        &self,
+        request: Request<pb::NodeStatusOverrideRequest>,
+    ) -> Result<Response<pb::NodeStatusOverrideResponse>, Status> {
+        let disabled = request.into_inner().scheduling_disabled;
+        if self.orchestration.set_scheduling_disabled(disabled) {
+            info!(
+                node_id = %self.node_id,
+                scheduling_disabled = disabled,
+                "node scheduling status overridden by the control plane"
+            );
+        }
+        Ok(Response::new(pb::NodeStatusOverrideResponse {}))
+    }
+
     async fn build_template(
         &self,
         request: Request<pb::TemplateBuildRequest>,

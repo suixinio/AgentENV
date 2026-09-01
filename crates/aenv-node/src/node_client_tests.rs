@@ -382,6 +382,15 @@ impl NodeSandboxService for ScriptedNodeService {
         }))
     }
 
+    async fn override_status(
+        &self,
+        _request: Request<pb::NodeStatusOverrideRequest>,
+    ) -> Result<Response<pb::NodeStatusOverrideResponse>, Status> {
+        Err(Status::unimplemented(
+            "ScriptedNode does not script override_status",
+        ))
+    }
+
     // Unscripted so accidental use fails loudly.
     async fn build_template(
         &self,
@@ -444,6 +453,29 @@ async fn a_sandbox_built_here_starts_on_the_node() {
         live[0].execution_id,
         Some(execution_id),
         "the node ran a different incarnation from the one it was asked for"
+    );
+}
+
+#[tokio::test]
+async fn a_status_override_lands_on_the_nodes_own_scheduling_switch() {
+    let node = real_node().await;
+    let orchestration = node.orchestration.as_ref().expect("a real node");
+    assert!(!orchestration.scheduling_disabled());
+
+    crate::node_client::override_node_status(&node.endpoint.endpoint, true)
+        .await
+        .expect("drain the node");
+    assert!(
+        orchestration.scheduling_disabled(),
+        "the drain must reach the node's own scheduling switch"
+    );
+
+    crate::node_client::override_node_status(&node.endpoint.endpoint, false)
+        .await
+        .expect("ready the node");
+    assert!(
+        !orchestration.scheduling_disabled(),
+        "the switch must flip back the same way it was set"
     );
 }
 

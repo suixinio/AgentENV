@@ -33,8 +33,9 @@ type projectionReader interface {
 func (s *Server) resolveFromProjection(ctx context.Context, sandboxID string) *schedulerv1.LookupNodeResponse {
 	if s.projectionReader == nil {
 		// The read switch is off. Nothing is counted here: the caller counts
-		// the scheduler call it is about to make, and counting a read that was
-		// never attempted would put a decision in the series nobody made.
+		// the answer it is about to get from the api half, and counting a
+		// read that was never attempted would put a decision in the series
+		// nobody made.
 		return nil
 	}
 
@@ -46,14 +47,14 @@ func (s *Server) resolveFromProjection(ctx context.Context, sandboxID string) *s
 		// request path, and a read failure that refused the request would be
 		// the opposite.
 		recordRouteResolution(routeResolutionRedisError)
-		s.logger.Warn("routing projection read failed, falling back to the scheduler",
+		s.logger.Warn("routing projection read failed, asking the api half",
 			zap.String("sandbox_id", sandboxID),
 			zap.Error(err),
 		)
 		return nil
 	case ok:
 		// Counted by the caller, as routeResolutionRedisHit: a hit is the
-		// answer, so it belongs in the same place the scheduler answer is
+		// answer, so it belongs in the same place the api half's answer is
 		// counted rather than half a level down.
 		return routing.Synthesize(record)
 	default:

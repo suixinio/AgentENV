@@ -81,7 +81,9 @@ type Verdict int
 
 const (
 	// VerdictUndecided means nobody could be asked, and is never an answer
-	// about whether the sandbox exists.
+	// about whether the sandbox exists. It ends the request as a 502: the api
+	// half is the only thing the gateway asks, so there is nothing to fall
+	// through to.
 	//
 	// 🔴 The zero value, deliberately. A Result that was never filled in has to
 	// read as "I do not know", because the two things it must not be mistaken
@@ -197,9 +199,8 @@ func NewFromClient(client apiproxyv1.SandboxResumeServiceClient, timeout time.Du
 // alike.
 func (c *Client) Wake(ctx context.Context, req Request) Result {
 	if c == nil || c.client == nil {
-		// The switch is off. Undecided rather than Gone: a gateway with no
-		// wake-up client configured knows nothing about this sandbox, and must
-		// fall back to what it did before this package existed.
+		// No client configured. Undecided rather than Gone: a gateway that
+		// cannot ask knows nothing about this sandbox.
 		return Result{Verdict: VerdictUndecided}
 	}
 

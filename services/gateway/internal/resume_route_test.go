@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	schedulerv1 "agentenv/services/api/proto"
 	apiproxyv1 "agentenv/services/api/proto/apiproxy"
 	"agentenv/services/gateway/internal/resume"
 	"agentenv/services/shared/routing"
@@ -62,37 +61,50 @@ func missingProjection() *stubProjectionReader {
 	return &stubProjectionReader{records: map[string]routing.Record{}}
 }
 
-// refusingScheduler fails the test if the scheduler is consulted at all.
-func refusingScheduler(t *testing.T, why string) stubSchedulerClient {
+// runningAt answers the resume RPC with a sandbox running on one node under a
+// fixed incarnation, whether the api half found it running or woke it.
+func runningAt(nodeID string, endpoint string) *stubResumeService {
+	return &stubResumeService{response: &apiproxyv1.SandboxResumeResponse{
+		NodeId:      nodeID,
+		NodeAddress: endpoint,
+		ExecutionId: "0198b7cc-1111-7000-8000-000000000001",
+	}}
+}
+
+// refusingResumeService fails the test if the api half is asked at all.
+type refusingResumeService struct {
+	t   *testing.T
+	why string
+}
+
+func (s refusingResumeService) ResumeSandbox(
+	context.Context,
+	*apiproxyv1.SandboxResumeRequest,
+	...grpc.CallOption,
+) (*apiproxyv1.SandboxResumeResponse, error) {
+	s.t.Fatalf("the api half must not be asked: %s", s.why)
+	return nil, nil
+}
+
+func refusingResume(t *testing.T, why string) apiproxyv1.SandboxResumeServiceClient {
 	t.Helper()
-	return stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			t.Fatalf("the scheduler must not be consulted: %s", why)
-			return nil, nil
-		},
-	}
+	return refusingResumeService{t: t, why: why}
 }
 
 // 🔴 The pair that makes either half mean anything.
 //
 // Both assertions here are of the shape that passes trivially against a broken
-// build: "the scheduler was not called" is true of a gateway that never routes
-// anything, and "the scheduler was called" is true of a gateway that ignores
-// the wake-up client entirely. Neither is evidence alone. Together — the same
-// request, the same projection miss, the same everything except what the api
-// half answered — they say the branch is live and that it branches.
-func TestAWakeUpAnswerDecidesWhetherTheSchedulerIsAskedAtAll(t *testing.T) {
-	t.Run("woken: the api half's node is used and the scheduler is not asked", func(t *testing.T) {
+// build: "the request was proxied" is true of a gateway that routes everything
+// somewhere, and "the request failed" is true of a gateway that routes nothing.
+// Neither is evidence alone. Together — the same request, the same projection
+// miss, the same everything except what the api half answered — they say the
+// branch is live and that it branches.
+func TestAWakeUpAnswerDecidesWhetherTheRequestIsRoutedAtAll(t *testing.T) {
+	t.Run("woken: the api half's node is used", func(t *testing.T) {
 		upstream, hits := newUpstream(t)
-		service := &stubResumeService{response: &apiproxyv1.SandboxResumeResponse{
-			NodeId:      "node-a",
-			NodeAddress: upstream.URL,
-			ExecutionId: "0198b7cc-1111-7000-8000-000000000001",
-		}}
+		service := runningAt("node-a", upstream.URL)
 
-		server := newTestServer(t,
-			refusingScheduler(t, "the api half already said where the sandbox is"),
-			5*time.Second, 1<<20,
+		server := newTestServer(t, 5*time.Second, 1<<20,
 			withProjectionReader(missingProjection()),
 			withResumeClient(service),
 		)
@@ -114,40 +126,63 @@ func TestAWakeUpAnswerDecidesWhetherTheSchedulerIsAskedAtAll(t *testing.T) {
 		}
 	})
 
-	t.Run("undecided: the scheduler answers, exactly as before this branch existed", func(t *testing.T) {
-		upstream, hits := newUpstream(t)
+	t.Run("undecided: the request fails, and nothing else is asked", func(t *testing.T) {
+		_, hits := newUpstream(t)
 		service := &stubResumeService{err: status.Error(codes.Unavailable, "api half is restarting")}
-		lookups := 0
-		scheduler := stubSchedulerClient{
-			lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-				lookups++
-				return &schedulerv1.LookupNodeResponse{
-					Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-					Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-				}, nil
-			},
-		}
 
-		server := newTestServer(t, scheduler, 5*time.Second, 1<<20,
+		server := newTestServer(t, 5*time.Second, 1<<20,
 			withProjectionReader(missingProjection()),
 			withResumeClient(service),
 		)
 		resp := serveDataPlaneRequest(t, server.Handler(), "sbx-1")
 		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("🔴 status = %d, want 200. An api half that cannot be reached "+
-				"must cost latency, not availability: the fallback is the same "+
-				"LookupNode this gateway called for every projection miss before "+
-				"the wake-up client existed", resp.StatusCode)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("🔴 status = %d, want 502. The api half is the only thing the "+
+				"gateway asks; when it cannot be asked the request fails, and it "+
+				"fails as a transport problem rather than as anything about the "+
+				"sandbox", resp.StatusCode)
 		}
 		if service.calls != 1 {
 			t.Fatalf("wake-up calls = %d, want 1", service.calls)
 		}
-		if lookups != 1 || hits.get() != 1 {
-			t.Fatalf("lookups = %d, upstream hits = %d, want 1 and 1", lookups, hits.get())
+		if hits.get() != 0 {
+			t.Fatalf("upstream hits = %d, want 0: nothing named a node", hits.get())
 		}
 	})
+}
+
+// 🔴 An api half that cannot be asked is a 502 and never a 404.
+//
+// Every way the resume client can come back undecided — the api half is
+// unavailable, too slow, the call was cancelled, or there is no client at
+// all — lands on the same status. 502 says the thing behind the gateway is
+// not answering; 404 would tell the platform to rebuild a sandbox nobody
+// established anything about, and 503 would advertise a retry against a
+// gateway that has nowhere else to look.
+func TestAnUnreachableApiHalfIsFiveOhTwo(t *testing.T) {
+	for name, service := range map[string]apiproxyv1.SandboxResumeServiceClient{
+		"unavailable":       &stubResumeService{err: status.Error(codes.Unavailable, "api half is restarting")},
+		"deadline exceeded": &stubResumeService{err: status.Error(codes.DeadlineExceeded, "too slow")},
+		"canceled":          &stubResumeService{err: status.Error(codes.Canceled, "gone away")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, hits := newUpstream(t)
+			server := newTestServer(t, 5*time.Second, 1<<20,
+				withProjectionReader(missingProjection()),
+				withResumeClient(service),
+			)
+			resp := serveDataPlaneRequest(t, server.Handler(), "sbx-1")
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusBadGateway {
+				t.Fatalf("status = %d, want 502", resp.StatusCode)
+			}
+			if hits.get() != 0 {
+				t.Fatalf("upstream hits = %d, want 0", hits.get())
+			}
+		})
+	}
 }
 
 // 🔴 "Gone" ends the request; "could not ask" does not.
@@ -159,12 +194,10 @@ func TestAWakeUpAnswerDecidesWhetherTheSchedulerIsAskedAtAll(t *testing.T) {
 // and the same conflation already deleted a paused sandbox's registry row in
 // 阶段 2c with its bytes intact in object storage.
 func TestOnlyAPositiveGoneAnswers404(t *testing.T) {
-	t.Run("gone: 404, and the scheduler is not given a second opinion", func(t *testing.T) {
+	t.Run("gone: 404", func(t *testing.T) {
 		service := &stubResumeService{err: status.Error(codes.NotFound, "sandbox sbx-1 not found")}
 
-		server := newTestServer(t,
-			refusingScheduler(t, "the api half already said the sandbox does not exist"),
-			5*time.Second, 1<<20,
+		server := newTestServer(t, 5*time.Second, 1<<20,
 			withProjectionReader(missingProjection()),
 			withResumeClient(service),
 		)
@@ -177,18 +210,9 @@ func TestOnlyAPositiveGoneAnswers404(t *testing.T) {
 	})
 
 	t.Run("unreachable: never 404", func(t *testing.T) {
-		upstream, _ := newUpstream(t)
 		service := &stubResumeService{err: status.Error(codes.DeadlineExceeded, "too slow")}
-		scheduler := stubSchedulerClient{
-			lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-				return &schedulerv1.LookupNodeResponse{
-					Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-					Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-				}, nil
-			},
-		}
 
-		server := newTestServer(t, scheduler, 5*time.Second, 1<<20,
+		server := newTestServer(t, 5*time.Second, 1<<20,
 			withProjectionReader(missingProjection()),
 			withResumeClient(service),
 		)
@@ -199,8 +223,8 @@ func TestOnlyAPositiveGoneAnswers404(t *testing.T) {
 			t.Fatal("🔴 a wake-up that timed out answered 404. That tells the " +
 				"platform to rebuild a sandbox nobody established anything about")
 		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d, want 200 from the fallback", resp.StatusCode)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Fatalf("status = %d, want 502", resp.StatusCode)
 		}
 	})
 }
@@ -210,9 +234,8 @@ func TestOnlyAPositiveGoneAnswers404(t *testing.T) {
 // For a sandbox whose snapshot never reached shared storage there is no second
 // copy: waking it elsewhere would not fail, it would *succeed*, by rebuilding
 // from an older snapshot and losing the last pause. So the refusal ends the
-// request rather than falling through to a scheduler that would happily name a
-// different machine.
-func TestAPinRefusalIs503AndNeverReachesTheScheduler(t *testing.T) {
+// request.
+func TestAPinRefusalIs503AndNeverRoutedAnywhere(t *testing.T) {
 	service := &stubResumeService{
 		err: status.Error(codes.FailedPrecondition,
 			`sandbox is local_only on node "node-b", which is not accepting work`),
@@ -222,9 +245,7 @@ func TestAPinRefusalIs503AndNeverReachesTheScheduler(t *testing.T) {
 		),
 	}
 
-	server := newTestServer(t,
-		refusingScheduler(t, "no other node has this sandbox's bytes"),
-		5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second, 1<<20,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -253,9 +274,7 @@ func TestATransitionInProgressCarriesRetryAfter(t *testing.T) {
 		),
 	}
 
-	server := newTestServer(t,
-		refusingScheduler(t, "somebody else is already waking this sandbox"),
-		5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second, 1<<20,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -274,15 +293,12 @@ func TestATransitionInProgressCarriesRetryAfter(t *testing.T) {
 // 🔴 §12 P3's control C, at the gateway.
 //
 // The probe stubs the RPC out with Unimplemented and requires the data plane to
-// fail. If the gateway fell through to the scheduler here the request would
-// succeed — proving only that a second wake-up path was doing the work, which
-// is exactly what the control is designed to detect.
-func TestAnUnimplementedWakeUpFailsRatherThanFallingBack(t *testing.T) {
+// fail: a request that succeeded would prove a second wake-up path was doing
+// the work, which is exactly what the control is designed to detect.
+func TestAnUnimplementedWakeUpFails(t *testing.T) {
 	service := &stubResumeService{err: status.Error(codes.Unimplemented, "not implemented")}
 
-	server := newTestServer(t,
-		refusingScheduler(t, "control C requires the data plane to fail when the surface is stubbed out"),
-		5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second, 1<<20,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -294,34 +310,17 @@ func TestAnUnimplementedWakeUpFailsRatherThanFallingBack(t *testing.T) {
 	}
 }
 
-// The switch off is today's behaviour exactly: no wake-up call, straight to the
-// scheduler. This is 阶段 3a's rollback, and it is a configuration value rather
-// than a deploy, which is what makes that rollback seconds rather than a
-// DaemonSet roll.
-func TestNoResumeClientNeverWakesAnything(t *testing.T) {
-	upstream, hits := newUpstream(t)
-	lookups := 0
-	scheduler := stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			lookups++
-			return &schedulerv1.LookupNodeResponse{
-				Node:     &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-				Location: schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-			}, nil
-		},
-	}
-
-	server := newTestServer(t, scheduler, 5*time.Second, 1<<20,
+// A gateway with no resume client has nobody to ask on a miss: the request
+// fails rather than being routed anywhere.
+func TestNoResumeClientFailsTheMissRatherThanRoutingAnywhere(t *testing.T) {
+	server := newTestServer(t, 5*time.Second, 1<<20,
 		withProjectionReader(missingProjection()),
 	)
 	resp := serveDataPlaneRequest(t, server.Handler(), "sbx-1")
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	if lookups != 1 || hits.get() != 1 {
-		t.Fatalf("lookups = %d, upstream hits = %d, want 1 and 1", lookups, hits.get())
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
 	}
 }
 
@@ -329,15 +328,9 @@ func TestNoResumeClientNeverWakesAnything(t *testing.T) {
 // is what decides whether the envd credential check runs there at all.
 func TestTheTargetPortReachesTheApiHalf(t *testing.T) {
 	upstream, _ := newUpstream(t)
-	service := &stubResumeService{response: &apiproxyv1.SandboxResumeResponse{
-		NodeId:      "node-a",
-		NodeAddress: upstream.URL,
-		ExecutionId: "0198b7cc-1111-7000-8000-000000000001",
-	}}
+	service := runningAt("node-a", upstream.URL)
 
-	server := newTestServer(t,
-		refusingScheduler(t, "the api half answered"),
-		5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second, 1<<20,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -371,9 +364,7 @@ func TestAutoResumeDisabledIs410AndNotRetryable(t *testing.T) {
 		),
 	}
 
-	server := newTestServer(t,
-		refusingScheduler(t, "a sandbox that declines to wake must not be routed anywhere"),
-		5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second, 1<<20,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)

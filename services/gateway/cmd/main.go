@@ -12,7 +12,6 @@ import (
 	"syscall"
 	"time"
 
-	schedulerv1 "agentenv/services/api/proto"
 	gateway "agentenv/services/gateway/internal"
 	"agentenv/services/gateway/internal/resume"
 	"agentenv/services/shared/config"
@@ -53,8 +52,6 @@ func main() {
 	}
 	defer conn.Close()
 
-	schedulerClient := schedulerv1.NewSchedulerClient(conn)
-
 	// 🔴 Built here and only when the read switch is on, so "the switch is off"
 	// is a nil reader rather than a live connection nothing uses. NewReader
 	// dials and pings, so a wrong address stops the process at start-up instead
@@ -82,14 +79,12 @@ func main() {
 	resumeClient := resume.New(conn, cfg.Gateway.RequestTimeout)
 
 	serverOptions := gateway.ServerOptions{
-		RequestTimeout:          cfg.Gateway.RequestTimeout,
-		MaxResponseSize:         cfg.Gateway.ForwardResponseSize,
-		DebugMode:               cfg.Gateway.DebugMode,
-		SandboxProxyDomains:     cfg.Gateway.SandboxProxyDomains,
-		ExecutionFencing:        string(cfg.Gateway.Routing.ExecutionFencing),
-		ControlPlaneToken:       cfg.Gateway.ControlPlaneToken,
-		ProjectionAuthoritative: cfg.Gateway.Routing.ProjectionAuthoritative,
-		ColdLookupTimeout:       cfg.Gateway.ColdLookupTimeout,
+		RequestTimeout:      cfg.Gateway.RequestTimeout,
+		MaxResponseSize:     cfg.Gateway.ForwardResponseSize,
+		DebugMode:           cfg.Gateway.DebugMode,
+		SandboxProxyDomains: cfg.Gateway.SandboxProxyDomains,
+		ExecutionFencing:    string(cfg.Gateway.Routing.ExecutionFencing),
+		ControlPlaneToken:   cfg.Gateway.ControlPlaneToken,
 	}
 	// 🔴 Assigned through the branch rather than passed inline: a typed nil
 	// pointer stored in an interface field is not a nil interface, and the read
@@ -100,7 +95,7 @@ func main() {
 	}
 	serverOptions.ResumeClient = resumeClient
 
-	s, err := gateway.NewServer(logger, schedulerClient, serverOptions)
+	s, err := gateway.NewServer(logger, serverOptions)
 	if err != nil {
 		logger.Fatal("init gateway server failed", zap.Error(err))
 	}
@@ -112,7 +107,6 @@ func main() {
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
 		zap.String("execution_fencing", string(cfg.Gateway.Routing.ExecutionFencing)),
 		zap.Bool("routing_projection_read", cfg.Gateway.Routing.ProjectionRead),
-		zap.Bool("routing_projection_authoritative", cfg.Gateway.Routing.ProjectionAuthoritative),
 		// Whether the token is set, never the token. An operator needs to know
 		// which of the two states the gate is in, and that is the whole of it.
 		zap.Bool("control_plane_token_configured", strings.TrimSpace(cfg.Gateway.ControlPlaneToken) != ""),

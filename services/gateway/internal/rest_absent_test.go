@@ -1,15 +1,10 @@
 package gateway
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
-
-	schedulerv1 "agentenv/services/api/proto"
-
-	"google.golang.org/grpc"
 )
 
 // 🔴 The gateway carries the sandbox data plane and nothing else. A request
@@ -37,7 +32,8 @@ func TestARequestThatNamesNoSandboxIsNotFound(t *testing.T) {
 		{name: "registry listing", method: http.MethodGet, target: "/registry/sandboxes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := newTestServer(t, refusingSchedulerClient(t), 5*time.Second, 4<<20)
+			server := newTestServer(t, 5*time.Second, 4<<20,
+				withResumeClient(refusingResume(t, "a request that names no sandbox has nothing to ask about")))
 
 			response := httptest.NewRecorder()
 			server.Handler().ServeHTTP(response, httptest.NewRequest(tc.method, tc.target, nil))
@@ -59,13 +55,7 @@ func TestTheSameRequestWithARoutingHeaderStillReachesANode(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-			}, nil
-		},
-	}, 5*time.Second, 4<<20)
+	server := newTestServer(t, 5*time.Second, 4<<20, routedTo("sbx-1", "node-a", upstream.URL))
 
 	for _, target := range []string{"/sandboxes/sbx-1/pause", "/nodes", "/anything"} {
 		request := httptest.NewRequest(http.MethodPost, target, nil)
@@ -76,26 +66,5 @@ func TestTheSameRequestWithARoutingHeaderStillReachesANode(t *testing.T) {
 		if response.Code != http.StatusTeapot {
 			t.Fatalf("%s with a routing header answered %d, want the node's 418", target, response.Code)
 		}
-	}
-}
-
-// refusingSchedulerClient answers every RPC with an error, so a test using it
-// can tell "nothing was asked" from "something was asked and answered".
-func refusingSchedulerClient(t *testing.T) stubSchedulerClient {
-	t.Helper()
-	fail := func(name string) error {
-		t.Errorf("the gateway called %s for a request that names no sandbox", name)
-		return context.Canceled
-	}
-	return stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return nil, fail("LookupNode")
-		},
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-			return nil, fail("Schedule")
-		},
-		getNodeFunc: func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
-			return nil, fail("GetNode")
-		},
 	}
 }

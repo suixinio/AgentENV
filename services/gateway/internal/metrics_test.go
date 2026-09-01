@@ -43,7 +43,6 @@ func TestStatusRecorderRouteSourceLabel(t *testing.T) {
 func TestInstrumentGatewayHTTPSkipsOnlyLocalEndpoints(t *testing.T) {
 	server := newTestServer(
 		t,
-		stubSchedulerClient{},
 		time.Second,
 		1024,
 		withSandboxProxyDomains("sandbox-proxy.example.invalid"),

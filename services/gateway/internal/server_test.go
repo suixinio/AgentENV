@@ -16,144 +16,18 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/routing"
 
 	"go.uber.org/zap"
-	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-type stubSchedulerClient struct {
-	scheduleFunc           func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error)
-	lookupNodeFunc         func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error)
-	recordAssignmentFunc   func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error)
-	heartbeatFunc          func(context.Context, *schedulerv1.HeartbeatRequest, ...grpc.CallOption) (*schedulerv1.HeartbeatResponse, error)
-	reportSandboxEventFunc func(context.Context, *schedulerv1.ReportSandboxEventRequest, ...grpc.CallOption) (*schedulerv1.ReportSandboxEventResponse, error)
-	listObservedFunc       func(context.Context, *schedulerv1.ListObservedNodesRequest, ...grpc.CallOption) (*schedulerv1.ListObservedNodesResponse, error)
-	listP2pPeersFunc       func(context.Context, *schedulerv1.ListP2PPeersRequest, ...grpc.CallOption) (*schedulerv1.ListP2PPeersResponse, error)
-	recordP2pArtifactFunc  func(context.Context, *schedulerv1.RecordP2PArtifactRequest, ...grpc.CallOption) (*schedulerv1.RecordP2PArtifactResponse, error)
-	forgetP2pArtifactFunc  func(context.Context, *schedulerv1.ForgetP2PArtifactRequest, ...grpc.CallOption) (*schedulerv1.ForgetP2PArtifactResponse, error)
-	lookupP2pArtifactFunc  func(context.Context, *schedulerv1.LookupP2PArtifactRequest, ...grpc.CallOption) (*schedulerv1.LookupP2PArtifactResponse, error)
-	getNodeFunc            func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error)
-	unregisterNodeFunc     func(context.Context, *schedulerv1.UnregisterNodeRequest, ...grpc.CallOption) (*schedulerv1.UnregisterNodeResponse, error)
-	listRegistryFunc       func(context.Context, *schedulerv1.ListRegistrySandboxesRequest, ...grpc.CallOption) (*schedulerv1.ListRegistrySandboxesResponse, error)
-}
-
-type trackingReadCloser struct {
-	readInvoked *bool
-	bodyClosed  *bool
-}
-
-func (t trackingReadCloser) Read(_ []byte) (int, error) {
-	if t.readInvoked != nil {
-		*t.readInvoked = true
-	}
-	return 0, io.EOF
-}
-
-func (t trackingReadCloser) Close() error {
-	if t.bodyClosed != nil {
-		*t.bodyClosed = true
-	}
-	return nil
-}
-
-func (s stubSchedulerClient) Schedule(ctx context.Context, req *schedulerv1.ScheduleRequest, opts ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
-	if s.scheduleFunc == nil {
-		return nil, fmt.Errorf("unexpected Schedule call")
-	}
-	return s.scheduleFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) LookupNode(ctx context.Context, req *schedulerv1.LookupNodeRequest, opts ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-	if s.lookupNodeFunc == nil {
-		return nil, fmt.Errorf("unexpected LookupNode call")
-	}
-	return s.lookupNodeFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) RecordAssignment(ctx context.Context, req *schedulerv1.RecordAssignmentRequest, opts ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-	if s.recordAssignmentFunc == nil {
-		return nil, fmt.Errorf("unexpected RecordAssignment call")
-	}
-	return s.recordAssignmentFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) Heartbeat(ctx context.Context, req *schedulerv1.HeartbeatRequest, opts ...grpc.CallOption) (*schedulerv1.HeartbeatResponse, error) {
-	if s.heartbeatFunc == nil {
-		return nil, fmt.Errorf("unexpected Heartbeat call")
-	}
-	return s.heartbeatFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) ListObservedNodes(ctx context.Context, req *schedulerv1.ListObservedNodesRequest, opts ...grpc.CallOption) (*schedulerv1.ListObservedNodesResponse, error) {
-	if s.listObservedFunc == nil {
-		return nil, fmt.Errorf("unexpected ListObservedNodes call")
-	}
-	return s.listObservedFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) ReportSandboxEvent(ctx context.Context, req *schedulerv1.ReportSandboxEventRequest, opts ...grpc.CallOption) (*schedulerv1.ReportSandboxEventResponse, error) {
-	if s.reportSandboxEventFunc == nil {
-		return nil, fmt.Errorf("unexpected ReportSandboxEvent call")
-	}
-	return s.reportSandboxEventFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) ListP2PPeers(ctx context.Context, req *schedulerv1.ListP2PPeersRequest, opts ...grpc.CallOption) (*schedulerv1.ListP2PPeersResponse, error) {
-	if s.listP2pPeersFunc == nil {
-		return nil, fmt.Errorf("unexpected ListP2pPeers call")
-	}
-	return s.listP2pPeersFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) RecordP2PArtifact(ctx context.Context, req *schedulerv1.RecordP2PArtifactRequest, opts ...grpc.CallOption) (*schedulerv1.RecordP2PArtifactResponse, error) {
-	if s.recordP2pArtifactFunc == nil {
-		return nil, fmt.Errorf("unexpected RecordP2PArtifact call")
-	}
-	return s.recordP2pArtifactFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) ForgetP2PArtifact(ctx context.Context, req *schedulerv1.ForgetP2PArtifactRequest, opts ...grpc.CallOption) (*schedulerv1.ForgetP2PArtifactResponse, error) {
-	if s.forgetP2pArtifactFunc == nil {
-		return nil, fmt.Errorf("unexpected ForgetP2PArtifact call")
-	}
-	return s.forgetP2pArtifactFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) LookupP2PArtifact(ctx context.Context, req *schedulerv1.LookupP2PArtifactRequest, opts ...grpc.CallOption) (*schedulerv1.LookupP2PArtifactResponse, error) {
-	if s.lookupP2pArtifactFunc == nil {
-		return nil, fmt.Errorf("unexpected LookupP2PArtifact call")
-	}
-	return s.lookupP2pArtifactFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) GetNode(ctx context.Context, req *schedulerv1.GetNodeRequest, opts ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
-	if s.getNodeFunc == nil {
-		return nil, fmt.Errorf("unexpected GetNode call")
-	}
-	return s.getNodeFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) UnregisterNode(ctx context.Context, req *schedulerv1.UnregisterNodeRequest, opts ...grpc.CallOption) (*schedulerv1.UnregisterNodeResponse, error) {
-	if s.unregisterNodeFunc == nil {
-		return nil, fmt.Errorf("unexpected UnregisterNode call")
-	}
-	return s.unregisterNodeFunc(ctx, req, opts...)
-}
-
-func (s stubSchedulerClient) ListRegistrySandboxes(ctx context.Context, req *schedulerv1.ListRegistrySandboxesRequest, opts ...grpc.CallOption) (*schedulerv1.ListRegistrySandboxesResponse, error) {
-	if s.listRegistryFunc == nil {
-		return nil, fmt.Errorf("unexpected ListRegistrySandboxes call")
-	}
-	return s.listRegistryFunc(ctx, req, opts...)
-}
-
 type testServerOption func(*ServerOptions)
 
-func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, timeout time.Duration, maxRespSize int64, opts ...testServerOption) *Server {
+func newTestServer(t *testing.T, timeout time.Duration, maxRespSize int64, opts ...testServerOption) *Server {
 	t.Helper()
-	return newTestServerWithLogger(t, zap.NewNop(), schedulerClient, timeout, maxRespSize, opts...)
+	return newTestServerWithLogger(t, zap.NewNop(), timeout, maxRespSize, opts...)
 }
 
 // newTestServerWithLogger is newTestServer for the tests that assert on what the
@@ -164,7 +38,6 @@ func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, ti
 func newTestServerWithLogger(
 	t *testing.T,
 	logger *zap.Logger,
-	schedulerClient schedulerv1.SchedulerClient,
 	timeout time.Duration,
 	maxRespSize int64,
 	opts ...testServerOption,
@@ -179,7 +52,7 @@ func newTestServerWithLogger(
 		opt(&options)
 	}
 
-	server, err := NewServer(logger, schedulerClient, options)
+	server, err := NewServer(logger, options)
 	if err != nil {
 		t.Fatalf("new gateway server failed: %v", err)
 	}
@@ -196,6 +69,20 @@ func withDebugMode(enabled bool) testServerOption {
 	return func(options *ServerOptions) {
 		options.DebugMode = enabled
 	}
+}
+
+// routedTo answers the projection read for sandboxID with one node and no
+// incarnation: the ordinary data-plane hit before fencing has anything to say.
+func routedTo(sandboxID string, nodeID string, endpoint string) testServerOption {
+	return routedToExecution(sandboxID, nodeID, endpoint, "")
+}
+
+// routedToExecution is routedTo with the incarnation the projection names,
+// which is what decideFencing reads.
+func routedToExecution(sandboxID string, nodeID string, endpoint string, executionID string) testServerOption {
+	return withProjectionReader(&stubProjectionReader{records: map[string]routing.Record{
+		sandboxID: {Node: routing.Node{ID: nodeID, Endpoint: endpoint}, ExecutionID: executionID},
+	}})
 }
 
 func TestSandboxIDFromHeadersPrimary(t *testing.T) {
@@ -337,21 +224,13 @@ func serve(t *testing.T, server *Server, req *http.Request) *http.Response {
 // field existed. It does not any more: the query-only-scheduler client
 // selection is deleted along with the Go scheduler it existed to
 // decommission.
-func TestLookupNodeGoesToTheConfiguredScheduler(t *testing.T) {
+func TestARoutedHealthRequestReachesTheNode(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
 
-	scheduler := stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-1" {
-				return nil, fmt.Errorf("lookup sandbox id = %q, want %q", req.GetSandboxId(), "sbx-1")
-			}
-			return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{NodeId: "node-1", Endpoint: upstream.URL}}, nil
-		},
-	}
-	server := newTestServer(t, scheduler, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024, routedTo("sbx-1", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -388,14 +267,7 @@ func TestDebugModeExposesBackendNodeIDOnResponse(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-1" {
-				return nil, fmt.Errorf("lookup sandbox id = %q, want %q", req.GetSandboxId(), "sbx-1")
-			}
-			return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{NodeId: "node-1", Endpoint: upstream.URL}}, nil
-		},
-	}, time.Second, 1024, withDebugMode(true))
+	server := newTestServer(t, time.Second, 1024, routedTo("sbx-1", "node-1", upstream.URL), withDebugMode(true))
 
 	req := httptest.NewRequest(http.MethodGet, "/anything", nil)
 	req.Header.Set(headerSandboxID, "sbx-1")
@@ -442,19 +314,7 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-path" {
-				return nil, fmt.Errorf("lookup sandbox id = %q, want %q", req.GetSandboxId(), "sbx-path")
-			}
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{
-					NodeId:   "node-1",
-					Endpoint: upstream.URL,
-				},
-			}, nil
-		},
-	}, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024, routedTo("sbx-path", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -486,78 +346,12 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 	}
 }
 
-// 🔴 assignmentRouteFor used to take the request, the route source and
-// whether the projection write switch was on, because it had to tell a
-// create, a fork, a resume/connect and a registry-resolved control-plane call
-// apart from each other and from data-plane traffic. None of that
-// distinguishing work is reachable through this function any more:
-// handleProxy's isUserFacingRestRequest branch forwards every create, fork,
-// resume, connect and other control-plane call to the api half — which
-// records its own placements — before assignmentRouteFor is ever called, so
-// by the time this function runs, routeSource can only be routeSourceHeader
-// or routeSourceHost (see assignmentRouteFor's own doc comment). What is left
-// to test is the one case that predates the REST switch and is unrelated to
-// it: a sandbox the scheduler resolved off the paused registry needs its
-// binding written from the first data-plane response that reaches it,
-// whatever the location.
-func TestAssignmentRouteFor(t *testing.T) {
-	unspecified := schedulerv1.SandboxLocation_SANDBOX_LOCATION_UNSPECIFIED
-	bound := schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND
-	placed := schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED
-	pinned := schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED
-
-	tests := []struct {
-		name       string
-		hasSandbox bool
-		location   schedulerv1.SandboxLocation
-		want       assignmentRoute
-	}{
-		{name: "no sandbox resolved", hasSandbox: false, location: unspecified, want: assignmentRouteNone},
-		{name: "bound sandbox already has a binding", hasSandbox: true, location: bound, want: assignmentRouteNone},
-		{name: "unspecified location (an older scheduler) needs no assignment", hasSandbox: true, location: unspecified, want: assignmentRouteNone},
-		{name: "placed sandbox reads the response", hasSandbox: true, location: placed, want: assignmentRouteResponse},
-		{name: "pinned sandbox reads the response", hasSandbox: true, location: pinned, want: assignmentRouteResponse},
-		// A location the gateway would otherwise treat as needing an
-		// assignment is still gated on hasSandbox: it is never true without a
-		// resolved sandbox, but the function does not assume that on its own.
-		{name: "placed location without a resolved sandbox", hasSandbox: false, location: placed, want: assignmentRouteNone},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := assignmentRouteFor(tc.hasSandbox, tc.location)
-			if got != tc.want {
-				t.Fatalf("expected %v, got %v", tc.want, got)
-			}
-		})
-	}
-}
-
 func TestSandboxIDFromHeadersOnResponse(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Agentenv-Sandbox-Id", "resp-sbx-1")
 	id, ok := sandboxIDFromHeaders(h)
 	if !ok || id != "resp-sbx-1" {
 		t.Fatalf("expected sandbox id from response header, got %q (ok=%v)", id, ok)
-	}
-}
-
-func TestExtractSandboxIDFromResponse(t *testing.T) {
-	id, ok := extractSandboxIDFromResponse([]byte(`{"sandboxID":"sbx-123"}`))
-	if !ok || id != "sbx-123" {
-		t.Fatalf("expected sandbox id to be extracted, got %q (ok=%v)", id, ok)
-	}
-
-	// 🔴 The real fork response: a bare top-level array of per-fork results,
-	// each wrapping a full sandbox. This test used to feed
-	// {"sandboxes":[…]} — an envelope no route in this repo produces — which
-	// is how the extraction shipped unable to read the one body it exists for.
-	assignments := extractSandboxAssignmentsFromResponse([]byte(`[
-		{"sandbox":{"sandboxID":"sbx-1","executionID":"exec-1"},"projectionTtlSecs":3600},
-		{"sandbox":{"sandboxID":"sbx-2","executionID":"exec-2"},"projectionTtlSecs":3600}
-	]`))
-	if !equalStrings(sandboxIDsOf(assignments), []string{"sbx-1", "sbx-2"}) {
-		t.Fatalf("expected the fork array's sandbox ids, got %#v", assignments)
 	}
 }
 
@@ -863,78 +657,6 @@ func TestInjectForwardedHeadersSetsXForwardedFor(t *testing.T) {
 	}
 }
 
-func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) {
-	readInvoked := false
-	bodyClosed := false
-
-	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 1)
-	server := newTestServer(t, stubSchedulerClient{
-		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			recorded <- req
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}, time.Second, 1024)
-
-	resp := &http.Response{
-		StatusCode: http.StatusCreated,
-		Header:     http.Header{},
-		Body:       trackingReadCloser{readInvoked: &readInvoked, bodyClosed: &bodyClosed},
-	}
-	resp.Header.Set(headerSandboxID, "sbx-from-header")
-
-	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, proxyRequestOptions{assignment: assignmentRouteResponse}); err != nil {
-		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
-	}
-
-	if readInvoked {
-		t.Fatal("expected response body to remain unread when sandbox id header is present")
-	}
-	if bodyClosed {
-		t.Fatal("expected response body to remain open when sandbox id header is present")
-	}
-
-	req := <-recorded
-	if req.GetSandboxId() != "sbx-from-header" {
-		t.Fatalf("recorded sandbox id = %q, want %q", req.GetSandboxId(), "sbx-from-header")
-	}
-}
-
-func TestReadBodyWithLimitWithinLimit(t *testing.T) {
-	body, truncated, err := readBodyWithLimit(strings.NewReader("hello"), 5)
-	if err != nil {
-		t.Fatalf("readBodyWithLimit returned error: %v", err)
-	}
-	if truncated {
-		t.Fatal("expected body to fit limit")
-	}
-	if string(body) != "hello" {
-		t.Fatalf("unexpected body: %q", string(body))
-	}
-}
-
-func TestReadBodyWithLimitDetectsOverflow(t *testing.T) {
-	_, truncated, err := readBodyWithLimit(strings.NewReader("hello!"), 5)
-	if err != nil {
-		t.Fatalf("readBodyWithLimit returned error: %v", err)
-	}
-	if !truncated {
-		t.Fatal("expected overflow to be detected")
-	}
-}
-
-func TestRecordAssignmentTimeout(t *testing.T) {
-	if got := recordAssignmentTimeout(2 * time.Second); got != 2*time.Second {
-		t.Fatalf("expected timeout to keep smaller value, got %s", got)
-	}
-	if got := recordAssignmentTimeout(30 * time.Second); got != maxRecordAssignmentTimeout {
-		t.Fatalf("expected timeout to be capped at %s, got %s", maxRecordAssignmentTimeout, got)
-	}
-	if got := recordAssignmentTimeout(0); got != maxRecordAssignmentTimeout {
-		t.Fatalf("expected zero timeout to fall back to %s, got %s", maxRecordAssignmentTimeout, got)
-	}
-}
-
 func TestFlushInterval(t *testing.T) {
 	if got := flushInterval(true); got != -1 {
 		t.Fatalf("flushInterval(true) = %s, want -1ns", got)
@@ -945,7 +667,7 @@ func TestFlushInterval(t *testing.T) {
 }
 
 func TestMetricsEndpointReturnsNotFoundWithoutProxyRouting(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024)
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -961,7 +683,7 @@ func TestMetricsEndpointReturnsNotFoundWithoutProxyRouting(t *testing.T) {
 }
 
 func TestHealthEndpointReturnsGatewayHealthWithoutProxyHeaders(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024)
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -999,19 +721,7 @@ func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T)
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-service" {
-				return nil, fmt.Errorf("unexpected sandbox id lookup: %q", req.GetSandboxId())
-			}
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{
-					NodeId:   "node-1",
-					Endpoint: upstream.URL,
-				},
-			}, nil
-		},
-	}, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024, routedTo("sbx-service", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -1050,7 +760,7 @@ func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T)
 }
 
 func TestHealthAndMetricsEndpointsWithProxyHeadersMissingSandboxIDReturnBadRequest(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024)
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -1093,19 +803,7 @@ func TestHealthAndMetricsEndpointsWithHostRoutingProxyToSandbox(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-service" {
-				return nil, fmt.Errorf("unexpected sandbox id lookup: %q", req.GetSandboxId())
-			}
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{
-					NodeId:   "node-1",
-					Endpoint: upstream.URL,
-				},
-			}, nil
-		},
-	}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	server := newTestServer(t, time.Second, 1024, routedTo("sbx-service", "node-1", upstream.URL), withSandboxProxyDomains("sandbox-proxy.example.invalid"))
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -1171,19 +869,7 @@ func TestHandleProxyHostBasedRoutingForwardsToSandboxProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != sandboxID {
-				return nil, fmt.Errorf("unexpected sandbox id lookup: %q", req.GetSandboxId())
-			}
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{
-					NodeId:   "node-1",
-					Endpoint: upstream.URL,
-				},
-			}, nil
-		},
-	}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	server := newTestServer(t, time.Second, 1024, routedTo(sandboxID, "node-1", upstream.URL), withSandboxProxyDomains("sandbox-proxy.example.invalid"))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -1232,7 +918,7 @@ func TestHandleProxyHostBasedRoutingForwardsToSandboxProxy(t *testing.T) {
 }
 
 func TestHandleProxyHostBasedRoutingRejectsInvalidHost(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	server := newTestServer(t, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -1361,19 +1047,7 @@ func TestHandleProxyWebSocketForwarding(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-1" {
-				return nil, fmt.Errorf("unexpected sandbox id lookup: %q", req.GetSandboxId())
-			}
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{
-					NodeId:   "node-1",
-					Endpoint: upstream.URL,
-				},
-			}, nil
-		},
-	}, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024, routedTo("sbx-1", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -1477,19 +1151,7 @@ func TestHandleProxyPreservesEncodedPathSegments(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-enc" {
-				return nil, fmt.Errorf("unexpected sandbox id lookup: %q", req.GetSandboxId())
-			}
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{
-					NodeId:   "node-1",
-					Endpoint: upstream.URL,
-				},
-			}, nil
-		},
-	}, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024, routedTo("sbx-enc", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -1572,7 +1234,7 @@ func websocketAccept(key string) string {
 }
 
 func TestProxyRequestContextDeadlineReturnsGatewayTimeout(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	server := newTestServer(t, time.Second, 1024)
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
@@ -1582,7 +1244,6 @@ func TestProxyRequestContextDeadlineReturnsGatewayTimeout(t *testing.T) {
 	server.proxyRequest(
 		recorder,
 		proxyReq,
-		context.Background(),
 		"http://127.0.0.1:1/sandboxes/sbx-timeout",
 		&schedulerv1.Node{NodeId: "node-1", Endpoint: "http://127.0.0.1:1"},
 		proxyRequestOptions{},
@@ -1613,269 +1274,15 @@ func TestGatewayClassifiesClientCanceledProxyErrors(t *testing.T) {
 // lookupNodeReturning builds a stub whose LookupNode answers with one node and
 // one location. Every other RPC is left unset, so any call the gateway makes
 // beyond the single lookup fails the test by itself.
-func lookupNodeReturning(node *schedulerv1.Node, location schedulerv1.SandboxLocation, originNodeID string) func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-	return func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-		return &schedulerv1.LookupNodeResponse{
-			Node:         node,
-			Location:     location,
-			OriginNodeId: originNodeID,
-		}, nil
-	}
-}
-
-// TestPlacedSandboxDataPlaneRequestRecordsTheAssignment is
-// TestResumeOfUnassignedSandboxIsRoutedToThePlacedNode's data-plane
-// descendant, folding in two things that used to be pinned elsewhere and
-// would otherwise have lost coverage along with it: what
-// execution_fencing_test.go's TestRecordedAssignmentCarriesTheNodesExecution
-// used to check about the recorded incarnation, and what projection_test.go's
-// TestCreateSendsNoBudgetWhileTheWriteSwitchIsOff /
-// TestCreateForwardsTheBudgetWithoutBufferingTheBody used to check about
-// ProjectionAuthoritative gating the recorded TTL.
-//
-// 🔴 The tests this replaces drove a resume or a create against an
-// unconfigured (restUpstream=="") fixture, which used to fall through to
-// this gateway's own scheduler-routed proxying. Every one of those routes is
-// forwarded to the api half unconditionally now — see the removed "else"
-// branch in handleProxy — so a PLACED sandbox no longer reaches this
-// package's own LookupNode/RecordAssignment plumbing that way. What is left,
-// and what this test exercises instead, is the one case unrelated to that
-// switch: a data-plane request to a sandbox the scheduler resolved off the
-// paused registry still needs its binding written from the first response
-// that reaches it, carrying whatever incarnation that response named and
-// whatever TTL ProjectionAuthoritative allows through.
-func TestPlacedSandboxDataPlaneRequestRecordsTheAssignment(t *testing.T) {
-	const executionID = "0198b7cc-1111-7000-8000-000000000001"
-
-	for _, tc := range []struct {
-		name          string
-		authoritative bool
-		wantTTL       uint32
-	}{
-		{name: "the write switch is off: no budget is sent", authoritative: false, wantTTL: 0},
-		{name: "the write switch is on: the node's budget is forwarded", authoritative: true, wantTTL: 86460},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			forwarded := make(chan string, 1)
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				forwarded <- r.URL.Path
-				w.Header().Set(headerSandboxID, "sbx-1")
-				w.Header().Set(headerExecutionID, executionID)
-				// The node stamps the budget whatever the gateway's switch
-				// says: it knows nothing about the gateway's configuration.
-				w.Header().Set(headerProjectionTTLSecs, "86460")
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer upstream.Close()
-
-			assignments := make(chan *schedulerv1.RecordAssignmentRequest, 1)
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: lookupNodeReturning(
-					&schedulerv1.Node{NodeId: "node-b", Endpoint: upstream.URL},
-					schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED,
-					"node-a",
-				),
-				recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-					assignments <- req
-					return &schedulerv1.RecordAssignmentResponse{}, nil
-				},
-			}, 5*time.Second, 4<<20, withProjectionAuthoritative(tc.authoritative))
-
-			request := httptest.NewRequest(http.MethodGet, "/anything", nil)
-			request.Header.Set(headerSandboxID, "sbx-1")
-			response := httptest.NewRecorder()
-			server.Handler().ServeHTTP(response, request)
-
-			if response.Code != http.StatusOK {
-				t.Fatalf("expected status 200, got %d (body %q)", response.Code, response.Body.String())
-			}
-			select {
-			case path := <-forwarded:
-				if path != "/proxy/anything" {
-					t.Fatalf("unexpected upstream path: %s", path)
-				}
-			default:
-				t.Fatal("request was not forwarded to the placed node")
-			}
-			// A placed node has never held this sandbox, so nothing has a
-			// binding for it. Waiting for that node's next heartbeat would
-			// leave the sandbox unroutable in the meantime.
-			select {
-			case assignment := <-assignments:
-				if assignment.GetNode().GetNodeId() != "node-b" {
-					t.Fatalf("assignment recorded against %q", assignment.GetNode().GetNodeId())
-				}
-				// 🔴 Not gated by the switch, and never a neighbour's
-				// incarnation or an echoed placeholder: the one this specific
-				// response named. Forwarding it is behaviour that already
-				// shipped before the write switch existed.
-				if assignment.GetExecutionId() != executionID {
-					t.Fatalf("assignment recorded incarnation %q, want %q", assignment.GetExecutionId(), executionID)
-				}
-				if assignment.GetProjectionTtlSecs() != tc.wantTTL {
-					t.Fatalf("recorded ttl %d, want %d", assignment.GetProjectionTtlSecs(), tc.wantTTL)
-				}
-			default:
-				t.Fatal("the placement was never recorded as an assignment")
-			}
-		})
-	}
-}
-
-// 🔴 TestPinnedSandboxIsRoutedToItsOriginAndRecorded used to live here as a
-// PINNED sibling of the PLACED test above, driven through the same dead
-// resume-via-routeSourcePath mechanism. It is not restored as a data-plane
-// test alongside it: locationNeedsAssignment (server.go) treats PLACED and
-// PINNED identically — `case PLACED, PINNED: return true` — so
-// TestPlacedSandboxDataPlaneRequestRecordsTheAssignment already exercises
-// every branch a PINNED-flavoured copy would, down to which line of that
-// switch decides it.
-
-// TestBoundSandboxDoesNotRecordAnAssignment is the control for the PLACED
-// case above: a node the scheduler resolved from a binding already has one,
-// so nothing is written back. Without this, the assignment write would be
-// indistinguishable from a blanket "record everything", and every proxied
-// request would cost an extra RPC and a buffered response body.
-//
-// 🔴 Converted to a data-plane request for the reason given above: BOUND
-// resolved through a resume no longer reaches this package's routing at all,
-// and BOUND resolved through data-plane traffic is the common case most other
-// passing data-plane tests in this package already exercise — but none of
-// them assert that RecordAssignment was not called, which is the one thing
-// this test adds.
-func TestBoundSandboxDoesNotRecordAnAssignment(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set(headerSandboxID, "sbx-1")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer upstream.Close()
-
-	// The call is counted rather than refused: a failed RecordAssignment is
-	// only logged, so a stub that errors would let the extra RPC through
-	// unnoticed.
-	recorded := 0
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: lookupNodeReturning(
-			&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-			schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-			"",
-		),
-		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-			recorded++
-			return &schedulerv1.RecordAssignmentResponse{}, nil
-		},
-	}, 5*time.Second, 4<<20)
-
-	request := httptest.NewRequest(http.MethodGet, "/anything", nil)
-	request.Header.Set(headerSandboxID, "sbx-1")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d (body %q)", response.Code, response.Body.String())
-	}
-	if recorded != 0 {
-		t.Fatalf("a bound sandbox had its assignment rewritten %d times", recorded)
-	}
-}
-
-// 🔴 The most important assertion in this file. A scheduler that cannot read the
-// paused registry answers Unavailable, and the gateway must turn that into a
-// 503. A 404 here tells the client its sandbox is gone, which for a resume is
-// the end of that sandbox — and it would be said on the strength of a database
-// that was merely unreachable for a moment.
-//
-// 🔴 Converted to a data-plane request: this used to drive a resume against
-// an unconfigured fixture, which is dead for the reason given on the PLACED
-// test above. writeSchedulerError's Unavailable branch is still live, but
-// only ever reached now from a data-plane LookupNode failure.
-func TestUnreadableRegistryIsFiveOhThreeAndNotFourOhFour(t *testing.T) {
-	for _, tc := range []struct {
-		name    string
-		message string
-	}{
-		{name: "read failed", message: "paused registry unavailable"},
-		// A freshly started scheduler that has never completed a read knows
-		// nothing about the table yet. Same answer, different cause.
-		{name: "not yet warm", message: "paused registry is not ready"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-					return nil, status.Error(codes.Unavailable, tc.message)
-				},
-			}, 5*time.Second, 4<<20)
-
-			request := httptest.NewRequest(http.MethodGet, "/anything", nil)
-			request.Header.Set(headerSandboxID, "sbx-1")
-			response := httptest.NewRecorder()
-			server.Handler().ServeHTTP(response, request)
-
-			if response.Code != http.StatusServiceUnavailable {
-				t.Fatalf("expected status 503, got %d (body %q)", response.Code, response.Body.String())
-			}
-			if !strings.Contains(response.Body.String(), tc.message) {
-				t.Fatalf("the reason was not passed through: %q", response.Body.String())
-			}
-		})
-	}
-}
-
-// A sandbox whose only copy is on a node that will not take work cannot be
-// served anywhere. The scheduler says so, and the gateway answers 503 with that
-// reason — rather than sending the request to a node that would refuse it and
-// leaving the client with a 503 whose body says the opposite.
-//
-// 🔴 Converted to a data-plane request for the same reason as the test above.
-func TestPinnedOriginThatCannotServeIsFiveOhThreeAndNeverForwarded(t *testing.T) {
-	contacted := 0
-	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		contacted++
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
-	defer origin.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return nil, status.Error(codes.FailedPrecondition,
-				`sandbox is local_only on node "node-a", which is not accepting work`)
-		},
-	}, 5*time.Second, 4<<20)
-
-	request := httptest.NewRequest(http.MethodGet, "/anything", nil)
-	request.Header.Set(headerSandboxID, "sbx-1")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected status 503, got %d (body %q)", response.Code, response.Body.String())
-	}
-	if !strings.Contains(response.Body.String(), "local_only") || !strings.Contains(response.Body.String(), "node-a") {
-		t.Fatalf("the body does not say why the sandbox cannot be served: %q", response.Body.String())
-	}
-	if contacted != 0 {
-		t.Fatalf("the origin node was contacted %d times", contacted)
-	}
-}
-
 // 🔴 A 503 is right; the gRPC client's own dial error is not a body.
 //
-// Measured on the dev cluster with the scheduler scaled to zero replicas:
-// POST /v3/templates answered 503 with
-// `dial tcp 10.43.165.31:9090: connect: connection refused`, handing every
-// caller the cluster's internal addressing and a Go transport string neither
-// this service nor the scheduler wrote.
-//
-// 🔴 Converted to a data-plane LookupNode failure. This used to drive the
-// dial failure through Schedule (POST /templates against an unconfigured
-// fixture), which is dead: /templates is a routeSourceSchedule call and is
-// now always forwarded to the api half before the gateway ever calls
-// Schedule — see the removed "else" branch in handleProxy. schedulerReason's
-// redaction is shared by both call sites (writeSchedulerError and, via
-// resumeReason, writeResumeError), so pinning it through the one that is
-// still live — a data-plane LookupNode failure — still catches a regression
-// in the shared function.
-func TestSchedulerTransportTextIsNotHandedToTheClient(t *testing.T) {
+// Measured on the dev cluster with the control plane scaled to zero replicas:
+// the body was `dial tcp 10.43.165.31:9090: connect: connection refused`,
+// handing every caller the cluster's internal addressing and a Go transport
+// string neither this service nor the api half wrote. The refusal is fed
+// through the resume client, the one RPC left, as a FailedPrecondition — the
+// code whose reason is forwarded to the caller.
+func TestTransportTextInAResumeRefusalIsNotHandedToTheClient(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		message string
@@ -1894,11 +1301,11 @@ func TestSchedulerTransportTextIsNotHandedToTheClient(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-					return nil, status.Error(codes.Unavailable, tc.message)
-				},
-			}, 5*time.Second, 4<<20)
+			service := &stubResumeService{err: status.Error(codes.FailedPrecondition, tc.message)}
+			server := newTestServer(t, 5*time.Second, 4<<20,
+				withProjectionReader(missingProjection()),
+				withResumeClient(service),
+			)
 
 			request := httptest.NewRequest(http.MethodGet, "/anything", nil)
 			request.Header.Set(headerSandboxID, "sbx-1")
@@ -1924,15 +1331,13 @@ func TestSchedulerTransportTextIsNotHandedToTheClient(t *testing.T) {
 // 🔴 The backstop, for a phrasing the list above has not seen. Whatever wrapped
 // it, an endpoint does not go in a response body — a future grpc-go, a proxy or
 // a mesh may word its failure any way it likes.
-//
-// 🔴 Converted to a data-plane LookupNode failure for the same reason as the
-// test above.
-func TestAnEndpointInASchedulerMessageIsRedacted(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return nil, status.Error(codes.Unavailable, "upstream 10.43.165.31:9090 said no, and so did [fd00::1]:8443")
-		},
-	}, 5*time.Second, 4<<20)
+func TestAnEndpointInAResumeRefusalIsRedacted(t *testing.T) {
+	service := &stubResumeService{err: status.Error(codes.FailedPrecondition,
+		"upstream 10.43.165.31:9090 said no, and so did [fd00::1]:8443")}
+	server := newTestServer(t, 5*time.Second, 4<<20,
+		withProjectionReader(missingProjection()),
+		withResumeClient(service),
+	)
 
 	request := httptest.NewRequest(http.MethodGet, "/anything", nil)
 	request.Header.Set(headerSandboxID, "sbx-1")
@@ -1949,38 +1354,18 @@ func TestAnEndpointInASchedulerMessageIsRedacted(t *testing.T) {
 		}
 	}
 	// 🔴 And only the endpoint goes. Redacting the whole message would take the
-	// reason with it, which is the failure the two tests above this one exist
-	// to prevent.
+	// reason with it, which is the failure the test above this one exists to
+	// prevent.
 	if !strings.Contains(body, "upstream") || !strings.Contains(body, "said no") {
 		t.Fatalf("redaction ate the reason: %q", body)
 	}
 }
 
-// 🔴 TestPauseOfUnassignedSandboxDoesNotReschedule and
-// TestResumeOfAnUnknownSandboxIsFourOhFour used to live here, both driving a
-// pause or a resume against an unconfigured (restUpstream=="") fixture with a
-// scheduler NotFound. Both routes are routeSourcePath calls and are now
-// always forwarded to the api half before either LookupNode or Schedule is
-// ever called from this package, so neither request exercises what these
-// tests were pinning any more.
-//
-// TestPauseOfUnassignedSandboxDoesNotReschedule guarded against a
-// create-time Schedule call being triggered by a control-plane request that
-// found no assignment. That Schedule call no longer exists anywhere in this
-// package — see the removed "else" branch in handleProxy — so the property
-// holds structurally now rather than by a decision a test needs to keep
-// pinning.
-//
-// TestResumeOfAnUnknownSandboxIsFourOhFour pinned that a scheduler NotFound
-// still maps to 404. That mapping (writeSchedulerError's NotFound branch) is
-// not uncovered: it is the same branch TestProjectionMissOnAnUnknownSandbox-
-// StillAnswers404 (projection_test.go) exercises through a genuine, still-live
-// data-plane LookupNode failure.
-
 // Routing headers that name no sandbox are refused where the /health branch
 // refuses them, not carried into the resolver to fail on an empty upstream.
 func TestRoutingHeadersNamingNoSandboxAreRefusedNotProxied(t *testing.T) {
-	server := newTestServer(t, refusingScheduler(t, "nothing named a sandbox to look up"), 5*time.Second, 4<<20)
+	server := newTestServer(t, 5*time.Second, 4<<20,
+		withResumeClient(refusingResume(t, "nothing named a sandbox to look up")))
 
 	request := httptest.NewRequest(http.MethodGet, "/anything", nil)
 	request.Header.Set(headerTargetPort, "8080")

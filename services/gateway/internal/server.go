@@ -1,13 +1,8 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
-	"math"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -36,14 +31,6 @@ const (
 	headerEnvdAccessToken = "x-access-token"
 	headerE2BTargetPort   = "e2b-sandbox-port"
 	headerNodeID          = "x-agentenv-node-id"
-	// headerProjectionTTLSecs is the node's own budget for how long the routing
-	// projection of the sandbox it just started should live, in whole seconds.
-	//
-	// 🔴 Absent, unparseable and non-positive all mean the same thing here:
-	// nothing to forward, and the scheduler falls back to its binding_ttl. None
-	// of them may ever become "no expiry".
-	headerProjectionTTLSecs    = "x-agentenv-projection-ttl-secs"
-	maxRecordAssignmentTimeout = 5 * time.Second
 )
 
 type routeSource string
@@ -70,20 +57,14 @@ type ServerOptions struct {
 	// node. Empty means stamp nothing, which is the state the fleet runs in
 	// until the node-side gate is turned on.
 	ControlPlaneToken string
-	// ProjectionReader lets a sandbox route be answered out of the routing
-	// projection instead of from a LookupNode call. Nil is the read switch in
-	// its off position, and is the behaviour that shipped before it existed.
+	// ProjectionReader answers a sandbox route out of the routing projection
+	// before the api half is asked. Nil is the read switch in its off
+	// position: every request naming a sandbox goes to ResumeClient.
 	ProjectionReader projectionReader
-	// ProjectionAuthoritative is the gateway's half of the write-side switch:
-	// resume and connect record an assignment, and the incarnation and TTL a
-	// node reports are forwarded to the scheduler. Off forwards neither, which
-	// is a projection write identical to today's.
-	ProjectionAuthoritative bool
 
-	// ResumeClient asks the API half to wake a paused sandbox when the routing
-	// projection has no answer. Nil makes the gateway fall through to the
-	// scheduler on every projection miss, exactly as it did before the
-	// wake-up decision moved.
+	// ResumeClient asks the API half where a sandbox is running, waking it
+	// when it is paused, whenever the routing projection has no answer. Nil
+	// makes every projection miss fail with a 502.
 	//
 	// 🔴 阶段 3a used to be able to leave this nil in production: nodes were
 	// still the pre-split single process and could wake a sandbox themselves,
@@ -97,34 +78,10 @@ type ServerOptions struct {
 	// projection, this wake-up client, and the cold-path LookupNode call
 	// below — none of which has ever depended on RestUpstreamAddr.
 	ResumeClient *resume.Client
-
-	// ColdLookupTimeout bounds the LookupNode call a projection miss and an
-	// undecided wake-up both fall through to (see the "if resp == nil" block
-	// below the wake-up attempt in handleProxy), separately from
-	// RequestTimeout. Zero (the default when unset by the caller) is resolved
-	// to defaultColdLookupTimeout in NewServer, never left as "no timeout" —
-	// a target that is merely unreachable (a Service with no ready endpoints,
-	// or a black-holed route) must not be allowed to hold this call open for
-	// whatever of RequestTimeout happens to be left, let alone for gRPC's own
-	// connection backoff.
-	//
-	// 🔴 Deliberately its own setting rather than a fraction of
-	// RequestTimeout: the two bound different things. RequestTimeout is a
-	// budget for a legitimate, possibly slow end-to-end exchange (including a
-	// proxied body); this is a budget for one read against a service that, in
-	// the scenario this exists for, is not answering at all. Tying it to
-	// RequestTimeout would mean nobody could tighten one without retuning the
-	// other.
-	//
-	// Removing it would silently widen this call's failure window from a few
-	// seconds to RequestTimeout's 30-90s: it is the ordinary protection any
-	// outbound RPC with a budget shorter than its caller's needs.
-	ColdLookupTimeout time.Duration
 }
 
 type Server struct {
 	logger         *zap.Logger
-	scheduler      schedulerv1.SchedulerClient
 	httpClient     *http.Client
 	requestTimeout time.Duration
 	maxRespSize    int64
@@ -141,28 +98,13 @@ type Server struct {
 	// projectionReader is nil when the read switch is off. Checked once per
 	// request rather than being wrapped in a no-op implementation, so "the
 	// switch is off" is a state a reader of this code can see.
-	projectionReader        projectionReader
-	projectionAuthoritative bool
+	projectionReader projectionReader
 	// Nil when no wake-up endpoint is configured — no longer reachable from a
 	// validated deployment, see ServerOptions.ResumeClient.
 	resumeClient *resume.Client
-	// See ServerOptions.ColdLookupTimeout. Never zero past NewServer — see
-	// defaultColdLookupTimeout.
-	coldLookupTimeout time.Duration
 }
 
-// defaultColdLookupTimeout is used when ServerOptions.ColdLookupTimeout is
-// zero, which includes every test and config that predates this setting.
-//
-// 🔴 Picked to be well clear of a healthy LookupNode's latency (a single
-// registry read, normally milliseconds) while being nowhere near
-// RequestTimeout's default 30s or a TCP handshake's own retry ceiling
-// (`tcp_syn_retries`'s default of 6 costs on the order of two minutes) — the
-// two failure shapes this setting exists to stop this call from being
-// exposed to.
-const defaultColdLookupTimeout = 3 * time.Second
-
-func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
+func NewServer(logger *zap.Logger, options ServerOptions) (*Server, error) {
 	sandboxProxyDomains, err := normalizeProxyDomains(options.SandboxProxyDomains)
 	if err != nil {
 		return nil, err
@@ -173,29 +115,17 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		return nil, err
 	}
 
-	// 🔴 Never left at zero: a zero timeout would make every cold-path call
-	// fail before it started, which for every test and config written before
-	// this setting existed silently changes today's behaviour instead of
-	// preserving it.
-	coldLookupTimeout := options.ColdLookupTimeout
-	if coldLookupTimeout <= 0 {
-		coldLookupTimeout = defaultColdLookupTimeout
-	}
-
 	return &Server{
-		logger:                  logger,
-		scheduler:               schedulerClient,
-		httpClient:              &http.Client{},
-		requestTimeout:          options.RequestTimeout,
-		maxRespSize:             options.MaxResponseSize,
-		debugMode:               options.DebugMode,
-		sandboxProxyDomains:     sandboxProxyDomains,
-		executionFencing:        executionFencing,
-		controlPlaneToken:       strings.TrimSpace(options.ControlPlaneToken),
-		projectionReader:        options.ProjectionReader,
-		projectionAuthoritative: options.ProjectionAuthoritative,
-		resumeClient:            options.ResumeClient,
-		coldLookupTimeout:       coldLookupTimeout,
+		logger:              logger,
+		httpClient:          &http.Client{},
+		requestTimeout:      options.RequestTimeout,
+		maxRespSize:         options.MaxResponseSize,
+		debugMode:           options.DebugMode,
+		sandboxProxyDomains: sandboxProxyDomains,
+		executionFencing:    executionFencing,
+		controlPlaneToken:   strings.TrimSpace(options.ControlPlaneToken),
+		projectionReader:    options.ProjectionReader,
+		resumeClient:        options.ResumeClient,
 	}, nil
 }
 
@@ -296,123 +226,49 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var node *schedulerv1.Node
-	// How the scheduler arrived at that node. Anything other than BOUND means
-	// the node does not hold the sandbox yet, which is what decides whether the
-	// binding has to be written on the way back.
-	location := schedulerv1.SandboxLocation_SANDBOX_LOCATION_UNSPECIFIED
-	// Decided once, from the one lookup answer, and carried to both ends of the
-	// proxied exchange. A request the scheduler never resolved has no incarnation
-	// to reason about, so it keeps the zero plan and stamps nothing.
-	fencing := fencingPlan{}
-	// Empty for a scheduled request, which resolves no sandbox and so has no
-	// route to have resolved one way or the other.
-	routeResolution := ""
-
-	if hasSandbox {
-		// The routing projection first, when the read switch is on. A hit is
-		// the same answer the scheduler's binding hit would have produced —
-		// routing.Synthesize and lookup.go's binding exit are held field-for-
-		// field identical by a golden test — so nothing below this block needs
-		// to know which of the two answered.
-		//
-		// source starts at "scheduler" and only a projection hit moves it. A
-		// miss or a read error counts itself where it happens and still leaves
-		// source alone, so the two series reconcile:
-		//
-		//	Δ{redis_miss} + Δ{redis_error} ≈ Δ{scheduler}
-		source := routeResolutionScheduler
-		resp := s.resolveFromProjection(routingCtx, sandboxID)
-		if resp != nil {
-			source = routeResolutionRedisHit
+	// The two ways a sandbox route gets answered, in order: the routing
+	// projection, then the api half's resume RPC. A hit and a woken sandbox
+	// are rendered in one shape — routing.Synthesize and resume.Result's
+	// LookupResponse both answer BOUND — so nothing below this block needs to
+	// know which of the two answered.
+	source := routeResolutionRedisHit
+	resp := s.resolveFromProjection(routingCtx, sandboxID)
+	if resp == nil {
+		// 🔴 Everything the projection could not answer lands here, and that
+		// includes a read error. A miss is not an absence: the api half walks
+		// the binding, then the heartbeat roster, then the paused registry,
+		// answers a running sandbox as it stands and wakes a paused one. Only
+		// the half that owns sandboxes can tell those apart, and it is the
+		// only thing asked: a verdict that is not "woken" ends the request
+		// here, with no second opinion from anywhere else. An api half that
+		// cannot be asked is a 502, never a 404.
+		woke := s.resumeClient.Wake(routingCtx, resume.Request{
+			SandboxID:       sandboxID,
+			TargetPort:      resumeTargetPort(r, hostRoute),
+			EnvdAccessToken: r.Header.Get(headerEnvdAccessToken),
+		})
+		recordResumeAttempt(woke)
+		if woke.Verdict != resume.VerdictWoken {
+			s.writeResumeError(w, r, sandboxID, woke)
+			return
 		}
-
-		if resp == nil {
-			// 🔴 Everything the projection could not answer lands here, and
-			// that includes a read error. A miss is not an absence: the
-			// scheduler walks the binding, then the heartbeat roster, then the
-			// paused registry, and the last two are exactly what covers a
-			// projection that has expired or been deleted. Answering 404 from
-			// a miss would cut all of that out.
-			//
-			// One call, one answer. The scheduler owns the whole decision —
-			// which node holds the sandbox, which node should rebuild it, and
-			// whether it exists at all — so there is nothing here to
-			// second-guess or retry against a different node.
-			// 🔴 The cold path. The projection had no answer, so the sandbox
-			// is paused, gone, or somewhere the projection has not caught up
-			// with — and only the half that owns sandboxes can tell which.
-			// Before this, the gateway asked the scheduler for a node and the
-			// node woke the sandbox itself; that is the arrangement `--role
-			// node` exists to end (§6.1).
-			//
-			// 🔴 Three states, and the third is why this is not a two-way
-			// branch. "The API half says there is no such sandbox" ends the
-			// request at 404. "The API half could not be asked" says nothing
-			// about the sandbox at all, and falls through to exactly what this
-			// gateway did before the wake-up client existed — so an api that
-			// is down costs latency and not availability.
-			if s.resumeClient != nil {
-				woke := s.resumeClient.Wake(routingCtx, resume.Request{
-					SandboxID:       sandboxID,
-					TargetPort:      resumeTargetPort(r, hostRoute),
-					EnvdAccessToken: r.Header.Get(headerEnvdAccessToken),
-				})
-				recordResumeAttempt(woke)
-				switch woke.Verdict {
-				case resume.VerdictWoken:
-					s.logger.Info("woke a paused sandbox through the api half",
-						zap.String("sandbox_id", sandboxID),
-						zap.String("node_id", woke.NodeID),
-						zap.String("execution_id", woke.ExecutionID),
-					)
-					resp = woke.LookupResponse()
-					source = routeResolutionResumeWoken
-				case resume.VerdictGone, resume.VerdictRefused:
-					s.writeResumeError(w, r, sandboxID, woke)
-					return
-				case resume.VerdictUndecided:
-					// Deliberately nothing. The scheduler call below is the
-					// fallback, and it is the same call this gateway made for
-					// every projection miss before this branch existed.
-					s.logger.Warn("could not ask the api half to wake a sandbox; falling back to the scheduler",
-						zap.String("sandbox_id", sandboxID),
-						zap.String("resume_error", s.resumeReason(woke)),
-					)
-					recordRouteResolution(routeResolutionResumeUndecided)
-				}
-			}
-		}
-
-		if resp == nil {
-			var err error
-			resp, err = s.lookupNodeColdPath(routingCtx, sandboxID)
-			if err != nil {
-				// 🔴 Still the only source of a 404 or a 503 on the scheduler
-				// path in this package.
-				s.writeSchedulerError(w, r, err)
-				return
-			}
-		}
-		recordRouteResolution(source)
-		routeResolution = source
-		node = resp.GetNode()
-		location = resp.GetLocation()
-		recordGatewaySandboxLocation(location)
-		plane := fencingPlaneFor(routeSource)
-		fencing = decideFencing(s.executionFencing, plane, resp)
-		recordExecutionFencing(plane, fencing.decision)
-		if locationNeedsAssignment(location) {
-			s.logger.Info("routing a sandbox the scheduler resolved from the paused registry",
-				zap.String("sandbox_id", sandboxID),
-				zap.String("location", gatewaySandboxLocationLabel(location)),
-				zap.String("node_id", node.GetNodeId()),
-				zap.String("origin_node_id", resp.GetOriginNodeId()),
-			)
-		}
+		s.logger.Info("the api half located the sandbox",
+			zap.String("sandbox_id", sandboxID),
+			zap.String("node_id", woke.NodeID),
+			zap.String("execution_id", woke.ExecutionID),
+		)
+		resp = woke.LookupResponse()
+		source = routeResolutionResumeWoken
 	}
-	// hasSandbox is always true here: a request naming no sandbox was refused
-	// above, so node is set.
+	recordRouteResolution(source)
+	node := resp.GetNode()
+	location := resp.GetLocation()
+	recordGatewaySandboxLocation(location)
+	// Decided once, from the one routing answer, and carried to both ends of
+	// the proxied exchange.
+	plane := fencingPlaneFor(routeSource)
+	fencing := decideFencing(s.executionFencing, plane, resp)
+	recordExecutionFencing(plane, fencing.decision)
 
 	s.logger.Debug("gateway routed request",
 		zap.String("method", r.Method),
@@ -427,7 +283,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		zap.String("expected_execution_id", fencing.expect),
 		zap.String("execution_authority", fencing.authority.String()),
 		zap.String("fencing_stage", fencingStageGatewayRoute),
-		zap.String("route_resolution", routeResolution),
+		zap.String("route_resolution", source),
 	)
 
 	decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
@@ -444,112 +300,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	s.proxyRequest(
 		w,
 		r.Clone(upstreamCtx),
-		r.Context(),
 		upstreamURL,
 		node,
 		proxyRequestOptions{
-			assignment:       assignmentRouteFor(hasSandbox, location),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
 			sandboxID:        sandboxID,
 			fencing:          fencing,
 		},
 	)
-}
-
-// locationNeedsAssignment reports whether the binding has to be written against
-// the node the scheduler named, as soon as that node answers.
-//
-// PLACED and PINNED both come from a registry row rather than from a binding,
-// so the node is about to hold a sandbox nothing has recorded against it.
-// Waiting for its next heartbeat to notice would leave every request for that
-// sandbox unroutable until then.
-func locationNeedsAssignment(location schedulerv1.SandboxLocation) bool {
-	switch location {
-	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED,
-		schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED:
-		return true
-	default:
-		return false
-	}
-}
-
-// lookupNodeColdPath is the cold path a projection miss and an undecided
-// wake-up both fall through to: the last resort that asks the scheduler
-// client directly instead of answering from a projection or from the api
-// half's own wake-up decision.
-//
-// What is left, and stays, is the timeout: an unreachable-but-not-yet-failed
-// target must not be allowed to hold this call open for whatever of the
-// request's overall budget happens to be left, or for gRPC's own connection
-// backoff, so it runs under its own deadline (coldLookupTimeout) rather than
-// only routingCtx's. Firing this cap is distinguished from routingCtx's own
-// (pre-existing) deadline firing by checking ctx's own error first — if the
-// caller's context is already done, this cap did not decide anything, and the
-// error it returns is left exactly as it would have been before this method
-// existed.
-func (s *Server) lookupNodeColdPath(ctx context.Context, sandboxID string) (*schedulerv1.LookupNodeResponse, error) {
-	coldCtx, cancel := context.WithTimeout(ctx, s.coldLookupTimeout)
-	defer cancel()
-
-	rpcStart := time.Now()
-	resp, err := s.scheduler.LookupNode(coldCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
-	recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
-	if err == nil {
-		return resp, nil
-	}
-
-	// Only our own cap firing is reclassified. If ctx (routingCtx) is also
-	// done, this timeout did not decide anything — some larger, pre-existing
-	// deadline did, and that keeps behaving exactly as it always has.
-	if ctx.Err() == nil && coldCtx.Err() != nil {
-		recordGatewayColdLookupTimeout()
-		s.logger.Warn("cold-path LookupNode timed out",
-			zap.String("sandbox_id", sandboxID),
-			zap.Duration("timeout", s.coldLookupTimeout),
-			zap.Error(err),
-		)
-
-		return nil, status.Error(codes.Unavailable, fmt.Sprintf(
-			"cold-path LookupNode did not answer within %s; the api half may be scaled down or "+
-				"unreachable (this is not the sandbox's fault)",
-			s.coldLookupTimeout,
-		))
-	}
-
-	return nil, err
-}
-
-// writeSchedulerError turns the scheduler's answer into a status code.
-//
-// 🔴 The three failure codes must stay distinct. NotFound is the scheduler
-// saying the sandbox exists nowhere, and a 404 on a resume is the end of that
-// sandbox as far as any client is concerned. Unavailable is the scheduler
-// saying it could not look, and FailedPrecondition is it saying the one node
-// that could serve this sandbox will not — both are 503s, because both are
-// states the caller may find changed a moment later. Collapsing any of them
-// into another is the bug this whole path exists to avoid.
-func (s *Server) writeSchedulerError(w http.ResponseWriter, r *http.Request, err error) {
-	// No node was named, so nobody upstream can answer a preflight.
-	if cors.HandlePreflight(w, r) {
-		return
-	}
-	st, ok := status.FromError(err)
-	if !ok {
-		cors.Error(w, "scheduler unavailable", http.StatusBadGateway)
-		return
-	}
-	reason := s.schedulerReason(st)
-	switch st.Code() {
-	case codes.InvalidArgument:
-		cors.Error(w, reason, http.StatusBadRequest)
-	case codes.NotFound:
-		cors.Error(w, reason, http.StatusNotFound)
-	case codes.Unavailable, codes.FailedPrecondition:
-		cors.Error(w, reason, http.StatusServiceUnavailable)
-	default:
-		cors.Error(w, "scheduler error", http.StatusBadGateway)
-	}
 }
 
 // schedulerUnreachable is what a caller is told when the RPC never reached a
@@ -626,7 +385,6 @@ func (s *Server) schedulerReason(st *status.Status) string {
 }
 
 type proxyRequestOptions struct {
-	assignment       assignmentRoute
 	hostRoute        *hostRoute
 	flushImmediately bool
 	// sandboxID is the sandbox this exchange was routed for, empty when the
@@ -642,7 +400,6 @@ type proxyRequestOptions struct {
 func (s *Server) proxyRequest(
 	w http.ResponseWriter,
 	proxyReq *http.Request,
-	originalCtx context.Context,
 	target string,
 	node *schedulerv1.Node,
 	options proxyRequestOptions,
@@ -684,15 +441,7 @@ func (s *Server) proxyRequest(
 					resp.Header.Set(headerNodeID, nodeID)
 				}
 			}
-			// Before the assignment record, on purpose: a refused exchange must
-			// not leave a binding behind naming the node that was refused.
-			if err := s.fenceProxyResponse(options.fencing, options.sandboxID, node, resp); err != nil {
-				return err
-			}
-			if options.assignment == assignmentRouteNone || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				return nil
-			}
-			return s.recordAssignmentFromResponse(originalCtx, resp, node, options)
+			return s.fenceProxyResponse(options.fencing, options.sandboxID, node, resp)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
@@ -796,180 +545,11 @@ func (e *proxyResponseError) Error() string {
 	return e.message
 }
 
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, options proxyRequestOptions) error {
-	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
-	defer cancelRecord()
-
-	// The node names the incarnation it just started on the same response. It is
-	// optional on the way in: absent only costs authority for the window between
-	// the create and the node's first heartbeat, and inside that window the
-	// sandbox is new and has exactly one incarnation.
-	executionID := executionIDFromResponse(resp.Header)
-	projectionTTLSecs := s.projectionTTLToRecord(resp.Header)
-
-	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
-		s.recordAssignment(recordCtx, sandboxID, node, executionID, projectionTTLSecs, "response_header")
-		return nil
-	}
-
-	body, truncated, err := readBodyWithLimit(resp.Body, s.maxRespSize)
-	if err != nil {
-		return &proxyResponseError{
-			statusCode: http.StatusBadGateway,
-			message:    "failed to read upstream response",
-			cause:      err,
-		}
-	}
-	if truncated {
-		s.logger.Warn("upstream response exceeded configured forwarding limit",
-			zap.Int64("max_response_size_bytes", s.maxRespSize),
-			zap.Int64("upstream_content_length", resp.ContentLength),
-			zap.String("content_type", resp.Header.Get("Content-Type")),
-		)
-		return &proxyResponseError{
-			statusCode: http.StatusBadGateway,
-			message:    "upstream response too large",
-		}
-	}
-	_ = resp.Body.Close()
-
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
-	if resp.Header == nil {
-		resp.Header = make(http.Header)
-	}
-	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
-
-	for _, assignment := range extractSandboxAssignmentsFromResponse(body) {
-		// 🔴 Each element's own incarnation, never the response's echoed one
-		// and never a neighbour's. A fork answers with several sandboxes and
-		// one echo; stamping that echo onto a child would name an incarnation
-		// that never ran there, which is why this path used to record none at
-		// all. Now that each element carries its own, an element that has one
-		// is recorded with it and an element that does not is recorded without
-		// — taking the same unauthoritative window a fresh create takes, until
-		// the node's first heartbeat.
-		s.recordAssignment(recordCtx, assignment.sandboxID, node,
-			assignment.executionID,
-			s.projectionTTLToRecordValue(assignment.projectionTTLSecs),
-			"response_body")
-	}
-	return nil
-}
-
-// projectionTTLToRecord is the gateway's half of the write-side switch, and it
-// is deliberately narrow.
-//
-// 🔴 It gates the TTL and nothing else. The incarnation is forwarded either
-// way: reading it off a response and passing it on is behaviour that already
-// shipped, and gating it here would be a rollback of something the switch was
-// never about. The TTL is the new fact, and with the switch off the gateway
-// sends zero — which the scheduler reads as "use binding_ttl", making the
-// projection write byte-identical to the one that shipped before this existed.
-// That is what lets the two halves of the switch be flipped in either order
-// without an intermediate state anybody has to reason about.
-func (s *Server) projectionTTLToRecord(h http.Header) uint32 {
-	return s.projectionTTLToRecordValue(projectionTTLSecsFromHeaders(h))
-}
-
-func (s *Server) projectionTTLToRecordValue(secs uint32) uint32 {
-	if !s.projectionAuthoritative {
-		return 0
-	}
-	return secs
-}
-
-func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, executionID string, projectionTTLSecs uint32, source string) {
-	rpcStart := time.Now()
-	_, err := s.scheduler.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
-		SandboxId:         sandboxID,
-		Node:              node,
-		ExecutionId:       executionID,
-		ProjectionTtlSecs: projectionTTLSecs,
-	})
-	recordGatewaySchedulerRPC("RecordAssignment", rpcStart, err)
-	if err != nil {
-		s.logger.Warn("record assignment failed", zap.Error(err), zap.String("sandbox_id", sandboxID), zap.String("node_id", node.GetNodeId()))
-		return
-	}
-
-	s.logger.Debug("gateway recorded sandbox assignment",
-		zap.String("sandbox_id", sandboxID),
-		zap.String("node_id", node.GetNodeId()),
-		zap.String("observed_execution_id", executionID),
-		zap.Uint32("projection_ttl_secs", projectionTTLSecs),
-		zap.String("source", source),
-	)
-}
-
-func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
-	if limit <= 0 {
-		body, err := io.ReadAll(src)
-		return body, false, err
-	}
-	body, err := io.ReadAll(io.LimitReader(src, limit+1))
-	if err != nil {
-		return nil, false, err
-	}
-	if int64(len(body)) > limit {
-		return nil, true, nil
-	}
-	return body, false, nil
-}
-
-func recordAssignmentTimeout(requestTimeout time.Duration) time.Duration {
-	if requestTimeout <= 0 {
-		return maxRecordAssignmentTimeout
-	}
-	if requestTimeout < maxRecordAssignmentTimeout {
-		return requestTimeout
-	}
-	return maxRecordAssignmentTimeout
-}
-
 func flushInterval(flushImmediately bool) time.Duration {
 	if flushImmediately {
 		return -1
 	}
 	return 0
-}
-
-// assignmentRoute says whether this exchange writes a routing projection.
-//
-// 🔴 Only two states remain. A third, assignmentRoutePath — the assignment is
-// for the sandbox this request was already routed for, used by resume,
-// connect and any other control-plane call the scheduler resolved off the
-// paused registry — existed for as long as those calls could be routed
-// straight to a node by this gateway. They cannot be any more: user-facing
-// REST reaches the api half at its own address and never enters this handler,
-// and the api half records its own placements
-// (`NodePlacement::record_placement`).
-type assignmentRoute int
-
-const (
-	// assignmentRouteNone: this exchange writes no assignment.
-	assignmentRouteNone assignmentRoute = iota
-	// assignmentRouteResponse: the sandbox is named in the response, read from
-	// a header if the node put one there, otherwise from the body.
-	assignmentRouteResponse
-)
-
-// assignmentRouteFor decides whether this exchange writes a routing
-// projection.
-//
-// 🔴 Only ever called for data-plane traffic — routed by a proxy header or by
-// a sandbox proxy host name. A request carrying neither is answered 404 in
-// handleProxy before this is reached, so there is no create or control-plane
-// path left to distinguish here; see the assignmentRoute doc comment. What
-// remains is a sandbox the scheduler resolved off the paused registry (PLACED
-// or PINNED): it is about to be held by a node nothing has recorded against,
-// and that binding still has to be written from the data-plane response that
-// reaches it first.
-func assignmentRouteFor(hasSandbox bool, location schedulerv1.SandboxLocation) assignmentRoute {
-	if hasSandbox && locationNeedsAssignment(location) {
-		return assignmentRouteResponse
-	}
-	return assignmentRouteNone
 }
 
 func sandboxIDFromHeaders(h http.Header) (string, bool) {
@@ -1218,182 +798,6 @@ func headerContainsToken(h http.Header, name string, want string) bool {
 
 // sandboxAssignment is one sandbox named by a response, with whatever that
 // response said about it alongside.
-type sandboxAssignment struct {
-	sandboxID   string
-	executionID string
-	// projectionTTLSecs is the node's budget for this sandbox's routing
-	// projection. 🔴 Zero means "not offered", which the scheduler reads as
-	// "use binding_ttl". It is never "no expiry".
-	projectionTTLSecs uint32
-}
-
-func extractSandboxIDFromResponse(body []byte) (string, bool) {
-	assignments := extractSandboxAssignmentsFromResponse(body)
-	if len(assignments) == 0 {
-		return "", false
-	}
-	return assignments[0].sandboxID, true
-}
-
-// extractSandboxAssignmentsFromResponse reads every sandbox a response names.
-//
-// 🔴 The top-level array comes first, and it is the whole reason this function
-// changed. Fork's 201 answers with a bare JSON array of per-fork results — no
-// envelope, no object — and this used to begin by unmarshalling into a
-// map[string]any, which fails outright on an array and returned nil. Fork's
-// projection write therefore never happened, in any build, and the only test
-// covering it fed a {"sandboxes":[…]} envelope that no route in this repo
-// produces.
-//
-// The object shapes below are kept because create and cold-create answer with
-// one, and because a caller may reach here with a body this function has always
-// been able to read.
-func extractSandboxAssignmentsFromResponse(body []byte) []sandboxAssignment {
-	var assignments []sandboxAssignment
-
-	var array []any
-	if err := json.Unmarshal(body, &array); err == nil {
-		for _, item := range array {
-			object, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			assignments = appendSandboxAssignment(assignments, object)
-		}
-		return dedupeSandboxAssignments(assignments)
-	}
-
-	var payload map[string]any
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil
-	}
-	assignments = appendSandboxAssignment(assignments, payload)
-	if data, ok := payload["data"].(map[string]any); ok {
-		assignments = appendSandboxAssignment(assignments, data)
-	}
-	appendFromArray := func(value any) {
-		items, ok := value.([]any)
-		if !ok {
-			return
-		}
-		for _, item := range items {
-			object, ok := item.(map[string]any)
-			if !ok {
-				continue
-			}
-			assignments = appendSandboxAssignment(assignments, object)
-		}
-	}
-	appendFromArray(payload["sandboxes"])
-	if data, ok := payload["data"].(map[string]any); ok {
-		appendFromArray(data["sandboxes"])
-	}
-	return dedupeSandboxAssignments(assignments)
-}
-
-// appendSandboxAssignment reads one object.
-//
-// A fork result wraps the sandbox one level down and carries the projection
-// budget beside it rather than inside it, because the budget is infrastructure
-// and the sandbox is the user-visible model. Every other shape carries both on
-// the object itself, so both levels are consulted, outer first for the budget.
-func appendSandboxAssignment(dst []sandboxAssignment, object map[string]any) []sandboxAssignment {
-	if object == nil {
-		return dst
-	}
-	inner := object
-	if nested, ok := object["sandbox"].(map[string]any); ok {
-		inner = nested
-	}
-	sandboxID := firstStringField(inner, "sandboxID", "sandboxId", "sandbox_id")
-	if sandboxID == "" {
-		return dst
-	}
-	ttl := firstTTLField(object)
-	if ttl == 0 && inner != nil {
-		ttl = firstTTLField(inner)
-	}
-	return append(dst, sandboxAssignment{
-		sandboxID:   sandboxID,
-		executionID: firstStringField(inner, "executionID", "executionId", "execution_id"),
-
-		projectionTTLSecs: ttl,
-	})
-}
-
-func firstStringField(object map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if value, ok := object[key].(string); ok {
-			if trimmed := strings.TrimSpace(value); trimmed != "" {
-				return trimmed
-			}
-		}
-	}
-	return ""
-}
-
-// firstTTLField reads a projection budget out of a decoded JSON object.
-//
-// 🔴 Anything that is not a positive whole number of seconds becomes zero,
-// which the scheduler reads as "use binding_ttl". A negative value in
-// particular must never survive into something a store could read as "keep this
-// forever" — that is the exact shape of the bug this rule exists to avoid.
-func firstTTLField(object map[string]any) uint32 {
-	for _, key := range []string{"projectionTtlSecs", "projectionTTLSecs", "projection_ttl_secs"} {
-		value, ok := object[key].(float64)
-		if !ok {
-			continue
-		}
-		if value <= 0 {
-			return 0
-		}
-		if value > math.MaxUint32 {
-			return math.MaxUint32
-		}
-		return uint32(value)
-	}
-	return 0
-}
-
-// dedupeSandboxAssignments keeps the first spelling of each sandbox id, as this
-// has always done. A later element naming the same sandbox is a duplicate, not
-// a correction.
-func dedupeSandboxAssignments(assignments []sandboxAssignment) []sandboxAssignment {
-	if len(assignments) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(assignments))
-	unique := assignments[:0]
-	for _, assignment := range assignments {
-		if _, ok := seen[assignment.sandboxID]; ok {
-			continue
-		}
-		seen[assignment.sandboxID] = struct{}{}
-		unique = append(unique, assignment)
-	}
-	return unique
-}
-
-// projectionTTLSecsFromHeaders reads the node's budget off a response header.
-//
-// 🔴 Absent, unparseable, and non-positive all come back as zero — "not
-// offered" — and the scheduler falls back to its own binding_ttl. None of them
-// may become "no expiry", which is what a Redis SET with no TTL argument is.
-func projectionTTLSecsFromHeaders(h http.Header) uint32 {
-	raw := strings.TrimSpace(h.Get(headerProjectionTTLSecs))
-	if raw == "" {
-		return 0
-	}
-	value, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || value <= 0 {
-		return 0
-	}
-	if value > math.MaxUint32 {
-		return math.MaxUint32
-	}
-	return uint32(value)
-}
-
 // resumeTargetPort is the port the data-plane request was addressed to, as it
 // appeared on the wire.
 //

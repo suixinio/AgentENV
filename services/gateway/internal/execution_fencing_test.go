@@ -1,7 +1,6 @@
 package gateway
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -13,14 +12,12 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	apiproxyv1 "agentenv/services/api/proto/apiproxy"
 	"agentenv/services/shared/config"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // Two incarnations of the same sandbox, in minting order. The comparison this
@@ -47,34 +44,6 @@ func withControlPlaneToken(token string) testServerOption {
 	return func(options *ServerOptions) {
 		options.ControlPlaneToken = token
 	}
-}
-
-func lookupNodeWithExecution(
-	node *schedulerv1.Node,
-	location schedulerv1.SandboxLocation,
-	executionID string,
-	authority schedulerv1.ExecutionAuthority,
-) func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-	return func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-		return &schedulerv1.LookupNodeResponse{
-			Node:               node,
-			Location:           location,
-			OriginNodeId:       node.GetNodeId(),
-			ExecutionId:        executionID,
-			ExecutionAuthority: authority,
-		}, nil
-	}
-}
-
-// boundToRegistry is the ordinary data-plane answer: the sandbox is bound to a
-// node and the scheduler can name the incarnation authoritatively.
-func boundToRegistry(node *schedulerv1.Node, executionID string) func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-	return lookupNodeWithExecution(
-		node,
-		schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-		executionID,
-		schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY,
-	)
 }
 
 // dataPlaneRequest is a proxied sandbox request routed by header, which is the
@@ -142,9 +111,7 @@ func TestTheFencingCounterProbeCanTellSeriesApart(t *testing.T) {
 	passBefore := fencingCounter(t, fencingPlaneData, fencingDecisionEnforcedPass)
 	refusedBefore := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedEcho)
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -179,9 +146,7 @@ func TestDataPlaneRequestCarriesTheExpectedExecutionHeader(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -213,24 +178,23 @@ func TestDataPlaneRequestCarriesTheExpectedExecutionHeader(t *testing.T) {
 // stamping — until the rollout it existed for finished and the mode was
 // deleted; its case in the table below went with it.)
 func TestGatewayStripsClientSuppliedExecutionHeaders(t *testing.T) {
+	// The incarnation the projection record names decides the authority: a
+	// named one is REGISTRY, an empty one is UNKNOWN (routing.AuthorityFor).
 	for _, tc := range []struct {
 		name       string
 		mode       config.GatewayExecutionFencing
-		authority  schedulerv1.ExecutionAuthority
 		execution  string
 		wantExpect string
 	}{
 		{
 			name:       "authoritative answer overwrites the forged value",
 			mode:       config.GatewayExecutionFencingEnforce,
-			authority:  schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY,
 			execution:  executionNewer,
 			wantExpect: executionNewer,
 		},
 		{
-			name:      "no authority deletes the forged value rather than forwarding it",
-			mode:      config.GatewayExecutionFencingEnforce,
-			authority: schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN,
+			name: "no authority deletes the forged value rather than forwarding it",
+			mode: config.GatewayExecutionFencingEnforce,
 		},
 		{
 			// The rollback rolls back this gateway, not the fleet's nodes. Off
@@ -238,7 +202,6 @@ func TestGatewayStripsClientSuppliedExecutionHeaders(t *testing.T) {
 			// before", stated in stampOutboundGatewayHeaders.
 			name:      "off deletes the forged value rather than forwarding it",
 			mode:      config.GatewayExecutionFencingOff,
-			authority: schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY,
 			execution: executionNewer,
 		},
 	} {
@@ -251,14 +214,9 @@ func TestGatewayStripsClientSuppliedExecutionHeaders(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: lookupNodeWithExecution(
-					&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-					schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-					tc.execution,
-					tc.authority,
-				),
-			}, 5*time.Second, 4<<20, withExecutionFencing(tc.mode))
+			server := newTestServer(t, 5*time.Second, 4<<20,
+				routedToExecution("sbx-1", "node-a", upstream.URL, tc.execution),
+				withExecutionFencing(tc.mode))
 
 			request := dataPlaneRequest("sbx-1")
 			request.Header.Set(headerExpectExecutionID, "forged-expect")
@@ -294,9 +252,8 @@ func TestHostRoutedDataPlaneIsFencedLikeHeaderRouted(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20,
+	server := newTestServer(t, 5*time.Second, 4<<20,
+		routedToExecution("11111111-2222-3333-4444-555555555555", "node-a", upstream.URL, executionNewer),
 		withExecutionFencing(config.GatewayExecutionFencingEnforce),
 		withSandboxProxyDomains("sandbox-proxy.example.invalid"),
 	)
@@ -344,63 +301,6 @@ func TestHostRoutedDataPlaneIsFencedLikeHeaderRouted(t *testing.T) {
 // any incarnation on the answer names the previous one. Stamping it would refuse
 // every auto-resume the data plane triggers — and auto-resume is the ordinary
 // way a paused sandbox comes back.
-func TestPlacedAndPinnedSandboxesAreNeverFenced(t *testing.T) {
-	for _, location := range []schedulerv1.SandboxLocation{
-		schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED,
-		schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED,
-	} {
-		t.Run(gatewaySandboxLocationLabel(location), func(t *testing.T) {
-			stamped := make(chan string, 1)
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				stamped <- r.Header.Get(headerExpectExecutionID)
-				w.Header().Set(headerSandboxID, "sbx-1")
-				// The freshly minted incarnation, which is older than nothing
-				// and would be refused against a stale expect.
-				w.Header().Set(headerExecutionID, executionOlder)
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer upstream.Close()
-
-			pendingBefore := fencingCounter(t, fencingPlaneData, fencingDecisionPending)
-
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: lookupNodeWithExecution(
-					&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-					location,
-					// A scheduler that leaks the previous incarnation onto a
-					// pending answer must still not cause a stamp: the authority
-					// decides, never the value.
-					executionNewer,
-					schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_PENDING,
-				),
-				recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-					return &schedulerv1.RecordAssignmentResponse{}, nil
-				},
-			}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
-
-			response := httptest.NewRecorder()
-			server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
-
-			if response.Code != http.StatusOK {
-				t.Fatalf("a %s sandbox was answered %d (body %q); it must not be fenced",
-					gatewaySandboxLocationLabel(location), response.Code, response.Body.String())
-			}
-			select {
-			case got := <-stamped:
-				if got != "" {
-					t.Fatalf("a %s sandbox carried expect header %q; nothing may be expected of a node about to mint one",
-						gatewaySandboxLocationLabel(location), got)
-				}
-			default:
-				t.Fatal("the request never reached the node")
-			}
-			if got := fencingCounter(t, fencingPlaneData, fencingDecisionPending) - pendingBefore; got != 1 {
-				t.Fatalf("the pending series moved by %v, want 1", got)
-			}
-		})
-	}
-}
-
 // The second gate, on the way back: the node answered from an incarnation the
 // control plane has moved past.
 func TestDataPlaneRequestRefusesWhenNodeEchoesAnOlderExecution(t *testing.T) {
@@ -414,9 +314,7 @@ func TestDataPlaneRequestRefusesWhenNodeEchoesAnOlderExecution(t *testing.T) {
 
 	refusedBefore := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedEcho)
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -465,9 +363,7 @@ func TestDataPlaneRequestTranslatesNodePreconditionRefusal(t *testing.T) {
 
 	refusedBefore := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedPreflight)
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -502,9 +398,7 @@ func TestMatchingExecutionPassesThrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -536,10 +430,7 @@ func TestNodeAheadOfTheControlPlanePassesThrough(t *testing.T) {
 
 	aheadBefore := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNodeAhead)
 
-	server := newTestServer(t, stubSchedulerClient{
-		// The scheduler still names the older incarnation.
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionOlder),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionOlder), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -571,9 +462,7 @@ func TestIncarnationsAreComparedAfterBeingLowerCased(t *testing.T) {
 
 	aheadBefore := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNodeAhead)
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionOlder),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionOlder), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -590,29 +479,32 @@ func TestIncarnationsAreComparedAfterBeingLowerCased(t *testing.T) {
 // event as a protected one and must not be recorded as one. The absolute value
 // of this series is the size of the coverage gap.
 func TestUnfencedRequestIsCountedNotSilentlyAllowed(t *testing.T) {
-	for _, authority := range []schedulerv1.ExecutionAuthority{
-		schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN,
-		// An older scheduler. It has to behave identically to UNKNOWN, or the
-		// fleet gets two behaviours for one situation for a whole rollout.
-		schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNSPECIFIED,
-	} {
-		t.Run(authority.String(), func(t *testing.T) {
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set(headerExecutionID, executionOlder)
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer upstream.Close()
+	// The projection feed and the resume feed both render an answer with no
+	// incarnation as UNKNOWN; both are driven here, since a decision that is
+	// only counted is invisible any other way.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(headerExecutionID, executionOlder)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
 
+	for name, feed := range map[string][]testServerOption{
+		"a projection record without an incarnation": {
+			routedToExecution("sbx-1", "node-a", upstream.URL, ""),
+		},
+		"a wake-up answer without an incarnation": {
+			withProjectionReader(missingProjection()),
+			withResumeClient(&stubResumeService{response: &apiproxyv1.SandboxResumeResponse{
+				NodeId:      "node-a",
+				NodeAddress: upstream.URL,
+			}}),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
 			before := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNoAuthority)
 
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: lookupNodeWithExecution(
-					&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL},
-					schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-					"",
-					authority,
-				),
-			}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+			server := newTestServer(t, 5*time.Second, 4<<20,
+				append(feed, withExecutionFencing(config.GatewayExecutionFencingEnforce))...)
 
 			response := httptest.NewRecorder()
 			server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -639,9 +531,7 @@ func TestNodeWithoutEchoHeaderIsCountedAsUnfenced(t *testing.T) {
 
 	before := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNodeSilent)
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -697,7 +587,7 @@ func TestLogExecutionMismatchWritesTheFrozenFieldSet(t *testing.T) {
 	for _, refusedBy := range []string{refusedByNode, refusedByGateway} {
 		t.Run(refusedBy, func(t *testing.T) {
 			logs, logged := observer.New(zap.WarnLevel)
-			server := newTestServerWithLogger(t, zap.New(logs), stubSchedulerClient{}, 5*time.Second, 4<<20)
+			server := newTestServerWithLogger(t, zap.New(logs), 5*time.Second, 4<<20)
 
 			server.logExecutionMismatch(
 				"sbx-1", &schedulerv1.Node{NodeId: "node-a"},
@@ -781,9 +671,7 @@ func TestFencingRefusalIsNeverFourOhFour(t *testing.T) {
 			upstream := httptest.NewServer(tc.upstream)
 			defer upstream.Close()
 
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-			}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+			server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 			response := httptest.NewRecorder()
 			server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -819,77 +707,6 @@ func TestFencingRefusalIsNeverFourOhFour(t *testing.T) {
 	})
 }
 
-// 🔴 TestSchedulerNotFoundStillMapsToFourOhFour used to live here, driving a
-// scheduler NotFound through `POST /sandboxes/sbx-1/resume` against an
-// unconfigured (restUpstream=="") fixture to pin that writeSchedulerError's
-// NotFound branch still answers 404. Resume is a routeSourcePath call and is
-// now always forwarded to the api half before that branch is reached, so the
-// specific request this test sent no longer exercises writeSchedulerError at
-// all. The mapping itself is not uncovered: it is the same NotFound→404
-// branch `TestProjectionMissOnAnUnknownSandboxStillAnswers404`
-// (projection_test.go) exercises through a genuine, still-live data-plane
-// LookupNode failure.
-
-// 🔴 The Scheduler service may never answer PermissionDenied.
-//
-// writeSchedulerError has no branch for it, so it falls through to the default
-// and becomes a 502 — "the upstream is broken", which is a wrong diagnosis of a
-// precise refusal. The code means a superseded incarnation tried to write;
-// aenv-api's own in-process paused registry enforces that fencing directly,
-// never through a gRPC service the gateway calls.
-//
-// The method list is frozen deliberately. Moving a refusing method onto this
-// service, or adding one, is exactly the change that would turn a fencing
-// refusal into a 502 with nothing to notice it, and the only mechanical way to
-// require that decision to be made on purpose is to make it break this list.
-func TestSchedulerServiceNeverReturnsPermissionDenied(t *testing.T) {
-	frozen := map[string]struct{}{
-		"Schedule":           {},
-		"LookupNode":         {},
-		"RecordAssignment":   {},
-		"Heartbeat":          {},
-		"ListObservedNodes":  {},
-		"ReportSandboxEvent": {},
-		"ListP2pPeers":       {},
-		"RecordP2pArtifact":  {},
-		"ForgetP2pArtifact":  {},
-		"LookupP2pArtifact":  {},
-		"GetNode":            {},
-		"UnregisterNode":     {},
-		// Read-only listing of the registry. It cannot refuse a write because
-		// it performs none, so it belongs on this service, answered for
-		// operators through the gateway.
-		"ListRegistrySandboxes": {},
-	}
-
-	for _, method := range schedulerv1.Scheduler_ServiceDesc.Methods {
-		if _, ok := frozen[method.MethodName]; !ok {
-			t.Fatalf("Scheduler grew the method %q. Before adding it here: it must not answer PermissionDenied, "+
-				"because writeSchedulerError has no branch for that code and turns it into a 502.", method.MethodName)
-		}
-		delete(frozen, method.MethodName)
-	}
-	for method := range frozen {
-		t.Fatalf("Scheduler no longer serves %q; remove it from this list once you have checked where it went — "+
-			"if it moved to a service the gateway calls, the PermissionDenied hazard moved with it.", method)
-	}
-
-	// And the hazard itself, stated as a fact rather than as a comment: this is
-	// what a PermissionDenied from this service costs today.
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			return nil, status.Error(codes.PermissionDenied, "a refusal that has no branch here")
-		},
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
-
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
-	if response.Code != http.StatusBadGateway {
-		t.Fatalf("PermissionDenied from the scheduler arrived as %d; this test's premise (that it becomes a 502) "+
-			"is stale and the frozen list above needs revisiting", response.Code)
-	}
-}
-
 // 🔴 The rollback has to be a rollback: off behaves as the gateway did before
 // any of this existed. The input is the one that every other mode reacts to —
 // an answer and an echo that disagree — so a single surviving branch shows up
@@ -910,9 +727,7 @@ func TestFencingOffMatchesLegacyBehaviour(t *testing.T) {
 	silentBefore := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNodeSilent)
 	offBefore := fencingCounter(t, fencingPlaneData, fencingDecisionOff)
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingOff))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingOff))
 
 	request := dataPlaneRequest("sbx-1")
 	request.Header.Set(headerExpectExecutionID, "forged-expect")
@@ -996,9 +811,7 @@ func TestGatewayStampsTheControlPlaneTokenOnForwardedRequests(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			server := newTestServer(t, stubSchedulerClient{
-				lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-			}, 5*time.Second, 4<<20, withControlPlaneToken(tc.token))
+			server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withControlPlaneToken(tc.token))
 
 			request := dataPlaneRequest("sbx-1")
 			if tc.clientSet != "" {
@@ -1061,7 +874,7 @@ func TestAnUnrecognisedFencingModeRefusesToStart(t *testing.T) {
 }
 
 func newServerWithFencing(mode string) (*Server, error) {
-	return NewServer(zap.NewNop(), stubSchedulerClient{}, ServerOptions{ExecutionFencing: mode})
+	return NewServer(zap.NewNop(), ServerOptions{ExecutionFencing: mode})
 }
 
 // 🔴 A WebSocket handshake is refused too, and it has to be refused before the
@@ -1095,9 +908,7 @@ func TestWebSocketHandshakeAgainstASupersededExecutionIsRefused(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	gateway := httptest.NewServer(server.Handler())
 	defer gateway.Close()
@@ -1183,9 +994,7 @@ func TestControlPlaneRequestsAreCountedUnderTheObservedLabel(t *testing.T) {
 	observedBefore := fencingCounter(t, fencingPlaneControl, "observed")
 	offBefore := fencingCounter(t, fencingPlaneControl, "off")
 
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: boundToRegistry(&schedulerv1.Node{NodeId: "node-a", Endpoint: upstream.URL}, executionNewer),
-	}, 5*time.Second, 4<<20, withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil)
 	request.Header.Set(headerSandboxID, "sbx-1")

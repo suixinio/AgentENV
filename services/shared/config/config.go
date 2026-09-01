@@ -11,34 +11,6 @@ import (
 	"time"
 )
 
-// defaultColdLookupTimeout bounds the LookupNode call a projection miss and
-// an undecided wake-up both fall through to
-// (services/gateway/internal/server.go's lookupNodeColdPath).
-//
-// 🔴 This is an ordinary timeout on a cold-path RPC, not a decommissioning
-// lever — it protects the call from a target that is merely slow or
-// unreachable (a bad rollout, a brief outage on whichever api replica
-// answers), which is a real failure mode independent of whether that target
-// is a Go scheduler or aenv-api's own in-process registry. It used to be
-// named defaultGatewaySchedulerFallbackTimeout and to have a sibling,
-// SchedulerFallbackDisabled, that could skip the call entirely; that sibling
-// (and the query-only-scheduler client selection it disabled) is deleted
-// outright along with the Go scheduler it was written to decommission, but
-// this cap stays — removing it would silently widen the call's failure
-// window from this value (3s) to whatever of gateway.request_timeout happens
-// to be left (30-90s), which is a real behavioural regression, not a cleanup.
-// GATEWAY_SCHEDULER_FALLBACK_TIMEOUT, the old name, is neither read nor
-// refused now: set GATEWAY_COLD_LOOKUP_TIMEOUT.
-//
-// 🔴 Mirrors gateway.defaultColdLookupTimeout, the value NewServer falls back
-// to when a caller constructs ServerOptions directly (every test, and any
-// embedder that does not go through config.Load). This package cannot import
-// the gateway package to share one constant, so the two are declared
-// independently and must be kept equal by hand — if they drift, config.Load's
-// callers see one value and a caller building ServerOptions directly sees the
-// other.
-const defaultColdLookupTimeout = 3 * time.Second
-
 // GatewayExecutionFencing is the two-state switch over the gateway's routing
 // layer refusal: whether it stamps the incarnation it routed against onto the
 // request, and whether a mismatch is refused or only counted.
@@ -136,10 +108,10 @@ type GatewayRoutingConfig struct {
 	// judging. There is no mechanism for it — the pairing is an operational
 	// rule, written here because this is where somebody reads it.
 	ProjectionRead bool `json:"projection_read"`
-	// ProjectionAuthoritative is the gateway's half of the write-side switch:
-	// it makes resume and connect record an assignment, and makes the gateway
-	// forward the incarnation and TTL a node reports. Off means it forwards
-	// neither, which is a projection write identical to today's.
+	// ProjectionAuthoritative is read by no gateway binary any more: the
+	// gateway writes no projection, the api half writes its own on wake and
+	// on a running miss. The key stays parsed and declared in the manifests
+	// for the rollback window, the same way GATEWAY_REST_UPSTREAM_ADDR does.
 	//
 	// 🔴 The write side is one logical switch across two processes and each
 	// holds half of it. Neither ordering is unsafe — see the note in the stage
@@ -184,21 +156,6 @@ type GatewayConfig struct {
 	// gateway stamps nothing and the node's gate stays open, which is what makes
 	// the rollout config-driven instead of deploy-driven.
 	ControlPlaneToken string `json:"-"`
-	// ColdLookupTimeout bounds the LookupNode call a projection miss and an
-	// undecided wake-up both fall through to, separately from RequestTimeout,
-	// so a target that is merely unreachable cannot hold it open for whatever
-	// of the request's overall budget is left. Zero (the default when unset)
-	// is resolved to a fixed default inside gateway.NewServer, never left as
-	// "no timeout".
-	//
-	// 🔴 Named for what it protects rather than for the process it used to
-	// name: this was SchedulerFallbackTimeout, and the call it bounds used to
-	// be a fallback to a query-only scheduler that could be a different
-	// process from gateway.scheduler_addr. That client-selection logic (and
-	// its own disable switch, SchedulerFallbackDisabled) is deleted along
-	// with the Go scheduler; this cap is not — it is an ordinary timeout on an
-	// ordinary RPC now, same as it protected before either switch existed.
-	ColdLookupTimeout time.Duration `json:"cold_lookup_timeout"`
 }
 
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
@@ -219,7 +176,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 			ProjectionRead          *bool   `json:"projection_read"`
 			ProjectionAuthoritative *bool   `json:"projection_authoritative"`
 		} `json:"routing"`
-		ColdLookupTimeout json.RawMessage `json:"cold_lookup_timeout"`
 	}
 
 	parsed := wire{}
@@ -269,14 +225,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		}
 		g.RequestTimeout = d
 	}
-	if len(bytes.TrimSpace(parsed.ColdLookupTimeout)) > 0 {
-		d, err := parseGatewayDuration("gateway.cold_lookup_timeout", parsed.ColdLookupTimeout)
-		if err != nil {
-			return err
-		}
-		g.ColdLookupTimeout = d
-	}
-
 	return nil
 }
 
@@ -362,7 +310,6 @@ func defaultConfig() Config {
 			RequestTimeout:      30 * time.Second,
 			ForwardResponseSize: 4 << 20,
 			SandboxProxyDomains: []string{},
-			ColdLookupTimeout:   defaultColdLookupTimeout,
 			// The default points at the end state rather than at the cautious
 			// first step. Starting a release on observe is release discipline,
 			// which belongs in the runbook; putting it in the default leaves
@@ -405,21 +352,6 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid GATEWAY_DEBUG_MODE %q: %w", v, err)
 		}
 		cfg.Gateway.DebugMode = b
-	}
-
-	// 🔴 Follows GATEWAY_DEBUG_MODE's shape rather than the mounted-file
-	// pattern the projection switches use below: this one is meant to be
-	// flipped by `kubectl set env` and a restart, the same way
-	// RestUpstreamAddr is. Named GATEWAY_COLD_LOOKUP_TIMEOUT, not
-	// GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — see ColdLookupTimeout's own doc for
-	// why the rename. The old name is neither read nor refused any more; a
-	// manifest that still sets it silently keeps the 3s default.
-	if v := strings.TrimSpace(os.Getenv("GATEWAY_COLD_LOOKUP_TIMEOUT")); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return fmt.Errorf("invalid GATEWAY_COLD_LOOKUP_TIMEOUT %q: %w", v, err)
-		}
-		cfg.Gateway.ColdLookupTimeout = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_ROUTING_EXECUTION_FENCING")); v != "" {

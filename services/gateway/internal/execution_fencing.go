@@ -219,9 +219,11 @@ func fencingPlaneFor(source routeSource) fencingPlane {
 	return fencingPlaneControl
 }
 
-// decideFencing turns one LookupNode answer into one plan. Pure: every input is
-// a value and it performs no IO, so the whole decision table can be enumerated
-// in a test and every mutation of it shows up in exactly one place.
+// decideFencing turns one routing answer into one plan. The answer is a
+// projection record or a wake-up result, both rendered as the LookupNodeResponse
+// shape. Pure: every input is a value and it performs no IO, so the whole
+// decision table can be enumerated in a test and every mutation of it shows up
+// in exactly one place.
 func decideFencing(mode fencingMode, plane fencingPlane, resp *schedulerv1.LookupNodeResponse) fencingPlan {
 	// 🔴 The rollback is this line and nothing else. Spreading the check across
 	// the stamping site, the response site and the metrics site would make "off"

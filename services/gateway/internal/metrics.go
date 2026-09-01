@@ -35,14 +35,6 @@ var (
 		},
 		[]string{"route", "status"},
 	)
-	gatewaySchedulerRPCDuration = promauto.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "agentenv_gateway_scheduler_rpc_duration_seconds",
-			Help:    "Gateway scheduler RPC duration by RPC and status.",
-			Buckets: observability.DurationBuckets,
-		},
-		[]string{"rpc", "status"},
-	)
 	// How each resolved sandbox request was located. This is deliberately its
 	// own series rather than another route_source value: route_source answers
 	// "where did the sandbox id come from", which is orthogonal and still
@@ -52,7 +44,7 @@ var (
 	gatewaySandboxLocations = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "agentenv_gateway_sandbox_location_total",
-			Help: "Resolved sandbox requests by how the scheduler located the sandbox.",
+			Help: "Resolved sandbox requests by the location the routing answer carried.",
 		},
 		[]string{"location"},
 	)
@@ -72,7 +64,7 @@ var (
 		[]string{"plane", "decision"},
 	)
 	// How each resolved sandbox route was answered: out of the routing
-	// projection, or by asking the scheduler.
+	// projection, or by asking the api half.
 	//
 	// 🔴 This exists because turning the direct read on drives the scheduler's
 	// own lookup counters towards zero, and those counters were half of a
@@ -91,7 +83,7 @@ var (
 	gatewayRouteResolution = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "agentenv_gateway_route_resolution_total",
-			Help: "Resolved sandbox routes by where the answer came from: a routing projection hit, a miss, a projection read error, or the scheduler.",
+			Help: "Resolved sandbox routes by where the answer came from: a routing projection hit, a miss, a projection read error, or the api half's resume RPC.",
 		},
 		[]string{"source"},
 	)
@@ -114,20 +106,6 @@ var (
 			Help: "Wake-up attempts against the api half, by outcome, using the api half's own result vocabulary.",
 		},
 		[]string{"result"},
-	)
-	// Cold-path LookupNode calls (a projection miss and an undecided wake-up
-	// both fall through to lookupNodeColdPath) that hit their own timeout
-	// before the RPC returned — recorded in addition to, not instead of,
-	// gatewaySchedulerRPCDuration, which already counts the RPC by status
-	// including this one's eventual DeadlineExceeded. This series exists only
-	// to answer "did the cold-path cap fire", which the RPC-status series
-	// cannot answer on its own since a caller-side deadline firing looks
-	// identical to it there.
-	gatewayColdLookupTimeout = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "agentenv_gateway_cold_lookup_timeout_total",
-			Help: "Cold-path LookupNode calls (a projection miss or an undecided wake-up) that hit their own timeout before the RPC returned.",
-		},
 	)
 )
 
@@ -229,11 +207,6 @@ func (s *Server) isLocalGatewayEndpointRequest(r *http.Request) bool {
 	return hostRoute == nil && hostRouteErr == nil
 }
 
-func recordGatewaySchedulerRPC(rpc string, start time.Time, err error) {
-	status := observability.GRPCStatusLabel(err)
-	gatewaySchedulerRPCDuration.WithLabelValues(rpc, status).Observe(time.Since(start).Seconds())
-}
-
 func recordGatewaySandboxLocation(location schedulerv1.SandboxLocation) {
 	gatewaySandboxLocations.WithLabelValues(gatewaySandboxLocationLabel(location)).Inc()
 }
@@ -248,20 +221,17 @@ func recordExecutionFencing(plane fencingPlane, decision string) {
 	gatewayExecutionFencing.WithLabelValues(string(plane), decision).Inc()
 }
 
-// The four ways a sandbox route gets answered. Closed set, and every path
-// through the read block lands on exactly one.
+// The ways a sandbox route gets answered. Closed set: a projection read lands
+// on one of the first three, and a route the api half produced lands on the
+// fourth. A miss or a read error still leaves the request to the api half, so
+// the series reconcile as Δ{redis_miss} + Δ{redis_error} ≈ Δ{resume_woken} +
+// Δ{agentenv_gateway_resume_total, result != ok}.
 const (
 	routeResolutionRedisHit   = "redis_hit"
 	routeResolutionRedisMiss  = "redis_miss"
 	routeResolutionRedisError = "redis_error"
-	routeResolutionScheduler  = "scheduler"
-	// A route the api half produced by waking the sandbox.
+	// A route the api half produced: a sandbox it found running, or one it woke.
 	routeResolutionResumeWoken = "resume_woken"
-	// A wake-up nobody could be asked about, which fell through to the
-	// scheduler. Like redis_error, this is not a failure mode of the request:
-	// it is the count of times the fallback earned its place. Alert on its
-	// rate, never on its existence.
-	routeResolutionResumeUndecided = "resume_undecided"
 )
 
 // The refusal reasons the api half can send, as a closed set.
@@ -336,10 +306,6 @@ func resumeResultLabel(result resume.Result) string {
 
 func recordResumeAttempt(result resume.Result) {
 	gatewayResumeAttempts.WithLabelValues(resumeResultLabel(result)).Inc()
-}
-
-func recordGatewayColdLookupTimeout() {
-	gatewayColdLookupTimeout.Inc()
 }
 
 func recordRouteResolution(source string) {

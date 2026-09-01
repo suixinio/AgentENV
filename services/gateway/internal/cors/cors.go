@@ -19,6 +19,17 @@ func Error(w http.ResponseWriter, message string, code int) {
 	http.Error(w, message, code)
 }
 
+// Fail answers a preflight when r is one and replies like Error otherwise.
+// Use ONLY where no upstream will answer: the rule is HandlePreflight's, and
+// the 204 is the browser's licence to send the real request to whatever
+// answers next.
+func Fail(w http.ResponseWriter, r *http.Request, message string, code int) {
+	if HandlePreflight(w, r) {
+		return
+	}
+	Error(w, message, code)
+}
+
 // NotFound replies like http.NotFound, with the same header for the same reason.
 func NotFound(w http.ResponseWriter, r *http.Request) {
 	SetHeaders(w)

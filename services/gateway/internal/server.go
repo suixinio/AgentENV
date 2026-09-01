@@ -49,10 +49,9 @@ const (
 type routeSource string
 
 const (
-	routeSourceHeader   routeSource = "header"
-	routeSourceHost     routeSource = "host"
-	routeSourcePath     routeSource = "path"
-	routeSourceSchedule routeSource = "schedule"
+	routeSourceHeader routeSource = "header"
+	routeSourceHost   routeSource = "host"
+	routeSourcePath   routeSource = "path"
 	// The gateway answered out of itself rather than resolving anything.
 	routeSourceGateway routeSource = "gateway"
 )
@@ -218,7 +217,7 @@ func (s *Server) Handler() http.Handler {
 			if hasProxyRoutingHeaders(r.Header) {
 				if _, hasSandbox := sandboxIDFromHeaders(r.Header); !hasSandbox {
 					setGatewayRouteSource(w, routeSourceHeader)
-					cors.Error(w, "sandbox id header required", http.StatusBadRequest)
+					cors.Fail(w, r, "sandbox id header required", http.StatusBadRequest)
 					return
 				}
 				s.handleProxy(w, r)
@@ -255,7 +254,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			zap.Error(hostRouteErr),
 			zap.Int("status", http.StatusBadRequest),
 		)
-		cors.Error(w, hostRouteErr.Error(), http.StatusBadRequest)
+		cors.Fail(w, r, hostRouteErr.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -287,10 +286,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else {
 		sandboxID, hasSandbox = sandboxIDFromHeaders(r.Header)
 	}
-	if !hasSandbox {
-		routeSource = routeSourceSchedule
-	}
 	setGatewayRouteSource(w, routeSource)
+	if !hasSandbox {
+		// Only the header route lands here: a proxy host always carries an id
+		// and isSandboxControlPlaneRequest refuses a blank path segment. Routing
+		// headers naming no sandbox is the shape the /health branch refuses
+		// too, and there is no upstream to hand it to.
+		cors.Fail(w, r, "sandbox id header required", http.StatusBadRequest)
+		return
+	}
 
 	var node *schedulerv1.Node
 	// How the scheduler arrived at that node. Anything other than BOUND means
@@ -365,7 +369,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 					resp = woke.LookupResponse()
 					source = routeResolutionResumeWoken
 				case resume.VerdictGone, resume.VerdictRefused:
-					s.writeResumeError(w, sandboxID, woke)
+					s.writeResumeError(w, r, sandboxID, woke)
 					return
 				case resume.VerdictUndecided:
 					// Deliberately nothing. The scheduler call below is the
@@ -386,7 +390,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				// 🔴 Still the only source of a 404 or a 503 on the scheduler
 				// path in this package.
-				s.writeSchedulerError(w, err)
+				s.writeSchedulerError(w, r, err)
 				return
 			}
 		}
@@ -407,20 +411,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 	}
-	// No else. Every request that resolves no sandbox — a create, a cold
-	// create, a template build — is a user-facing REST call, and the
-	// isUserFacingRestRequest branch above has already forwarded it (and
-	// returned) before this point is reached. Placement is the api half's
-	// decision (`NodePlacement::record_placement`, called from the stub that
-	// has just had a create or a resume acknowledged), and calling Schedule
-	// only to discard the answer would consume a placement and move the
-	// strategy's cursor for a request that never went there.
-	//
-	// What is left of this branch at runtime is a defensive no-op: `node`
-	// stays nil for the one shape of request that can still reach here
-	// without a sandbox — proxy routing headers present, but none of them
-	// naming a sandbox id — and the upstream-URL build below fails closed
-	// with a 502 rather than proxying anywhere.
+	// hasSandbox is always true here: a request naming no sandbox was refused
+	// above, so node is set.
 
 	s.logger.Debug("gateway routed request",
 		zap.String("method", r.Method),
@@ -442,7 +434,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
 	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
 	if err != nil {
-		cors.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		cors.Fail(w, r, "invalid upstream endpoint", http.StatusBadGateway)
 		return
 	}
 
@@ -537,7 +529,11 @@ func (s *Server) lookupNodeColdPath(ctx context.Context, sandboxID string) (*sch
 // that could serve this sandbox will not — both are 503s, because both are
 // states the caller may find changed a moment later. Collapsing any of them
 // into another is the bug this whole path exists to avoid.
-func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
+func (s *Server) writeSchedulerError(w http.ResponseWriter, r *http.Request, err error) {
+	// No node was named, so nobody upstream can answer a preflight.
+	if cors.HandlePreflight(w, r) {
+		return
+	}
 	st, ok := status.FromError(err)
 	if !ok {
 		cors.Error(w, "scheduler unavailable", http.StatusBadGateway)
@@ -653,7 +649,7 @@ func (s *Server) proxyRequest(
 ) {
 	upstreamURL, err := url.Parse(target)
 	if err != nil {
-		cors.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		cors.Fail(w, proxyReq, "invalid upstream endpoint", http.StatusBadGateway)
 		return
 	}
 
@@ -720,13 +716,13 @@ func (s *Server) proxyRequest(
 					zap.String("path", proxyReq.URL.Path),
 					zap.String("target", upstreamURL.String()),
 				)
-				cors.Error(rw, "upstream timeout", http.StatusGatewayTimeout)
+				cors.Fail(rw, proxyReq, "upstream timeout", http.StatusGatewayTimeout)
 				return
 			}
 
 			var proxyErr *proxyResponseError
 			if errors.As(err, &proxyErr) {
-				proxyErr.write(rw)
+				proxyErr.write(rw, proxyReq)
 				return
 			}
 
@@ -736,7 +732,7 @@ func (s *Server) proxyRequest(
 				zap.String("path", proxyReq.URL.Path),
 				zap.String("target", upstreamURL.String()),
 			)
-			cors.Error(rw, "upstream unavailable", http.StatusBadGateway)
+			cors.Fail(rw, proxyReq, "upstream unavailable", http.StatusBadGateway)
 		},
 	}
 
@@ -767,8 +763,12 @@ type proxyResponseError struct {
 	headers     http.Header
 }
 
-// write emits the error as a response.
-func (e *proxyResponseError) write(rw http.ResponseWriter) {
+// write emits the error as a response. The upstream's answer was discarded,
+// so a preflight is the gateway's to answer.
+func (e *proxyResponseError) write(rw http.ResponseWriter, r *http.Request) {
+	if cors.HandlePreflight(rw, r) {
+		return
+	}
 	if len(e.body) == 0 {
 		cors.Error(rw, e.message, e.statusCode)
 		return
@@ -1426,7 +1426,7 @@ func resumeTargetPort(r *http.Request, route *hostRoute) string {
 // from an older snapshot and losing the last pause. Retry-After tells the
 // client to wait for the machine that has the bytes, which is the only correct
 // thing to wait for.
-func (s *Server) writeResumeError(w http.ResponseWriter, sandboxID string, result resume.Result) {
+func (s *Server) writeResumeError(w http.ResponseWriter, r *http.Request, sandboxID string, result resume.Result) {
 	reason := s.resumeReason(result)
 	code := codes.Unknown
 	if result.Status != nil {
@@ -1440,6 +1440,12 @@ func (s *Server) writeResumeError(w http.ResponseWriter, sandboxID string, resul
 		zap.String("refusal", result.Reason),
 		zap.String("origin_node_id", result.OriginNodeID),
 	)
+
+	// The refusal ends the request here, so nobody upstream can answer a
+	// preflight; the real request gets the status below.
+	if cors.HandlePreflight(w, r) {
+		return
+	}
 
 	switch code {
 	case codes.NotFound:

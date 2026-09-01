@@ -592,12 +592,6 @@ func TestUpstreamTargetPath(t *testing.T) {
 			path:        "/sandboxes/sbx-1/pause",
 			want:        "/sandboxes/sbx-1/pause",
 		},
-		{
-			name:        "schedule route unchanged",
-			routeSource: routeSourceSchedule,
-			path:        "/sandboxes",
-			want:        "/sandboxes",
-		},
 	}
 
 	for _, tc := range tests {
@@ -1982,3 +1976,24 @@ func TestAnEndpointInASchedulerMessageIsRedacted(t *testing.T) {
 // not uncovered: it is the same branch TestProjectionMissOnAnUnknownSandbox-
 // StillAnswers404 (projection_test.go) exercises through a genuine, still-live
 // data-plane LookupNode failure.
+
+// Routing headers that name no sandbox are refused where the /health branch
+// refuses them, not carried into the resolver to fail on an empty upstream.
+func TestRoutingHeadersNamingNoSandboxAreRefusedNotProxied(t *testing.T) {
+	server := newTestServer(t, refusingScheduler(t, "nothing named a sandbox to look up"), 5*time.Second, 4<<20)
+
+	request := httptest.NewRequest(http.MethodGet, "/anything", nil)
+	request.Header.Set(headerTargetPort, "8080")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.Code)
+	}
+	if body := strings.TrimSpace(response.Body.String()); body != "sandbox id header required" {
+		t.Fatalf("body = %q, want the same refusal the /health branch gives", body)
+	}
+	if got := response.Header().Get(headerAllowOrigin); got != "*" {
+		t.Fatalf("%s = %q, want %q", headerAllowOrigin, got, "*")
+	}
+}

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,9 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const headerAllowOrigin = "Access-Control-Allow-Origin"
@@ -158,5 +162,135 @@ func TestNoRawHTTPErrorInTheGatewayPackage(t *testing.T) {
 	}
 	if scanned == 0 {
 		t.Fatal("the scan read no source files, so it proves nothing")
+	}
+}
+
+// unreachableEndpoint is an address nothing listens on: the port was bound and
+// released, so a dial is refused rather than left hanging.
+func unreachableEndpoint(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("release the port: %v", err)
+	}
+	return "http://" + address
+}
+
+// Every failure the gateway synthesizes before an upstream could answer has to
+// answer a preflight too, or the browser never sends the real request and the
+// status it would have got — the 410 of a sandbox that declines to wake, say —
+// is never seen.
+func TestAPreflightIsAnsweredAtEverySynthesizedFailure(t *testing.T) {
+	cases := []struct {
+		name    string
+		server  func(t *testing.T) *Server
+		request func(method string) *http.Request
+		// What the same request is answered when it is not a preflight.
+		wantStatus int
+	}{
+		{
+			name: "a malformed host inside a configured proxy domain",
+			server: func(t *testing.T) *Server {
+				return newTestServer(t, stubSchedulerClient{}, 5*time.Second, 4<<20,
+					withSandboxProxyDomains("sandbox.test"))
+			},
+			request: func(method string) *http.Request {
+				request := httptest.NewRequest(method, "/anything", nil)
+				request.Host = "notaport-sbx1.sandbox.test"
+				return request
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "routing headers naming no sandbox",
+			server: func(t *testing.T) *Server {
+				return newTestServer(t, refusingScheduler(t, "nothing named a sandbox to look up"),
+					5*time.Second, 4<<20)
+			},
+			request: func(method string) *http.Request {
+				request := httptest.NewRequest(method, "/anything", nil)
+				request.Header.Set(headerTargetPort, "8080")
+				return request
+			},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name: "a resume refusal",
+			server: func(t *testing.T) *Server {
+				service := &stubResumeService{
+					err: status.Error(codes.FailedPrecondition,
+						"this sandbox was created with auto-resume off and does not wake on data-plane traffic"),
+					trailer: metadata.Pairs(
+						"x-agentenv-resume-refusal", "auto_resume_disabled",
+						"x-agentenv-resume-origin-node", "",
+					),
+				}
+				return newTestServer(t,
+					refusingScheduler(t, "a sandbox that declines to wake must not be routed anywhere"),
+					5*time.Second, 4<<20,
+					withProjectionReader(missingProjection()),
+					withResumeClient(service),
+				)
+			},
+			request: func(method string) *http.Request {
+				request := httptest.NewRequest(method, "/anything", nil)
+				request.Header.Set(headerSandboxID, "sbx-1")
+				return request
+			},
+			wantStatus: http.StatusGone,
+		},
+		{
+			name: "an unreachable upstream",
+			server: func(t *testing.T) *Server {
+				endpoint := unreachableEndpoint(t)
+				return newTestServer(t, stubSchedulerClient{
+					lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+						return &schedulerv1.LookupNodeResponse{
+							Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: endpoint},
+						}, nil
+					},
+				}, 5*time.Second, 4<<20)
+			},
+			request: func(method string) *http.Request {
+				request := httptest.NewRequest(method, "/anything", nil)
+				request.Header.Set(headerSandboxID, "sbx-1")
+				return request
+			},
+			wantStatus: http.StatusBadGateway,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := tc.server(t)
+
+			preflight := tc.request(http.MethodOptions)
+			preflight.Header.Set("Access-Control-Request-Method", "POST")
+			response := httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, preflight)
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("preflight status = %d, want 204", response.Code)
+			}
+			if got := response.Header().Get("Access-Control-Allow-Methods"); got != "*" {
+				t.Fatalf("Access-Control-Allow-Methods = %q, want %q", got, "*")
+			}
+
+			// A bare OPTIONS is an ordinary request and gets the ordinary refusal.
+			response = httptest.NewRecorder()
+			server.Handler().ServeHTTP(response, tc.request(http.MethodOptions))
+			if response.Code != tc.wantStatus {
+				t.Fatalf("bare OPTIONS status = %d, want %d", response.Code, tc.wantStatus)
+			}
+			if got := response.Header().Get("Access-Control-Allow-Methods"); got != "" {
+				t.Fatalf("Access-Control-Allow-Methods = %q on a response that answered no preflight", got)
+			}
+			if got := response.Header().Get(headerAllowOrigin); got != "*" {
+				t.Fatalf("%s = %q, want %q", headerAllowOrigin, got, "*")
+			}
+		})
 	}
 }

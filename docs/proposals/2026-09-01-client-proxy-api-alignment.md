@@ -3,7 +3,7 @@
 > 2026-09-01 · 基线 `dev`@`8248c8f`。配套
 > [`2026-08-20-module-responsibilities.md`](2026-08-20-module-responsibilities.md)（§4.3 与连边表 A1/A2 是本方案的终态依据）、
 > [`2026-08-31-residue-decisions.md`](2026-08-31-residue-decisions.md)（本方案落地后取代其 D2）、
-> [`2026-09-01-bidirectional-reconciler.md`](2026-09-01-bidirectional-reconciler.md)（P4 的前置）。
+> [`2026-09-01-bidirectional-reconciler.md`](2026-09-01-bidirectional-reconciler.md)（并行项，见 §7）。
 > e2b 侧事实来自本地 `/home/debian/e2b-infra`@`fdc3359` 逐行核对 + DeepWiki（e2b-dev/infra）交叉确认，
 > AgentENV 侧全部 file:line 已在 `8248c8f` 上验证。
 
@@ -63,7 +63,7 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 | 合成响应的 CORS | ➕ 采纳 e2b 形制（P3） | — | `shared/pkg/proxy/cors` |
 | 冷路径 | projection 直读 → resume（P4 后两级） | resume 内化「先查 running、再按门控 wake」的完整判定（P4） | catalog 直读 → resume，同为两级 |
 | execution fencing、内部 header 加盖 | ✔ 保留（喂源 P4 后收为 projection + resume 响应） | — | 无同位物，永久偏离 |
-| 路由修复 | ✂ RecordAssignment 移交（P4） | reconciler 对账 + wake 时自写投影 | catalog 只由 api 写 |
+| 路由修复 | ✂ RecordAssignment 移交（P4） | wake 与 running-miss 时自写投影；reconciler 只作命中率优化 | catalog 只由 api 写 |
 
 ## 4. 与 e2b 的偏离：永久两项，过渡三项
 
@@ -90,7 +90,8 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 四个阶段 + 一个可选项，每阶段可独立合入、独立回滚（镜像 digest 回退，与 D3 的回滚口径一致；
 **P3 例外**——它删配置也删门禁，纯镜像回退不完整，回滚口径见 P3 部署段的回滚窗口约定）。
 顺序约束：P1 与 P2 互相独立；**P3 必须在 P2 之后**（客户端先搬家，转发再断）；
-**P4 必须在 P3 上线稳定且 reconciler 落地之后**。
+**P4 必须在 P3 上线稳定之后**（reconciler 不再卡 P4——2026-09-01 裁决降格为并行项，
+依据与替代验收见 P4 验收段）。
 
 ### P1 — `/registry/sandboxes` 收进 REST 面，`/nodes` 形状对齐
 
@@ -217,7 +218,7 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 `reporter.rs` 的测试桩、两侧生成码（`make -C services`、`build.rs`）；
 `rest_upstream_addr` 键与 `GATEWAY_REST_UPSTREAM_ADDR` 至此才删。
 
-### P4 — 连边折叠：gateway 掉线 scheduler.v1（前置：P3 上线稳定 + reconciler 落地）
+### P4 — 连边折叠：gateway 掉线 scheduler.v1（前置：P3 上线稳定）
 
 终点：gateway 连边 = Redis 直读 + apiproxy 一条 RPC，与 e2b client-proxy 同形（设计图 A1/A2）。
 
@@ -229,7 +230,10 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   折叠进一个 RPC 不许把它折没（e2b 此处更弱：政策非 Any 时 miss 连 running 都答
   NotFound/502，我们不跟，这是有据的既证偏离）。wake 成功与 running-miss 修复时
   api 都自写投影（它拥有 Redis 写权），取代 gateway 的 RecordAssignment——e2b 的
-  edge 不回写、每次 miss 重发 RPC，回写是我们对命中率的既定改良。
+  edge 不回写、每次 miss 重发 RPC，回写是我们对命中率的既定改良。投影 TTL 采
+  e2b 写法：写入时覆盖沙箱剩余寿命（e2b `lifetime = MaxLengthInHours` 进 Redis
+  `SET EX`），条目不在沙箱存活期内过期，api 不可达窗口撞上 miss 的概率压到与
+  e2b 同水平；`projectionTTLToRecord` 的 api 半边按此实现。
 - **gateway 侧删除**：`lookupNodeColdPath`（:558）与 VerdictUndecided 的第三级回落——
   Undecided 收窄为纯传输失败 → 请求失败（e2b 形状：api 不可答则数据面冷路径失败；
   PG 降级窗口内 running 沙箱的冷路由损失是接受的代价，冷路径命中率列为监控项）；
@@ -248,8 +252,8 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   `resume_for_data_plane` 照常路由，且 api 回写投影恢复命中；(b) autoResume 双门控
   断言原样保住（上方 api 侧）；(c) 冷路径命中率与「api 不可达时 miss 即失败」的
   影响面进看板。reconciler 据此定性为**命中率优化 + 孤儿方向清理**（e2b 的
-  `Store.Reconcile` 只做杀孤儿），不是折叠的正确性前提；是否维持「reconciler 落地」
-  作为 P4 硬前置，留单独裁决。
+  `Store.Reconcile` 只做杀孤儿），不是折叠的正确性前提。**已裁决（2026-09-01）：
+  降格为并行项**——P4 的前置只剩 P3 稳定，正确性由 (a) 的演练直接证明。
 - **收尾提交**：`scheduler.proto` 删 `LookupNode`、`RecordAssignment`，连同
   `grpc_service.rs` 实现与生成码。scheduler.v1 至此只剩 node↔api 面。
 
@@ -275,8 +279,10 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 ## 7. 与在途事项的关系
 
 - **取代 D2**（`agentenv_gateway_rest_upstream_total`）：从折叠标签升级为删除整条指标。
-- **reconciler**（`2026-09-01-bidirectional-reconciler.md`）：从「互不阻塞」升格为
-  **P4 的前置**——RecordAssignment 的修复职责由它接收；P4 排期挂它。
+- **reconciler**（`2026-09-01-bidirectional-reconciler.md`）：**并行项，不卡 P4**
+  （2026-09-01 裁决；此前一度升格为前置）。RecordAssignment 的修复职责由
+  `resume_for_data_plane` 的按请求修复接收（e2b StateRunning 同形），reconciler
+  收窄为命中率优化 + 杀孤儿，按它自己的方案推进。
 - **discard 竞态**：不同子系统；P3/P4 与它不要同一批滚集群，避免归因混叠。
 - **scheduler 面**：P3 净减两个 RPC，P4 再减两个；此后仅剩 node↔api 的
   Heartbeat/ReportSandboxEvent/ListSandboxes/p2p hints 等。
@@ -309,4 +315,4 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 | 指标/label 消失打断看板 | P3/P4 变更说明各列全部消失序列 |
 | P3 后残余流量打到 gateway 的 REST 路径 | 定义 404 行为并在 gateway 访问日志观察一个发布周期 |
 | P4 折没 autoResume 双门控（历史上删掉那趟读时 1397 个测试全绿） | 两个门控用例显式断言 + 变异证据；不许以「测试全绿」为删除依据 |
-| P4 后 PG 降级窗口 running 沙箱冷路由失败 | e2b 同形的接受代价；reconciler 保投影新鲜 + 冷路径命中率监控，恶化再议 |
+| P4 后 PG 降级窗口 running 沙箱冷路由失败 | e2b 同形的接受代价；投影 TTL 覆盖沙箱剩余寿命（e2b 同款）+ 冷路径命中率监控，恶化再议 |

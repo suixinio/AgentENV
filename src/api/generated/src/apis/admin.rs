@@ -53,6 +53,24 @@ pub enum NodesNodeIdPostResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum RegistrySandboxesGetResponse {
+    /// Successfully returned the registry page
+    Status200_SuccessfullyReturnedTheRegistryPage(models::RegistrySandboxListing),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+    /// This deployment is not configured with a cluster registry
+    Status501_ThisDeploymentIsNotConfiguredWithAClusterRegistry(models::Error),
+    /// The registry could not be read
+    Status503_TheRegistryCouldNotBeRead(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SnapshotsSnapshotIdDeleteResponse {
     /// The snapshot was deleted successfully
     Status204_TheSnapshotWasDeletedSuccessfully,
@@ -111,6 +129,19 @@ pub trait Admin<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::ErrorHa
         query_params: &models::NodesNodeIdPostQueryParams,
         body: &models::NodeStatusChange,
     ) -> Result<NodesNodeIdPostResponse, E>;
+
+    /// List registry sandboxes.
+    ///
+    /// RegistrySandboxesGet - GET /registry/sandboxes
+    async fn registry_sandboxes_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        query_params: &models::RegistrySandboxesGetQueryParams,
+    ) -> Result<RegistrySandboxesGetResponse, E>;
 
     /// Delete snapshot.
     ///

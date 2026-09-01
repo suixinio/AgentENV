@@ -169,7 +169,7 @@ mod tests {
         let paths = generated_route_paths();
         assert_eq!(
             paths.len(),
-            25,
+            26,
             "the generated route table changed. Partition the new route below and \
              update this count; the routes are {paths:?}"
         );
@@ -193,7 +193,11 @@ mod tests {
             vec!["/health", "/nodes", "/nodes/{node_id}"],
             "a aenv-node process serves exactly the three routes §7.2 names"
         );
-        assert_eq!(refused.len(), 22);
+        assert_eq!(refused.len(), 23);
+        assert!(
+            refused.contains(&"/registry/sandboxes"),
+            "the cluster registry listing is answered by the api half only"
+        );
         for group in ["/sandboxes", "/snapshots", "/templates", "/v2/", "/v3/"] {
             assert!(
                 refused.iter().any(|path| path.starts_with(group)),

@@ -109,6 +109,28 @@ pub struct NodesNodeIdPostQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct RegistrySandboxesGetQueryParams {
+    /// Registry state to filter by
+    #[serde(rename = "state")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    /// Holder node to filter by
+    #[serde(rename = "nodeID")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Maximum rows per page; zero or absent returns every match
+    #[serde(rename = "limit")]
+    #[validate(range(min = 0u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Page token returned by a previous call
+    #[serde(rename = "nextToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotsSnapshotIdDeletePathParams {
     pub snapshot_id: String,
 }
@@ -3382,9 +3404,7 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err(
-                        "Missing value while parsing Node".to_string(),
-                    );
+                    return std::result::Result::Err("Missing value while parsing Node".to_string());
                 }
             };
 
@@ -4227,7 +4247,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NodeMetrics>
     }
 }
 
-/// Status of the node. - draining: the node is bound to be shut down. It will not accept new sandboxes and will stop once all existing sandboxes are done.
+/// Status of the node. - draining: the node is bound to be shut down. It will not accept new sandboxes and will stop once all existing sandboxes are done. - lingering: the node left discovery while it still holds sandboxes. It is not schedulable and only `ready` and `draining` may be set by a client.
 /// Enumeration of values.
 /// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
 /// which helps with FFI.
@@ -4246,6 +4266,8 @@ pub enum NodeStatus {
     NodeStatusConnecting,
     #[serde(rename = "unhealthy")]
     NodeStatusUnhealthy,
+    #[serde(rename = "lingering")]
+    NodeStatusLingering,
 }
 
 impl validator::Validate for NodeStatus {
@@ -4261,6 +4283,7 @@ impl std::fmt::Display for NodeStatus {
             NodeStatus::NodeStatusDraining => write!(f, "draining"),
             NodeStatus::NodeStatusConnecting => write!(f, "connecting"),
             NodeStatus::NodeStatusUnhealthy => write!(f, "unhealthy"),
+            NodeStatus::NodeStatusLingering => write!(f, "lingering"),
         }
     }
 }
@@ -4274,6 +4297,7 @@ impl std::str::FromStr for NodeStatus {
             "draining" => std::result::Result::Ok(NodeStatus::NodeStatusDraining),
             "connecting" => std::result::Result::Ok(NodeStatus::NodeStatusConnecting),
             "unhealthy" => std::result::Result::Ok(NodeStatus::NodeStatusUnhealthy),
+            "lingering" => std::result::Result::Ok(NodeStatus::NodeStatusLingering),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
         }
     }
@@ -4422,6 +4446,538 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NodeStatusCh
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into NodeStatusChange - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// One row of the cluster paused-sandbox registry.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct RegistrySandbox {
+    /// Identifier of the sandbox
+    #[serde(rename = "sandboxID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub sandbox_id: String,
+
+    /// Identifier of the cluster
+    #[serde(rename = "clusterID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub cluster_id: String,
+
+    /// Registry state of the row
+    #[serde(rename = "state")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub state: String,
+
+    /// Row generation the registry fences writes against
+    #[serde(rename = "generation")]
+    pub generation: i64,
+
+    /// Node that published the row
+    #[serde(rename = "originNodeID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub origin_node_id: String,
+
+    /// Node currently claiming the row, empty when unclaimed
+    #[serde(rename = "claimedByNodeID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub claimed_by_node_id: String,
+
+    /// Snapshot the row resumes from, empty until publication completes
+    #[serde(rename = "snapshotID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub snapshot_id: String,
+
+    /// Authoritative holder of the row
+    #[serde(rename = "holderNodeID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub holder_node_id: String,
+
+    /// When the sandbox was paused
+    #[serde(rename = "pausedAtUnixMs")]
+    pub paused_at_unix_ms: i64,
+
+    /// When the row was last written
+    #[serde(rename = "updatedAtUnixMs")]
+    pub updated_at_unix_ms: i64,
+
+    /// Lease deadline. Null means the lease is already expired, which is not the same as a deadline of zero.
+    #[serde(rename = "leaseExpiresAtUnixMs")]
+    pub lease_expires_at_unix_ms: Nullable<i64>,
+
+    /// Sandbox deadline. Null means the sandbox was asked never to expire, which is the opposite of a deadline that has passed.
+    #[serde(rename = "sandboxExpiresAtUnixMs")]
+    pub sandbox_expires_at_unix_ms: Nullable<i64>,
+
+    /// Incarnation this row is fenced against, empty in states that pin the column to null. Read-only: it is not a filter, because an incarnation supplied by a caller is stale by construction.
+    #[serde(rename = "executionID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub execution_id: String,
+}
+
+impl RegistrySandbox {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        sandbox_id: String,
+        cluster_id: String,
+        state: String,
+        generation: i64,
+        origin_node_id: String,
+        claimed_by_node_id: String,
+        snapshot_id: String,
+        holder_node_id: String,
+        paused_at_unix_ms: i64,
+        updated_at_unix_ms: i64,
+        lease_expires_at_unix_ms: Nullable<i64>,
+        sandbox_expires_at_unix_ms: Nullable<i64>,
+        execution_id: String,
+    ) -> RegistrySandbox {
+        RegistrySandbox {
+            sandbox_id,
+            cluster_id,
+            state,
+            generation,
+            origin_node_id,
+            claimed_by_node_id,
+            snapshot_id,
+            holder_node_id,
+            paused_at_unix_ms,
+            updated_at_unix_ms,
+            lease_expires_at_unix_ms,
+            sandbox_expires_at_unix_ms,
+            execution_id,
+        }
+    }
+}
+
+/// Converts the RegistrySandbox value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for RegistrySandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("sandboxID".to_string()),
+            Some(self.sandbox_id.to_string()),
+            Some("clusterID".to_string()),
+            Some(self.cluster_id.to_string()),
+            Some("state".to_string()),
+            Some(self.state.to_string()),
+            Some("generation".to_string()),
+            Some(self.generation.to_string()),
+            Some("originNodeID".to_string()),
+            Some(self.origin_node_id.to_string()),
+            Some("claimedByNodeID".to_string()),
+            Some(self.claimed_by_node_id.to_string()),
+            Some("snapshotID".to_string()),
+            Some(self.snapshot_id.to_string()),
+            Some("holderNodeID".to_string()),
+            Some(self.holder_node_id.to_string()),
+            Some("pausedAtUnixMs".to_string()),
+            Some(self.paused_at_unix_ms.to_string()),
+            Some("updatedAtUnixMs".to_string()),
+            Some(self.updated_at_unix_ms.to_string()),
+            Some("leaseExpiresAtUnixMs".to_string()),
+            Some(
+                self.lease_expires_at_unix_ms
+                    .as_ref()
+                    .map_or("null".to_string(), |x| x.to_string()),
+            ),
+            Some("sandboxExpiresAtUnixMs".to_string()),
+            Some(
+                self.sandbox_expires_at_unix_ms
+                    .as_ref()
+                    .map_or("null".to_string(), |x| x.to_string()),
+            ),
+            Some("executionID".to_string()),
+            Some(self.execution_id.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a RegistrySandbox value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for RegistrySandbox {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub sandbox_id: Vec<String>,
+            pub cluster_id: Vec<String>,
+            pub state: Vec<String>,
+            pub generation: Vec<i64>,
+            pub origin_node_id: Vec<String>,
+            pub claimed_by_node_id: Vec<String>,
+            pub snapshot_id: Vec<String>,
+            pub holder_node_id: Vec<String>,
+            pub paused_at_unix_ms: Vec<i64>,
+            pub updated_at_unix_ms: Vec<i64>,
+            pub lease_expires_at_unix_ms: Vec<i64>,
+            pub sandbox_expires_at_unix_ms: Vec<i64>,
+            pub execution_id: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing RegistrySandbox".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "sandboxID" => intermediate_rep.sandbox_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "clusterID" => intermediate_rep.cluster_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "state" => intermediate_rep.state.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "generation" => intermediate_rep.generation.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "originNodeID" => intermediate_rep.origin_node_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "claimedByNodeID" => intermediate_rep.claimed_by_node_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "snapshotID" => intermediate_rep.snapshot_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "holderNodeID" => intermediate_rep.holder_node_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "pausedAtUnixMs" => intermediate_rep.paused_at_unix_ms.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "updatedAtUnixMs" => intermediate_rep.updated_at_unix_ms.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "leaseExpiresAtUnixMs" => return std::result::Result::Err(
+                        "Parsing a nullable type in this style is not supported in RegistrySandbox"
+                            .to_string(),
+                    ),
+                    "sandboxExpiresAtUnixMs" => return std::result::Result::Err(
+                        "Parsing a nullable type in this style is not supported in RegistrySandbox"
+                            .to_string(),
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "executionID" => intermediate_rep.execution_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing RegistrySandbox".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(RegistrySandbox {
+            sandbox_id: intermediate_rep
+                .sandbox_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "sandboxID missing in RegistrySandbox".to_string())?,
+            cluster_id: intermediate_rep
+                .cluster_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "clusterID missing in RegistrySandbox".to_string())?,
+            state: intermediate_rep
+                .state
+                .into_iter()
+                .next()
+                .ok_or_else(|| "state missing in RegistrySandbox".to_string())?,
+            generation: intermediate_rep
+                .generation
+                .into_iter()
+                .next()
+                .ok_or_else(|| "generation missing in RegistrySandbox".to_string())?,
+            origin_node_id: intermediate_rep
+                .origin_node_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "originNodeID missing in RegistrySandbox".to_string())?,
+            claimed_by_node_id: intermediate_rep
+                .claimed_by_node_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "claimedByNodeID missing in RegistrySandbox".to_string())?,
+            snapshot_id: intermediate_rep
+                .snapshot_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "snapshotID missing in RegistrySandbox".to_string())?,
+            holder_node_id: intermediate_rep
+                .holder_node_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "holderNodeID missing in RegistrySandbox".to_string())?,
+            paused_at_unix_ms: intermediate_rep
+                .paused_at_unix_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "pausedAtUnixMs missing in RegistrySandbox".to_string())?,
+            updated_at_unix_ms: intermediate_rep
+                .updated_at_unix_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "updatedAtUnixMs missing in RegistrySandbox".to_string())?,
+            lease_expires_at_unix_ms: std::result::Result::Err(
+                "Nullable types not supported in RegistrySandbox".to_string(),
+            )?,
+            sandbox_expires_at_unix_ms: std::result::Result::Err(
+                "Nullable types not supported in RegistrySandbox".to_string(),
+            )?,
+            execution_id: intermediate_rep
+                .execution_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "executionID missing in RegistrySandbox".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<RegistrySandbox> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<RegistrySandbox>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<RegistrySandbox>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for RegistrySandbox - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<RegistrySandbox> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <RegistrySandbox as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into RegistrySandbox - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// A page of registry rows and the database clock they were read against.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct RegistrySandboxListing {
+    #[serde(rename = "sandboxes")]
+    #[validate(nested)]
+    pub sandboxes: Vec<models::RegistrySandbox>,
+
+    /// Token for the next page, absent on the last page
+    #[serde(rename = "nextToken")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+
+    /// Database clock the rows were read against. Every lease field is only meaningful against this, never against the reader's own clock.
+    #[serde(rename = "databaseTimeUnixMs")]
+    pub database_time_unix_ms: i64,
+}
+
+impl RegistrySandboxListing {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        sandboxes: Vec<models::RegistrySandbox>,
+        database_time_unix_ms: i64,
+    ) -> RegistrySandboxListing {
+        RegistrySandboxListing {
+            sandboxes,
+            next_token: None,
+            database_time_unix_ms,
+        }
+    }
+}
+
+/// Converts the RegistrySandboxListing value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for RegistrySandboxListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping sandboxes in query parameter serialization
+            self.next_token
+                .as_ref()
+                .map(|next_token| ["nextToken".to_string(), next_token.to_string()].join(",")),
+            Some("databaseTimeUnixMs".to_string()),
+            Some(self.database_time_unix_ms.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a RegistrySandboxListing value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for RegistrySandboxListing {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub sandboxes: Vec<Vec<models::RegistrySandbox>>,
+            pub next_token: Vec<String>,
+            pub database_time_unix_ms: Vec<i64>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing RegistrySandboxListing".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "sandboxes" => return std::result::Result::Err("Parsing a container in this style is not supported in RegistrySandboxListing".to_string()),
+                    #[allow(clippy::redundant_clone)]
+                    "nextToken" => intermediate_rep.next_token.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "databaseTimeUnixMs" => intermediate_rep.database_time_unix_ms.push(<i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    _ => return std::result::Result::Err("Unexpected key while parsing RegistrySandboxListing".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(RegistrySandboxListing {
+            sandboxes: intermediate_rep
+                .sandboxes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "sandboxes missing in RegistrySandboxListing".to_string())?,
+            next_token: intermediate_rep.next_token.into_iter().next(),
+            database_time_unix_ms: intermediate_rep
+                .database_time_unix_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "databaseTimeUnixMs missing in RegistrySandboxListing".to_string()
+                })?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<RegistrySandboxListing> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<RegistrySandboxListing>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<RegistrySandboxListing>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for RegistrySandboxListing - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<RegistrySandboxListing> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <RegistrySandboxListing as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into RegistrySandboxListing - {err}"#
                     )),
                 }
             }

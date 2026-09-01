@@ -1084,16 +1084,19 @@ components:
       description: |
         Status of the node.
         - draining: the node is bound to be shut down. It will not accept new sandboxes and will stop once all existing sandboxes are done.
+        - lingering: the node left discovery while it still holds sandboxes. It is not schedulable and only `ready` and `draining` may be set by a client.
       enum:
         - ready
         - draining
         - connecting
         - unhealthy
+        - lingering
       x-enum-varnames:
         - NodeStatusReady
         - NodeStatusDraining
         - NodeStatusConnecting
         - NodeStatusUnhealthy
+        - NodeStatusLingering
 
     DiskMetrics:
       required:
@@ -1307,6 +1310,97 @@ components:
           type: integer
           format: uint32
           description: Number of sandboxes currently in the Paused state
+
+    RegistrySandbox:
+      description: One row of the cluster paused-sandbox registry.
+      required:
+        - sandboxID
+        - clusterID
+        - state
+        - generation
+        - originNodeID
+        - claimedByNodeID
+        - snapshotID
+        - holderNodeID
+        - pausedAtUnixMs
+        - updatedAtUnixMs
+        - leaseExpiresAtUnixMs
+        - sandboxExpiresAtUnixMs
+        - executionID
+      properties:
+        sandboxID:
+          type: string
+          description: Identifier of the sandbox
+        clusterID:
+          type: string
+          description: Identifier of the cluster
+        state:
+          type: string
+          description: Registry state of the row
+        generation:
+          type: integer
+          format: int64
+          description: Row generation the registry fences writes against
+        originNodeID:
+          type: string
+          description: Node that published the row
+        claimedByNodeID:
+          type: string
+          description: Node currently claiming the row, empty when unclaimed
+        snapshotID:
+          type: string
+          description: Snapshot the row resumes from, empty until publication completes
+        holderNodeID:
+          type: string
+          description: Authoritative holder of the row
+        pausedAtUnixMs:
+          type: integer
+          format: int64
+          description: When the sandbox was paused
+        updatedAtUnixMs:
+          type: integer
+          format: int64
+          description: When the row was last written
+        leaseExpiresAtUnixMs:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            Lease deadline. Null means the lease is already expired, which is not
+            the same as a deadline of zero.
+        sandboxExpiresAtUnixMs:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            Sandbox deadline. Null means the sandbox was asked never to expire,
+            which is the opposite of a deadline that has passed.
+        executionID:
+          type: string
+          description: >
+            Incarnation this row is fenced against, empty in states that pin the
+            column to null. Read-only: it is not a filter, because an incarnation
+            supplied by a caller is stale by construction.
+
+    RegistrySandboxListing:
+      description: A page of registry rows and the database clock they were read against.
+      required:
+        - sandboxes
+        - databaseTimeUnixMs
+      properties:
+        sandboxes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RegistrySandbox"
+        nextToken:
+          type: string
+          description: Token for the next page, absent on the last page
+        databaseTimeUnixMs:
+          type: integer
+          format: int64
+          description: >
+            Database clock the rows were read against. Every lease field is only
+            meaningful against this, never against the reader's own clock.
 
     Error:
       required:
@@ -2494,3 +2588,69 @@ paths:
           $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
+
+  /registry/sandboxes:
+    get:
+      summary: List registry sandboxes
+      description: |
+        List the cluster paused-sandbox registry.
+
+        The parameter set below is closed. In particular there is no filter on
+        `executionID`: an incarnation a caller can supply is stale by
+        construction, and a filter that silently fails to apply returns an
+        answer that still looks like an answer.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+      parameters:
+        - in: query
+          name: state
+          description: Registry state to filter by
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: nodeID
+          description: Holder node to filter by
+          required: false
+          schema:
+            type: string
+        - in: query
+          name: limit
+          description: Maximum rows per page; zero or absent returns every match
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+        - in: query
+          name: nextToken
+          description: Page token returned by a previous call
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successfully returned the registry page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrySandboxListing"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+        "501":
+          description: This deployment is not configured with a cluster registry
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: The registry could not be read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"

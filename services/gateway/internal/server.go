@@ -52,7 +52,8 @@ const (
 	routeSourceHost     routeSource = "host"
 	routeSourcePath     routeSource = "path"
 	routeSourceSchedule routeSource = "schedule"
-	routeSourceGateway  routeSource = "gateway"
+	// The gateway answered out of itself rather than resolving anything.
+	routeSourceGateway routeSource = "gateway"
 )
 
 type ServerOptions struct {
@@ -96,22 +97,6 @@ type ServerOptions struct {
 	// projection, this wake-up client, and the cold-path LookupNode call
 	// below — none of which has ever depended on RestUpstreamAddr.
 	ResumeClient *resume.Client
-
-	// RestUpstreamAddr sends every user-facing REST call to the api half.
-	// Parsed in NewServer, so an address that cannot be used stops the
-	// process rather than becoming a 502 per request.
-	//
-	// 🔴 The empty string is still accepted here — see rest_upstream.go for
-	// why — but it is no longer a supported deployment position, and unlike
-	// 阶段 3a it is not a rollback lever either: there is no longer a
-	// node-routing fallback in handleProxy for an empty value to fall through
-	// to. `services/shared/config`'s `Config.Validate` refuses to load a
-	// gateway config with `rest_upstream_addr` empty, so no code reachable
-	// from a validated deployment can leave this empty; only this package's
-	// tests still construct a `*Server` that way, purely as a data-plane
-	// fixture — a REST call against one now answers 502 rather than
-	// exercising anything.
-	RestUpstreamAddr string
 
 	// ColdLookupTimeout bounds the LookupNode call a projection miss and an
 	// undecided wake-up both fall through to (see the "if resp == nil" block
@@ -161,13 +146,6 @@ type Server struct {
 	// Nil when no wake-up endpoint is configured — no longer reachable from a
 	// validated deployment, see ServerOptions.ResumeClient.
 	resumeClient *resume.Client
-	// Empty is a data-plane-only test fixture, a position
-	// `services/shared/config` no longer lets a deployed gateway reach; see
-	// ServerOptions.RestUpstreamAddr and rest_upstream.go. Normalised to a
-	// base URL once, at construction, for the reason executionFencing is: a
-	// string re-read and re-interpreted at each call site is how one switch
-	// ends up meaning two things.
-	restUpstream string
 	// See ServerOptions.ColdLookupTimeout. Never zero past NewServer — see
 	// defaultColdLookupTimeout.
 	coldLookupTimeout time.Duration
@@ -195,11 +173,6 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		return nil, err
 	}
 
-	restUpstream, err := config.ParseRestUpstream(options.RestUpstreamAddr)
-	if err != nil {
-		return nil, err
-	}
-
 	// 🔴 Never left at zero: a zero timeout would make every cold-path call
 	// fail before it started, which for every test and config written before
 	// this setting existed silently changes today's behaviour instead of
@@ -222,7 +195,6 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		projectionReader:        options.ProjectionReader,
 		projectionAuthoritative: options.ProjectionAuthoritative,
 		resumeClient:            options.ResumeClient,
-		restUpstream:            restUpstream,
 		coldLookupTimeout:       coldLookupTimeout,
 	}, nil
 }
@@ -267,27 +239,6 @@ func (s *Server) Handler() http.Handler {
 	return s.instrumentGatewayHTTP(core)
 }
 
-func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
-	var buf bytes.Buffer
-	if err := json.NewEncoder(&buf).Encode(value); err != nil {
-		s.logger.Warn("encode json response failed",
-			zap.Error(err),
-			zap.Int("status", status),
-		)
-		http.Error(w, "failed to encode response", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if _, err := buf.WriteTo(w); err != nil {
-		s.logger.Warn("write json response failed",
-			zap.Error(err),
-			zap.Int("status", status),
-		)
-	}
-}
-
 func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	websocket := isWebSocketRequest(r)
 	streaming := isStreamingRequest(r)
@@ -307,20 +258,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Nothing addresses a sandbox: no proxy host name and no routing headers.
+	// The gateway carries the sandbox data plane and nothing else — user-facing
+	// REST has its own address, on the api half — so there is no upstream here
+	// to hand this to.
 	if hostRoute == nil && !hasProxyRoutingHeaders(r.Header) {
-		if isNodeListRequest(r) {
-			setGatewayRouteSource(w, routeSourceGateway)
-			s.handleNodeList(w, r, routingCtx)
-			return
-		} else if isRegistryListRequest(r) {
-			setGatewayRouteSource(w, routeSourceGateway)
-			s.handleRegistryList(w, r, routingCtx)
-			return
-		} else if nodeID, ok := isNodeAdminRequest(r); ok {
-			setGatewayRouteSource(w, routeSourcePath)
-			s.handleNodeDetail(w, r, routingCtx, nodeID, longLived)
-			return
-		}
+		setGatewayRouteSource(w, routeSourceGateway)
+		http.NotFound(w, r)
+		return
 	}
 
 	sandboxID, hasSandbox := "", false
@@ -340,16 +285,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		routeSource = routeSourceSchedule
 	}
 	setGatewayRouteSource(w, routeSource)
-
-	// Every user-facing REST exchange goes to the api half; no node-routing
-	// fallback exists. `shared/config`'s `Config.Validate` refuses a gateway
-	// config with `rest_upstream_addr` empty
-	// (TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest).
-	if isUserFacingRestRequest(r, hostRoute, routeSource) {
-		recordRestUpstream()
-		s.forwardToRestUpstream(w, r, routingCtx, sandboxID, longLived)
-		return
-	}
 
 	var node *schedulerv1.Node
 	// How the scheduler arrived at that node. Anything other than BOUND means
@@ -998,12 +933,10 @@ func flushInterval(flushImmediately bool) time.Duration {
 // for the sandbox this request was already routed for, used by resume,
 // connect and any other control-plane call the scheduler resolved off the
 // paused registry — existed for as long as those calls could be routed
-// straight to a node by this gateway. They cannot be any more:
-// isUserFacingRestRequest forwards every one of them to the api half before
-// assignmentRouteFor is ever reached, and the api half records its own
-// placements (`NodePlacement::record_placement`). Reintroducing a
-// path-routed control-plane call here would mean this predicate has stopped
-// being true.
+// straight to a node by this gateway. They cannot be any more: user-facing
+// REST reaches the api half at its own address and never enters this handler,
+// and the api half records its own placements
+// (`NodePlacement::record_placement`).
 type assignmentRoute int
 
 const (
@@ -1018,16 +951,13 @@ const (
 // projection.
 //
 // 🔴 Only ever called for data-plane traffic — routed by a proxy header or by
-// a sandbox proxy host name. Every user-facing REST call (create, fork,
-// resume, connect, and the rest of the sandbox control surface) is forwarded
-// to the api half by handleProxy's isUserFacingRestRequest branch before this
-// is reached, so there is no create or control-plane path left to
-// distinguish here; see the assignmentRoute doc comment. What remains is the
-// one case that predates the REST switch entirely and is unrelated to it: a
-// sandbox the scheduler resolved off the paused registry (PLACED or PINNED)
-// is about to be held by a node nothing has recorded against, and that
-// binding still has to be written from the data-plane response that reaches
-// it first.
+// a sandbox proxy host name. A request carrying neither is answered 404 in
+// handleProxy before this is reached, so there is no create or control-plane
+// path left to distinguish here; see the assignmentRoute doc comment. What
+// remains is a sandbox the scheduler resolved off the paused registry (PLACED
+// or PINNED): it is about to be held by a node nothing has recorded against,
+// and that binding still has to be written from the data-plane response that
+// reaches it first.
 func assignmentRouteFor(hasSandbox bool, location schedulerv1.SandboxLocation) assignmentRoute {
 	if hasSandbox && locationNeedsAssignment(location) {
 		return assignmentRouteResponse

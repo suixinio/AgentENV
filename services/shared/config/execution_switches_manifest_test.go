@@ -1,14 +1,10 @@
 package config
 
 import (
-	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
-
-	corev1 "k8s.io/api/core/v1"
 )
 
 // The incarnation work's switches still owned by a running process — the
@@ -44,11 +40,8 @@ import (
 const (
 	fencingConfigMap    = "execution-fencing-config"
 	projectionConfigMap = "routing-projection-config"
-	upstreamConfigMap   = "api-upstream-config"
 
 	gatewayFenceEnv = "GATEWAY_ROUTING_EXECUTION_FENCING"
-
-	restUpstreamEnv = "GATEWAY_REST_UPSTREAM_ADDR"
 )
 
 // projectionEnvs are the two environment variables the gateway's half of the
@@ -208,105 +201,6 @@ func TestTheMountedFilesDoNotUndoTheSwitches(t *testing.T) {
 		t.Fatal("the mounted gateway config came back with no scheduler address, so the " +
 			"assertions above are reading defaults rather than the file")
 	}
-}
-
-// 🔴 The gateway's REST upstream is not optional, because the nodes never serve
-// user-facing REST.
-//
-// `aenv-node` answers 404 on every user-facing REST route
-// (`src/api/role_gate.rs`), and there is no argument, environment variable or
-// ConfigMap key that changes that — it is which binary the DaemonSet's image
-// runs. The gateway only sends REST somewhere that answers when
-// `GATEWAY_REST_UPSTREAM_ADDR` names the api half. Empty that key and every
-// REST call in the cluster 404s.
-//
-// 🔴 This used to be a *conditional*: the DaemonSet passed `aenv-node`, and
-// the assertion fired only while it did, because emptying the key was a
-// legitimate rollback of 阶段 3a as long as the DaemonSet went back to
-// `--role all` in the same apply. That pair no longer exists — rolling the
-// nodes back is an image-tag change, which this manifest cannot express as an
-// argument, and an apply against the current image with these keys empty is an
-// outage with no matching half. So the requirement is unconditional now.
-//
-// 🔴 It used to assert the same thing about a second key, GATEWAY_RESUME_ADDR,
-// which named the api half's wake-up surface. That address is deleted: the
-// wake-up RPC rides gateway.scheduler_addr's connection, which is the same
-// api gRPC listener resume_addr always named. One key is left to pin here.
-func TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest(t *testing.T) {
-	upstream := generatedLiteral(t, upstreamConfigMap, restUpstreamEnv)
-
-	if upstream == "" {
-		t.Fatalf("%s ships REST upstream %q. The node DaemonSet runs aenv-node, "+
-			"which answers 404 on the sandboxes routes whatever it is passed, so a gateway with "+
-			"no api upstream has nowhere to send user-facing REST — emptying this is not a "+
-			"rollback of anything, it is an outage",
-			upstreamConfigMap, upstream)
-	}
-
-	// The address has to be one the loader can use, and it has to name the port
-	// the api Service actually publishes. A REST upstream the gateway cannot
-	// parse stops the process; one that parses and names the wrong port does
-	// not.
-	parsed, err := ParseRestUpstream(upstream)
-	if err != nil {
-		t.Fatalf("%s/%s does not parse: %v", upstreamConfigMap, restUpstreamEnv, err)
-	}
-	if parsed == "" {
-		t.Fatalf("%s/%s parses to an empty upstream", upstreamConfigMap, restUpstreamEnv)
-	}
-
-	http, _ := apiServicePorts(t)
-	assertPort(t, restUpstreamEnv, upstream, http)
-}
-
-// assertPort checks that an address — a URL or a bare host:port — names the
-// given port.
-func assertPort(t *testing.T, env, addr string, want int32) {
-	t.Helper()
-
-	hostport := addr
-	if strings.Contains(addr, "://") {
-		parsed, err := url.Parse(addr)
-		if err != nil {
-			t.Fatalf("%s is %q, which is not a URL: %v", env, addr, err)
-		}
-		hostport = parsed.Host
-	}
-	_, port, found := strings.Cut(hostport, ":")
-	if !found {
-		t.Fatalf("%s is %q and names no port; the api Service publishes %d", env, addr, want)
-	}
-	got, err := strconv.Atoi(port)
-	if err != nil {
-		t.Fatalf("%s is %q, whose port is not a number", env, addr)
-	}
-	if int32(got) != want {
-		t.Fatalf("%s is %q, but the api Service publishes that traffic on %d. The gateway would "+
-			"dial a port nothing serves", env, addr, want)
-	}
-}
-
-// apiServicePorts returns the api Service's http and grpc ports.
-func apiServicePorts(t *testing.T) (int32, int32) {
-	t.Helper()
-
-	var service corev1.Service
-	decodeManifest(t, filepath.Join(manifestDir, "agentenv-api-service.yaml"), &service)
-
-	var http, grpc int32
-	for _, port := range service.Spec.Ports {
-		switch port.Name {
-		case "http":
-			http = port.Port
-		case "grpc":
-			grpc = port.Port
-		}
-	}
-	if http == 0 || grpc == 0 {
-		t.Fatalf("the api Service publishes http=%d grpc=%d; this test cannot check an address "+
-			"against a port it could not read", http, grpc)
-	}
-	return http, grpc
 }
 
 // 🔴 Every ConfigMap the base layer *reads* is a ConfigMap the base layer

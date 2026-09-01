@@ -47,55 +47,10 @@ func TestValidateAcceptsSupportedLogFormats(t *testing.T) {
 	for _, format := range formats {
 		cfg := defaultConfig()
 		cfg.LogFormat = format
-		// defaultConfig deliberately gives this no value — see
-		// GatewayConfig.RestUpstreamAddr — so a Validate() call made directly
-		// against the struct, bypassing Load's env overlay, has to supply it
-		// itself.
-		cfg.Gateway.RestUpstreamAddr = "http://agentenv-api:8000"
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("expected format %q to validate, got error %v", format, err)
 		}
 	}
-}
-
-// 🔴 阶段 3a's REST upstream switch is mandatory now: nodes run `aenv-node`
-// and answer 404 on every user-facing REST route, so an empty
-// `rest_upstream_addr` is not a rollback, it is an outage discovered only once
-// something calls in. This is the direct unit test of that refusal; the
-// manifest-level guards in manifest_test.go and
-// execution_switches_manifest_test.go check that the deployed cluster never
-// actually supplies an empty one.
-//
-// It used to cover a second address, `resume_addr`, under the same reasoning.
-// That one is deleted rather than made optional again — the wake-up RPC rides
-// `gateway.scheduler_addr`'s connection now — so there is no second empty to
-// refuse.
-func TestValidateRefusesAnEmptyGatewayUpstream(t *testing.T) {
-	base := func() Config {
-		cfg := defaultConfig()
-		cfg.Gateway.RestUpstreamAddr = "http://agentenv-api:8000"
-		return cfg
-	}
-
-	if err := base().Validate(); err != nil {
-		t.Fatalf("a config with the address set was refused: %v", err)
-	}
-
-	t.Run("empty rest_upstream_addr", func(t *testing.T) {
-		cfg := base()
-		cfg.Gateway.RestUpstreamAddr = ""
-		if err := cfg.Validate(); err == nil {
-			t.Fatal("an empty rest_upstream_addr was accepted")
-		}
-	})
-
-	t.Run("whitespace rest_upstream_addr", func(t *testing.T) {
-		cfg := base()
-		cfg.Gateway.RestUpstreamAddr = "   "
-		if err := cfg.Validate(); err == nil {
-			t.Fatal("a whitespace-only rest_upstream_addr was accepted")
-		}
-	})
 }
 
 func TestLoadParsesGatewayRequestTimeoutDurationString(t *testing.T) {

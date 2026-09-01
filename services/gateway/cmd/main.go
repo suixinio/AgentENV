@@ -81,10 +81,6 @@ func main() {
 	// briefly down must delay a wake-up, not stop the gateway from starting.
 	resumeClient := resume.New(conn, cfg.Gateway.RequestTimeout)
 
-	logger.Info("sending user-facing rest to the api half",
-		zap.String("addr", cfg.Gateway.RestUpstreamAddr),
-	)
-
 	serverOptions := gateway.ServerOptions{
 		RequestTimeout:          cfg.Gateway.RequestTimeout,
 		MaxResponseSize:         cfg.Gateway.ForwardResponseSize,
@@ -93,7 +89,6 @@ func main() {
 		ExecutionFencing:        string(cfg.Gateway.Routing.ExecutionFencing),
 		ControlPlaneToken:       cfg.Gateway.ControlPlaneToken,
 		ProjectionAuthoritative: cfg.Gateway.Routing.ProjectionAuthoritative,
-		RestUpstreamAddr:        cfg.Gateway.RestUpstreamAddr,
 		ColdLookupTimeout:       cfg.Gateway.ColdLookupTimeout,
 	}
 	// 🔴 Assigned through the branch rather than passed inline: a typed nil
@@ -114,7 +109,6 @@ func main() {
 		zap.String("addr", cfg.Gateway.HTTPListenAddr),
 		zap.String("metrics_addr", cfg.Gateway.MetricsListenAddr),
 		zap.String("scheduler", cfg.Gateway.SchedulerAddr),
-		zap.String("rest_upstream", cfg.Gateway.RestUpstreamAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
 		zap.String("execution_fencing", string(cfg.Gateway.Routing.ExecutionFencing)),
 		zap.Bool("routing_projection_read", cfg.Gateway.Routing.ProjectionRead),

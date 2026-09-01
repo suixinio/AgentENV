@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -117,58 +116,6 @@ func ParseRoutingProjectionSwitch(raw string) (bool, error) {
 	}
 }
 
-// ParseRestUpstream turns the configured REST upstream into the base URL the
-// gateway forwards to, or reports that there is none.
-//
-// The empty string — the switch off — is not an error: it answers "" with a nil
-// error, and the caller reads that as "fan out to the nodes, as before".
-//
-// 🔴 Anything else must be a usable absolute address or the process stops. A
-// REST upstream that cannot be parsed is not a degraded upstream, it is a
-// gateway that answers every sandbox create with a 502 while reporting the
-// switch as on — and "the switch is on and nothing works" is the state an
-// operator will spend the incident staring at the api half for. A bare
-// `host:port` is accepted and read as http, because that is the shape every
-// other address in this config file has and an operator copying the style of
-// `scheduler_addr` should not get a refusal for it.
-func ParseRestUpstream(raw string) (string, error) {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return "", nil
-	}
-
-	candidate := trimmed
-	if !strings.Contains(candidate, "://") {
-		candidate = "http://" + candidate
-	}
-	parsed, err := url.Parse(candidate)
-	if err != nil {
-		return "", fmt.Errorf("gateway.rest_upstream_addr %q is not an address: %w", raw, err)
-	}
-	switch parsed.Scheme {
-	case "http", "https":
-	default:
-		return "", fmt.Errorf("gateway.rest_upstream_addr %q must be http or https, got scheme %q", raw, parsed.Scheme)
-	}
-	if parsed.Host == "" {
-		return "", fmt.Errorf("gateway.rest_upstream_addr %q names no host", raw)
-	}
-	// 🔴 A path would be silently prepended to every forwarded route, so a
-	// value like `http://agentenv-api:8000/` — which an operator pasting from a
-	// browser produces without thinking — must not turn `/sandboxes` into
-	// `//sandboxes`. A bare "/" is the one path that means nothing, so it is
-	// dropped rather than refused; anything longer is a real prefix and this
-	// switch does not carry one.
-	if path := strings.Trim(parsed.Path, "/"); path != "" {
-		return "", fmt.Errorf("gateway.rest_upstream_addr %q must not carry a path (%q)", raw, parsed.Path)
-	}
-	parsed.Path = ""
-	parsed.RawPath = ""
-	parsed.RawQuery = ""
-	parsed.Fragment = ""
-	return parsed.String(), nil
-}
-
 // GatewayRoutingConfig groups the switches over what the gateway does with a
 // routing answer, as opposed to where it listens or who it talks to.
 type GatewayRoutingConfig struct {
@@ -215,26 +162,6 @@ type GatewayConfig struct {
 	// a knob with exactly one correct value is a knob somebody eventually
 	// sets to a second one — and the gateway reuses this connection for both.
 	SchedulerAddr string `json:"scheduler_addr"`
-	// RestUpstreamAddr is where user-facing REST goes: sandbox, snapshot and
-	// template calls, the routes `aenv-node` answers 404 on.
-	//
-	// 🔴 Not optional. Empty
-	// used to be the switch off — the gateway asked the scheduler which node
-	// should serve the call and forwarded it there, because the nodes were
-	// still the pre-split single process and never stopped being able to
-	// serve it (`_sd-impl-phase3-role.md` §11.1, §11.2). That premise is
-	// retired: nodes run `aenv-node` now and answer 404 on every user-facing
-	// REST route under any configuration, so `Validate` refuses a config with
-	// this empty rather than letting a cluster discover it as REST 404s. Set —
-	// `http://agentenv-api:8000`, or a bare `agentenv-api:8000` which is read
-	// as http — the calls go to the api half, which owns sandboxes and drives
-	// the machines itself. See rest_upstream.go and
-	// `TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest`.
-	//
-	// 🔴 Never carries data-plane traffic. A request routed by proxy headers or
-	// by a sandbox proxy domain goes to the node holding the sandbox whatever
-	// this says: the api half runs no sandboxes and has nothing to proxy to.
-	RestUpstreamAddr string `json:"rest_upstream_addr"`
 	// RedisAddr is where the routing projection lives. Read-only from here:
 	// the gateway never writes a record, and the scheduler is the only process
 	// that arbitrates one.
@@ -279,7 +206,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		HTTPListenAddr      *string         `json:"http_listen_addr"`
 		MetricsListenAddr   *string         `json:"metrics_listen_addr"`
 		SchedulerAddr       *string         `json:"scheduler_addr"`
-		RestUpstreamAddr    *string         `json:"rest_upstream_addr"`
 		RedisAddr           *string         `json:"redis_addr"`
 		RequestTimeout      json.RawMessage `json:"request_timeout"`
 		ForwardResponseSize *int64          `json:"forward_response_size"`
@@ -309,9 +235,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.SchedulerAddr != nil {
 		g.SchedulerAddr = *parsed.SchedulerAddr
-	}
-	if parsed.RestUpstreamAddr != nil {
-		g.RestUpstreamAddr = *parsed.RestUpstreamAddr
 	}
 	if parsed.RedisAddr != nil {
 		g.RedisAddr = *parsed.RedisAddr
@@ -460,7 +383,6 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_HTTP_LISTEN_ADDR", &cfg.Gateway.HTTPListenAddr)
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
-	set("GATEWAY_REST_UPSTREAM_ADDR", &cfg.Gateway.RestUpstreamAddr)
 	set("GATEWAY_REDIS_ADDR", &cfg.Gateway.RedisAddr)
 	// A shared secret, so it arrives the same way the DSN does and never through
 	// the ConfigMap.
@@ -606,25 +528,6 @@ func (c Config) validate() error {
 	// what the switch being off looks like.
 	if c.Gateway.Routing.ProjectionRead && strings.TrimSpace(c.Gateway.RedisAddr) == "" {
 		return errors.New("gateway.routing.projection_read requires gateway.redis_addr")
-	}
-	// Same reasoning, one step earlier: a REST upstream nobody can parse
-	// stops the process here rather than turning into a 502 per request.
-	if _, err := ParseRestUpstream(c.Gateway.RestUpstreamAddr); err != nil {
-		return err
-	}
-	// 🔴 阶段 3a no longer has an "off" position for its REST upstream.
-	// Nodes run aenv-node now and answer 404 on every user-facing REST
-	// route, so an empty rest_upstream_addr is not a rollback — it is an
-	// outage with no matching half, and refusing it here turns that into a
-	// startup failure instead of a 404/502 discovered per request. See
-	// rest_upstream.go and TestTheRestUpstreamIsAlwaysSetBecauseNodesNeverServeRest.
-	//
-	// Its former sibling, resume_addr, needs no such check any more: the
-	// wake-up RPC rides scheduler_addr's connection, so there is no second
-	// address left to be emptied independently of it.
-	if strings.TrimSpace(c.Gateway.RestUpstreamAddr) == "" {
-		return errors.New("gateway.rest_upstream_addr is required: aenv-node answers 404 on " +
-			"user-facing REST, so the gateway has nowhere else to send it")
 	}
 	return nil
 }

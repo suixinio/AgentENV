@@ -231,7 +231,7 @@ func TestTheApiServiceCarriesTheTwoAddressesTheGatewayIsPointedAt(t *testing.T) 
 		env      string
 		what     string
 	}{
-		{portName: "http", env: "API_ADDR", what: "user-facing REST (gateway.rest_upstream_addr)"},
+		{portName: "http", env: "API_ADDR", what: "user-facing REST"},
 		{portName: "grpc", env: "AENV_API_GRPC_ADDR", what: "the Scheduler protocol and the wake-up RPC (gateway.scheduler_addr)"},
 	} {
 		t.Run(tc.portName, func(t *testing.T) {
@@ -358,19 +358,14 @@ func TestEachHalfRunsItsOwnImage(t *testing.T) {
 	}
 }
 
-// The gateway's end of the switch: declared on the Deployment, sourced from a
-// ConfigMap the base layer generates, and generated empty.
+// The rollback window's manifest half: this build ignores the key, and the
+// build before it requires one that parses.
 //
-// 🔴 Declared-but-empty and absent are different states, and only the first one
-// makes each direction of the flip a value change. A key that has to be added to
-// this list before it can be set turns enabling 3a into a manifest edit, and —
-// the half that actually costs something — turns rolling it back into a manifest
-// edit during an incident.
-//
-// 🔴 This list used to hold two names. GATEWAY_RESUME_ADDR is deleted, not
-// merely unpinned: the wake-up RPC rides gateway.scheduler_addr's connection,
-// which is the same api gRPC listener that key always named.
-func TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest(t *testing.T) {
+// 🔴 Keeping the key declared and non-empty is what makes rolling the gateway
+// back a pure image-digest change. Remove it while an older digest is still a
+// rollback target and that gateway refuses to start, with the manifest edit
+// that would fix it happening during the incident.
+func TestTheGatewayKeepsTheRestUpstreamKeyForTheRollbackWindow(t *testing.T) {
 	var gateway appsv1.Deployment
 	decodeManifest(t, filepath.Join(manifestDir, "gateway-deployment.yaml"), &gateway)
 	container := onlyContainer(t, "the gateway Deployment", gateway.Spec.Template.Spec.Containers)
@@ -379,8 +374,8 @@ func TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			declared, ok := envValue(container, name)
 			if !ok {
-				t.Fatalf("the gateway Deployment does not declare %s, so flipping 阶段 3a — in "+
-					"either direction — means editing this manifest", name)
+				t.Fatalf("the gateway Deployment does not declare %s. This build ignores it, but "+
+					"the digest it rolls back to requires it", name)
 			}
 			if declared.ValueFrom == nil || declared.ValueFrom.ConfigMapKeyRef == nil {
 				t.Fatalf("%s is not read from a ConfigMap key (%+v); it is an address rather than a "+
@@ -389,19 +384,11 @@ func TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest(t *testing.T)
 			ref := declared.ValueFrom.ConfigMapKeyRef
 			if ref.Optional == nil || !*ref.Optional {
 				t.Fatalf("%s is a required ConfigMap key; a cluster that has not created that "+
-					"ConfigMap would fail to start its gateway over a switch that is off", name)
+					"ConfigMap would fail to start its gateway", name)
 			}
-			// 🔴 The switch is *on*, and this assertion was flipped with it.
-			// It shipped empty through 阶段 3a because turning it on was
-			// meant to be a deliberate act rather than something that
-			// arrives with an image — and then it was deliberately done. The
-			// DaemonSet has since taken `aenv-node`, so the nodes answer 404
-			// on the sandboxes routes and an empty upstream here is no longer
-			// "3a off", it is a gateway with nowhere to send REST.
 			if value := generatedLiteral(t, ref.Name, ref.Key); value == "" {
-				t.Fatalf("%s/%s is generated empty. The node DaemonSet holds `aenv-node`, so REST "+
-					"has to reach the api half — an empty upstream sends it to nodes that 404",
-					ref.Name, ref.Key)
+				t.Fatalf("%s/%s is generated empty. The digest this deployment rolls back to "+
+					"refuses to start on an empty one", ref.Name, ref.Key)
 			}
 		})
 	}

@@ -129,14 +129,6 @@ var (
 			Help: "Cold-path LookupNode calls (a projection miss or an undecided wake-up) that hit their own timeout before the RPC returned.",
 		},
 	)
-	// User-facing REST exchanges. The api half is the only upstream that can
-	// serve them, so this counter carries no label naming one.
-	gatewayRestUpstream = promauto.NewCounter(
-		prometheus.CounterOpts{
-			Name: "agentenv_gateway_rest_upstream_total",
-			Help: "User-facing REST exchanges served by the api half.",
-		},
-	)
 )
 
 type statusRecorder struct {
@@ -352,12 +344,6 @@ func recordGatewayColdLookupTimeout() {
 
 func recordRouteResolution(source string) {
 	gatewayRouteResolution.WithLabelValues(source).Inc()
-}
-
-// recordRestUpstream counts one user-facing REST exchange about to be handed
-// to the api half.
-func recordRestUpstream() {
-	gatewayRestUpstream.Inc()
 }
 
 // gatewaySandboxLocationLabel keeps the label set closed. An enum value this

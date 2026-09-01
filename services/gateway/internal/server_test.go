@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -318,162 +317,13 @@ func TestIsSandboxControlPlaneRequest(t *testing.T) {
 	}
 }
 
-func TestNodeIDFromPath(t *testing.T) {
-	tests := []struct {
-		name string
-		path string
-		want string
-		ok   bool
-	}{
-		{name: "node detail", path: "/nodes/node-a", want: "node-a", ok: true},
-		{name: "node detail trailing slash", path: "/nodes/node-a/", want: "node-a", ok: true},
-		{name: "nodes list", path: "/nodes", ok: false},
-		{name: "nested path", path: "/nodes/node-a/extra", ok: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := nodeIDFromPath(tc.path)
-			if got != tc.want || ok != tc.ok {
-				t.Fatalf("nodeIDFromPath(%q) = (%q, %v), want (%q, %v)", tc.path, got, ok, tc.want, tc.ok)
-			}
-		})
-	}
-}
-
-func TestWriteJSONEncodeErrorReturnsInternalServerError(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
-	recorder := httptest.NewRecorder()
-
-	server.writeJSON(recorder, http.StatusOK, map[string]any{
-		"unsupported": make(chan int),
-	})
-
-	resp := recorder.Result()
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusInternalServerError {
-		t.Fatalf("status code = %d, want %d", resp.StatusCode, http.StatusInternalServerError)
-	}
-	if got := resp.Header.Get("Content-Type"); !strings.HasPrefix(got, "text/plain;") {
-		t.Fatalf("content type = %q, want text/plain error response", got)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	if !strings.Contains(string(body), "failed to encode response") {
-		t.Fatalf("body = %q, want encode failure message", string(body))
-	}
-}
-
-func TestHandleProxyReturnsAggregatedNodesFromScheduler(t *testing.T) {
-	server := newTestServer(t, stubSchedulerClient{
-		listObservedFunc: func(_ context.Context, req *schedulerv1.ListObservedNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListObservedNodesResponse, error) {
-			if req.GetClusterId() != "cluster-1" {
-				t.Fatalf("unexpected cluster id: %s", req.GetClusterId())
-			}
-
-			return &schedulerv1.ListObservedNodesResponse{
-				Nodes: []*schedulerv1.ObservedNode{
-					{
-						NodeId:            "node-a",
-						ClusterId:         "cluster-1",
-						ServiceInstanceId: "svc-a",
-						Version:           "0.1.0",
-						Commit:            "abc123",
-						MachineInfo: &schedulerv1.MachineInfo{
-							CpuFamily:       "6",
-							CpuModel:        "158",
-							CpuModelName:    "Intel",
-							CpuArchitecture: "x86_64",
-						},
-						Snapshot: &schedulerv1.NodeSnapshot{
-							Status:               schedulerv1.NodeStatus_NODE_STATUS_READY,
-							SandboxCount:         3,
-							SandboxStartingCount: 1,
-							AllocatedCpu:         4,
-							AllocatedMemoryBytes: 1024,
-							CpuPercent:           50,
-							CpuCount:             8,
-							MemoryUsedBytes:      2048,
-							MemoryTotalBytes:     4096,
-							CreateSuccesses:      9,
-							CreateFails:          2,
-						},
-					},
-				},
-			}, nil
-		},
-	}, 5*time.Second, 4<<20)
-
-	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/nodes?clusterID=cluster-1", nil)
-	response := httptest.NewRecorder()
-
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", response.Code)
-	}
-
-	var nodes []map[string]any
-	if err := json.Unmarshal(response.Body.Bytes(), &nodes); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
-
-	if len(nodes) != 1 {
-		t.Fatalf("expected 1 node, got %d", len(nodes))
-	}
-
-	if got := nodes[0]["id"]; got != "node-a" {
-		t.Fatalf("unexpected node id field: %v", got)
-	}
-
-	if got := nodes[0]["status"]; got != "ready" {
-		t.Fatalf("unexpected status field: %v", got)
-	}
-}
-
-func TestHandleProxyDirectForwardsNodeDetail(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/nodes/node-a" {
-			t.Fatalf("unexpected path: %s", r.URL.Path)
-		}
-		if got := r.URL.Query().Get("clusterID"); got != "cluster-1" {
-			t.Fatalf("unexpected clusterID query: %q", got)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"node-a"}`))
-	}))
-	defer upstream.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		getNodeFunc: func(_ context.Context, req *schedulerv1.GetNodeRequest, _ ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
-			if req.GetNodeId() != "node-a" {
-				t.Fatalf("unexpected node id: %s", req.GetNodeId())
-			}
-			if req.GetClusterId() != "cluster-1" {
-				t.Fatalf("unexpected cluster id: %s", req.GetClusterId())
-			}
-			return &schedulerv1.GetNodeResponse{
-				Node: &schedulerv1.ObservedNode{NodeId: "node-a", Endpoint: upstream.URL},
-			}, nil
-		},
-	}, 5*time.Second, 4<<20)
-
-	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/nodes/node-a?clusterID=cluster-1", nil)
-	response := httptest.NewRecorder()
-
-	server.Handler().ServeHTTP(response, request)
-
-	if response.Code != http.StatusOK {
-		t.Fatalf("expected status 200, got %d", response.Code)
-	}
-	if strings.TrimSpace(response.Body.String()) != `{"id":"node-a"}` {
-		t.Fatalf("unexpected response body: %s", response.Body.String())
-	}
+// serve runs one request through the server's own handler chain, which is what
+// makes a test a statement about routing rather than about one handler.
+func serve(t *testing.T, server *Server, req *http.Request) *http.Response {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+	return rec.Result()
 }
 
 // TestLookupNodeGoesToTheConfiguredScheduler pins the cold path's client

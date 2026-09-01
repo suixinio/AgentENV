@@ -311,9 +311,9 @@ func stampGatewayHeader(h http.Header, name string, value string) {
 }
 
 // stampOutboundGatewayHeaders is the single exit for everything the gateway
-// asserts about itself on the way to a node. Both forwarding paths call it — the
-// reverse proxy and the cluster-list fan-out — so neither can grow a header the
-// other does not sanitise.
+// asserts about itself on the way to a node. The reverse proxy is the one path
+// that reaches a node, and it calls this, so no outbound header escapes the
+// sanitising below.
 //
 // 🔴 It runs whatever the fencing mode is, and that is one deliberate departure
 // from "off behaves exactly as before". Off rolls back the gateway's own

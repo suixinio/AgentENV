@@ -250,11 +250,21 @@ impl RemoteSandboxStub {
         origin_node_id: String,
     ) -> Result<()> {
         let sandbox_id = self.sandbox_id;
-        let placed = self
-            .placement
-            .place_existing(sandbox_id)
-            .await
-            .with_context(|| format!("locate the machine holding sandbox {sandbox_id}"))?;
+        let placed = match self.placement.place_existing(sandbox_id).await {
+            Ok(placed) => placed,
+            // A scheduler that answered about this sandbox and refused has told us
+            // the holder cannot serve it; one that could not answer has not.
+            Err(err) if crate::node_client::wire::placement_gave_a_verdict(&err) => {
+                return Err(anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
+                    &origin_node_id,
+                    sandbox_id,
+                    format!("{err:#}"),
+                )))
+            }
+            Err(err) => {
+                return Err(err.context(format!("locate the machine holding sandbox {sandbox_id}")))
+            }
+        };
         let node = match placed {
             Some(node) => {
                 if node.node_id != origin_node_id {

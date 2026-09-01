@@ -74,8 +74,10 @@
   （对齐 `maybeRemapResumeOriginNode`）。注意：改写 origin 的写入方会同时改变
   每个拿它与自身身份比较的读取方——按身份轴清单逐个核对消费方。
 - 错误分类学：capture 永久不可得且行不可重建 → 4xx 语义（Gone/Conflict）；
-  GET 对不可恢复行不再报可恢复的 paused；DELETE 能收割 Redis-only 孤儿形态
-  （binding 在、pg 行不在）。
+  GET 对不可恢复行不再报可恢复的 paused；DELETE 能收割 Redis-only 孤儿形态。
+  **孤儿形态更正**（pve-mf Phase 4 实证）：该孤儿**没有 binding**（EXISTS 0），
+  pg 行也没有，只剩一条 ~25h 的 `agentenv:api:{global}:sbx:<id>` 暖 key——按
+  "binding 在、pg 行不在"写的修复会打空。此项**仍未修**，理由见 as-built。
 - 阶段 B 后，pve-mf 验证的"25h 暖位过期才可能解锁"的开放问题失效——不再依赖
   过期。
 
@@ -101,17 +103,47 @@ staging 双轨。阶段 C 后整个模型与 e2b 同构，origin 权威只剩上
 本地与远端两种形状。**未新增任何 scheduler gRPC 面，也未新增 node RPC**：只是
 既有 resume RPC 的一个状态码。
 
-**阶段 B 的前两条在实施前已经成立。** 放置回落：`binding_store/lookup.rs` 对
-`Paused` 行早已用 `select_node(prefer = origin)`，而 `select_node` 只在 origin
-落在可调度集合内才优先，否则回落到 round-robin——即方向稿要的 `node = nil`
-语义。提示自我纠正：`MARK_RUNNING_SQL` 的 `SET origin_node_id = $7`（holder）
-每次 resume 都在改写 origin，契约测试已钉住。`claim_for_resume` 对已发布
-parked 行也无租约门槛，所以"等 90s"从来不在 claim 上。真正残留的锁是
-`node_client/stub.rs::reopen`：placement 选中的机器 ≠ 记录里的 origin 时它
-`bail!` 出一个未分类错误，origin 地址解析不到时同样。B 阶段把这两处改成
-`RemoteResumeFailure::OriginUnavailable`，判据放宽为"origin 无法服务此次
-reopen"（含 `NodeUnreachable`），**排除 `Refused`**——节点对该沙箱有明确意见时
-重建属于推翻判断而非绕过缺席。
+**阶段 B 的前两条"在实施前已经成立"是错的——代码在，路径不通。**（本段由
+pve-mf@7b5e232 验收推翻并重写：criterion (b) 14/14 全 500，重建入口从未触发。）
+
+- **D3a 顺序**：resume 先取 claim 把行从 `paused` 翻成 `resuming`，之后才问放置。
+  `lookup.rs` 带 round-robin 回落的 `Paused` 分支因此**在 resume 链路上永远走不到**，
+  实际落进 `Running | Resuming` 分支——钉死 origin、无回落。修法：把 `Resuming`
+  从 `Running` 里分出来。origin 活着时行为不变（暖 capture 仍优先，且 `Running`
+  行必须钉死——活沙箱在死节点上不可改投）；origin 不活且行已发布时回落到放置，
+  且**不把 origin 作为偏好传入**（它正是刚判定为不活的那台，传入会把重建放回原地）。
+- **D3b 分类**：`reopen` 开头的 `place_existing(...)?` 是裸 anyhow，`warrants_rebuild()`
+  恒 false，重建臂即使分类正确也到不了。修法：`native_placement` 保留 tonic
+  `Status` 于错误链，`reopen` 只把 **FailedPrecondition**（调度器对该沙箱作出的判决）
+  升为 `OriginUnavailable`；`Unavailable`（问不到）保持不可重建——问不到不是证据。
+- **D2 冷副本**：`warmup.rs` 的 `reported` 是每进程闩，心跳只钉一个 api 副本，
+  其余副本永远冷，把永久拒绝伪装成可重试的 "still seeding"，并挡住上面两条修复的
+  一半。修法：warm 依据改为"每个已发现节点都已被观测"，`reported` 只再守 deadline
+  分支（防止什么都没听到的注册表宣告全体消失）。
+
+**D1：每次重建都把 pg 行搁浅在 `resuming`（潜伏缺陷，被重建常态化）。**
+`restore_request` 写死 `execution_id: None`（"a restore mints a new incarnation"），
+而 claim 已经在行里写下一个 incarnation，`MARK_RUNNING_SQL` 的 `$6` **同时是 CAS
+守卫和写入值**，于是新铸的 id 匹配 0 行。后果不只是搁浅：`mark_running` 正是
+`origin_node_id` 的唯一写入方，所以整个"提示自我纠正"被静默停用，delete 侧
+`live_elsewhere` 又以 origin 为判据，于是 D4 的 pg 孤儿。修法：重建消费 claim
+已分配的 incarnation（`restore_request` 接收 `run_as = entry.execution_id`），与
+`resume_sandbox` 消费 `ClaimedExecution` 的既有模型一致。
+
+**测试夹具补正**：`RecordingRegistry` 与 `CountingRegistry` 的 `mark_running` 都
+忽略 `execution_id`，`CountingRegistry` 更是无条件 `Adopted`——D1 在单测里结构性
+不可见。两者现按 `MARK_RUNNING_SQL` 分支①/③ 补上 incarnation 围栏。
+
+**DELETE-500 的推断修法被本地守卫否掉，未修。** Phase 4 的诊断建议"warm 的
+placement 源答 NotFound 是判决，应产出 `RuntimeConfirmedGone`"。照此实现后，
+`node_client_tests` 的 `a_sandbox_can_be_deleted_before_the_cluster_has_heard_of_it`
+Face 2（"a cluster nothing tells … must still refuse"）立刻转红，且它是对的：
+注册表的 warm 只说明节点发现完成，**不说明某个沙箱的 binding 已经写下**。刚创建、
+binding 尚未落盘的沙箱在 warm 注册表上同样得到 NotFound，把它判为 gone 会删掉
+仍然存在的运行时——正是那条被删掉的注释所守的东西。改动已回退。真正的判据需要
+区分"这个沙箱的指派从未被记录"与"记录过且已消失"，当前没有任何数据源携带该区分；
+候选方向是向节点求证（roster/逐节点询问）而非向 placement 源求证，属独立工作项，
+须带集群验证。
 
 **租约缺陷与 B 无交互，且原描述基本被证伪，不修。** `replica_renewal.rs` 有
 10s 心跳驱动的续租回路（roster 驱动，`RENEW_LIVE_LEASE_SQL`），running 行还

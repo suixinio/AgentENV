@@ -3099,6 +3099,142 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     }
 
+    /// A row mid-resume, shaped the way the claim leaves it before placement runs.
+    fn claimed_resuming_row(
+        sandbox_id: SandboxId,
+        origin_node_id: &str,
+        published: bool,
+    ) -> PausedSandboxEntry {
+        let mut entry = paused_entry(
+            sandbox_id,
+            PausedRegistryState::Resuming,
+            origin_node_id,
+            Some(ExecutionId::new()),
+        );
+        entry.claimed_by_node_id = Some("agentenv-api-replica-0".to_string());
+        entry.snapshot_id = published.then(crate::snapshot::SnapshotId::generate);
+        entry
+    }
+
+    #[tokio::test]
+    async fn lookup_node_places_a_resuming_row_elsewhere_when_its_origin_is_gone() {
+        let sandbox_id = SandboxId::new();
+        // node-b is the origin and has left the cluster: discovery has dropped it,
+        // exactly as deleting its pod does, while the row still names it.
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://10.0.0.1:8000")],
+            Duration::from_secs(30),
+        ));
+        registry
+            .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
+            .expect("node-a is in discovery");
+        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
+            claimed_resuming_row(sandbox_id, "node-b", true),
+            true,
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
+            .with_paused_registry(paused);
+
+        let resp = service
+            .lookup_node(Request::new(LookupNodeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }))
+            .await
+            .expect(
+                "🔴 the assertion. Taking the claim is what flips a row to resuming, and it \
+                 happens before placement is ever asked, so refusing here refuses every resume \
+                 whose origin is gone -- the whole of criterion (b)",
+            )
+            .into_inner();
+
+        assert_eq!(
+            resp.node.as_ref().unwrap().node_id,
+            "node-a",
+            "the only node still reporting"
+        );
+        assert_eq!(resp.location(), scheduler::SandboxLocation::Placed);
+        assert_eq!(
+            resp.origin_node_id, "node-b",
+            "the hint is reported as it still stands; the rewrite happens where the rebuild lands"
+        );
+        assert_eq!(resp.execution_id, "", "PLACED never carries an incarnation");
+    }
+
+    #[tokio::test]
+    async fn lookup_node_keeps_a_resuming_row_on_a_live_origin() {
+        let sandbox_id = SandboxId::new();
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-b", "http://10.0.0.2:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        registry
+            .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
+            .expect("node-a is in discovery");
+        registry
+            .heartbeat(&heartbeat_req("node-b", vec![]), SystemTime::now())
+            .expect("node-b is in discovery");
+        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
+            claimed_resuming_row(sandbox_id, "node-b", true),
+            true,
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
+            .with_paused_registry(paused);
+
+        let resp = service
+            .lookup_node(Request::new(LookupNodeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }))
+            .await
+            .expect("the origin is live")
+            .into_inner();
+
+        assert_eq!(
+            resp.node.as_ref().unwrap().node_id,
+            "node-b",
+            "the control: a live origin still holds the warm capture, and a resume in flight \
+             there must not be routed away from it"
+        );
+        assert_eq!(resp.location(), scheduler::SandboxLocation::Bound);
+    }
+
+    #[tokio::test]
+    async fn lookup_node_refuses_an_unpublished_resuming_row_whose_origin_is_gone() {
+        let sandbox_id = SandboxId::new();
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-b", "http://10.0.0.2:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        registry
+            .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
+            .expect("node-a is in discovery");
+        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
+            claimed_resuming_row(sandbox_id, "node-b", false),
+            true,
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
+            .with_paused_registry(paused);
+
+        let status = service
+            .lookup_node(Request::new(LookupNodeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }))
+            .await
+            .expect_err(
+                "the control: with nothing published there is nothing another node could \
+                 rebuild from, so naming one would send the resume somewhere it must fail",
+            );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    }
+
     #[tokio::test]
     async fn lookup_node_withholds_a_running_rows_holder_unreachable_verdict_while_cold() {
         let sandbox_id = SandboxId::new();

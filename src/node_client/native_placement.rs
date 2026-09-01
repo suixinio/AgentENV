@@ -167,7 +167,12 @@ impl NodePlacement for NativeNodePlacement {
         {
             Ok(response) => response.into_inner(),
             Err(status) if status.code() == Code::NotFound => return Ok(None),
-            Err(status) => bail!("the local scheduler could not locate {sandbox_id}: {status}"),
+            // Keep the status in the chain: its code is what separates a verdict
+            // about this sandbox from a scheduler that could not answer.
+            Err(status) => {
+                return Err(anyhow::Error::new(status)
+                    .context(format!("the local scheduler could not locate {sandbox_id}")))
+            }
         };
         self.node_service_endpoint_from_wire(response.node)
             .map(Some)

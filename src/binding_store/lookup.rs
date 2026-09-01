@@ -430,6 +430,33 @@ pub async fn lookup_node(
                     LookupResultLabel::UnavailableColdBindings,
                     "scheduler is still seeding sandbox assignments",
                 ),
+                // A resuming row names where the capture was taken, not where a
+                // live sandbox is: the claim holder has not started anything yet.
+                // With that machine gone and a snapshot published, the resume may
+                // run anywhere, so this arm answers the same way the paused one
+                // would have before the claim moved the row out of it.
+                None if entry.state == PausedRegistryState::Resuming
+                    && entry.snapshot_id.is_some() =>
+                {
+                    // No preference: the origin is the one node already known not
+                    // to be live, and naming it here would place the rebuild back
+                    // on the machine this arm exists to route around.
+                    match select_node(&deps.place, None, "", ShadowSource::PausedLookup, now) {
+                        Err(NoNodesAvailable) => LookupOutcome::Unavailable(
+                            LookupResultLabel::UnavailableNoNodes,
+                            "no nodes available",
+                        ),
+                        Ok(placement) => LookupOutcome::Answer(LookupAnswer {
+                            node: placement.node,
+                            location: SandboxLocation::Placed,
+                            origin_node_id: entry.origin_node_id,
+                            // The node about to rebuild will mint the new incarnation.
+                            execution_id: String::new(),
+                            execution_authority: ExecutionAuthority::Pending,
+                            label: LookupResultLabel::Placed,
+                        }),
+                    }
+                }
                 None => LookupOutcome::FailedPrecondition(
                     LookupResultLabel::HolderUnreachable,
                     format!(

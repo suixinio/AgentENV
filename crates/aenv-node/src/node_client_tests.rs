@@ -3272,6 +3272,9 @@ enum LookupAnswer {
     FromBindings,
     Holder(NodeEndpoint),
     Unavailable,
+    /// The scheduler answered about this sandbox and refused, as it does once the
+    /// claim has moved the row to `resuming` and the origin has left the cluster.
+    Refused,
 }
 
 struct ClusterPlacement {
@@ -3381,9 +3384,19 @@ impl NodePlacement for ClusterPlacement {
         match &self.lookup {
             LookupAnswer::FromBindings => Ok(self.is_bound(sandbox_id).then(|| self.node.clone())),
             LookupAnswer::Holder(holder) => Ok(Some(holder.clone())),
-            LookupAnswer::Unavailable => {
-                anyhow::bail!("the scheduler could not locate {sandbox_id}: unavailable")
-            }
+            // Both carry the status the way NativeNodePlacement does, so the
+            // classification is exercised on the code rather than on the wording.
+            LookupAnswer::Unavailable => Err(anyhow::Error::new(tonic::Status::unavailable(
+                "scheduler is still seeding sandbox assignments",
+            ))
+            .context(format!("the local scheduler could not locate {sandbox_id}"))),
+            LookupAnswer::Refused => Err(anyhow::Error::new(tonic::Status::failed_precondition(
+                format!(
+                    "sandbox is resuming on node {}, which is not reporting",
+                    self.node.node_id
+                ),
+            ))
+            .context(format!("the local scheduler could not locate {sandbox_id}"))),
         }
     }
 
@@ -3868,6 +3881,25 @@ async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record
         "an unreadable placement source was treated as an absent record"
     );
     assert!(running_on(&node).await.is_empty());
+
+    // Face 5: the scheduler answered about this sandbox and refused, which is what
+    // it does once the claim has flipped the row to resuming and the origin has
+    // left. This is the pve-mf criterion-(b) shape.
+    let refused_by_scheduler =
+        ClusterPlacement::answering(node.endpoint.clone(), LookupAnswer::Refused);
+    let refused_err = reopen(Arc::clone(&refused_by_scheduler))
+        .await
+        .expect_err("the origin is gone, so no reopen can happen");
+    assert!(
+        crate::node_client::wire::warrants_rebuild(&refused_err),
+        "🔴 the assertion. A scheduler verdict that the origin is not reporting is exactly \
+         when a published row must rebuild elsewhere; leaving it unclassified is the 500 that \
+         failed criterion (b) 14 times out of 14: {refused_err:#}"
+    );
+    assert!(
+        running_on(&node).await.is_empty(),
+        "a refused resume started something anyway"
+    );
 
     // Face 3: no record, and the fallback answers about a different machine.
     let misdirected = ClusterPlacement::resolving_to(node.endpoint.clone(), Some(impostor.clone()));

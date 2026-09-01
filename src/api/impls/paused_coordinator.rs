@@ -1240,7 +1240,7 @@ mod tests {
             sandbox_id: &SandboxId,
             node_id: &str,
             holder_node_id: &str,
-            _execution_id: ExecutionId,
+            execution_id: ExecutionId,
             _expires_at: Option<SystemTime>,
         ) -> RegistryResult<MarkRunningOutcome> {
             let mut rows = self.rows.lock().unwrap();
@@ -1248,10 +1248,16 @@ mod tests {
                 return Ok(MarkRunningOutcome::Untracked);
             };
 
+            // A row seeded without an incarnation has none to disagree with, the
+            // same convention `renew_sandbox_deadline` below uses.
+            let same_incarnation = row.execution_id.is_none_or(|on_row| on_row == execution_id);
+
             let eligible = match row.state {
                 // ① cross-node: this write's claimant must be the one the
-                // claim was taken under.
-                PausedRegistryState::Resuming => row.claimed_by_node_id.as_deref() == Some(node_id),
+                // claim was taken under, running the incarnation it allocated.
+                PausedRegistryState::Resuming => {
+                    row.claimed_by_node_id.as_deref() == Some(node_id) && same_incarnation
+                }
                 // ② local reopen: no claim was ever taken, so the claimant
                 // must already be the row's origin.
                 PausedRegistryState::Paused
@@ -1263,7 +1269,9 @@ mod tests {
                 // is what branch ① or ② already wrote into origin_node_id —
                 // see markRunningFencedSQL's note on why this is the one
                 // branch that reads holder_node_id instead of node_id.
-                PausedRegistryState::Running => row.origin_node_id == holder_node_id,
+                PausedRegistryState::Running => {
+                    row.origin_node_id == holder_node_id && same_incarnation
+                }
             };
 
             if !eligible {
@@ -1273,6 +1281,7 @@ mod tests {
             row.origin_node_id = holder_node_id.to_string();
             row.claimed_by_node_id = None;
             row.state = PausedRegistryState::Running;
+            row.execution_id = Some(execution_id);
             row.generation += 1;
 
             Ok(MarkRunningOutcome::Adopted)
@@ -2049,6 +2058,10 @@ pub mod test_support {
             std::sync::Mutex<Vec<(SandboxId, ExecutionId, Option<std::time::SystemTime>)>>,
         /// Parked row this fixture both answers reads with and grants claims on.
         parked: Option<PausedSandboxEntry>,
+        /// Incarnation the last granted claim allocated, which fences mark_running.
+        granted_execution: std::sync::Mutex<Option<ExecutionId>>,
+        /// Holder and incarnation of every mark_running call observed.
+        marked_running: std::sync::Mutex<Vec<(String, ExecutionId)>>,
     }
 
     /// Programmed response for registry reads.
@@ -2075,7 +2088,19 @@ pub mod test_support {
                 renew_deadline_fails: false,
                 renewed_deadlines: std::sync::Mutex::new(Vec::new()),
                 parked: None,
+                granted_execution: std::sync::Mutex::new(None),
+                marked_running: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// Holder and incarnation of every mark_running call, in order.
+        pub fn marked_running(&self) -> Vec<(String, ExecutionId)> {
+            self.marked_running.lock().unwrap().clone()
+        }
+
+        /// The incarnation this fixture's last granted claim allocated.
+        pub fn granted_execution(&self) -> Option<ExecutionId> {
+            *self.granted_execution.lock().unwrap()
         }
 
         /// Answers reads with `parked` and grants every claim on it.
@@ -2244,6 +2269,8 @@ pub mod test_support {
                     });
                 }
 
+                *self.granted_execution.lock().unwrap() = Some(execution_id);
+
                 // The claimant is the calling process; the origin stays the machine.
                 return Ok(ResumeClaim::Claimed {
                     entry: Box::new(PausedSandboxEntry {
@@ -2286,15 +2313,26 @@ pub mod test_support {
             &self,
             _sandbox_id: &SandboxId,
             _node_id: &str,
-            _holder_node_id: &str,
-            _execution_id: ExecutionId,
+            holder_node_id: &str,
+            execution_id: ExecutionId,
             _expires_at: Option<std::time::SystemTime>,
         ) -> RegistryResult<MarkRunningOutcome> {
             if self.mark_running_fails {
                 return Err(unreachable_backend("mark_running"));
             }
 
-            Ok(MarkRunningOutcome::Adopted)
+            self.marked_running
+                .lock()
+                .unwrap()
+                .push((holder_node_id.to_string(), execution_id));
+
+            // Mirrors markRunningFencedSQL branch ①: the write has to name the
+            // incarnation the claim allocated, or it matches no row and the claim
+            // is left stranded in `resuming`.
+            match *self.granted_execution.lock().unwrap() {
+                Some(granted) if granted != execution_id => Ok(MarkRunningOutcome::HeldElsewhere),
+                _ => Ok(MarkRunningOutcome::Adopted),
+            }
         }
 
         async fn renew_sandbox_deadline(

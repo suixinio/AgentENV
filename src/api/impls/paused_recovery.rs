@@ -446,7 +446,8 @@ impl ApiImpl {
         // Remote orchestration needs the catalog row, not node-local runnable artifacts.
         let source = SandboxLaunchSource::SnapshotRecord(Box::new(record));
 
-        let request = restore_request(&metadata, source, timeout);
+        // Run under the incarnation the claim allocated; the row is fenced on it.
+        let request = restore_request(&metadata, source, timeout, entry.execution_id);
 
         match self
             .orchestrator()
@@ -1049,6 +1050,7 @@ fn restore_request(
     metadata: &SandboxMetadata,
     source: SandboxLaunchSource,
     timeout: NewTimeout,
+    run_as: Option<ExecutionId>,
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
         source,
@@ -1072,8 +1074,10 @@ fn restore_request(
         custom_extension_params: metadata.custom_extension_params.clone(),
         // Preserve the control-plane owner across runs.
         control_plane_config: metadata.control_plane_config.clone(),
-        // A restore mints a new incarnation.
-        execution_id: None,
+        // The claim already allocated this restore's incarnation, and the row is
+        // fenced on it: minting a second one makes `mark_running` match no row and
+        // strands the claim in `resuming`.
+        execution_id: run_as,
     }
 }
 
@@ -2616,6 +2620,27 @@ mod absent_capture_tests {
             registry.claimed_as(),
             vec![api.paused.node_id().to_string()],
             "the rebuild has to run under the claim this process took, not under the origin"
+        );
+
+        let granted = registry
+            .granted_execution()
+            .expect("the claim allocated an incarnation");
+        let marked = registry.marked_running();
+        let [(holder, ran_as)] = marked.as_slice() else {
+            panic!("the rebuild has to record the sandbox as running exactly once: {marked:?}");
+        };
+        assert_eq!(
+            *ran_as, granted,
+            "🔴 the rebuild has to finish under the incarnation its claim allocated. Minting a \
+             fresh one leaves mark_running matching no row, which strands the claim in \
+             'resuming' forever"
+        );
+        assert_ne!(
+            holder.as_str(),
+            ORIGIN,
+            "🔴 and the holder it records has to be the machine that actually rebuilt it. \
+             mark_running is the only writer of origin_node_id, so this call is the origin \
+             rewrite: without it the row keeps pointing at a machine holding nothing"
         );
     }
 

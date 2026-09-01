@@ -135,6 +135,19 @@ impl RemoteResumeFailure {
     }
 }
 
+/// Whether a placement failure is the scheduler's verdict about this sandbox
+/// rather than an admission that it could not answer.
+///
+/// A verdict names a holder that cannot serve the sandbox. An unavailable
+/// scheduler has said nothing about it, and rebuilding on that would discard a
+/// capture that is still where it always was.
+pub fn placement_gave_a_verdict(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<Status>())
+        .any(|status| status.code() == tonic::Code::FailedPrecondition)
+}
+
 /// Whether anything in this chain says the origin cannot serve a reopen.
 ///
 /// Walks the chain because callers add context around the reopen failure.

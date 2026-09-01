@@ -66,6 +66,23 @@ impl WarmupGate {
         if self.warm.load(Ordering::SeqCst) {
             return true;
         }
+
+        // Observation, not this process's own heartbeat traffic. Heartbeats pin to
+        // one replica, so a gate keyed on having received one leaves every other
+        // replica permanently cold, reporting each miss as "still seeding".
+        // Lingering nodes may never heartbeat again and do not block warm-up.
+        let discovered = self.nodes.snapshot(/* allow_lingering */ false);
+        if !discovered.is_empty()
+            && discovered
+                .iter()
+                .all(|node| self.nodes.peek_observed(&node.id).is_some())
+        {
+            self.warm.store(true, Ordering::SeqCst);
+            return true;
+        }
+
+        // Only the deadline still needs a report: it must not let a registry that
+        // has heard nothing declare every runtime gone.
         if !self.reported.load(Ordering::SeqCst) {
             return false;
         }
@@ -75,15 +92,7 @@ impl WarmupGate {
             return true;
         }
 
-        // Lingering nodes may never heartbeat again and do not block warm-up.
-        for node in self.nodes.snapshot(/* allow_lingering */ false) {
-            if self.nodes.peek_observed(&node.id).is_none() {
-                return false;
-            }
-        }
-
-        self.warm.store(true, Ordering::SeqCst);
-        true
+        false
     }
 }
 
@@ -106,7 +115,8 @@ mod tests {
         }
     }
 
-    fn heartbeat(registry: &AtomicNodeRegistry, gate: &WarmupGate, node_id: &str, now: SystemTime) {
+    /// Records the heartbeat in the registry without telling any gate about it.
+    fn observe(registry: &AtomicNodeRegistry, node_id: &str, now: SystemTime) {
         registry
             .heartbeat(
                 &HeartbeatRequest {
@@ -122,6 +132,10 @@ mod tests {
                 now,
             )
             .expect("heartbeat");
+    }
+
+    fn heartbeat(registry: &AtomicNodeRegistry, gate: &WarmupGate, node_id: &str, now: SystemTime) {
+        observe(registry, node_id, now);
         gate.reported_in(now);
     }
 
@@ -204,6 +218,31 @@ mod tests {
         assert!(
             !gate.warmed_up(start + Duration::from_secs(1_000_000)),
             "and it must stay shut arbitrarily far past the deadline, for the same reason"
+        );
+    }
+
+    #[test]
+    fn a_replica_the_heartbeats_never_reached_warms_on_what_its_registry_observed() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a")],
+            Duration::from_secs(30),
+        ));
+        let now = unix(100);
+        let gate = WarmupGate::new(
+            registry.clone() as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            now,
+        );
+
+        // Every discovered node is observed, but no heartbeat RPC landed on this
+        // process: the state of every replica the heartbeats did not pin to.
+        observe(&registry, "node-a", now);
+
+        assert!(
+            gate.warmed_up(now),
+            "🔴 a gate that counts only heartbeats delivered to its own process leaves every \
+             other replica cold forever, answering each lookup miss with 'still seeding' and \
+             disguising a permanent refusal as something worth retrying"
         );
     }
 

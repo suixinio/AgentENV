@@ -282,7 +282,11 @@ report_existing_sandboxes() {
 
 report_ready_nodes() {
   local response status body ready_count total_count
-  response=$(curl -s -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" -w $'\n%{http_code}' "${AENV_URL}/nodes" 2>/dev/null || true)
+  # The REST address may sit behind a control-plane gate; the suites carry that
+  # credential through _curl_do, and a preflight addressing REST directly needs
+  # it too or it reports a 403 as an unreachable node list.
+  _e2e_control_plane_args "${AENV_URL}"
+  response=$(curl -s "${_E2E_CP_ARGS[@]}" -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" -w $'\n%{http_code}' "${AENV_URL}/nodes" 2>/dev/null || true)
   status="${response##*$'\n'}"
   body="${response%$'\n'*}"
   if [[ "${status}" == "200" ]]; then

@@ -312,7 +312,7 @@ impl Client {
     pub fn files(&self, sandbox_id: &str) -> Result<EnvdFilesClient> {
         let sandbox = self.get_sandbox(sandbox_id)?;
         EnvdFilesClient::new(
-            &self.base,
+            self.proxy_base(),
             &self.api_key,
             sandbox_id,
             sandbox.envd_access_token.as_deref(),

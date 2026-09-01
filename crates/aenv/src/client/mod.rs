@@ -13,17 +13,26 @@ use ureq::Agent;
 pub struct Client {
     agent: Agent,
     base: String,
+    /// Sandbox traffic goes here; the two addresses coincide until a deployment
+    /// separates them.
+    proxy_base: String,
     api_key: String,
 }
 
 impl Client {
     pub fn from_env() -> Result<Self> {
         let creds = Credentials::load()?;
-        Self::new(&creds.url, &creds.api_key)
+        Self::with_proxy(&creds.url, creds.data_plane_url(), &creds.api_key)
     }
 
     pub fn new(url: &str, api_key: &str) -> Result<Self> {
+        Self::with_proxy(url, url, api_key)
+    }
+
+    /// `url` answers REST; `proxy_url` carries sandbox data-plane traffic.
+    pub fn with_proxy(url: &str, proxy_url: &str, api_key: &str) -> Result<Self> {
         let base = url.trim_end_matches('/').to_string();
+        let proxy_base = proxy_url.trim_end_matches('/').to_string();
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(5))
             .timeout(Duration::from_secs(120))
@@ -31,8 +40,14 @@ impl Client {
         Ok(Self {
             agent,
             base,
+            proxy_base,
             api_key: api_key.to_string(),
         })
+    }
+
+    /// The data-plane base every envd connection is opened against.
+    pub fn proxy_base(&self) -> &str {
+        &self.proxy_base
     }
 
     pub fn transport(
@@ -40,7 +55,12 @@ impl Client {
         sandbox_id: &str,
         envd_access_token: Option<&str>,
     ) -> Result<Transport> {
-        Transport::new(&self.base, &self.api_key, sandbox_id, envd_access_token)
+        Transport::new(
+            &self.proxy_base,
+            &self.api_key,
+            sandbox_id,
+            envd_access_token,
+        )
     }
 
     fn url(&self, path: &str) -> String {
@@ -92,4 +112,26 @@ fn parse_api_error(body: &str) -> Option<String> {
     serde_json::from_str::<ApiError>(body)
         .ok()
         .and_then(|e| e.message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Client;
+
+    #[test]
+    fn one_address_still_carries_both_surfaces() {
+        let client = Client::new("http://gateway:8000/", "k").expect("a client");
+
+        assert_eq!(client.url("/sandboxes"), "http://gateway:8000/sandboxes");
+        assert_eq!(client.proxy_base(), "http://gateway:8000");
+    }
+
+    #[test]
+    fn a_data_plane_address_does_not_move_the_rest_address() {
+        let client =
+            Client::with_proxy("http://api:8010", "http://gateway:8000/", "k").expect("a client");
+
+        assert_eq!(client.url("/sandboxes"), "http://api:8010/sandboxes");
+        assert_eq!(client.proxy_base(), "http://gateway:8000");
+    }
 }

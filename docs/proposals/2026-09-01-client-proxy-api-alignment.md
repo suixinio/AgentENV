@@ -57,7 +57,7 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 |---|---|---|---|
 | 用户 REST 入口 | ✂ 删除转发（P3） | ✔ 唯一入口（现已实现全部端点） | LB 直达 `packages/api` |
 | 客户鉴权 | 不做 | 不做——维持 `auth.rs` 网络边界立场（§6 条件项） | `packages/auth` 认证链（公网多租户 SaaS 的前提，我们没有） |
-| `/nodes`、`/nodes/{id}` | ✂ 删 `node_list.go`（P3） | ✔ 已有 `admin.rs:91,128,186` | `AdminNodes`/`AdminNodeDetail`（api 内） |
+| `/nodes`、`/nodes/{id}` | ✂ 删 `node_list.go`（P3） | ✔ 接入 node registry 后才是 fleet 端点（P1）——原 `admin.rs` 实现只答本进程 observability 快照 | `AdminNodes`/`AdminNodeDetail`（api 内） |
 | `/registry/sandboxes` | ✂ 删 `registry_list.go`（P3） | ➕ 新增 REST 端点（P1） | 无同名物；同类查询在 api 控制面 |
 | Host/路由头解析、反代、WebSocket | ✔ 保留 | — | `client-proxy` 核心 |
 | 合成响应的 CORS | ➕ 采纳 e2b 形制（P3） | — | `shared/pkg/proxy/cors` |
@@ -96,6 +96,15 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 - 先做形状对账：`node_list.go` 手搓的 `nodeListItem` JSON vs `openapi.yml` `/nodes` 模型，
   逐字段 diff；缺的字段扩进 openapi 模型（canonical = openapi），消费方（e2e 07 套件、运维脚本）
   按新形状核对断言。
+- **数据源对账**（形状之外的一刀，2026-09-01 pve-mf 验收暴露）：`admin.rs` 的 `/nodes`、
+  `/nodes/{id}` 原本只读本进程 `ObservabilityService` 快照——在 split 部署里那是**应答请求的
+  那个 api 副本自己**，一行，不是集群清册；split 模式套件 11 因此等两个节点等到超时（网关版
+  答 2 节点，api 版答 1 行自身）。api 半边持有进程内 node registry，接上它才是 fleet 端点。
+  **双形态是刻意的**：`role_gate.rs` 的 `node_serves` 放行 node 侧的 `GET /nodes` 与
+  `GET|POST /nodes/{id}`（其余生成路由一律拒），所以本地快照语义是 node 的自报面，必须留着；
+  形态由句柄决定——持 registry 答集群、不持答自身。REST 渲染与 `ListObservedNodes` 走
+  `node_registry::fleet` 同一读取路径，字段级 parity 测试钉住 `nodeListItem` 的 JSON 标签与
+  `nodeStatusToString` 的拼写（含 `lingering`）。`nodes_node_id_post` 语义不动。
 - `openapi.yml` 新增 `GET /registry/sandboxes` → `make agentenv-server` → 实现在
   `src/api/impls/admin.rs`，直读 paused registry（与 `grpc_service.rs` 同数据源）。
   保留 `registry_list.go` 已经论证过的两条语义：lease 的 NULL 必须渲染为 JSON null
@@ -143,6 +152,29 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   无 credentials；preflight 只在无上游可答处应答（`IsPreflight` = OPTIONS +
   `Access-Control-Request-Method`，`Allow-Headers` 回显请求值，`Max-Age: 86400`）。
   **活沙箱的响应一律不碰**——CORS 属于 envd 或用户自己的服务器（e2b 的注释原文如此）。
+
+裁决：**api 侧控制面 REST 门禁随转发一并退役**。
+
+- 对象是 `src/api/server.rs:141` `assemble` 里加在生成路由上的 `require_control_plane`
+  （`ControlPlaneGate`，头 `x-agentenv-control-plane`）。它的前提是「用户 REST 只经 gateway
+  到达，gateway 替客户端盖这个内部头」；P3 删掉转发之后客户端直连 REST，这个前提不存在了，
+  门在 armed 集群上只会把合法客户端挡成 403（本轮 pve-mf 直连验收即撞到）。
+  参照 e2b：`packages/api` 对 REST 不设内部来源门，安全靠网络边界与真实鉴权（§6 的条件项）。
+- **node 侧的 gate token 不动**：node 进程的 `role_gate` 与其凭据是另一件事，
+  它挡的不是用户 REST。
+- 连带删除：e2e 的 `AENV_CONTROL_PLANE_TOKEN` 注入（`lib/helpers.sh` 的
+  `_e2e_control_plane_args` 及各调用点、`run_dev_cluster.sh` 的 preflight）。
+- 本轮（P1）**不动**任何门禁代码，只落这条裁决。
+
+凭据轴迁移注记（消费方要改头，写进变更说明）：
+
+- api 侧 `/nodes` 与 `/registry/sandboxes` 统一 `AdminApiKeyAuth` = **`X-Admin-Token`**
+  （`openapi.yml` securitySchemes；与 e2b 的 admin 面同型）。
+- 网关版两个端点的凭据要求与之不同，且**两者之间也不一致**：`registry_list.go:123` 要求
+  非空 `X-API-Key`（否则 401），而 `node_list.go` 对 `/nodes` **不查任何凭据**。
+  这两种行为都随 P3 删拦截一起消亡。
+- 因此：从网关地址迁到 REST 地址的消费方（运维脚本、看板、e2e 07 套件）必须换头——
+  `X-API-Key` → `X-Admin-Token`；原先裸调 `/nodes` 不带凭据的调用方则要**开始**带头。
 
 部署与文档（同批）：
 
@@ -215,7 +247,8 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 - 每阶段通用：`make fmt clippy test-unit`、`make -C services test`（改到 Go 守卫扫描的文件后
   `-count=1` 重跑）、两套 contract suite 的 Redis 侧、新增守卫一律附变异证据。
 - P1：api 的 `/nodes` 与 `/registry/sandboxes` 响应对 gateway 版本逐字段等价
-  （lease NULL → null 显式断言）。
+  （lease NULL → null 显式断言）；`/nodes` 另需数据源断言——集群有 N 个节点时 api 直连答
+  N 行而非 1 行自身。split 模式**套件 11 恢复 117/8/0**。
 - P2/P3：pve-mf 全量 e2e（109+8 基线）双地址通过；数据面五项冒烟——Host 路由、路由头路由、
   暂停自动唤醒（resume curl 注意 Content-Type，历史 415 坑）、fencing 拒旧 incarnation、
   RecordAssignment 后 projection 收敛。

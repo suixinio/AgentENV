@@ -13,8 +13,8 @@ use ureq::Agent;
 pub struct Client {
     agent: Agent,
     base: String,
-    /// Sandbox traffic goes here; the two addresses coincide until a deployment
-    /// separates them.
+    /// Sandbox traffic goes here. Named separately from `base` always; a
+    /// deployment may still front both with one name.
     proxy_base: String,
     api_key: String,
 }
@@ -22,7 +22,7 @@ pub struct Client {
 impl Client {
     pub fn from_env() -> Result<Self> {
         let creds = Credentials::load()?;
-        Self::new(&creds.url, creds.data_plane_url(), &creds.api_key)
+        Self::new(&creds.url, creds.data_plane_url()?, &creds.api_key)
     }
 
     /// `url` answers REST; `proxy_url` carries sandbox data-plane traffic.

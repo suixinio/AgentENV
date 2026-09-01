@@ -9,8 +9,9 @@ use std::path::PathBuf;
 pub struct Credentials {
     /// REST entry point: sandbox, snapshot, template and node calls.
     pub url: String,
-    /// Data-plane entry point for sandbox traffic. Absent means `url` carries
-    /// both, which is what a credentials file written before the split says.
+    /// Data-plane entry point for sandbox traffic. Optional in the file so one
+    /// written before the split still parses; the client cannot run without it,
+    /// because no process serves both surfaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy_url: Option<String>,
     pub api_key: String,
@@ -18,12 +19,17 @@ pub struct Credentials {
 
 impl Credentials {
     /// The address sandbox data-plane traffic is sent to.
-    pub fn data_plane_url(&self) -> &str {
-        self.proxy_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .unwrap_or(&self.url)
+    ///
+    /// `url` answers REST only, so a file naming no proxy URL is an error
+    /// rather than a fallback.
+    pub fn data_plane_url(&self) -> Result<&str> {
+        match self.proxy_url.as_deref().map(str::trim) {
+            Some(url) if !url.is_empty() => Ok(url),
+            _ => bail!(
+                "no sandbox proxy URL in the credentials file; run `aenv auth` and enter the \
+                 data-plane (gateway) address, which is separate from the REST address"
+            ),
+        }
     }
 }
 
@@ -77,15 +83,16 @@ mod tests {
     use super::Credentials;
 
     #[test]
-    fn a_credentials_file_written_before_the_split_still_loads() {
+    fn a_credentials_file_written_before_the_split_still_parses_but_names_no_data_plane() {
         let creds: Credentials = toml::from_str("url = \"http://gateway:8000\"\napi_key = \"k\"\n")
             .expect("an older credentials file parses");
 
-        assert_eq!(
-            creds.data_plane_url(),
-            "http://gateway:8000",
-            "🔴 one address must keep carrying both surfaces, or every existing \
-             install loses its data plane"
+        let err = creds
+            .data_plane_url()
+            .expect_err("no process serves both surfaces, so one address cannot carry both");
+        assert!(
+            err.to_string().contains("aenv auth"),
+            "the error must name the fix, got: {err}"
         );
     }
 
@@ -97,16 +104,27 @@ mod tests {
         .expect("a two-address credentials file parses");
 
         assert_eq!(creds.url, "http://api:8010");
-        assert_eq!(creds.data_plane_url(), "http://gateway:8000");
+        assert_eq!(creds.data_plane_url().unwrap(), "http://gateway:8000");
     }
 
     #[test]
-    fn a_blank_proxy_url_falls_back_rather_than_addressing_nothing() {
+    fn a_blank_proxy_url_addresses_nothing_and_is_refused() {
         let creds: Credentials =
             toml::from_str("url = \"http://api:8010\"\nproxy_url = \"  \"\napi_key = \"k\"\n")
                 .expect("it parses");
 
-        assert_eq!(creds.data_plane_url(), "http://api:8010");
+        let err = creds.data_plane_url().expect_err("blank is not an address");
+        assert!(err.to_string().contains("aenv auth"), "got: {err}");
+    }
+
+    #[test]
+    fn a_proxy_url_equal_to_the_rest_url_is_kept_and_returned() {
+        let creds: Credentials = toml::from_str(
+            "url = \"http://one:8000\"\nproxy_url = \"http://one:8000\"\napi_key = \"k\"\n",
+        )
+        .expect("it parses");
+
+        assert_eq!(creds.data_plane_url().unwrap(), "http://one:8000");
     }
 
     #[test]

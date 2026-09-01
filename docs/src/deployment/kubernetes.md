@@ -47,10 +47,11 @@ Service's `http` port: `agentenv-api`'s `grpc` (8002) and `agentenv-gateway`'s
 `metrics` (9102) are cluster-internal listeners, not part of either address —
 a LoadBalancer must front the one named port, never the whole Service.
 
-The `aenv` client names them as `url` and `proxy_url` in its credentials file.
-`proxy_url` is optional and falls back to `url`. Point both at their own
-address: a client that names only the gateway now gets a 404 on every REST
-call, because the gateway forwards none.
+The `aenv` client names them as `url` and `proxy_url` in its credentials file,
+and requires both: nothing defaults `proxy_url` to `url`, and a file naming
+only one address makes the client refuse to run rather than send data-plane
+traffic to the REST address. Point each at its own address; they share a name
+only when one Ingress fronts both.
 
 ### Why a DaemonSet for Runtime Nodes
 
@@ -173,10 +174,10 @@ replicas is the only place that divergence shows up.
 
 This Deployment is the REST address, and it is the only one. The gateway
 carries the sandbox data plane; a request that reaches it naming no sandbox —
-no proxy host name, no routing header — is answered 404, so a client has to be
-configured with both addresses. `proxy_url` defaulting to `url` is what a
-one-address client falls back to, and that fallback now only reaches the data
-plane.
+no proxy host name, no routing header — is answered 404. A client therefore
+has to be configured with both addresses, and the `aenv` client enforces it:
+with only one address in its credentials file it refuses to run and points at
+`aenv auth`.
 
 🔴 `GATEWAY_REST_UPSTREAM_ADDR` (`api-upstream-config`) is still declared in
 `deploy/k8s/base`, and this build ignores it. It stays for one release because

@@ -126,9 +126,13 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 ### P2 — 客户端双地址与参考部署
 
 - `crates/aenv/src/auth.rs` 的 `Credentials { url, api_key }` 增加 `proxy_url: Option<String>`：
-  `url` = REST 入口，`proxy_url` = 数据面入口，缺省回落到 `url`（过渡期两者都指 gateway 时
-  行为不变）。`client/files.rs`（envd 数据面，含 `bypass_proxy_for_base_url`）与 `grpc/`
-  改用 `proxy_url`。
+  `url` = REST 入口，`proxy_url` = 数据面入口。文件格式里它仍是可选项（P3 前写下的凭据
+  文件必须还能解析），但**缺省回落到 `url` 的规则随 P3 失效**：P3 之后没有任何进程同时
+  服务两个面（api 半边不挂数据面路由，gateway 不转发 REST），回落只会把数据面流量送到
+  一个答 404 的地址。现行规则：`data_plane_url()` 在 `proxy_url` 缺失或为空时报错并指向
+  `aenv auth`；`aenv auth` 的代理地址提示不带默认值，留空即拒绝，且**即使与 `url` 相同也
+  原样保存**（一个 Ingress 名可以合法地同时前置两个面）。`client/files.rs`（envd 数据面，
+  含 `bypass_proxy_for_base_url`）与 `grpc/` 改用 `proxy_url`。
 - `deploy/docker-compose.yml`：api 已直发 8010（:234），把它扶正为文档化 REST 入口，
   改写 :220-233 的「gateway 8000 也当 API 入口」注释；gateway 端口标注数据面专用。
   compose 路径要实测——它是上一轮迁移中唯一烂掉且单测全盲的部署面。
@@ -329,7 +333,7 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 | 风险 | 缓解 |
 |---|---|
 | `/nodes` 形状漂移破坏消费方 | P1 先 diff 后动，openapi 为 canonical，e2e 断言同批改 |
-| 客户端双地址切换窗口 | `proxy_url` 缺省回落 `url`，过渡期全指 gateway 行为不变；P3 前 e2e 必须已在双地址上通过 |
+| 客户端双地址切换窗口 | 窗口已随 P3 关闭：`proxy_url` 不再回落 `url`，只配一个地址的客户端拒绝运行并指向 `aenv auth`；P3 前 e2e 已在双地址上通过 |
 | compose 面再次静默烂掉 | P2 实测 compose 全流程（历史事故单测全盲） |
 | 指标/label 消失打断看板 | P3/P4 变更说明各列全部消失序列 |
 | P3 后残余流量打到 gateway 的 REST 路径 | 定义 404 行为并在 gateway 访问日志观察一个发布周期 |

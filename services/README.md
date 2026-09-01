@@ -28,11 +28,17 @@ see CLAUDE.md's "Distributed Control Plane" section for the full picture.
   `/registry/sandboxes` — is answered by `aenv-api` at its own address. A
   request here that names no sandbox (no proxy host name, no routing header)
   gets a 404.
-- Gateway routes sandbox data-plane requests to whichever node the Scheduler
-  protocol names, in a single `LookupNode` call. The answer comes from the
-  sandbox-to-node binding, from the heartbeat roster that seeded it, or —
-  when neither knows the sandbox — from the paused-sandbox registry, and says
-  which of the three it used.
+- Gateway routes sandbox data-plane requests out of the Redis routing
+  projection (`aenv-api`'s sandbox-to-node bindings, read directly). A miss
+  goes to `aenv-api`'s `apiproxy.ResumeSandbox`, which walks the binding, the
+  heartbeat roster and the paused-sandbox registry, answers a sandbox that is
+  running as it stands, wakes one that is paused, and writes the projection
+  back so the next request is a hit. That is the gateway's whole control
+  plane: the projection read and that one RPC; it calls no scheduler.v1 RPC.
+  An api half it cannot ask is a 502 (a `LookupNode` fallback no longer
+  exists), a positive "no such sandbox" is a 404, and a refusal keeps its
+  reason (503 with `Retry-After: 1` for a transition in progress, 410 for
+  `autoResume` off).
 - The Scheduler protocol (`api/proto/scheduler.proto`) supports pluggable
   placement strategies; `aenv-api`'s implementation (`src/node_registry/`)
   always places with round-robin. `RoundRobinStrategy`
@@ -146,13 +152,13 @@ listener on every current deployment, not a local Go scheduler process
 
 ## Gateway configuration
 
-- `gateway.scheduler_addr` points to whichever process answers the Scheduler protocol — `agentenv-api` on every current deployment. The gateway uses it for scheduling, assignment writes, and P2P scheduler APIs, and reuses its connection for the `apiproxy.ResumeSandbox` wake-up.
-- 🔴 `gateway.query_only_scheduler_addr` is **deleted**, knob and client path both. It named a second Scheduler-protocol endpoint that `LookupNode` alone would use, for HA read traffic served by `services/scheduler`'s `--query-only` replica mode; that Go binary is gone, and the client-selection field it configured (`QueryOnlySchedulerClient`) went with it. Every `LookupNode` call now goes to `gateway.scheduler_addr`, like every other Scheduler RPC this process makes. `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR` is **inert**: this package reads no such key and refuses no such name, so a manifest that still sets it is silently ignored. The same is true of `GATEWAY_SCHEDULER_FALLBACK_DISABLED` (deleted outright — the cold-path `LookupNode` call is unconditional again) and `GATEWAY_SCHEDULER_FALLBACK_TIMEOUT` (renamed, not removed — set `GATEWAY_COLD_LOOKUP_TIMEOUT` instead, or the cap silently stays at its 3s default). The startup refusal that named all three for one release has been removed with the rest of that transition's scaffolding.
+- `gateway.scheduler_addr` points to `agentenv-api`'s gRPC listener. The gateway dials it for one thing, `apiproxy.ResumeSandbox`; the name survives because it is the same listener that serves `scheduler.proto` to the nodes.
+- 🔴 `gateway.query_only_scheduler_addr` is **deleted**, knob and client path both. It named a second Scheduler-protocol endpoint that `LookupNode` alone would use, for HA read traffic served by `services/scheduler`'s `--query-only` replica mode; that Go binary is gone, and the client-selection field it configured (`QueryOnlySchedulerClient`) went with it. `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR` is **inert**: this package reads no such key and refuses no such name, so a manifest that still sets it is silently ignored. The same is true of `GATEWAY_SCHEDULER_FALLBACK_DISABLED`, `GATEWAY_SCHEDULER_FALLBACK_TIMEOUT` and, since P4, `GATEWAY_COLD_LOOKUP_TIMEOUT` / `gateway.cold_lookup_timeout`: the cold-path `LookupNode` call they governed no longer exists. The last pair stays declared in `deploy/k8s/base` for the rollback window and is removed in the closing commit. The startup refusal that named the first three for one release has been removed with the rest of that transition's scaffolding.
 - `gateway.request_timeout` must be a duration string such as `"30s"` in JSON config files.
 - Metrics that stopped existing when the gateway stopped calling scheduler.v1 (P4 of `docs/proposals/2026-09-01-client-proxy-api-alignment.md`): the whole series `agentenv_gateway_scheduler_rpc_duration_seconds` (its `rpc` label only ever carried `LookupNode` and `RecordAssignment` by then) and `agentenv_gateway_cold_lookup_timeout_total`; the `source` label values `scheduler` and `resume_undecided` of `agentenv_gateway_route_resolution_total`; and the `placed`, `pinned` and `unspecified` values of `agentenv_gateway_sandbox_location_total{location}`, which only a `LookupNode` answer could carry (the series stays, valued `bound`). The gateway's control-plane edges are the projection read and `apiproxy.ResumeSandbox`, counted by `agentenv_gateway_route_resolution_total` and `agentenv_gateway_resume_total`.
 - `gateway.request_timeout` applies to regular proxied HTTP requests. Streaming requests and WebSocket connections reuse the client context and are not cut off by this timeout.
-- `gateway.forward_response_size` only limits how much of a successful `POST /sandboxes` response the gateway buffers while extracting a sandbox ID for `RecordAssignment`; it is not a global response-size cap for all proxied traffic.
-- `gateway.rest_upstream_addr` and `GATEWAY_REST_UPSTREAM_ADDR` are **inert**: the gateway reads neither. They stay declared in `deploy/k8s/base` and `deploy/docker-compose.yml` for one release because the digest this one rolls back to requires an upstream that parses, which is what keeps that rollback a pure image-digest change.
+- `gateway.forward_response_size` is parsed and passed to the server but read by nothing since P4: the only reader was the response-body scan that fed `RecordAssignment`, and the gateway writes no projection any more. It was never a cap on proxied traffic. Candidate for the closing commit.
+- `gateway.rest_upstream_addr` and `GATEWAY_REST_UPSTREAM_ADDR` are **inert**: the gateway reads neither. They stay declared in `deploy/k8s/base` and `deploy/docker-compose.yml` for one release because the digest this one rolls back to requires an upstream that parses, which is what keeps that rollback a pure image-digest change. `gateway.routing.projection_authoritative` / `GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE` is in the same state since P4: parsed, declared, read by no gateway code (the api half's `[binding_store].projection_authoritative` is the one that matters).
 - Responses the gateway synthesizes itself — the 404 above, resume errors, scheduler and fencing rejections — carry `Access-Control-Allow-Origin: *`, and a preflight is answered where no upstream can answer it. A response a sandbox produced is never touched: CORS there is envd's or the user's own server's.
 - `GATEWAY_REQUEST_TIMEOUT=<duration>` overrides `gateway.request_timeout` from the environment (for example, `1m30s`).
 - `gateway.sandbox_proxy_domains` enables host-based sandbox data-plane routing for `{port}-{sandboxID}.{domain}` URLs. Domains are normalized to lowercase, deduplicated, and must be valid DNS names. Sandbox IDs used in host routes must be lowercase RFC 952/1123 DNS labels, and the full `{port}-{sandboxID}` label must be at most 63 characters.
@@ -305,9 +311,12 @@ Operational notes:
 
 ## gRPC API
 
-Proto contract: `api/proto/scheduler.proto`. `services/gateway` is a client of
-this contract, not a server for it — `aenv-api` (`src/node_registry/grpc_service.rs`)
-is the only production implementation left.
+Proto contract: `api/proto/scheduler.proto`. `aenv-api` (`src/node_registry/grpc_service.rs`)
+is the only production implementation, and `aenv-node` its only client:
+`services/gateway` calls none of these methods since P4 (its one RPC is
+`apiproxy.ResumeSandbox`, `api/proto/apiproxy/apiproxy.proto`). `LookupNode` and
+`RecordAssignment` are answered in-process by the resume surface and stay on the
+wire only until the closing commit deletes them.
 
 Methods:
 

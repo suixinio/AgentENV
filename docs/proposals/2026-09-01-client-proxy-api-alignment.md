@@ -331,6 +331,59 @@ e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过
 - **收尾提交**：`scheduler.proto` 删 `LookupNode`、`RecordAssignment`，连同
   `grpc_service.rs` 实现与生成码。scheduler.v1 至此只剩 node↔api 面。
 
+> **实施修订（2026-09-01，落地时；四个提交，api 先行可独立滚集群）**
+>
+> - **api 侧**（`feat(api)`）：`resume_for_data_plane` 在 `locate_for_resume` 之后、
+>   envd 鉴权与 autoResume 门控之前新增 running 短路：三步查找答 BOUND 且
+>   `execution_authority = REGISTRY`（`ResumePlacement::Running`）即直接答
+>   `Woken{node, execution_id}`——与 projection 命中给 gateway 的答案同形，token 由
+>   envd 在节点上校验。PLACED/PINNED 不算 running；REGISTRY 但 id 不可解析退化为
+>   Preferred。两道 autoResume 门控原样保留（false+paused → AutoResumeDisabled，
+>   claim 前后各一道），变异证据：删短路 → 两个 running 用例红；删 paused 门 → 拒绝
+>   用例红。投影由 api 同步写入（响应返回前）：wake 成功时用
+>   `metadata.projection_ttl_secs` 经 `resolve_projection_ttl`（与 RecordAssignment
+>   同一门与上限）；running-miss（答案来自心跳清册或 registry 而非 binding store）
+>   时同样写入，用 api 半边元数据记录的预算；binding store 答的短路**不**回写。
+>   写失败只 warn，不影响 wake（变异证据：删 wake 回写 → 两个用例红）。
+>   `NodeRegistryGrpcService` 新增进程内入口 `lookup_sandbox`（带来源标签）与
+>   `record_running`（source 标签 `resume`），gRPC 的 `LookupNode`/`RecordAssignment`
+>   改为其薄包装。**偏离 P4 文本一处**：api 半边的远端后端在 resume 启动沙箱时本就
+>   经 `announce_placement` 写一次 TTL=0 的投影，本批未动它，wake 路径因此写两次
+>   （第二次带真实预算，同 incarnation 属 refresh）。transitioning 维持
+>   FailedPrecondition，无等待预算；线上响应形状不变。
+> - **gateway 侧**（`refactor(gateway)`）：删 `lookupNodeColdPath`、`writeSchedulerError`、
+>   `recordAssignmentFromResponse` 两腿、`recordAssignment`、`assignmentRoute*`、
+>   `projectionTTLToRecord*`、`ServerOptions.ProjectionAuthoritative`、
+>   `SchedulerClient` 字段与 `NewServer` 参数、`cmd/main.go` 的 scheduler 客户端
+>   （到 `gateway.scheduler_addr` 的连接保留承载 resume RPC）、`ColdLookupTimeout`
+>   与 `services/shared/config` 的 `cold_lookup_timeout` 键/环境变量绑定。
+>   VerdictUndecided 收进 `writeResumeError` 的 default 分支 → 502（变异证据：把
+>   Undecided 映成 503 → 三个用例红）。fencing 保留 `LookupNodeResponse` 载体类型，
+>   喂源只剩 projection Synthesize 与 resume `LookupResponse`；LookupNode 喂源的
+>   fencing 用例改由同 incarnation 的 projection 记录喂入，PLACED/PINNED 与
+>   UNSPECIFIED authority 两条用例因无喂源能产生而删除。**response_body 腿可达性
+>   查证**：HEAD 上 `recordAssignmentFromResponse` 只在 PLACED/PINNED 时运行，而
+>   只有冷路径 LookupNode 能答 PLACED/PINNED；节点的数据面 `/proxy` 响应从不盖
+>   `x-agentenv-sandbox-id`，所以 header 腿在数据面上本就不可达，真正跑的是 body
+>   腿——它把沙箱自己的 2xx 响应体当 JSON 找 `sandboxID`，找不到就什么也不写。冷
+>   路径删除后两腿皆无喂源，整函数删除。`projectionAuthoritative` 在 gateway 内
+>   唯一消费者是写侧 TTL 门控，读侧从未由它门控（读由 `projection_read` 门控），
+>   故 gateway 内整个字段删除；配置键随回滚窗口保留。
+> - **消失的指标**：`agentenv_gateway_scheduler_rpc_duration_seconds` 整条（rpc
+>   标签值 LookupNode/RecordAssignment）、`agentenv_gateway_cold_lookup_timeout_total`
+>   整条、`agentenv_gateway_route_resolution_total{source}` 的 `scheduler` 与
+>   `resume_undecided` 两个值、`agentenv_gateway_sandbox_location_total{location}`
+>   的 `placed`/`pinned`/`unspecified` 三个值（序列保留，只剩 `bound`）。
+> - **回滚窗口**（`test(config)`）：`GATEWAY_COLD_LOOKUP_TIMEOUT` 与
+>   `cold_lookup_timeout` 保留在 `deploy/k8s/base`（新二进制忽略，
+>   `rollback_window_test.go` 与 manifest 守卫各加一项，删 manifest 键 → 守卫红），
+>   `env-vars.md` 记为 P4 起忽略、收尾提交删除。`gateway.forward_response_size` 与
+>   `gateway.routing.projection_authoritative` 同为「解析但无人读」，归收尾提交。
+> - **未动**：`deploy/k8s/base` 与 compose 的 manifest 及其注释（回滚窗口）；
+>   保留代码上仍指向 `writeSchedulerError`/回落的 🔴 注释四处（`writeResumeError`、
+>   `executionSupersededStatusCode`、`resolveFromProjection`、resume client 的
+>   Unavailable 分支）按「不改他处 🔴 注释」规则原样留下，收尾提交一并清。
+
 ### P5（可选，默认不做）— 改名 gateway → client-proxy
 
 `agentenv_gateway_*` 全系指标名和 k8s Service 名都是序列/寻址身份，改名的代价是
@@ -358,7 +411,9 @@ e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过
   `resume_for_data_plane` 的按请求修复接收（e2b StateRunning 同形），reconciler
   收窄为命中率优化 + 杀孤儿，按它自己的方案推进。
 - **discard 竞态**：不同子系统；P3/P4 与它不要同一批滚集群，避免归因混叠。
-- **scheduler 面**：P3 净减两个 RPC，P4 再减两个；此后仅剩 node↔api 的
+- **scheduler 面**：P3 净减两个 RPC，P4 再减两个（**待收尾提交**：gateway 已于
+  2026-09-01 停止调用 `LookupNode`/`RecordAssignment`，proto、`grpc_service.rs`
+  实现与生成码仍在，随回滚窗口关闭后的收尾提交删除）；此后仅剩 node↔api 的
   Heartbeat/ReportSandboxEvent/ListSandboxes/p2p hints 等。
 
 ## 8. 验收

@@ -76,6 +76,8 @@ Proto contract: `services/api/proto/scheduler.proto`
 
 RPCs: `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ReportSandboxEvent`, `ListObservedNodes`, `ListP2pPeers`, `RecordP2pArtifact`, `ForgetP2pArtifact`, `LookupP2pArtifact`, `GetNode`, `UnregisterNode`, `ListRegistrySandboxes`
 
+The gateway calls none of them: its control-plane edges are the Redis routing projection, read directly, and `apiproxy.ResumeSandbox` (`services/api/proto/apiproxy/apiproxy.proto`), which answers a running sandbox as it stands, wakes a paused one, and writes the projection back. `LookupNode` and `RecordAssignment` are served in-process by that resume surface and stay on the wire only until the closing commit removes them.
+
 Runtime node heartbeats may include an opaque `P2pEndpoint` containing a backend name and backend-specific address. `aenv-api`'s native registry stores that endpoint with the observed-node record and returns ready peers through `ListP2pPeers(cluster_id, backend, exclude_node_id)`. It does not query artifact catalogs and never forwards artifact data.
 
 ## Metric Name Cross-Walk

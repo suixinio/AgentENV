@@ -7,8 +7,8 @@ use redis::AsyncCommands;
 use uuid::Uuid;
 
 use super::super::{
-    MetadataStore, PausedHandle, Reservation, SandboxMetadata, StoreError, TransitionEffect,
-    TransitionOutcome, TransitionRequest, TransitionSettlement,
+    MetadataStore, PausedHandle, SandboxMetadata, StoreError, TransitionEffect, TransitionOutcome,
+    TransitionRequest, TransitionSettlement,
 };
 use super::harness::{raw, sibling, store_or_skip};
 use super::keys::{ExpiryMember, TransitionMember};
@@ -1174,136 +1174,6 @@ async fn the_reaper_drops_members_for_dead_incarnations_and_missing_records() {
         store.get(&id).await.unwrap().unwrap().state,
         SandboxState::Running
     );
-}
-
-#[tokio::test]
-async fn a_reservation_moves_through_its_three_states() {
-    let store = store_or_skip!("a_reservation_moves_through_its_three_states");
-    let id = SandboxId::new();
-    let Reservation::Reserved(guard) = store.reserve(&id).await.unwrap() else {
-        panic!("the first caller must get the window");
-    };
-
-    let other = sibling(&store).await;
-    let Reservation::AlreadyPending(waiter) = other.reserve(&id).await.unwrap() else {
-        panic!("the second caller must find the window open");
-    };
-
-    let metadata = running(id);
-    store.add(metadata.clone()).await.unwrap();
-    guard.finish(Ok(())).await.unwrap();
-
-    let seen = tokio::time::timeout(Duration::from_secs(5), waiter.wait())
-        .await
-        .expect("the waiter should have woken")
-        .unwrap();
-    assert_eq!(seen.id, id);
-    assert_eq!(seen.execution_id, metadata.execution_id);
-
-    assert!(matches!(
-        store.reserve(&id).await.unwrap(),
-        Reservation::AlreadyInStorage
-    ));
-}
-
-#[tokio::test]
-async fn adding_the_record_closes_the_creation_window() {
-    let store = store_or_skip!("adding_the_record_closes_the_creation_window");
-    let id = SandboxId::new();
-    let Reservation::Reserved(guard) = store.reserve(&id).await.unwrap() else {
-        panic!("the window should open");
-    };
-
-    let mut connection = raw(&store);
-    let pending: Option<f64> = connection
-        .zscore(store.inner().keys().pending(), id.to_string())
-        .await
-        .unwrap();
-    assert!(pending.is_some());
-
-    store.add(running(id)).await.unwrap();
-
-    let pending: Option<f64> = connection
-        .zscore(store.inner().keys().pending(), id.to_string())
-        .await
-        .unwrap();
-    assert!(
-        pending.is_none(),
-        "the record landed, so the creation window must be closed"
-    );
-    guard.finish(Ok(())).await.unwrap();
-}
-
-#[tokio::test]
-async fn a_failed_creation_reports_its_failure_to_the_waiter() {
-    let store = store_or_skip!("a_failed_creation_reports_its_failure_to_the_waiter");
-    let id = SandboxId::new();
-    let Reservation::Reserved(guard) = store.reserve(&id).await.unwrap() else {
-        panic!("the window should open");
-    };
-    let Reservation::AlreadyPending(waiter) = store.reserve(&id).await.unwrap() else {
-        panic!("the second caller should wait");
-    };
-
-    guard
-        .finish(Err("the image could not be pulled".to_string()))
-        .await
-        .unwrap();
-
-    let error = tokio::time::timeout(Duration::from_secs(5), waiter.wait())
-        .await
-        .expect("the waiter should have woken")
-        .unwrap_err();
-    assert!(
-        error.to_string().contains("the image could not be pulled"),
-        "{error}"
-    );
-}
-
-#[tokio::test]
-async fn a_creation_window_is_visible_before_the_record_exists() {
-    let store = store_or_skip!("a_creation_window_is_visible_before_the_record_exists");
-    let id = SandboxId::new();
-    let Reservation::Reserved(guard) = store.reserve(&id).await.unwrap() else {
-        panic!("the window should open");
-    };
-    let other = sibling(&store).await;
-    assert!(other.get(&id).await.unwrap().is_none());
-    let rows = other.get_many(&[id]).await.unwrap();
-    assert!(rows.entries.is_empty());
-    assert!(rows.covers(&[id]), "the read did cover this id");
-
-    assert!(matches!(
-        other.reserve(&id).await.unwrap(),
-        Reservation::AlreadyPending(_)
-    ));
-    guard.finish(Ok(())).await.unwrap();
-}
-
-#[tokio::test]
-async fn a_stale_creation_window_is_released() {
-    let store = store_or_skip!(
-        "a_stale_creation_window_is_released",
-        |config: &mut super::RedisStoreConfig| {
-            config.reserve_stale_ttl = Duration::from_secs(1);
-        }
-    );
-    let id = SandboxId::new();
-    let mut connection = raw(&store);
-    let long_ago = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64
-        - 3600;
-    let _: i64 = connection
-        .zadd(store.inner().keys().pending(), id.to_string(), long_ago)
-        .await
-        .unwrap();
-
-    assert!(matches!(
-        store.reserve(&id).await.unwrap(),
-        Reservation::Reserved(_)
-    ));
 }
 
 #[tokio::test]

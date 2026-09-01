@@ -2508,12 +2508,6 @@ impl crate::orchestrator::MetadataStore for SharedLedger {
             .transition_settlement(sandbox_id, transition_id)
             .await
     }
-    async fn reserve(
-        &self,
-        sandbox_id: &crate::types::SandboxId,
-    ) -> StoreResult<crate::orchestrator::Reservation> {
-        self.0.reserve(sandbox_id).await
-    }
     async fn heal_expiry_index(&self) -> StoreResult<usize> {
         self.0.heal_expiry_index().await
     }

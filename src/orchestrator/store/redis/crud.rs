@@ -9,8 +9,8 @@ use tracing::{debug, warn};
 
 use super::super::{
     state_from_token, state_token, FencedRemoval, MetadataRows, MetadataStore,
-    MetadataUpdateResult, PausedHandle, Reservation, Result, SandboxListFilter, SandboxMetadata,
-    StoreError, TransitionOutcome, TransitionRequest, TransitionSettlement,
+    MetadataUpdateResult, PausedHandle, Result, SandboxListFilter, SandboxMetadata, StoreError,
+    TransitionOutcome, TransitionRequest, TransitionSettlement,
 };
 use super::keys::{routing, ExpiryMember};
 use super::record::{to_unix_millis, StoredSandboxRecord};
@@ -194,7 +194,6 @@ impl StoreInner {
             .key(self.keys().record(sandbox_id))
             .key(self.keys().index())
             .key(self.keys().expiry())
-            .key(self.keys().pending())
             .arg(sandbox_id.to_string())
             .invoke_async(&mut connection)
             .await
@@ -324,7 +323,6 @@ impl MetadataStore for RedisMetadataStore {
             .key(inner.keys().record(&sandbox_id))
             .key(inner.keys().index())
             .key(inner.keys().expiry())
-            .key(inner.keys().pending())
             .arg(record.encode()?)
             .arg(ttl)
             .arg(
@@ -345,7 +343,6 @@ impl MetadataStore for RedisMetadataStore {
 
         inner.invalidate_listing_memo().await;
         inner.notify(&routing::record(&sandbox_id)).await;
-        inner.notify(&routing::reservation(&sandbox_id)).await;
         Ok(())
     }
 
@@ -471,7 +468,6 @@ impl MetadataStore for RedisMetadataStore {
             .key(inner.keys().record(sandbox_id))
             .key(inner.keys().index())
             .key(inner.keys().expiry())
-            .key(inner.keys().pending())
             .arg(sandbox_id.to_string())
             .arg(expected_execution_id.to_string());
         // Variadic states begin after fixed script arguments.
@@ -676,10 +672,6 @@ impl MetadataStore for RedisMetadataStore {
             ))
         })?;
         super::transition::read_transition_result(self.inner(), sandbox_id, &transition_id).await
-    }
-
-    async fn reserve(&self, sandbox_id: &SandboxId) -> Result<Reservation> {
-        super::reserve::reserve(self.inner(), sandbox_id).await
     }
 
     async fn heal_expiry_index(&self) -> Result<usize> {

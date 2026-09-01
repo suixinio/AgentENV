@@ -9,7 +9,6 @@ mod keys;
 mod lock;
 mod notify;
 mod record;
-mod reserve;
 mod scripts;
 mod transition;
 

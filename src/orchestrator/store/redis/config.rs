@@ -51,10 +51,6 @@ pub struct RedisStoreConfig {
     pub expiry_healer_enabled: bool,
     pub transition_reaper_enabled: bool,
 
-    pub reserve_result_ttl: Duration,
-    /// Maximum age of an unfinished creation reservation.
-    pub reserve_stale_ttl: Duration,
-
     /// Fallback poll interval for every wait in this module, so that a
     /// dropped pub/sub notification costs latency rather than a hang.
     pub poll_interval: Duration,
@@ -101,8 +97,6 @@ impl Default for RedisStoreConfig {
             reap_interval: Duration::from_secs(30),
             expiry_healer_enabled: true,
             transition_reaper_enabled: true,
-            reserve_result_ttl: Duration::from_secs(30),
-            reserve_stale_ttl: Duration::from_secs(300),
             poll_interval: Duration::from_secs(1),
             batch_chunk: 256,
             metrics_memo_ttl: Duration::from_secs(1),

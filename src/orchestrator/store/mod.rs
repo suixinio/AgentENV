@@ -311,110 +311,6 @@ pub enum TransitionOutcome {
     NotExpired,
 }
 
-/// Outcome of reserving a sandbox id for creation.
-#[derive(Debug)]
-pub enum Reservation {
-    /// This caller owns the creation window and must finish the guard.
-    Reserved(ReservationGuard),
-    /// The sandbox already exists.
-    AlreadyInStorage,
-    /// Another creator owns the pending window.
-    AlreadyPending(WaitForStart),
-    /// Reserved for a future tenant quota model and unreachable today.
-    LimitExceeded { subject: String, limit: u64 },
-}
-
-/// Store-side reservation settlement contract.
-#[async_trait]
-pub trait ReservationFinisher: Send + Sync {
-    async fn finish(
-        &self,
-        sandbox_id: &SandboxId,
-        outcome: std::result::Result<(), String>,
-    ) -> Result<()>;
-}
-
-/// Owned creation reservation that must be finished.
-pub struct ReservationGuard {
-    sandbox_id: SandboxId,
-    finisher: Option<Arc<dyn ReservationFinisher>>,
-}
-
-impl std::fmt::Debug for ReservationGuard {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ReservationGuard")
-            .field("sandbox_id", &self.sandbox_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ReservationGuard {
-    pub fn new(sandbox_id: SandboxId, finisher: Arc<dyn ReservationFinisher>) -> Self {
-        Self {
-            sandbox_id,
-            finisher: Some(finisher),
-        }
-    }
-
-    pub async fn finish(mut self, outcome: std::result::Result<(), String>) -> Result<()> {
-        let Some(finisher) = self.finisher.take() else {
-            return Ok(());
-        };
-        finisher.finish(&self.sandbox_id, outcome).await
-    }
-}
-
-impl Drop for ReservationGuard {
-    fn drop(&mut self) {
-        let Some(finisher) = self.finisher.take() else {
-            return;
-        };
-        tracing::warn!(
-            sandbox_id = %self.sandbox_id,
-            "reservation guard dropped without finishing; releasing it best-effort"
-        );
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let sandbox_id = self.sandbox_id;
-        handle.spawn(async move {
-            let _ = finisher
-                .finish(&sandbox_id, Err("reservation guard dropped".to_string()))
-                .await;
-        });
-    }
-}
-
-/// Waits for the owner of a creation window to publish its result.
-#[async_trait]
-pub trait StartWaiter: Send + Sync {
-    async fn wait(&self, sandbox_id: &SandboxId) -> Result<SandboxMetadata>;
-}
-
-pub struct WaitForStart {
-    sandbox_id: SandboxId,
-    waiter: Arc<dyn StartWaiter>,
-}
-
-impl std::fmt::Debug for WaitForStart {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WaitForStart")
-            .field("sandbox_id", &self.sandbox_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl WaitForStart {
-    pub fn new(sandbox_id: SandboxId, waiter: Arc<dyn StartWaiter>) -> Self {
-        Self { sandbox_id, waiter }
-    }
-
-    /// Waits without imposing a caller deadline.
-    pub async fn wait(self) -> Result<SandboxMetadata> {
-        self.waiter.wait(&self.sandbox_id).await
-    }
-}
-
 #[async_trait]
 pub trait MetadataStore: Send + Sync {
     async fn add(&self, metadata: SandboxMetadata) -> Result<()>;
@@ -530,11 +426,6 @@ pub trait MetadataStore: Send + Sync {
         Err(StoreError::UnsupportedByBackend {
             method: "transition_settlement",
         })
-    }
-
-    /// Claims a sandbox id for creation.
-    async fn reserve(&self, _sandbox_id: &SandboxId) -> Result<Reservation> {
-        Err(StoreError::UnsupportedByBackend { method: "reserve" })
     }
 
     /// Repairs missing expiry-index entries; in-lock stores return zero.

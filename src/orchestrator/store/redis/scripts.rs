@@ -13,7 +13,7 @@ macro_rules! lazy_script {
     };
 }
 
-// KEYS: record, index, expiry, pending.
+// KEYS: record, index, expiry.
 // ARGV: JSON, TTL, expiry score/member, sandbox id.
 const ADD: &str = r#"
 if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
@@ -26,7 +26,6 @@ redis.call('SADD', KEYS[2], ARGV[5])
 if ARGV[3] ~= '' then
   redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4])
 end
-redis.call('ZREM', KEYS[4], ARGV[5])
 return 1
 "#;
 
@@ -85,7 +84,6 @@ const REMOVE: &str = r#"
 local raw = redis.call('GET', KEYS[1])
 redis.call('DEL', KEYS[1])
 redis.call('SREM', KEYS[2], ARGV[1])
-redis.call('ZREM', KEYS[4], ARGV[1])
 if raw then
   local ok, cur = pcall(cjson.decode, raw)
   if ok and cur['execution_id'] then
@@ -119,7 +117,6 @@ end
 if not matched then return {2, state, execution} end
 redis.call('DEL', KEYS[1])
 redis.call('SREM', KEYS[2], ARGV[1])
-redis.call('ZREM', KEYS[4], ARGV[1])
 redis.call('ZREM', KEYS[3], ARGV[1] .. ':' .. execution)
 return {1, '', ''}
 "#;
@@ -181,33 +178,6 @@ return 2
 
 lazy_script!(complete_transition, COMPLETE_TRANSITION);
 
-pub const RESERVE_RESERVED: i64 = 0;
-pub const RESERVE_ALREADY_IN_STORAGE: i64 = 1;
-pub const RESERVE_ALREADY_PENDING: i64 = 2;
-/// Reserved for a future tenant quota model; never returned today.
-pub const RESERVE_LIMIT_EXCEEDED: i64 = 3;
-
-// Reserves an id after removing stale pending entries.
-const RESERVE: &str = r#"
-redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', ARGV[3])
-if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 1 then return 1 end
-if redis.call('ZSCORE', KEYS[2], ARGV[1]) then return 2 end
-redis.call('DEL', KEYS[3])
-redis.call('ZADD', KEYS[2], ARGV[2], ARGV[1])
-return 0
-"#;
-
-lazy_script!(reserve, RESERVE);
-
-// Publishes the result before removing the pending entry.
-const FINISH_RESERVATION: &str = r#"
-redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3])
-redis.call('ZREM', KEYS[1], ARGV[1])
-return 1
-"#;
-
-lazy_script!(finish_reservation, FINISH_RESERVATION);
-
 // Releases a lock only when its token still matches.
 const RELEASE_LOCK: &str = r#"
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -243,8 +213,6 @@ mod tests {
             sweep_index_member(),
             start_transition(),
             complete_transition(),
-            reserve(),
-            finish_reservation(),
             release_lock(),
             heal_expiry(),
         ];

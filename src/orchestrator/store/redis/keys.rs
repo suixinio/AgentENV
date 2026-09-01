@@ -59,16 +59,6 @@ impl KeySpace {
         self.scoped(&format!("lock:sbx:{sandbox_id}"))
     }
 
-    /// Cluster-visible pending creation ids.
-    pub fn pending(&self) -> String {
-        self.scoped("pending")
-    }
-
-    /// Where a finished creation leaves its outcome for waiters.
-    pub fn reserve_result(&self, sandbox_id: &SandboxId) -> String {
-        self.scoped(&format!("reserve:{sandbox_id}"))
-    }
-
     /// Shared wake-up channel carrying routing keys as payloads.
     pub fn notify_channel(&self) -> String {
         format!("{}:notify", self.prefix)
@@ -89,10 +79,6 @@ pub mod routing {
 
     pub fn transition(sandbox_id: &SandboxId) -> String {
         format!("txn:{sandbox_id}")
-    }
-
-    pub fn reservation(sandbox_id: &SandboxId) -> String {
-        format!("reserve:{sandbox_id}")
     }
 }
 
@@ -181,12 +167,10 @@ mod tests {
             k.record(&sandbox_id),
             k.index(),
             k.expiry(),
-            k.pending(),
             k.transition(&sandbox_id),
             k.transition_index(),
             k.transition_result(&sandbox_id, &Uuid::now_v7()),
             k.lock(&sandbox_id),
-            k.reserve_result(&sandbox_id),
         ] {
             assert!(key.contains(GLOBAL_TAG), "{key} has no hash tag");
             assert!(key.starts_with("agentenv:api:"), "{key}");

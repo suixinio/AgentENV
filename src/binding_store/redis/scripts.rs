@@ -8,17 +8,22 @@ use redis::Script;
 const PARSE_BINDING: &str = r#"
 local function parse_binding(raw)
   if not raw then
-    return nil, nil
+    return nil, nil, nil
   end
   local ok, decoded = pcall(cjson.decode, raw)
   if not ok or not decoded or not decoded["node"] then
-    return nil, nil
+    return nil, nil, nil
   end
   local node_id = decoded["node"]["node_id"]
   if not node_id or node_id == "" then
-    return nil, nil
+    return nil, nil, nil
   end
-  return node_id, decoded["execution_id"]
+  return node_id, decoded["execution_id"], decoded["state"]
+end
+
+local function is_reservation(raw)
+  local _, _, state = parse_binding(raw)
+  return state == "starting"
 end
 "#;
 
@@ -117,11 +122,16 @@ end
 local current = redis.call("SMEMBERS", node_key)
 for _, sandbox_id in ipairs(current) do
   if desired[sandbox_id] == nil then
-    local old_node_id = parse_binding(redis.call("GET", binding_key(sandbox_id)))
-    if old_node_id == node_id then
+    local raw = redis.call("GET", binding_key(sandbox_id))
+    local old_node_id = parse_binding(raw)
+    -- A reservation names a create this node has not acknowledged yet, so its
+    -- roster is right to omit it. Only its TTL may retire it.
+    if old_node_id == node_id and not is_reservation(raw) then
       redis.call("DEL", binding_key(sandbox_id))
+      redis.call("SREM", node_key, sandbox_id)
+    elseif old_node_id ~= node_id then
+      redis.call("SREM", node_key, sandbox_id)
     end
-    redis.call("SREM", node_key, sandbox_id)
   end
 end
 
@@ -212,6 +222,33 @@ return outcome
 pub fn delete_script() -> &'static Script {
     static SCRIPT: OnceLock<Script> = OnceLock::new();
     SCRIPT.get_or_init(|| Script::new(&format!("{PARSE_BINDING}{DELETE_BODY}")))
+}
+
+// KEYS: binding. ARGV: sandbox id, execution id, key prefix.
+// Withdraws only a reservation; a confirmation names a runtime a node acknowledged.
+const RELEASE_BODY: &str = r#"
+local raw = redis.call("GET", KEYS[1])
+if not raw then
+  return "noop_absent"
+end
+local node_id, incumbent, state = parse_binding(raw)
+if not node_id then
+  return "noop_absent"
+end
+if state ~= "starting" then
+  return "rejected_confirmed"
+end
+if incumbent and incumbent ~= "" and incumbent ~= ARGV[2] then
+  return "rejected_stale"
+end
+redis.call("DEL", KEYS[1])
+redis.call("SREM", ARGV[3] .. ":node:" .. node_id, ARGV[1])
+return "deleted"
+"#;
+
+pub fn release_script() -> &'static Script {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    SCRIPT.get_or_init(|| Script::new(&format!("{PARSE_BINDING}{RELEASE_BODY}")))
 }
 
 #[cfg(test)]

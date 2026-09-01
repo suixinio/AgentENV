@@ -1151,6 +1151,7 @@ mod tests {
                     node: discovered("node-a", "http://10.0.0.1:8000"),
                     execution_id: ExecutionId::new().to_string(),
                     projection_ttl: std::time::Duration::ZERO,
+                    state: crate::binding_store::BindingState::Confirmed,
                 },
                 std::time::SystemTime::now(),
             )

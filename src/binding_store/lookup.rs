@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use crate::binding_store::BindingStore;
+use crate::binding_store::{BindingState, BindingStore};
 use crate::node_registry::filter::filter_unschedulable;
 use crate::node_registry::placement::score::SnapshotFreshness;
 use crate::node_registry::placement::{
@@ -128,6 +128,7 @@ pub enum LookupResultLabel {
     UnavailableRegistry,
     UnavailableColdBindings,
     UnavailableNoNodes,
+    UnavailableStarting,
     OriginUnschedulable,
     OriginNotReporting,
     HolderUnreachable,
@@ -147,6 +148,7 @@ impl LookupResultLabel {
             Self::UnavailableRegistry => "unavailable_registry",
             Self::UnavailableColdBindings => "unavailable_cold_bindings",
             Self::UnavailableNoNodes => "unavailable_no_nodes",
+            Self::UnavailableStarting => "unavailable_starting",
             Self::OriginUnschedulable => "origin_unschedulable",
             Self::OriginNotReporting => "origin_not_reporting",
             Self::HolderUnreachable => "holder_unreachable",
@@ -316,6 +318,15 @@ pub async fn lookup_node(
             return LookupOutcome::Unavailable(
                 LookupResultLabel::UnavailableBindingStore,
                 "binding store unavailable",
+            );
+        }
+        // A reservation names the node a create was sent to, not a runtime it
+        // acknowledged. Answering it as bound would route traffic at a VM that may
+        // not exist; answering absence would license reaping one that does.
+        Ok(Some(binding)) if binding.state == BindingState::Starting => {
+            return LookupOutcome::Unavailable(
+                LookupResultLabel::UnavailableStarting,
+                "a create for this sandbox has not finished",
             );
         }
         Ok(Some(binding)) => {

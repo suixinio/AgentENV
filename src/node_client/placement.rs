@@ -66,7 +66,36 @@ pub trait NodePlacement: Send + Sync + 'static {
         execution_id: ExecutionId,
         node: &NodeEndpoint,
     ) -> anyhow::Result<()>;
+
+    /// Records the chosen node before the runtime is asked for, so that no runtime
+    /// exists that a complete lookup cannot find.
+    ///
+    /// Failing this must fail the launch: a lookup that finds nothing is read as a
+    /// verdict, and a runtime started without a record would be reaped as an orphan.
+    /// The reservation expires on its own, which is what bounds a caller that dies
+    /// between here and [`Self::record_placement`].
+    async fn reserve_placement(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        node: &NodeEndpoint,
+    ) -> anyhow::Result<()>;
+
+    /// Withdraws a reservation whose launch failed, leaving a confirmed placement
+    /// of the same incarnation alone.
+    async fn release_placement_reservation(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<()>;
 }
+
+/// How long a reservation outlives the process that wrote it.
+///
+/// It bounds the window in which a launch that died mid-flight keeps a sandbox id
+/// unreapable, so it must exceed the slowest create — a cold image pull and
+/// conversion — while staying far below any human's patience for a stuck id.
+pub const PLACEMENT_RESERVATION_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Sends every operation to one fixed node.
 pub struct FixedNodePlacement {
@@ -110,6 +139,25 @@ impl NodePlacement for FixedNodePlacement {
         _sandbox_id: SandboxId,
         _execution_id: ExecutionId,
         _node: &NodeEndpoint,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Succeeds without writing: the one fixed node is already the whole answer,
+    /// and a lookup against it can never come back empty.
+    async fn reserve_placement(
+        &self,
+        _sandbox_id: SandboxId,
+        _execution_id: ExecutionId,
+        _node: &NodeEndpoint,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn release_placement_reservation(
+        &self,
+        _sandbox_id: SandboxId,
+        _execution_id: ExecutionId,
     ) -> anyhow::Result<()> {
         Ok(())
     }

@@ -154,7 +154,8 @@ impl BindingSweeper {
                         // A newer incarnation has already taken over.
                         outcome.refused_stale += 1;
                     }
-                    Ok(BindingDeleteOutcome::Absent) => {}
+                    // `delete` is not state-fenced, so it never refuses a confirmation.
+                    Ok(BindingDeleteOutcome::Absent | BindingDeleteOutcome::RejectedConfirmed) => {}
                     Err(_) => {
                         outcome.store_errors += 1;
                         complete = false;
@@ -246,7 +247,7 @@ const SWEEP_NODES_SUPPRESSED_METRIC: &str = "agentenv_api_binding_sweep_nodes_su
 mod tests {
     use super::*;
     use crate::binding_store::in_memory::InMemoryBindingStore;
-    use crate::binding_store::{Binding, BindingStoreSettings};
+    use crate::binding_store::{Binding, BindingState, BindingStoreSettings};
     use crate::node_registry::registry::AtomicNodeRegistry;
     use crate::node_registry::types::Node;
 
@@ -305,6 +306,7 @@ mod tests {
                     node: node("node-a"),
                     execution_id: "00000000-0000-7000-8000-000000000001".to_string(),
                     projection_ttl: Duration::from_secs(200_000),
+                    state: BindingState::Confirmed,
                 },
                 unix(0),
             )
@@ -336,6 +338,7 @@ mod tests {
                     node: node("node-a"),
                     execution_id: "00000000-0000-7000-8000-000000000001".to_string(),
                     projection_ttl: Duration::from_secs(3600),
+                    state: BindingState::Confirmed,
                 },
                 unix(0),
             )
@@ -375,6 +378,7 @@ mod tests {
                     node: node("node-b"),
                     execution_id: "00000000-0000-7000-8000-000000000002".to_string(),
                     projection_ttl: Duration::from_secs(3600),
+                    state: BindingState::Confirmed,
                 },
                 unix(0),
             )
@@ -459,6 +463,7 @@ mod tests {
                     node: node("node-a"),
                     execution_id: "00000000-0000-7000-8000-000000000001".to_string(),
                     projection_ttl: Duration::from_secs(3600),
+                    state: BindingState::Confirmed,
                 },
                 unix(0),
             )
@@ -505,6 +510,7 @@ mod tests {
                     node: node("node-a-old"),
                     execution_id: "00000000-0000-7000-8000-000000000001".to_string(),
                     projection_ttl: Duration::from_secs(3600),
+                    state: BindingState::Confirmed,
                 },
                 unix(0),
             )
@@ -577,6 +583,7 @@ mod tests {
                         node: node(node_id),
                         execution_id: exec.to_string(),
                         projection_ttl: Duration::from_secs(3600),
+                        state: BindingState::Confirmed,
                     },
                     unix(0),
                 )

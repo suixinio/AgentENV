@@ -34,19 +34,50 @@ impl From<WireNode> for Node {
     }
 }
 
+/// Whether a routing record names a runtime its node has acknowledged.
+///
+/// A record written before the node create RPC is `Starting`: the assignment is
+/// decided but the runtime may not exist yet. Absent in the stored JSON means
+/// `Confirmed`, which is what every record written before this field existed is.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingState {
+    #[default]
+    Confirmed,
+    Starting,
+}
+
+impl BindingState {
+    pub fn is_confirmed(&self) -> bool {
+        matches!(self, BindingState::Confirmed)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BindingState::Confirmed => "confirmed",
+            BindingState::Starting => "starting",
+        }
+    }
+}
+
 /// JSON value stored at `{prefix}:sandbox:{sandbox_id}`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub node: WireNode,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub execution_id: String,
+    /// Omitted when confirmed, so a confirmed record is byte-identical to one
+    /// written before this field existed and every reader agrees on it.
+    #[serde(default, skip_serializing_if = "BindingState::is_confirmed")]
+    pub state: BindingState,
 }
 
 /// Serializes a gateway-compatible routing record.
-pub fn marshal_record(node: &Node, execution_id: &str) -> String {
+pub fn marshal_record(node: &Node, execution_id: &str, state: BindingState) -> String {
     let record = Record {
         node: node.into(),
         execution_id: execution_id.to_string(),
+        state,
     };
     // This string-only record shape is infallible to serialize.
     serde_json::to_string(&record).expect("Record serialization is infallible for this shape")
@@ -98,7 +129,11 @@ mod tests {
             endpoint: "http://10.0.0.1:8000".to_string(),
             pod_name: String::new(),
         };
-        let json = marshal_record(&node, "0198f5c0-1234-7abc-8def-000000000001");
+        let json = marshal_record(
+            &node,
+            "0198f5c0-1234-7abc-8def-000000000001",
+            BindingState::Confirmed,
+        );
         assert_eq!(
             json,
             r#"{"node":{"node_id":"node-a","endpoint":"http://10.0.0.1:8000"},"execution_id":"0198f5c0-1234-7abc-8def-000000000001"}"#
@@ -112,7 +147,7 @@ mod tests {
             endpoint: "http://10.0.0.1:8000".to_string(),
             pod_name: "agentenv-node-xk29f".to_string(),
         };
-        let json = marshal_record(&node, "");
+        let json = marshal_record(&node, "", BindingState::Confirmed);
         assert_eq!(
             json,
             r#"{"node":{"node_id":"node-a","endpoint":"http://10.0.0.1:8000","pod_name":"agentenv-node-xk29f"}}"#
@@ -131,7 +166,7 @@ mod tests {
             pod_name: "agentenv-node-7f4c2".to_string(),
         };
         assert_eq!(
-            marshal_record(&with_pod_name, EXECUTION_ID),
+            marshal_record(&with_pod_name, EXECUTION_ID, BindingState::Confirmed),
             STORED_RECORD_WITH_POD_NAME
         );
 
@@ -141,7 +176,7 @@ mod tests {
             pod_name: String::new(),
         };
         assert_eq!(
-            marshal_record(&without_pod_name, EXECUTION_ID),
+            marshal_record(&without_pod_name, EXECUTION_ID, BindingState::Confirmed),
             STORED_RECORD_WITHOUT_POD_NAME
         );
     }
@@ -153,10 +188,47 @@ mod tests {
             endpoint: "http://10.0.0.1:8000".to_string(),
             pod_name: String::new(),
         };
-        let json = marshal_record(&node, "exec-1");
+        let json = marshal_record(&node, "exec-1", BindingState::Confirmed);
         let record = parse_record(json.as_bytes()).expect("parses");
         assert_eq!(record.node.node_id, "node-a");
         assert_eq!(record.execution_id, "exec-1");
+        assert_eq!(record.state, BindingState::Confirmed);
+    }
+
+    #[test]
+    fn a_reservation_names_its_state_and_a_confirmation_stays_silent_about_it() {
+        let node = Node {
+            id: "node-a".to_string(),
+            endpoint: "http://node-a".to_string(),
+            pod_name: String::new(),
+        };
+        assert_eq!(
+            marshal_record(&node, "exec-1", BindingState::Starting),
+            r#"{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1","state":"starting"}"#
+        );
+        assert_eq!(
+            marshal_record(&node, "exec-1", BindingState::Confirmed),
+            r#"{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1"}"#,
+            "a confirmed record must stay byte-identical to one written before the field existed"
+        );
+    }
+
+    #[test]
+    fn a_record_written_before_the_state_field_existed_reads_as_confirmed() {
+        let record = parse_record(
+            br#"{"node":{"node_id":"a","endpoint":"http://a"},"execution_id":"exec-1"}"#,
+        )
+        .expect("parses");
+        assert_eq!(record.state, BindingState::Confirmed);
+    }
+
+    #[test]
+    fn parse_reads_back_a_reservation() {
+        let record = parse_record(
+            br#"{"node":{"node_id":"a","endpoint":"http://a"},"execution_id":"e","state":"starting"}"#,
+        )
+        .expect("parses");
+        assert_eq!(record.state, BindingState::Starting);
     }
 
     #[test]

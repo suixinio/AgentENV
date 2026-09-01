@@ -22,7 +22,7 @@ use crate::proto::scheduler::{self, ObservedNode};
 use crate::scheduler_endpoint::qualified;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
+use super::placement::{NodeEndpoint, NodeMembership, NodePlacement, PLACEMENT_RESERVATION_TTL};
 
 /// Replaces the port in an HTTP node address, including bracketed IPv6 literals.
 pub fn rewrite_port(endpoint: &str, port: u16) -> Result<String> {
@@ -237,6 +237,50 @@ impl NodePlacement for NativeNodePlacement {
             })?;
         Ok(())
     }
+
+    /// Reserves through the local assignment surface, in process.
+    async fn reserve_placement(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        node: &NodeEndpoint,
+    ) -> Result<()> {
+        let decision = self
+            .local
+            .reserve_assignment(
+                &sandbox_id.to_string(),
+                &node.node_id,
+                &execution_id.to_string(),
+                PLACEMENT_RESERVATION_TTL,
+            )
+            .await
+            .map_err(|status| {
+                anyhow!("the local scheduler refused to reserve {sandbox_id}: {status}")
+            })?;
+        if !decision.accepted() {
+            bail!(
+                "the local scheduler refused to reserve {sandbox_id} on node {}: another \
+                 incarnation ({}) already holds it",
+                node.node_id,
+                decision.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    async fn release_placement_reservation(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> Result<()> {
+        self.local
+            .release_assignment_reservation(&sandbox_id.to_string(), &execution_id.to_string())
+            .await
+            .map(|_| ())
+            .map_err(|status| {
+                anyhow!("the local scheduler could not release the reservation for {sandbox_id}: {status}")
+            })
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +432,43 @@ mod tests {
         assert!(absent.is_none(), "nothing was ever recorded for this id");
     }
 
+    /// Two creates of one sandbox id are unreachable — every id is a server-minted
+    /// UUIDv7 and no request carries one — so the reservation refuses a colliding
+    /// launch outright instead of joining it to the one already in flight.
+    #[tokio::test]
+    async fn a_colliding_reservation_is_refused_rather_than_joined() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![Node {
+                id: "node-a".to_string(),
+                endpoint: "http://10.0.0.1:8000".to_string(),
+                pod_name: String::new(),
+            }],
+            Duration::from_secs(30),
+        ));
+        let placement = placement_with_binding_store(
+            Arc::clone(&registry),
+            Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default())),
+        );
+        let node = NodeEndpoint::same_address("node-a", "http://10.0.0.1:8000");
+        let sandbox_id = SandboxId::new();
+
+        let newer = ExecutionId::parse_str("00000000-0000-7000-8000-000000000002").expect("uuid");
+        let older = ExecutionId::parse_str("00000000-0000-7000-8000-000000000001").expect("uuid");
+        placement
+            .reserve_placement(sandbox_id, newer, &node)
+            .await
+            .expect("the first launch reserves");
+
+        let err = placement
+            .reserve_placement(sandbox_id, older, &node)
+            .await
+            .expect_err("an older incarnation must not silently start a second runtime");
+        assert!(
+            err.to_string().contains("already holds it"),
+            "the refusal did not say another incarnation holds the id: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn place_existing_reports_a_binding_store_failure_as_an_error_not_a_clean_miss() {
         use crate::binding_store::{BindingDeleteOutcome, BindingStoreError};
@@ -427,6 +508,14 @@ mod tests {
                 _now: SystemTime,
             ) -> Result<BindingDeleteOutcome, BindingStoreError> {
                 unreachable!("this test never deletes")
+            }
+            async fn release_reservation(
+                &self,
+                _sandbox_id: &str,
+                _execution_id: &str,
+                _now: SystemTime,
+            ) -> Result<BindingDeleteOutcome, BindingStoreError> {
+                unreachable!("this test never releases")
             }
         }
 

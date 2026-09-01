@@ -840,6 +840,23 @@ impl NodePlacement for ReplacementNodePlacement {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn reserve_placement(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+        _node: &NodeEndpoint,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn release_placement_reservation(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -1070,6 +1087,21 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
             _sandbox_id: crate::types::SandboxId,
             _execution_id: ExecutionId,
             _node: &NodeEndpoint,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn reserve_placement(
+            &self,
+            _sandbox_id: crate::types::SandboxId,
+            _execution_id: ExecutionId,
+            _node: &NodeEndpoint,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn release_placement_reservation(
+            &self,
+            _sandbox_id: crate::types::SandboxId,
+            _execution_id: ExecutionId,
         ) -> anyhow::Result<()> {
             Ok(())
         }
@@ -3280,8 +3312,18 @@ enum LookupAnswer {
 struct ClusterPlacement {
     node: NodeEndpoint,
     bindings: Mutex<std::collections::HashSet<crate::types::SandboxId>>,
+    /// Reservations written before a create and cleared by its confirmation, the
+    /// way the binding store's `Starting` state is.
+    reservations: Mutex<std::collections::HashSet<crate::types::SandboxId>>,
     records: bool,
     record_fails: bool,
+    /// Whether the reservation write lands. `false` is a cluster that cannot
+    /// record, which must refuse the launch outright.
+    reserves: bool,
+    /// Whether a reservation is written at all. `false` is a build without the
+    /// create-time reservation, kept so a test can show what the delete verdict
+    /// does without it.
+    reserves_at_all: bool,
     lookup: LookupAnswer,
     resolves: Option<NodeEndpoint>,
     recorded: Mutex<Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint)>>,
@@ -3300,8 +3342,11 @@ impl ClusterPlacement {
     fn recording(node: NodeEndpoint) -> Arc<Self> {
         Arc::new(Self {
             bindings: Mutex::new(Default::default()),
+            reservations: Mutex::new(Default::default()),
             records: true,
             record_fails: false,
+            reserves: true,
+            reserves_at_all: true,
             lookup: LookupAnswer::FromBindings,
             resolves: Some(node.clone()),
             recorded: Mutex::new(Vec::new()),
@@ -3316,6 +3361,24 @@ impl ClusterPlacement {
             .ok()
             .expect("sole owner");
         placement.records = false;
+        Arc::new(placement)
+    }
+
+    /// A cluster whose binding store refuses the reservation write.
+    fn refusing_reservations(node: NodeEndpoint) -> Arc<Self> {
+        let mut placement = Arc::try_unwrap(Self::recording(node))
+            .ok()
+            .expect("sole owner");
+        placement.reserves = false;
+        Arc::new(placement)
+    }
+
+    /// A cluster that records confirmations but never reservations.
+    fn never_reserving(node: NodeEndpoint) -> Arc<Self> {
+        let mut placement = Arc::try_unwrap(Self::recording(node))
+            .ok()
+            .expect("sole owner");
+        placement.reserves_at_all = false;
         Arc::new(placement)
     }
 
@@ -3345,13 +3408,33 @@ impl ClusterPlacement {
 
     fn heartbeat(&self, ids: &[crate::types::SandboxId]) {
         let mut bindings = self.bindings.lock().expect("lock");
+        let mut reservations = self.reservations.lock().expect("lock");
         for id in ids {
             bindings.insert(*id);
+            // A node reporting the sandbox is the node acknowledging it, which is
+            // what `reconcile_node` promotes a reservation on.
+            reservations.remove(id);
         }
     }
 
     fn is_bound(&self, id: crate::types::SandboxId) -> bool {
         self.bindings.lock().expect("lock").contains(&id)
+    }
+
+    fn is_reserved(&self, id: crate::types::SandboxId) -> bool {
+        self.reservations.lock().expect("lock").contains(&id)
+    }
+
+    /// Drops every record of a sandbox, as a pause plus an expired reservation does.
+    fn forget(&self, id: crate::types::SandboxId) {
+        self.bindings.lock().expect("lock").remove(&id);
+        self.reservations.lock().expect("lock").remove(&id);
+    }
+
+    /// Installs a reservation without a launch, as another replica's in-flight
+    /// rebuild of this sandbox looks from here.
+    fn reserve_elsewhere(&self, id: crate::types::SandboxId) {
+        self.reservations.lock().expect("lock").insert(id);
     }
 
     fn recorded(&self) -> Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint)> {
@@ -3382,6 +3465,12 @@ impl NodePlacement for ClusterPlacement {
         sandbox_id: crate::types::SandboxId,
     ) -> anyhow::Result<Option<NodeEndpoint>> {
         match &self.lookup {
+            // A reservation is neither an answer nor an absence, exactly as
+            // `lookup_node` treats a `Starting` binding.
+            LookupAnswer::FromBindings if self.is_reserved(sandbox_id) => Err(anyhow::Error::new(
+                tonic::Status::unavailable("a create for this sandbox has not finished"),
+            )
+            .context(format!("the local scheduler could not locate {sandbox_id}"))),
             LookupAnswer::FromBindings => Ok(self.is_bound(sandbox_id).then(|| self.node.clone())),
             LookupAnswer::Holder(holder) => Ok(Some(holder.clone())),
             // Both carry the status the way NativeNodePlacement does, so the
@@ -3436,10 +3525,126 @@ impl NodePlacement for ClusterPlacement {
             anyhow::bail!("the scheduler refused an assignment for {sandbox_id}");
         }
         if self.records {
+            // Only a write that lands replaces the reservation it was written over;
+            // a lost confirmation leaves the reservation to expire on its own.
+            self.reservations.lock().expect("lock").remove(&sandbox_id);
             self.bindings.lock().expect("lock").insert(sandbox_id);
         }
         Ok(())
     }
+
+    async fn reserve_placement(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+        _node: &NodeEndpoint,
+    ) -> anyhow::Result<()> {
+        if !self.reserves {
+            anyhow::bail!("the scheduler refused to reserve {sandbox_id}");
+        }
+        if self.reserves_at_all {
+            self.reservations.lock().expect("lock").insert(sandbox_id);
+        }
+        Ok(())
+    }
+
+    async fn release_placement_reservation(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        self.reservations.lock().expect("lock").remove(&sandbox_id);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_create_reserves_the_routing_record_before_it_asks_for_a_runtime() {
+    let (script, node) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    let config = launch_config();
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: config.sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+
+    let placement = ClusterPlacement::refusing_reservations(node.endpoint.clone());
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
+        .expect("building a stub does no I/O");
+
+    let err = backend
+        .start()
+        .await
+        .expect_err("a cluster that cannot record the assignment must not start a runtime");
+    assert!(
+        format!("{err:#}").contains("reserve a routing record"),
+        "the refusal did not say the reservation was what failed: {err:#}"
+    );
+    assert!(
+        script.seen_create.lock().expect("lock").is_empty(),
+        "the node was asked for a runtime the cluster had no record of: recording after the \
+         create is what leaves an orphan the delete path then reads as a live sandbox"
+    );
+}
+
+#[tokio::test]
+async fn a_reservation_becomes_a_binding_when_the_node_acknowledges_the_create() {
+    let (script, node) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+
+    let placement = ClusterPlacement::recording(node.endpoint.clone());
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
+        .expect("building a stub does no I/O");
+    backend.start().await.expect("start");
+
+    assert!(
+        placement.is_bound(sandbox_id),
+        "a started sandbox is not routable"
+    );
+    assert!(
+        !placement.is_reserved(sandbox_id),
+        "the reservation outlived the create it was written for, so the sandbox stays \
+         unroutable until it expires"
+    );
+}
+
+#[tokio::test]
+async fn a_create_the_node_refused_withdraws_its_reservation() {
+    let (script, node) = scripted_node().await;
+    let execution_id = ExecutionId::new();
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    *script.create.lock().expect("lock") =
+        Some(Err(Status::resource_exhausted("no room on this node")));
+
+    let placement = ClusterPlacement::recording(node.endpoint.clone());
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
+        .expect("building a stub does no I/O");
+    backend.start().await.expect_err("the node refused");
+
+    assert!(
+        !placement.is_reserved(sandbox_id),
+        "a launch that never started anything left its id reserved, so nothing can reap it \
+         until the reservation expires"
+    );
+    assert!(!placement.is_bound(sandbox_id));
 }
 
 async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger) -> ApiReplica {

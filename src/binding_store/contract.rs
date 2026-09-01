@@ -3,7 +3,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use super::{Binding, BindingDecision, BindingDeleteOutcome, BindingStore};
+use super::{Binding, BindingDecision, BindingDeleteOutcome, BindingState, BindingStore};
 use crate::node_registry::types::{Node, RosterEntry};
 
 fn unix(secs: u64) -> SystemTime {
@@ -30,6 +30,7 @@ pub async fn record_then_get_round_trips<S: BindingStore>(store: &S) {
                 node: node("node-a"),
                 execution_id: "0198f5c0-1234-7abc-8def-000000000001".to_string(),
                 projection_ttl: Duration::ZERO,
+                state: BindingState::Confirmed,
             },
             unix(0),
         )
@@ -65,6 +66,7 @@ pub async fn record_rejects_an_older_incarnation<S: BindingStore>(store: &S) {
                 node: node("node-a"),
                 execution_id: "b-newer".to_string(),
                 projection_ttl: Duration::ZERO,
+                state: BindingState::Confirmed,
             },
             unix(0),
         )
@@ -78,6 +80,7 @@ pub async fn record_rejects_an_older_incarnation<S: BindingStore>(store: &S) {
                 node: node("node-b"),
                 execution_id: "a-older".to_string(),
                 projection_ttl: Duration::ZERO,
+                state: BindingState::Confirmed,
             },
             unix(1),
         )
@@ -362,6 +365,7 @@ pub async fn record_with_an_empty_sandbox_id_is_a_noop_that_reports_not_arbitrat
                     node: node("node-a"),
                     execution_id: "exec-1".to_string(),
                     projection_ttl: Duration::ZERO,
+                    state: BindingState::Confirmed,
                 },
                 unix(0),
             )
@@ -390,6 +394,7 @@ pub async fn record_with_an_empty_sandbox_id_is_a_noop_that_reports_not_arbitrat
                 node: node("node-a"),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::ZERO,
+                state: BindingState::Confirmed,
             },
             unix(0),
         )
@@ -397,6 +402,191 @@ pub async fn record_with_an_empty_sandbox_id_is_a_noop_that_reports_not_arbitrat
         .unwrap();
     assert_eq!(decision, BindingDecision::Installed);
     assert!(store.get("sbx-1", unix(0)).await.unwrap().is_some());
+}
+
+fn reservation(node_id: &str, execution_id: &str) -> Binding {
+    Binding {
+        node: node(node_id),
+        execution_id: execution_id.to_string(),
+        projection_ttl: Duration::from_secs(300),
+        state: BindingState::Starting,
+    }
+}
+
+fn confirmation(node_id: &str, execution_id: &str) -> Binding {
+    Binding {
+        node: node(node_id),
+        execution_id: execution_id.to_string(),
+        projection_ttl: Duration::ZERO,
+        state: BindingState::Confirmed,
+    }
+}
+
+fn roster(sandbox_id: &str, execution_id: &str) -> RosterEntry {
+    RosterEntry {
+        sandbox_id: sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        projection_ttl: Duration::ZERO,
+        paused: false,
+    }
+}
+
+pub async fn a_reservation_reads_back_as_starting<S: BindingStore>(store: &S) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+    let binding = store
+        .get("sbx-1", unix(0))
+        .await
+        .unwrap()
+        .expect("reserved");
+    assert_eq!(binding.state, BindingState::Starting);
+    assert_eq!(binding.node.id, "node-a");
+}
+
+pub async fn a_confirmation_over_a_reservation_promotes_it<S: BindingStore>(store: &S) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+    let decision = store
+        .record("sbx-1", confirmation("node-a", "exec-1"), unix(1))
+        .await
+        .unwrap();
+    assert_eq!(decision, BindingDecision::Refreshed);
+    assert_eq!(
+        store
+            .get("sbx-1", unix(1))
+            .await
+            .unwrap()
+            .expect("still bound")
+            .state,
+        BindingState::Confirmed,
+        "the launch's own confirmation left the record saying a create is still in flight"
+    );
+}
+
+pub async fn a_heartbeat_that_has_not_heard_of_a_reservation_leaves_it_alone<S: BindingStore>(
+    store: &S,
+) {
+    store
+        .record("reserved", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+    store
+        .record("running", confirmation("node-a", "exec-2"), unix(0))
+        .await
+        .unwrap();
+
+    // The node is running one sandbox and has not acknowledged the create yet.
+    store
+        .reconcile_node(node("node-a"), vec![roster("running", "exec-2")], unix(1))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get("reserved", unix(1))
+            .await
+            .unwrap()
+            .expect("a heartbeat retired a create that had not finished")
+            .state,
+        BindingState::Starting
+    );
+    assert!(store.get("running", unix(1)).await.unwrap().is_some());
+}
+
+pub async fn an_empty_roster_still_leaves_a_reservation_alone<S: BindingStore>(store: &S) {
+    store
+        .record("reserved", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+    store
+        .reconcile_node(node("node-a"), Vec::new(), unix(1))
+        .await
+        .unwrap();
+    assert!(
+        store.get("reserved", unix(1)).await.unwrap().is_some(),
+        "a node that reported nothing retired a create that had not finished"
+    );
+}
+
+pub async fn a_heartbeat_that_names_a_reservation_confirms_it<S: BindingStore>(store: &S) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+    store
+        .reconcile_node(node("node-a"), vec![roster("sbx-1", "exec-1")], unix(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get("sbx-1", unix(1))
+            .await
+            .unwrap()
+            .expect("still bound")
+            .state,
+        BindingState::Confirmed,
+        "the node reported it running and the record still says it is starting"
+    );
+}
+
+pub async fn releasing_a_reservation_removes_it<S: BindingStore>(store: &S) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .release_reservation("sbx-1", "exec-1", unix(0))
+            .await
+            .unwrap(),
+        BindingDeleteOutcome::Deleted
+    );
+    assert!(store.get("sbx-1", unix(0)).await.unwrap().is_none());
+}
+
+pub async fn releasing_refuses_to_withdraw_a_confirmation<S: BindingStore>(store: &S) {
+    store
+        .record("sbx-1", confirmation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .release_reservation("sbx-1", "exec-1", unix(0))
+            .await
+            .unwrap(),
+        BindingDeleteOutcome::RejectedConfirmed,
+        "a launch that failed after its node acknowledged the sandbox unrouted a live runtime"
+    );
+    assert!(store.get("sbx-1", unix(0)).await.unwrap().is_some());
+}
+
+pub async fn releasing_refuses_another_incarnations_reservation<S: BindingStore>(store: &S) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-2"), unix(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .release_reservation("sbx-1", "exec-1", unix(0))
+            .await
+            .unwrap(),
+        BindingDeleteOutcome::RejectedStale
+    );
+    assert!(store.get("sbx-1", unix(0)).await.unwrap().is_some());
+}
+
+pub async fn releasing_an_absent_reservation_is_a_noop<S: BindingStore>(store: &S) {
+    assert_eq!(
+        store
+            .release_reservation("never-reserved", "exec-1", unix(0))
+            .await
+            .unwrap(),
+        BindingDeleteOutcome::Absent
+    );
 }
 
 macro_rules! binding_store_contract_suite {
@@ -431,6 +621,15 @@ macro_rules! binding_store_contract {
             delete_of_a_record_with_no_known_incarnation_deletes_anyway,
             delete_with_an_empty_execution_id_is_a_noop_never_an_unguarded_delete,
             record_with_an_empty_sandbox_id_is_a_noop_that_reports_not_arbitrated,
+            a_reservation_reads_back_as_starting,
+            a_confirmation_over_a_reservation_promotes_it,
+            a_heartbeat_that_has_not_heard_of_a_reservation_leaves_it_alone,
+            an_empty_roster_still_leaves_a_reservation_alone,
+            a_heartbeat_that_names_a_reservation_confirms_it,
+            releasing_a_reservation_removes_it,
+            releasing_refuses_to_withdraw_a_confirmation,
+            releasing_refuses_another_incarnations_reservation,
+            releasing_an_absent_reservation_is_a_noop,
         );
     };
 }

@@ -7,7 +7,10 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use super::arbitration::{arbitrate_fenced, BindingDecision};
-use super::{Binding, BindingDeleteOutcome, BindingStore, BindingStoreError, BindingStoreSettings};
+use super::{
+    Binding, BindingDeleteOutcome, BindingState, BindingStore, BindingStoreError,
+    BindingStoreSettings,
+};
 use crate::node_registry::types::{Node, RosterEntry};
 
 #[derive(Debug, Clone)]
@@ -15,6 +18,7 @@ struct BindingRecord {
     node: Node,
     execution_id: String,
     expires_at: SystemTime,
+    state: BindingState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,9 +140,17 @@ impl InMemoryBindingStore {
                 node: binding.node.clone(),
                 execution_id: binding.execution_id.clone(),
                 expires_at,
+                state: binding.state,
             },
         );
         decision
+    }
+
+    fn is_reservation(inner: &Inner, sandbox_id: &str) -> bool {
+        inner
+            .bindings
+            .get(sandbox_id)
+            .is_some_and(|record| record.state == BindingState::Starting)
     }
 
     fn delete_locked(inner: &mut Inner, sandbox_id: &str) {
@@ -169,6 +181,7 @@ impl BindingStore for InMemoryBindingStore {
             node: record.node.clone(),
             execution_id: record.execution_id.clone(),
             projection_ttl: std::time::Duration::ZERO,
+            state: record.state,
         }))
     }
 
@@ -223,6 +236,9 @@ impl BindingStore for InMemoryBindingStore {
                 .map(|set| set.iter().cloned().collect())
                 .unwrap_or_default();
             for sandbox_id in &owned {
+                if Self::is_reservation(&inner, sandbox_id) {
+                    continue;
+                }
                 Self::delete_locked(&mut inner, sandbox_id);
             }
             return Ok(Vec::new());
@@ -230,10 +246,13 @@ impl BindingStore for InMemoryBindingStore {
 
         let mut decisions = Vec::with_capacity(normalized.len());
         for (sandbox_id, entry) in &normalized {
+            // A roster entry is a runtime the node is running now, so a heartbeat
+            // both installs and promotes.
             let binding = Binding {
                 node: node.clone(),
                 execution_id: entry.execution_id.clone(),
                 projection_ttl: entry.projection_ttl,
+                state: BindingState::Confirmed,
             };
             let decision = self.upsert_locked(
                 &mut inner,
@@ -245,6 +264,8 @@ impl BindingStore for InMemoryBindingStore {
             decisions.push((sandbox_id.clone(), decision));
         }
 
+        // A reservation names a create this node has not acknowledged yet, so its
+        // roster is right to omit it. Only its TTL may retire it.
         let stale: Vec<String> = inner
             .node_binding
             .get(&node.id)
@@ -256,6 +277,9 @@ impl BindingStore for InMemoryBindingStore {
             })
             .unwrap_or_default();
         for sandbox_id in stale {
+            if Self::is_reservation(&inner, &sandbox_id) {
+                continue;
+            }
             Self::delete_locked(&mut inner, &sandbox_id);
         }
 
@@ -291,6 +315,35 @@ impl BindingStore for InMemoryBindingStore {
         };
         Self::delete_locked(&mut inner, sandbox_id);
         Ok(outcome)
+    }
+
+    async fn release_reservation(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        now: SystemTime,
+    ) -> Result<BindingDeleteOutcome, BindingStoreError> {
+        let sandbox_id = sandbox_id.trim();
+        let execution_id = execution_id.trim();
+        if sandbox_id.is_empty() || execution_id.is_empty() {
+            return Ok(BindingDeleteOutcome::Absent);
+        }
+        let mut inner = self.inner.write().expect("binding store lock poisoned");
+        let Some(record) = inner.bindings.get(sandbox_id) else {
+            return Ok(BindingDeleteOutcome::Absent);
+        };
+        if record.expires_at <= now {
+            Self::delete_locked(&mut inner, sandbox_id);
+            return Ok(BindingDeleteOutcome::Absent);
+        }
+        if record.state != BindingState::Starting {
+            return Ok(BindingDeleteOutcome::RejectedConfirmed);
+        }
+        if !record.execution_id.is_empty() && record.execution_id != execution_id {
+            return Ok(BindingDeleteOutcome::RejectedStale);
+        }
+        Self::delete_locked(&mut inner, sandbox_id);
+        Ok(BindingDeleteOutcome::Deleted)
     }
 }
 
@@ -377,6 +430,7 @@ mod tests {
                     node: node("node-a"),
                     execution_id: "exec-1".to_string(),
                     projection_ttl: Duration::ZERO,
+                    state: BindingState::Confirmed,
                 },
                 unix(0),
             )
@@ -389,6 +443,7 @@ mod tests {
                     node: node("node-b"),
                     execution_id: "exec-2".to_string(),
                     projection_ttl: Duration::ZERO,
+                    state: BindingState::Confirmed,
                 },
                 unix(1),
             )
@@ -418,6 +473,7 @@ mod tests {
                     node: node("node-a"),
                     execution_id: "exec-2".to_string(),
                     projection_ttl: Duration::ZERO,
+                    state: BindingState::Confirmed,
                 },
                 unix(0),
             )
@@ -430,6 +486,7 @@ mod tests {
                     node: node("node-b"),
                     execution_id: "exec-1".to_string(),
                     projection_ttl: Duration::ZERO,
+                    state: BindingState::Confirmed,
                 },
                 unix(1),
             )

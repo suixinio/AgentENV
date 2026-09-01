@@ -102,6 +102,16 @@ impl RedisBindingStore {
         }
     }
 
+    fn delete_outcome_from_label(label: &str) -> BindingDeleteOutcome {
+        match label {
+            "deleted" => BindingDeleteOutcome::Deleted,
+            "deleted_unknown_incumbent" => BindingDeleteOutcome::DeletedUnknownIncumbent,
+            "rejected_stale" => BindingDeleteOutcome::RejectedStale,
+            "rejected_confirmed" => BindingDeleteOutcome::RejectedConfirmed,
+            _ => BindingDeleteOutcome::Absent,
+        }
+    }
+
     /// Raw test connection for assertions outside the store API.
     #[cfg(test)]
     pub fn raw_connection(&self) -> redis::aio::ConnectionManager {
@@ -136,6 +146,7 @@ impl BindingStore for RedisBindingStore {
             node: record.node.into(),
             execution_id: record.execution_id,
             projection_ttl: Duration::ZERO,
+            state: record.state,
         }))
     }
 
@@ -149,7 +160,7 @@ impl BindingStore for RedisBindingStore {
         if sandbox_id.is_empty() {
             return Ok(BindingDecision::NotArbitrated);
         }
-        let value = marshal_record(&binding.node, &binding.execution_id);
+        let value = marshal_record(&binding.node, &binding.execution_id, binding.state);
         let mut connection = self.connection.clone();
         let result: Vec<(String, String)> = scripts::record_script()
             .key(self.binding_key(sandbox_id))
@@ -261,11 +272,29 @@ impl BindingStore for RedisBindingStore {
             .invoke_async(&mut connection)
             .await
             .map_err(backend)?;
-        Ok(match outcome.as_str() {
-            "deleted" => BindingDeleteOutcome::Deleted,
-            "deleted_unknown_incumbent" => BindingDeleteOutcome::DeletedUnknownIncumbent,
-            "rejected_stale" => BindingDeleteOutcome::RejectedStale,
-            _ => BindingDeleteOutcome::Absent,
-        })
+        Ok(Self::delete_outcome_from_label(&outcome))
+    }
+
+    async fn release_reservation(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        _now: SystemTime,
+    ) -> Result<BindingDeleteOutcome, BindingStoreError> {
+        let sandbox_id = sandbox_id.trim();
+        let execution_id = execution_id.trim();
+        if sandbox_id.is_empty() || execution_id.is_empty() {
+            return Ok(BindingDeleteOutcome::Absent);
+        }
+        let mut connection = self.connection.clone();
+        let outcome: String = scripts::release_script()
+            .key(self.binding_key(sandbox_id))
+            .arg(sandbox_id)
+            .arg(execution_id)
+            .arg(&self.redis_config.key_prefix)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend)?;
+        Ok(Self::delete_outcome_from_label(&outcome))
     }
 }

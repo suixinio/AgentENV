@@ -14,7 +14,9 @@ use crate::binding_store::artifact_index::ArtifactStore;
 use crate::binding_store::lookup::{
     self as lookup_logic, LookupDeps, LookupOutcome, LookupResultLabel, ScheduleDeps,
 };
-use crate::binding_store::{BindingDecision, BindingDeleteOutcome, BindingStore};
+use crate::binding_store::{
+    Binding, BindingDecision, BindingDeleteOutcome, BindingState, BindingStore,
+};
 use crate::orchestrator::{PausedRegistryListEntry, PausedRegistryState, PausedSandboxRegistry};
 use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{
@@ -114,6 +116,89 @@ impl NodeRegistryGrpcService {
         self.projection_authoritative = projection_authoritative;
         self.max_projection_ttl = max_projection_ttl;
         self
+    }
+
+    /// Reserves a sandbox's routing record before the node that will run it is asked to.
+    ///
+    /// In-process only: it is the create path's half of the invariant that every
+    /// runtime has a control-plane record older than itself, and no `Scheduler`
+    /// caller may reserve on another's behalf.
+    pub async fn reserve_assignment(
+        &self,
+        sandbox_id: &str,
+        node_id: &str,
+        execution_id: &str,
+        reservation_ttl: Duration,
+    ) -> Result<BindingDecision, Status> {
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "reserving an assignment needs a binding store, and this deployment has none \
+                 wired: {NOT_WIRED}"
+            )));
+        };
+        let sandbox_id = sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        let Some(node) = self.registry.resolve(node_id.trim()) else {
+            return Err(Status::invalid_argument(
+                "node is not in scheduler node list",
+            ));
+        };
+        let (execution, _reason) =
+            crate::binding_store::record::normalize_execution_id_reason(execution_id);
+        binding_store
+            .record(
+                sandbox_id,
+                Binding {
+                    node,
+                    execution_id: execution,
+                    projection_ttl: reservation_ttl,
+                    state: BindingState::Starting,
+                },
+                SystemTime::now(),
+            )
+            .await
+            .inspect(|decision| Self::record_binding_execution("assignment", *decision))
+            .map_err(|err| {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "scheduler reserve_assignment binding write failed"
+                );
+                Status::unavailable("binding store unavailable")
+            })
+    }
+
+    /// Withdraws a reservation this process wrote, leaving a confirmation alone.
+    pub async fn release_assignment_reservation(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+    ) -> Result<BindingDeleteOutcome, Status> {
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "releasing a reservation needs a binding store, and this deployment has none \
+                 wired: {NOT_WIRED}"
+            )));
+        };
+        let sandbox_id = sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        let (execution, _reason) =
+            crate::binding_store::record::normalize_execution_id_reason(execution_id);
+        binding_store
+            .release_reservation(sandbox_id, &execution, SystemTime::now())
+            .await
+            .map_err(|err| {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "scheduler release_assignment_reservation failed"
+                );
+                Status::unavailable("binding store unavailable")
+            })
     }
 
     /// Resolves the received projection TTL, applying the authoritative gate and cap.
@@ -622,6 +707,7 @@ impl Scheduler for NodeRegistryGrpcService {
                     node,
                     execution_id: execution,
                     projection_ttl,
+                    state: BindingState::Confirmed,
                 },
                 now,
             )
@@ -1089,6 +1175,7 @@ mod tests {
                         node: node("node-a", "http://node-a"),
                         execution_id: EXEC_1.to_string(),
                         projection_ttl: Duration::ZERO,
+                        state: BindingState::Confirmed,
                     },
                     SystemTime::now(),
                 )
@@ -1115,6 +1202,7 @@ mod tests {
                         node: node("node-a", "http://node-a"),
                         execution_id: EXEC_1.to_string(),
                         projection_ttl: Duration::ZERO,
+                        state: BindingState::Confirmed,
                     },
                     SystemTime::now(),
                 )
@@ -1145,6 +1233,7 @@ mod tests {
                         node: node("node-a", "http://node-a"),
                         execution_id: EXEC_1.to_string(),
                         projection_ttl: Duration::ZERO,
+                        state: BindingState::Confirmed,
                     },
                     SystemTime::now(),
                 )
@@ -1176,6 +1265,7 @@ mod tests {
                         node: node("node-a", "http://node-a"),
                         execution_id: EXEC_2.to_string(),
                         projection_ttl: Duration::ZERO,
+                        state: BindingState::Confirmed,
                     },
                     SystemTime::now(),
                 )
@@ -1204,6 +1294,7 @@ mod tests {
                         node: node("node-a", "http://node-a"),
                         execution_id: EXEC_1.to_string(),
                         projection_ttl: Duration::ZERO,
+                        state: BindingState::Confirmed,
                     },
                     SystemTime::now(),
                 )
@@ -1230,6 +1321,7 @@ mod tests {
                         node: node("node-a", "http://node-a"),
                         execution_id: EXEC_1.to_string(),
                         projection_ttl: Duration::ZERO,
+                        state: BindingState::Confirmed,
                     },
                     SystemTime::now(),
                 )
@@ -1549,6 +1641,14 @@ mod tests {
         ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
             Err(crate::binding_store::BindingStoreError::new("always fails"))
         }
+        async fn release_reservation(
+            &self,
+            _sandbox_id: &str,
+            _execution_id: &str,
+            _now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            Err(crate::binding_store::BindingStoreError::new("always fails"))
+        }
     }
 
     #[tokio::test]
@@ -1589,6 +1689,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingBindingStore {
         reconciled: std::sync::Mutex<Vec<Vec<crate::node_registry::types::RosterEntry>>>,
+        written: std::sync::Mutex<Vec<(String, Binding)>>,
     }
 
     impl RecordingBindingStore {
@@ -1600,23 +1701,43 @@ mod tests {
                 .cloned()
                 .expect("reconcile_node must have been called at least once")
         }
+
+        fn last_written(&self) -> (String, Binding) {
+            self.written
+                .lock()
+                .expect("not poisoned")
+                .last()
+                .cloned()
+                .expect("record must have been called at least once")
+        }
     }
 
     #[async_trait::async_trait]
     impl BindingStore for RecordingBindingStore {
         async fn get(
             &self,
-            _sandbox_id: &str,
+            sandbox_id: &str,
             _now: SystemTime,
         ) -> Result<Option<Binding>, crate::binding_store::BindingStoreError> {
-            Ok(None)
+            Ok(self
+                .written
+                .lock()
+                .expect("not poisoned")
+                .iter()
+                .rev()
+                .find(|(id, _)| id == sandbox_id)
+                .map(|(_, binding)| binding.clone()))
         }
         async fn record(
             &self,
-            _sandbox_id: &str,
-            _binding: Binding,
+            sandbox_id: &str,
+            binding: Binding,
             _now: SystemTime,
         ) -> Result<BindingDecision, crate::binding_store::BindingStoreError> {
+            self.written
+                .lock()
+                .expect("not poisoned")
+                .push((sandbox_id.to_string(), binding));
             Ok(BindingDecision::Installed)
         }
         async fn reconcile_node(
@@ -1636,6 +1757,28 @@ mod tests {
             _now: SystemTime,
         ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
             Ok(BindingDeleteOutcome::Absent)
+        }
+        /// Carries the real state fence so a reservation test cannot pass on a
+        /// fake that withdraws confirmations too.
+        async fn release_reservation(
+            &self,
+            sandbox_id: &str,
+            execution_id: &str,
+            _now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            let mut written = self.written.lock().expect("not poisoned");
+            let Some(position) = written.iter().rposition(|(id, _)| id == sandbox_id) else {
+                return Ok(BindingDeleteOutcome::Absent);
+            };
+            let binding = &written[position].1;
+            if binding.state != BindingState::Starting {
+                return Ok(BindingDeleteOutcome::RejectedConfirmed);
+            }
+            if !binding.execution_id.is_empty() && binding.execution_id != execution_id {
+                return Ok(BindingDeleteOutcome::RejectedStale);
+            }
+            written.remove(position);
+            Ok(BindingDeleteOutcome::Deleted)
         }
     }
 
@@ -2759,6 +2902,7 @@ mod tests {
                     node: node("node-a", "http://10.0.0.1:8000"),
                     execution_id: execution_id.clone(),
                     projection_ttl: Duration::ZERO,
+                    state: BindingState::Confirmed,
                 },
                 SystemTime::now(),
             )
@@ -2780,6 +2924,154 @@ mod tests {
         assert_eq!(
             resp.execution_authority(),
             scheduler::ExecutionAuthority::Registry
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_node_answers_neither_bound_nor_absent_while_a_create_is_in_flight() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://10.0.0.1:8000")],
+            Duration::from_secs(30),
+        ));
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new().to_string();
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO);
+        service
+            .reserve_assignment(
+                &sandbox_id.to_string(),
+                "node-a",
+                &execution_id,
+                Duration::from_secs(300),
+            )
+            .await
+            .expect("reserve");
+
+        let status = service
+            .lookup_node(Request::new(LookupNodeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }))
+            .await
+            .expect_err("a reservation is not a runtime to route at");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "a create in flight answered {:?}: NotFound would license reaping the runtime it is \
+             about to start",
+            status.code()
+        );
+
+        service
+            .record_assignment(Request::new(scheduler::RecordAssignmentRequest {
+                sandbox_id: sandbox_id.to_string(),
+                node: Some(scheduler::Node {
+                    node_id: "node-a".to_string(),
+                    endpoint: "http://10.0.0.1:8000".to_string(),
+                }),
+                execution_id: execution_id.clone(),
+                projection_ttl_secs: 0,
+            }))
+            .await
+            .expect("the node acknowledged it");
+
+        let resp = service
+            .lookup_node(Request::new(LookupNodeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }))
+            .await
+            .expect("confirmed")
+            .into_inner();
+        assert_eq!(resp.node.as_ref().unwrap().node_id, "node-a");
+        assert_eq!(resp.execution_id, execution_id);
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_reservation_leaves_the_sandbox_absent_again() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://10.0.0.1:8000")],
+            Duration::from_secs(30),
+        ));
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new().to_string();
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO);
+        service
+            .reserve_assignment(
+                &sandbox_id.to_string(),
+                "node-a",
+                &execution_id,
+                Duration::from_secs(300),
+            )
+            .await
+            .expect("reserve");
+        assert_eq!(
+            service
+                .release_assignment_reservation(&sandbox_id.to_string(), &execution_id)
+                .await
+                .expect("release"),
+            BindingDeleteOutcome::Deleted
+        );
+
+        let status = service
+            .lookup_node(Request::new(LookupNodeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            }))
+            .await
+            .expect_err("nothing holds it any more");
+        assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_reservation_is_refused_for_a_node_the_registry_does_not_know() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://10.0.0.1:8000")],
+            Duration::from_secs(30),
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO);
+        let status = service
+            .reserve_assignment(
+                &SandboxId::new().to_string(),
+                "node-z",
+                &ExecutionId::new().to_string(),
+                Duration::from_secs(300),
+            )
+            .await
+            .expect_err("node-z is not in the registry");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn a_reservation_write_says_it_is_a_reservation() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://10.0.0.1:8000")],
+            Duration::from_secs(30),
+        ));
+        let store = Arc::new(RecordingBindingStore::default());
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+            .with_binding_store(
+                Arc::clone(&store) as Arc<dyn BindingStore>,
+                false,
+                Duration::ZERO,
+            );
+        let sandbox_id = SandboxId::new();
+        service
+            .reserve_assignment(
+                &sandbox_id.to_string(),
+                "node-a",
+                &ExecutionId::new().to_string(),
+                Duration::from_secs(300),
+            )
+            .await
+            .expect("reserve");
+        let (id, binding) = store.last_written();
+        assert_eq!(id, sandbox_id.to_string());
+        assert_eq!(binding.state, BindingState::Starting);
+        assert_eq!(
+            binding.projection_ttl,
+            Duration::from_secs(300),
+            "a reservation with the store's ordinary TTL would outlive a slow create or die \
+             during one, depending on which is shorter"
         );
     }
 
@@ -3114,6 +3406,61 @@ mod tests {
         entry.claimed_by_node_id = Some("agentenv-api-replica-0".to_string());
         entry.snapshot_id = published.then(crate::snapshot::SnapshotId::generate);
         entry
+    }
+
+    /// The other half of "a runtime always has a record older than itself": on the
+    /// resume path the claim CAS writes the row before anything is restored, and a
+    /// row in any state must keep the lookup off `NotFound` — which is what the
+    /// delete path reads as a verdict.
+    #[tokio::test]
+    async fn a_registry_row_in_any_state_is_never_a_warm_absence() {
+        for state in [
+            PausedRegistryState::Paused,
+            PausedRegistryState::Publishing,
+            PausedRegistryState::LocalOnly,
+            PausedRegistryState::Running,
+            PausedRegistryState::Resuming,
+        ] {
+            for origin_is_live in [true, false] {
+                let sandbox_id = SandboxId::new();
+                let registry = Arc::new(AtomicNodeRegistry::new(
+                    vec![node("node-a", "http://10.0.0.1:8000")],
+                    Duration::from_secs(30),
+                ));
+                if origin_is_live {
+                    registry
+                        .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
+                        .expect("node-a is in discovery");
+                }
+                let origin = if origin_is_live {
+                    "node-a"
+                } else {
+                    "node-gone"
+                };
+                let paused: Arc<dyn PausedSandboxRegistry> =
+                    Arc::new(FakePausedRegistry::with_entry(
+                        paused_entry(sandbox_id, state, origin, Some(ExecutionId::new())),
+                        true,
+                    ));
+                let service =
+                    NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
+                        .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
+                        .with_paused_registry(paused);
+
+                let outcome = service
+                    .lookup_node(Request::new(LookupNodeRequest {
+                        sandbox_id: sandbox_id.to_string(),
+                    }))
+                    .await;
+                let code = outcome.err().map(|status| status.code());
+                assert_ne!(
+                    code,
+                    Some(tonic::Code::NotFound),
+                    "a {state:?} row with origin_is_live={origin_is_live} answered NotFound, so \
+                     the row that fences this sandbox does not stop a delete from reaping it"
+                );
+            }
+        }
     }
 
     #[tokio::test]

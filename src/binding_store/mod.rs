@@ -25,6 +25,7 @@ use crate::node_registry::types::{Node, RosterEntry};
 pub use arbitration::BindingDecision;
 #[cfg(any(test, feature = "test-support"))]
 pub use in_memory::InMemoryBindingStore;
+pub use record::BindingState;
 pub use redis::{RedisBindingStore, RedisBindingStoreConfig};
 
 /// A sandbox's serving node and, when known, execution incarnation.
@@ -35,6 +36,9 @@ pub struct Binding {
     pub execution_id: String,
     /// `ZERO` selects the store's configured binding TTL.
     pub projection_ttl: Duration,
+    /// Defaults to [`BindingState::Confirmed`]; only a create-time reservation
+    /// is [`BindingState::Starting`].
+    pub state: BindingState,
 }
 
 /// Guarded delete outcome and its metrics label.
@@ -48,6 +52,9 @@ pub enum BindingDeleteOutcome {
     DeletedUnknownIncumbent,
     /// Refused because the record names another incarnation.
     RejectedStale,
+    /// Refused because the record is a confirmation, not the reservation the
+    /// caller asked to withdraw.
+    RejectedConfirmed,
 }
 
 impl BindingDeleteOutcome {
@@ -57,6 +64,7 @@ impl BindingDeleteOutcome {
             BindingDeleteOutcome::Deleted => "deleted",
             BindingDeleteOutcome::DeletedUnknownIncumbent => "deleted_unknown_incumbent",
             BindingDeleteOutcome::RejectedStale => "rejected_stale",
+            BindingDeleteOutcome::RejectedConfirmed => "rejected_confirmed",
         }
     }
 }
@@ -100,6 +108,18 @@ pub trait BindingStore: Send + Sync {
 
     /// Removes a binding only when it still names `execution_id`.
     async fn delete(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        now: SystemTime,
+    ) -> Result<BindingDeleteOutcome, BindingStoreError>;
+
+    /// Withdraws a reservation, leaving a confirmed binding of the same
+    /// incarnation in place.
+    ///
+    /// A create whose node acknowledged it between the failure and this call is
+    /// already confirmed, and the runtime it names is real.
+    async fn release_reservation(
         &self,
         sandbox_id: &str,
         execution_id: &str,

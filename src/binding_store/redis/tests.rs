@@ -5,7 +5,7 @@ use std::time::Duration;
 use redis::AsyncCommands;
 
 use super::harness::store_or_skip;
-use crate::binding_store::{Binding, BindingStore, BindingStoreSettings};
+use crate::binding_store::{Binding, BindingState, BindingStore, BindingStoreSettings};
 use crate::node_registry::types::{Node, RosterEntry};
 
 fn unix(secs: u64) -> std::time::SystemTime {
@@ -208,6 +208,7 @@ async fn a_recorded_binding_is_byte_compatible_with_gateways_own_reader_shape() 
                 node: node("node-a"),
                 execution_id: "0198f5c0-1234-7abc-8def-000000000001".to_string(),
                 projection_ttl: Duration::ZERO,
+                state: BindingState::Confirmed,
             },
             unix(0),
         )

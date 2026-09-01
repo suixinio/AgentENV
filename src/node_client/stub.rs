@@ -402,6 +402,26 @@ impl RemoteSandboxStub {
         }
     }
 
+    /// Withdraws the reservation a failed launch wrote.
+    ///
+    /// Best-effort: a reservation that outlives this call expires on its own, and
+    /// one the node meanwhile confirmed names a runtime that really is there.
+    async fn withdraw_reservation(&self) {
+        if let Err(error) = self
+            .placement
+            .release_placement_reservation(self.sandbox_id, self.execution_id)
+            .await
+        {
+            warn!(
+                sandbox_id = %self.sandbox_id,
+                execution_id = %self.execution_id,
+                error = %error,
+                "could not withdraw the routing reservation of a launch that failed; it expires \
+                 on its own"
+            );
+        }
+    }
+
     /// Connects with [`STUB_CONNECT_TIMEOUT`], which also bounds tonic reconnects.
     pub async fn connect(endpoint: &str) -> Result<NodeSandboxServiceClient<Channel>> {
         let channel = Endpoint::from_shared(endpoint.to_string())
@@ -628,19 +648,40 @@ impl SandboxBackend for RemoteSandboxStub {
             .place_new(self.sandbox_id, self.resources)
             .await
             .with_context(|| format!("choose a node for sandbox {}", self.sandbox_id))?;
-        let mut client = Self::connect(&node.endpoint).await?;
 
-        let ack = client
-            .create(request)
+        // Reserve before asking for the runtime, never after: a lookup that finds
+        // no record of a sandbox is read as a verdict that it is gone, so a runtime
+        // must not be able to exist before its record does.
+        self.placement
+            .reserve_placement(self.sandbox_id, self.execution_id, &node)
             .await
-            .map_err(wire::into_error)
             .with_context(|| {
                 format!(
-                    "create sandbox {} on node {}",
+                    "reserve a routing record for sandbox {} on node {} before starting it",
                     self.sandbox_id, node.node_id
                 )
-            })?
-            .into_inner();
+            })?;
+
+        let mut client = match Self::connect(&node.endpoint).await {
+            Ok(client) => client,
+            Err(error) => {
+                self.withdraw_reservation().await;
+                return Err(error);
+            }
+        };
+
+        let ack = match client.create(request).await {
+            Ok(ack) => ack.into_inner(),
+            Err(status) => {
+                self.withdraw_reservation().await;
+                return Err(wire::into_error(status)).with_context(|| {
+                    format!(
+                        "create sandbox {} on node {}",
+                        self.sandbox_id, node.node_id
+                    )
+                });
+            }
+        };
 
         // The node must start the incarnation already recorded by the caller.
         if ack.execution_id != self.execution_id.to_string() {
@@ -650,6 +691,7 @@ impl SandboxBackend for RemoteSandboxStub {
                     execution_id: ack.execution_id.clone(),
                 })
                 .await;
+            self.withdraw_reservation().await;
             bail!(
                 "node {} started sandbox {} as execution {}, and this launch is execution {}",
                 node.node_id,

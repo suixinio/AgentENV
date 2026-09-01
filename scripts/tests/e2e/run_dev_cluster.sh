@@ -68,11 +68,6 @@
 #                                            18079, below the node range)
 #   AENV_TEMPLATE_ID                      - skip self-building a base template
 #   SUITE_FILTER                          - glob against suites/*.sh (default: *.sh)
-#   AENV_CONTROL_PLANE_TOKEN              - credential for a REST address that
-#                                            sits behind a control-plane gate;
-#                                            a split run addresses it directly
-#                                            and the gateway is not there to
-#                                            stamp it (default: empty, no gate)
 #   AENV_API_KEY / AENV_ADMIN_TOKEN       - default to the same e2e-test-key /
 #                                            e2e-admin-token values run_e2e.sh
 #                                            uses; override if this cluster's
@@ -282,11 +277,7 @@ report_existing_sandboxes() {
 
 report_ready_nodes() {
   local response status body ready_count total_count
-  # The REST address may sit behind a control-plane gate; the suites carry that
-  # credential through _curl_do, and a preflight addressing REST directly needs
-  # it too or it reports a 403 as an unreachable node list.
-  _e2e_control_plane_args "${AENV_URL}"
-  response=$(curl -s "${_E2E_CP_ARGS[@]}" -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" -w $'\n%{http_code}' "${AENV_URL}/nodes" 2>/dev/null || true)
+  response=$(curl -s -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" -w $'\n%{http_code}' "${AENV_URL}/nodes" 2>/dev/null || true)
   status="${response##*$'\n'}"
   body="${response%$'\n'*}"
   if [[ "${status}" == "200" ]]; then

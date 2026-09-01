@@ -265,9 +265,7 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
 
     log "Waiting for scheduler to observe ${expected_count} ready node(s) via ${AENV_URL}/nodes (timeout ${timeout}s) ..."
     for ((i = 1; i <= timeout; i++)); do
-      # An armed deployment refuses the poll without the control-plane header.
-      _e2e_control_plane_args "${AENV_URL}/nodes"
-      response=$(curl -s "${_E2E_CP_ARGS[@]}" \
+      response=$(curl -s \
         -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
         -w $'\n%{http_code}' \
         "${AENV_URL}/nodes" 2>/dev/null || true)

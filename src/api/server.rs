@@ -131,17 +131,23 @@ where
 
 /// Applies credential then role layers to control-plane routes before merging
 /// the ungated data plane; layer order makes role refusal run first.
+///
+/// The credential gate is attached on the half that does not own user-facing
+/// REST. On the half that does, clients reach the REST surface directly and no
+/// caller stamps an internal header for them.
 fn assemble(
     generated: Router,
     data_plane: Router,
     gate: Arc<ControlPlaneGate>,
     serves_user_facing_rest: bool,
 ) -> Router {
-    role_gate::attach(
-        generated.layer(middleware::from_fn_with_state(gate, require_control_plane)),
-        serves_user_facing_rest,
-    )
-    .merge(data_plane)
+    let generated = if serves_user_facing_rest {
+        generated
+    } else {
+        generated.layer(middleware::from_fn_with_state(gate, require_control_plane))
+    };
+
+    role_gate::attach(generated, serves_user_facing_rest).merge(data_plane)
 }
 
 #[cfg(test)]
@@ -160,6 +166,7 @@ mod tests {
     fn stand_in_control_plane() -> Router {
         Router::new()
             .route("/health", get(|| async { "ok" }))
+            .route("/nodes", get(|| async { "described" }))
             .route("/sandboxes", get(|| async { "listed" }))
             .route("/sandboxes", post(|| async { "created" }))
             .route("/v2/sandboxes", get(|| async { "listed" }))
@@ -172,12 +179,16 @@ mod tests {
             .fallback(get(|| async { "fallback" }))
     }
 
+    /// The half the credential gate is attached on.
     fn gated(tokens: Vec<String>, token_file: &str) -> Router {
-        assemble_as(SERVES_USER_REST, tokens, token_file)
+        assemble_as(REFUSES_USER_REST, tokens, token_file)
     }
 
     const SERVES_USER_REST: bool = true;
     const REFUSES_USER_REST: bool = false;
+
+    /// A route the gated half both serves and gates.
+    const NODE_PATH: &str = "/nodes";
 
     fn assemble_as(serves_user_facing_rest: bool, tokens: Vec<String>, token_file: &str) -> Router {
         assemble(
@@ -203,14 +214,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_gate_covers_the_control_plane_router_and_nothing_merged_after_it() {
-        let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
-
         // The probe has resolution: a gated route with no credential is refused.
         assert_eq!(
             status(
                 gated(vec![TOKEN.to_string()], ""),
-                Method::POST,
-                sandbox_path,
+                Method::GET,
+                NODE_PATH,
                 None
             )
             .await,
@@ -244,16 +253,18 @@ mod tests {
 
     #[tokio::test]
     async fn a_route_merged_before_assemble_is_gated_and_the_same_route_added_after_is_not() {
-        let debug_route = || Router::new().route("/debug/example", get(|| async { "debug" }));
+        // A path the role gate serves, so the credential gate is what answers.
+        const EXTRA: &str = "/nodes/example-debug";
+        let extra_route = || Router::new().route(EXTRA, get(|| async { "debug" }));
 
         let merged_before_assemble = assemble(
-            stand_in_control_plane().merge(debug_route()),
+            stand_in_control_plane().merge(extra_route()),
             stand_in_data_plane(),
             Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], "")),
-            SERVES_USER_REST,
+            REFUSES_USER_REST,
         );
         assert_eq!(
-            status(merged_before_assemble, Method::GET, "/debug/example", None).await,
+            status(merged_before_assemble, Method::GET, EXTRA, None).await,
             StatusCode::FORBIDDEN,
             "merged into the generated router before assemble runs, this route must be gated \
              exactly like every other control-plane route"
@@ -267,14 +278,53 @@ mod tests {
             stand_in_control_plane(),
             stand_in_data_plane(),
             Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], "")),
-            SERVES_USER_REST,
+            REFUSES_USER_REST,
         )
-        .route("/debug/example", get(|| async { "debug" }));
+        .route(EXTRA, get(|| async { "debug" }));
         assert_ne!(
-            status(added_after_assemble, Method::GET, "/debug/example", None).await,
+            status(added_after_assemble, Method::GET, EXTRA, None).await,
             StatusCode::FORBIDDEN,
             "the control: a route added after assemble's own return must not be covered by its \
              layer — this is the bug the assertion above is the fix for"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_half_that_does_not_own_user_facing_rest_carries_the_credential_gate() {
+        for (method, path) in [
+            (Method::GET, "/sandboxes"),
+            (Method::POST, "/sandboxes"),
+            (Method::GET, "/v2/sandboxes"),
+            (
+                Method::POST,
+                "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause",
+            ),
+        ] {
+            assert_eq!(
+                status(
+                    assemble_as(SERVES_USER_REST, vec![TOKEN.to_string()], ""),
+                    method.clone(),
+                    path,
+                    None
+                )
+                .await,
+                StatusCode::OK,
+                "a client reaching the REST surface directly stamps no internal header; \
+                 {method} {path} must not be refused for the lack of one"
+            );
+        }
+
+        // The probe has resolution: the same credential, on the half that does
+        // carry the gate, still refuses a call that presents nothing.
+        assert_eq!(
+            status(
+                assemble_as(REFUSES_USER_REST, vec![TOKEN.to_string()], ""),
+                Method::GET,
+                NODE_PATH,
+                None
+            )
+            .await,
+            StatusCode::FORBIDDEN
         );
     }
 
@@ -378,12 +428,8 @@ mod tests {
         ))
     }
 
-    fn stand_in_debug_route() -> Router {
-        Router::new().route("/debug/example-registry", get(|| async { "debug" }))
-    }
-
     #[tokio::test]
-    async fn extra_control_plane_routes_require_the_control_plane_credential() {
+    async fn compose_leaves_the_user_facing_rest_half_ungated() {
         let api_impl = build_api_impl_for_gate_test().await;
         let gate = Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], ""));
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
@@ -393,38 +439,16 @@ mod tests {
                 compose(
                     Arc::clone(&api_impl),
                     data_plane,
-                    stand_in_debug_route(),
+                    Router::new(),
                     Arc::clone(&gate),
                 )
             };
 
-            assert_eq!(
-                status(router(), Method::GET, "/debug/example-registry", None).await,
-                StatusCode::FORBIDDEN,
-                "a route merged in through compose must require the control-plane credential, \
-                 same as /debug/node-registry did ({data_plane:?})"
-            );
-            assert_eq!(
+            assert_ne!(
                 status(router(), Method::POST, sandbox_path, None).await,
                 StatusCode::FORBIDDEN,
-                "regression control: an existing gated route must still be gated ({data_plane:?})"
-            );
-            assert_ne!(
-                status(
-                    router(),
-                    Method::GET,
-                    "/debug/example-registry",
-                    Some(TOKEN)
-                )
-                .await,
-                StatusCode::FORBIDDEN,
-                "the correct credential must reach the merged-in debug route ({data_plane:?})"
-            );
-            assert_ne!(
-                status(router(), Method::POST, sandbox_path, Some(TOKEN)).await,
-                StatusCode::FORBIDDEN,
-                "the correct credential must still reach the pre-existing gated route \
-                 ({data_plane:?})"
+                "this impl owns user-facing REST, so a configured credential must gate \
+                 nothing on it ({data_plane:?})"
             );
             assert_ne!(
                 status(router(), Method::GET, "/health", None).await,
@@ -568,68 +592,21 @@ mod tests {
             "kubelet's probe stays reachable on a node"
         );
         assert_eq!(
-            status(
-                assemble_as(SERVES_USER_REST, vec![TOKEN.to_string()], ""),
-                Method::POST,
-                sandbox_path,
-                None
-            )
-            .await,
+            status(node(), Method::GET, NODE_PATH, None).await,
             StatusCode::FORBIDDEN,
-            "under the pre-split single process the same route is still gated on the credential, \
-             which is what makes the 404s above a statement about the role"
+            "a route the node does serve is still gated on the credential, which is what makes \
+             the 404s above a statement about the role"
         );
-    }
-
-    #[tokio::test]
-    async fn the_sandbox_listing_is_gated_like_any_other_route() {
-        for path in ["/sandboxes", "/v2/sandboxes"] {
-            assert_eq!(
-                status(
-                    assemble_as(SERVES_USER_REST, vec![TOKEN.to_string()], ""),
-                    Method::GET,
-                    path,
-                    None
-                )
-                .await,
-                StatusCode::FORBIDDEN,
-                "the listing must not be reachable without the credential: {path}"
-            );
-            assert_eq!(
-                status(
-                    assemble_as(SERVES_USER_REST, vec![TOKEN.to_string()], ""),
-                    Method::GET,
-                    path,
-                    Some(TOKEN)
-                )
-                .await,
-                StatusCode::OK,
-                "and must still be reachable with it: {path}"
-            );
-            assert_eq!(
-                status(
-                    assemble_as(REFUSES_USER_REST, vec![TOKEN.to_string()], ""),
-                    Method::GET,
-                    path,
-                    Some(TOKEN)
-                )
-                .await,
-                StatusCode::NOT_FOUND,
-                "a node still answers the listing as absent, not as forbidden: {path}"
-            );
-        }
     }
 
     /// T-A4-2. The credential is checked, not merely counted.
     #[tokio::test]
     async fn a_call_without_the_control_plane_credential_is_refused() {
-        let path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
-
         assert_eq!(
             status(
                 gated(vec![TOKEN.to_string()], ""),
-                Method::POST,
-                path,
+                Method::GET,
+                NODE_PATH,
                 Some(TOKEN)
             )
             .await,
@@ -639,8 +616,8 @@ mod tests {
             assert_eq!(
                 status(
                     gated(vec![TOKEN.to_string()], ""),
-                    Method::POST,
-                    path,
+                    Method::GET,
+                    NODE_PATH,
                     presented
                 )
                 .await,
@@ -658,13 +635,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_configured_token_lets_everything_through() {
         assert_eq!(
-            status(
-                gated(Vec::new(), ""),
-                Method::POST,
-                "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause",
-                None
-            )
-            .await,
+            status(gated(Vec::new(), ""), Method::GET, NODE_PATH, None).await,
             StatusCode::OK
         );
     }
@@ -686,40 +657,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_sandbox_route_is_exempt_from_the_gate() {
-        for path in ["/sandboxes", "/v2/sandboxes"] {
-            assert_eq!(
-                status(gated(vec![TOKEN.to_string()], ""), Method::GET, path, None).await,
-                StatusCode::FORBIDDEN,
-                "the cluster listing is gated like every other REST route: {path}"
-            );
-        }
-
-        assert_eq!(
-            status(
-                gated(vec![TOKEN.to_string()], ""),
-                Method::POST,
-                "/sandboxes",
-                None
-            )
-            .await,
-            StatusCode::FORBIDDEN,
-            "creating a sandbox is not a read and is not exempt"
-        );
-        assert_ne!(
-            status(
-                gated(vec![TOKEN.to_string()], ""),
-                Method::GET,
-                "/health",
-                None
-            )
-            .await,
-            StatusCode::FORBIDDEN,
-            "kubelet's probe is the one thing that stays ungated"
-        );
-    }
-
-    #[tokio::test]
     async fn the_gate_picks_up_a_token_written_after_startup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("control-plane-token");
@@ -732,25 +669,24 @@ mod tests {
                 stand_in_control_plane(),
                 stand_in_data_plane(),
                 Arc::clone(&gate),
-                SERVES_USER_REST,
+                REFUSES_USER_REST,
             )
         };
-        let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
 
         // Nothing mounted yet: the node behaves as it did before the gate.
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, None).await,
+            status(router(), Method::GET, NODE_PATH, None).await,
             StatusCode::OK
         );
 
         // The operator writes the Secret.
         std::fs::write(&path, format!("{TOKEN}\n")).unwrap();
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, None).await,
+            status(router(), Method::GET, NODE_PATH, None).await,
             StatusCode::FORBIDDEN
         );
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, Some(TOKEN)).await,
+            status(router(), Method::GET, NODE_PATH, Some(TOKEN)).await,
             StatusCode::OK
         );
 
@@ -758,7 +694,7 @@ mod tests {
         // read of zero credentials, which is the deliberate off switch.
         std::fs::write(&path, "").unwrap();
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, None).await,
+            status(router(), Method::GET, NODE_PATH, None).await,
             StatusCode::OK
         );
     }
@@ -780,25 +716,24 @@ mod tests {
                 stand_in_control_plane(),
                 stand_in_data_plane(),
                 Arc::clone(&gate),
-                SERVES_USER_REST,
+                REFUSES_USER_REST,
             )
         };
-        let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
 
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, None).await,
+            status(router(), Method::GET, NODE_PATH, None).await,
             StatusCode::FORBIDDEN
         );
 
         // The file goes away — a volume swap mid-flight, or a bad mount.
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, None).await,
+            status(router(), Method::GET, NODE_PATH, None).await,
             StatusCode::FORBIDDEN,
             "an unreadable credential file must not open the control plane"
         );
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, Some(TOKEN)).await,
+            status(router(), Method::GET, NODE_PATH, Some(TOKEN)).await,
             StatusCode::OK,
             "the last credential that was read successfully stays in force"
         );
@@ -806,7 +741,7 @@ mod tests {
         // Writing it back empty is the deliberate way to turn the gate off.
         std::fs::write(&path, "").unwrap();
         assert_eq!(
-            status(router(), Method::POST, sandbox_path, None).await,
+            status(router(), Method::GET, NODE_PATH, None).await,
             StatusCode::OK
         );
     }

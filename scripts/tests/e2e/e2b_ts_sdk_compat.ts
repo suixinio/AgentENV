@@ -52,16 +52,10 @@ async function main(): Promise<void> {
   if (!apiUrl) throw new Error("E2B_API_URL is not set");
   if (!sandboxUrl) throw new Error("E2B_SANDBOX_URL is not set");
   if (!apiKey) throw new Error("E2B_API_KEY is not set");
-  // apiHeaders reaches the REST address only, which is where a control-plane
-  // gate sits; the sandbox data plane goes to the gateway, which stamps its own.
-  const controlPlaneToken = (process.env.AENV_CONTROL_PLANE_TOKEN ?? "").trim();
   const connOpts = {
     apiUrl,
     apiKey,
     sandboxUrl,
-    ...(controlPlaneToken
-      ? { apiHeaders: { "x-agentenv-control-plane": controlPlaneToken } }
-      : {}),
   };
 
   let buildInfo: BuildInfo | null = null;

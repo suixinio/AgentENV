@@ -1,8 +1,8 @@
-//! Gateway credential gate for user-facing REST, mounted by both halves.
+//! Credential gate for the node's own control-plane routes.
 //!
 //! The layer attaches to the generated router before the data-plane proxy is
-//! merged, so proxy traffic remains outside this gate. On `aenv-api` it is the
-//! only transport-level gate on user-facing REST.
+//! merged, so proxy traffic remains outside this gate. It is attached only on
+//! the half that does not own user-facing REST — see `server::assemble`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,17 +19,17 @@ use tracing::{info, warn};
 
 use crate::cfg::ConfigManager;
 
-/// Header carrying the gateway's control-plane credential.
+/// Header carrying the control-plane credential.
 pub const CONTROL_PLANE_HEADER: &str = "x-agentenv-control-plane";
 
-/// Returns whether a route must remain reachable without a gateway credential.
+/// Returns whether a route must remain reachable without a credential.
 ///
 /// Only kubelet's `/health` probe is exempt.
 fn is_exempt(_method: &Method, path: &str) -> bool {
     path == "/health"
 }
 
-/// Gateway credentials accepted from static configuration and a reloadable file.
+/// Credentials accepted from static configuration and a reloadable file.
 pub struct ControlPlaneGate {
     static_tokens: Vec<String>,
     token_file: Option<PathBuf>,
@@ -217,7 +217,7 @@ fn normalize(tokens: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// Refuses control-plane calls that did not come through the gateway.
+/// Refuses control-plane calls that present no accepted credential.
 pub async fn require_control_plane(
     State(gate): State<Arc<ControlPlaneGate>>,
     request: Request,
@@ -252,7 +252,7 @@ pub async fn require_control_plane(
     warn!(
         method = %request.method(),
         path = %request.uri().path(),
-        "refusing a control-plane call that did not come through the gateway"
+        "refusing a control-plane call that presented no accepted credential"
     );
 
     Response::builder()
@@ -315,66 +315,6 @@ mod tests {
                 .count()
                 >= 2,
             "the preStop hook and the server must read the same credential file"
-        );
-    }
-
-    #[test]
-    fn the_api_half_projects_its_own_key_of_the_credential_secret() {
-        const API: &str = include_str!("../../deploy/k8s/base/agentenv-api-deployment.yaml");
-        const SECRET: &str = "agentenv-control-plane-token";
-        const API_KEY: &str = "api-gate-token";
-        const GATEWAY_KEY: &str = "token";
-        const TOKEN_FILE: &str = "/etc/agentenv/control-plane/token";
-
-        // The volume, not the volumeMount that shares its name.
-        let after_marker = API
-            .rsplit_once("        - name: control-plane-token\n")
-            .expect("the api deployment mounts the control-plane credential")
-            .1;
-        // Bound checks to this volume so sibling projections cannot satisfy them.
-        let volume = after_marker
-            .split_once("\n        - name: ")
-            .map_or(after_marker, |(this_volume, _next_sibling)| this_volume);
-
-        assert!(
-            volume.contains(&format!("secretName: {SECRET}\n")),
-            "the api half's credential volume must name the shared Secret"
-        );
-        assert!(
-            volume.contains(&format!("- key: {API_KEY}\n")),
-            "the volume must project `{API_KEY}` by name; on this half that key is the \
-             only transport-level check on user-facing REST"
-        );
-        assert!(
-            volume.contains("optional: true"),
-            "the projection must stay optional, or a Secret without `{API_KEY}` fails \
-             the mount instead of leaving the gate off"
-        );
-        assert!(
-            !volume.contains(&format!("- key: {GATEWAY_KEY}\n")),
-            "the api half must not project the gateway's stamping key"
-        );
-        assert_ne!(
-            API_KEY, GATEWAY_KEY,
-            "the api gate and the gateway's stamp must be different keys of the Secret"
-        );
-
-        // The projected file, the mount point and the env var naming it agree.
-        let (token_dir, token_basename) = TOKEN_FILE
-            .rsplit_once('/')
-            .expect("the credential path names a directory and a file");
-        assert!(
-            volume.contains(&format!("path: {token_basename}\n")),
-            "the projected path must be the basename the env var below names"
-        );
-        assert!(
-            API.contains("- name: AENV_API_CONTROL_PLANE_TOKEN_FILE")
-                && API.contains(&format!("value: {TOKEN_FILE}\n")),
-            "the process must be told to read the credential from the mounted file"
-        );
-        assert!(
-            API.contains(&format!("mountPath: {token_dir}\n")),
-            "the volume must be mounted at the directory the env var's path lives in"
         );
     }
 

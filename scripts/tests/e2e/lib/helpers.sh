@@ -12,10 +12,6 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   : "${AENV_ADMIN_TOKEN:=e2e-admin-token}"
   : "${AENV_TEMPLATE_ID:=ubuntu}"
   : "${AENV_PROXY_URL:=${AENV_URL}}"
-  # A deployment may put a control-plane gate in front of the REST address. The
-  # gateway stamps that credential on what it forwards, so only a run that
-  # addresses REST directly has to carry it. Empty means no gate in front.
-  : "${AENV_CONTROL_PLANE_TOKEN:=}"
   : "${E2E_MODE:=single-node}"
   : "${E2E_DEFAULT_USER_IMAGE:=ghcr.io/linuxserver/baseimage-ubuntu:noble}"
   : "${E2E_TEMPLATE_USER_IMAGE:=${E2E_DEFAULT_USER_IMAGE}}"
@@ -32,7 +28,6 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   HTTP_STATUS=""
   HTTP_BODY=""
   HTTP_HEADERS=""
-  _E2E_CP_ARGS=()
   _E2E_ERROR_REPORTED=0
   _E2E_SUITE_SUMMARY_RAN=0
 
@@ -69,20 +64,8 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     return "${status}"
   }
 
-  # Fills _E2E_CP_ARGS with the control-plane header for a REST-addressed URL.
-  #
-  # Only the REST address gets it. A data-plane request reaches the gateway,
-  # which stamps its own credential and must not be handed a caller's.
-  _e2e_control_plane_args() {
-    local url="$1"
-    _E2E_CP_ARGS=()
-    [[ -n "${AENV_CONTROL_PLANE_TOKEN}" && "${url}" == "${AENV_URL}"* ]] || return 0
-    _E2E_CP_ARGS=(-H "x-agentenv-control-plane: ${AENV_CONTROL_PLANE_TOKEN}")
-  }
-
   _curl_do() {
-    _e2e_control_plane_args "${*: -1}"
-    curl "${_E2E_CP_ARGS[@]}" "$@" -o "$_E2E_BODY" -w '%{http_code}' > "$_E2E_STATUS" 2>/dev/null || true
+    curl "$@" -o "$_E2E_BODY" -w '%{http_code}' > "$_E2E_STATUS" 2>/dev/null || true
     HTTP_STATUS=$(<"$_E2E_STATUS")
     HTTP_BODY=$(<"$_E2E_BODY")
   }
@@ -121,8 +104,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   api_get_with_headers() {
     local path="$1"
     [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
-    _e2e_control_plane_args "${AENV_URL}"
-    curl "${_E2E_CP_ARGS[@]}" -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
+    curl -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
       -H "X-API-Key: ${AENV_API_KEY}" \
       "${AENV_URL}${path}" > "$_E2E_STATUS" 2>/dev/null || true
     HTTP_STATUS=$(<"$_E2E_STATUS")
@@ -134,8 +116,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     local base_url="$1"
     local path="$2"
     [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
-    _e2e_control_plane_args "${base_url}"
-    curl "${_E2E_CP_ARGS[@]}" -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
+    curl -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
       -H "X-API-Key: ${AENV_API_KEY}" \
       "${base_url}${path}" > "$_E2E_STATUS" 2>/dev/null || true
     HTTP_STATUS=$(<"$_E2E_STATUS")
@@ -161,8 +142,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   api_admin_get_with_headers() {
     local path="$1"
     [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
-    _e2e_control_plane_args "${AENV_URL}"
-    curl "${_E2E_CP_ARGS[@]}" -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
+    curl -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
       -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
       "${AENV_URL}${path}" > "$_E2E_STATUS" 2>/dev/null || true
     HTTP_STATUS=$(<"$_E2E_STATUS")
@@ -174,8 +154,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     local base_url="$1"
     local path="$2"
     [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
-    _e2e_control_plane_args "${base_url}"
-    curl "${_E2E_CP_ARGS[@]}" -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
+    curl -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
       -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
       "${base_url}${path}" > "$_E2E_STATUS" 2>/dev/null || true
     HTTP_STATUS=$(<"$_E2E_STATUS")

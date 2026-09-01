@@ -519,20 +519,6 @@ spec:
             # yet — see `src/node_registry/kubernetes_discovery.rs`'s module
             # doc. Setting a selector before that gate exists risks a window
             # where it filters nothing instead of everything.
-            # Where this half's control-plane credential is read from, re-read
-            # while the process runs. A volume rather than a secretKeyRef for
-            # the reason the DaemonSet gives: kubelet refreshes volumes and does
-            # not refresh env.
-            #
-            # 🔴 A key of its own (`api-gate-token`), not the node's. One Secret
-            # carries the gateway's stamp under `token` and each gate's copy
-            # under its own key, so that creating or extending the Secret lights
-            # one participant at a time. Projecting the node's key here would
-            # mean the step that opens the node's gate also opens this one — and
-            # if the gateway were not yet stamping, that single act would refuse
-            # every REST request in the cluster at once.
-            - name: AENV_API_CONTROL_PLANE_TOKEN_FILE
-              value: /etc/agentenv/control-plane/token
             # The domain sandbox URLs are built from. Not node state: this half
             # answers `GET /sandboxes/{id}`, and `sandbox.domain` in that answer
             # comes from this value. An api half without it answers `null` and
@@ -639,9 +625,6 @@ spec:
               readOnly: true
             - name: scratch
               mountPath: /workspace/env
-            - name: control-plane-token
-              mountPath: /etc/agentenv/control-plane
-              readOnly: true
       volumes:
         # 🔴 The config ConfigMap, an emptyDir and two projected Secret keys —
         # and nothing else. In particular **no `hostPath: /var/lib/aenv` and no
@@ -739,16 +722,3 @@ spec:
         # state belongs in the shared store — and not a missing volume.
         - name: scratch
           emptyDir: {}
-        # optional: an absent Secret, or a Secret without this key, mounts
-        # nothing, this half reads no credential, and its gate stays off — which
-        # is the state this ships in. Rolling the gate back is setting
-        # `api-gate-token` to the empty string, never deleting the key: a failed
-        # read deliberately keeps the last credential, and a deleted key is a
-        # failed read (`src/api/control_plane_gate.rs`).
-        - name: control-plane-token
-          secret:
-            secretName: agentenv-control-plane-token
-            optional: true
-            items:
-              - key: api-gate-token
-                path: token

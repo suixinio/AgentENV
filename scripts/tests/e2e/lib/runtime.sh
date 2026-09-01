@@ -33,7 +33,7 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   # Below the node range: node forwards grow upward from the base, so a port
   # above it collides with the Nth node and the newer forward kills the older.
   : "${E2E_K8S_API_LOCAL_PORT:=18079}"
-  : "${E2E_SPLIT_ADDRESSES:=0}"
+  : "${E2E_SPLIT_ADDRESSES:=1}"
 
   _K8S_PORT_FORWARD_PIDS=()
   _K8S_PORT_FORWARD_LOGS=()
@@ -43,8 +43,9 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   }
 
   # Whether this run addresses REST and the sandbox data plane separately.
-  # Off means one address answers both, which is what a deployment that has
-  # not split its entry points still looks like.
+  # On by default: the gateway forwards no REST, so a run that sends both to it
+  # gets 404s for every sandbox, snapshot and template call. Off is left for
+  # driving a cluster that still runs a gateway which forwards.
   e2e_addresses_are_split() {
     [[ "${E2E_SPLIT_ADDRESSES}" == "1" ]]
   }

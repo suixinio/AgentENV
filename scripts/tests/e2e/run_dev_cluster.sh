@@ -59,10 +59,11 @@
 #   E2E_K8S_GATEWAY_LOCAL_PORT            - local port-forward port if the
 #                                            NodePort path isn't used/reachable
 #                                            (default: 18080)
-#   E2E_SPLIT_ADDRESSES                   - 1 to drive REST at svc/agentenv-api
-#                                            and leave the gateway holding only
-#                                            the data plane (default 0: one
-#                                            address, the gateway, for both)
+#   E2E_SPLIT_ADDRESSES                   - default 1: REST at svc/agentenv-api,
+#                                            the gateway holding only the data
+#                                            plane. 0 sends both to the gateway
+#                                            and only works against one that
+#                                            still forwards REST
 #   E2E_K8S_API_LOCAL_PORT                - local port for the api port-forward
 #                                            when the run is split (default:
 #                                            18079, below the node range)

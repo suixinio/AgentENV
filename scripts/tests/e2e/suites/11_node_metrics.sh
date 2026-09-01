@@ -221,7 +221,7 @@ done < <(echo "${baseline_nodes_json}" | jq -r '.[] | [
 # sandbox, and whether that node's own `/nodes` moved by that sandbox's cpu and
 # memory. Both halves of it read a node's own REST port, which the split closed
 # — `wait_for_admin_nodes_count` against a node endpoint is what timed out and
-# killed this suite. The gateway-level assertions above (`/nodes`,
+# killed this suite. The REST-address assertions above (`/nodes`,
 # `/nodes/{id}`, the expected node count) are unaffected and have already run.
 #
 # Restoring this needs a user-facing way to ask which node owns a sandbox.
@@ -329,24 +329,24 @@ for node_id in "${!BASELINE_SANDBOX_COUNT[@]}"; do
       "${expected_allocated_memory}" \
       "${expected_create_successes_min}" \
       30; then
-    _pass "gateway /nodes metrics converge for ${node_id}"
+    _pass "admin /nodes metrics converge for ${node_id}"
   else
     api_admin_get "/nodes"
     _fail \
-      "gateway /nodes metrics converge for ${node_id}" \
+      "admin /nodes metrics converge for ${node_id}" \
       "sandboxCount=${expected_sandbox_count}, allocatedCPU=${expected_allocated_cpu}, allocatedMemoryBytes=${expected_allocated_memory}, createSuccesses>=${expected_create_successes_min}" \
       "${HTTP_BODY}"
   fi
 
   api_admin_get "/nodes/${node_id}"
-  assert_status "${HTTP_STATUS}" "200" "gateway /nodes/${node_id} returns 200 after workload"
+  assert_status "${HTTP_STATUS}" "200" "admin /nodes/${node_id} returns 200 after workload"
   detail_sandboxes="$(echo "${HTTP_BODY}" | jq '.sandboxCount')"
   expected_detail_sandboxes=$((BASELINE_DETAIL_SANDBOX_COUNT["${node_id}"] + owned_count))
-  assert_eq "${detail_sandboxes}" "${expected_detail_sandboxes}" "gateway /nodes/${node_id} detail reflects running sandboxes"
+  assert_eq "${detail_sandboxes}" "${expected_detail_sandboxes}" "admin /nodes/${node_id} detail reflects running sandboxes"
   detail_allocated_cpu="$(echo "${HTTP_BODY}" | jq -r '.metrics.allocatedCPU')"
-  assert_eq "${detail_allocated_cpu}" "${expected_allocated_cpu}" "gateway /nodes/${node_id} detail reflects allocated CPU"
+  assert_eq "${detail_allocated_cpu}" "${expected_allocated_cpu}" "admin /nodes/${node_id} detail reflects allocated CPU"
   detail_allocated_memory="$(echo "${HTTP_BODY}" | jq -r '.metrics.allocatedMemoryBytes')"
-  assert_eq "${detail_allocated_memory}" "${expected_allocated_memory}" "gateway /nodes/${node_id} detail reflects allocated memory"
+  assert_eq "${detail_allocated_memory}" "${expected_allocated_memory}" "admin /nodes/${node_id} detail reflects allocated memory"
 
   if [[ -n "${NODE_URL_BY_ID[${node_id}]:-}" ]]; then
     local_detail_sandboxes="$(node_detail_sandbox_count "${NODE_URL_BY_ID[${node_id}]}" "${node_id}")"
@@ -383,11 +383,11 @@ for node_id in "${!BASELINE_SANDBOX_COUNT[@]}"; do
       "${BASELINE_ALLOCATED_MEMORY[${node_id}]}" \
       "${expected_create_successes_min_after_cleanup}" \
       30; then
-    _pass "gateway /nodes runtime allocation resets for ${node_id} after cleanup"
+    _pass "admin /nodes runtime allocation resets for ${node_id} after cleanup"
   else
     api_admin_get "/nodes"
     _fail \
-      "gateway /nodes runtime allocation resets for ${node_id} after cleanup" \
+      "admin /nodes runtime allocation resets for ${node_id} after cleanup" \
       "sandboxCount=${BASELINE_SANDBOX_COUNT[${node_id}]}, allocatedCPU=${BASELINE_ALLOCATED_CPU[${node_id}]}, allocatedMemoryBytes=${BASELINE_ALLOCATED_MEMORY[${node_id}]}, createSuccesses>=${expected_create_successes_min_after_cleanup}" \
       "${HTTP_BODY}"
   fi

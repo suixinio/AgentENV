@@ -42,8 +42,10 @@ A client talks to two addresses, not one:
 
 The repository does not presume how these map to names outside the cluster.
 Both Services are ClusterIP; an Ingress, a LoadBalancer or a port-forward per
-address is a deployment decision, and the only requirement is that each address
-is reachable in full.
+address is a deployment decision. Whatever the mechanism, expose only each
+Service's `http` port: `agentenv-api`'s `grpc` (8002) and `agentenv-gateway`'s
+`metrics` (9102) are cluster-internal listeners, not part of either address —
+a LoadBalancer must front the one named port, never the whole Service.
 
 The `aenv` client names them as `url` and `proxy_url` in its credentials file.
 `proxy_url` is optional and falls back to `url`, so a client configured with a

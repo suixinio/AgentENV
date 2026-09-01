@@ -68,6 +68,11 @@
 #                                            18090)
 #   AENV_TEMPLATE_ID                      - skip self-building a base template
 #   SUITE_FILTER                          - glob against suites/*.sh (default: *.sh)
+#   AENV_CONTROL_PLANE_TOKEN              - credential for a REST address that
+#                                            sits behind a control-plane gate;
+#                                            a split run addresses it directly
+#                                            and the gateway is not there to
+#                                            stamp it (default: empty, no gate)
 #   AENV_API_KEY / AENV_ADMIN_TOKEN       - default to the same e2e-test-key /
 #                                            e2e-admin-token values run_e2e.sh
 #                                            uses; override if this cluster's

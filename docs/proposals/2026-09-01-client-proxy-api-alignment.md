@@ -383,6 +383,22 @@ e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过
 >   保留代码上仍指向 `writeSchedulerError`/回落的 🔴 注释四处（`writeResumeError`、
 >   `executionSupersededStatusCode`、`resolveFromProjection`、resume client 的
 >   Unavailable 分支）按「不改他处 🔴 注释」规则原样留下，收尾提交一并清。
+> - **集群验收修订（2026-09-01，autoResume 双门控失败后）**：`ff8a45d` 的 running 短路把
+>   心跳清册里 `paused: true` 的条目也当 running 答——`roster_holder` 从不读
+>   `entry.paused`，`lookup_node` 把任何新鲜的清册命中都报成 BOUND/REGISTRY，短路于是在
+>   envd 校验、autoResume 门控与 claim 之前直接答 `Woken`，并为一个没有 VM 的沙箱写下
+>   寿命级投影（下一次心跳 reconcile 又删掉，逐请求反复）。集群表现：autoResume:false +
+>   paused 拿到节点的原始 410（无 CORS 头，api 的 `auto_resume_disabled` 计数器不动）；
+>   autoResume:true + paused 在一次 5 s 心跳把它列为 paused 之后再也不被流量唤醒。单元
+>   测试与 e2e 06 全绿的原因：没有任何夹具喂过 `paused: true` 的清册条目，e2e 在同一秒
+>   内暂停并探测。修法：`roster_holder` 带上 `paused`，`lookup_node` 对 paused 的最佳持有
+>   者不答 `bound_roster` 而继续走注册表一步（PLACED/PINNED/`bound_registry` 由行状态决
+>   定），无行时在清册节点答 PINNED，标签 `pinned_roster`。REST 侧 `place_existing` 消费
+>   同一函数，这类沙箱的答案从「清册节点 BOUND」变为注册表的放置——同一节点，或行为
+>   Paused 且 origin 不可调度时的另一节点。e2e 06 的两个 paused 用例在
+>   `wait_for_sandbox_state … paused` 之后各等 7 s（超过一次心跳）再探测，disabled 用例
+>   另断言 410 带 `Access-Control-Allow-Origin: *`（gateway 合成的拒绝才有，节点原始 410
+>   没有）。
 
 ### P5（可选，默认不做）— 改名 gateway → client-proxy
 

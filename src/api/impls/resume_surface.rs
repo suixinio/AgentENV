@@ -1900,6 +1900,90 @@ mod tests {
         assert_eq!(binding.execution_id, execution_id.to_string());
     }
 
+    /// node-a reporting the sandbox parked, as its roster does from the first
+    /// heartbeat after a pause until the api tells it to forget the record.
+    fn node_a_parking(
+        sandbox_id: SandboxId,
+    ) -> Arc<crate::node_registry::registry::AtomicNodeRegistry> {
+        let registry = registry_with_node_a();
+        crate::node_registry::registry::NodeRegistry::heartbeat(
+            registry.as_ref(),
+            &scheduler::HeartbeatRequest {
+                roster: vec![scheduler::SandboxRosterEntry {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: ExecutionId::new().to_string(),
+                    projection_ttl_secs: 0,
+                    paused: true,
+                }],
+                ..a_heartbeat(NODE_A, scheduler::NodeStatus::Ready)
+            },
+            std::time::SystemTime::now(),
+        )
+        .expect("node-a reports the sandbox");
+        registry
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_the_heartbeat_ledger_says_is_paused_is_not_answered_as_running() {
+        let refused_id = SandboxId::new();
+        let store = CountingBindingStore::over(empty_binding_store(), false);
+        let api = api_half_over(wired_service(
+            &node_a_parking(refused_id),
+            Arc::clone(&store) as Arc<dyn crate::binding_store::BindingStore>,
+            paused_row_registry(refused_id),
+        ))
+        .await;
+        seed_paused(&api, refused_id, false).await;
+
+        assert_eq!(
+            api.resume_for_data_plane(data_plane_request(refused_id))
+                .await,
+            DataPlaneResume::AutoResumeDisabled,
+            "🔴 a parked roster entry is where the bytes are, not a VM: answering \
+             it as running skips the owner's auto-resume choice and hands the \
+             data plane a node that answers 410"
+        );
+        assert_eq!(
+            store.writes(),
+            0,
+            "a projection was written for a sandbox that has no VM to route to"
+        );
+
+        // With the flag on, the roster entry changes nothing: the sandbox takes
+        // the same path as one the roster never mentioned.
+        let woken_id = SandboxId::new();
+        let via_roster = api_half_over(wired_service(
+            &node_a_parking(woken_id),
+            empty_binding_store(),
+            paused_row_registry(woken_id),
+        ))
+        .await;
+        seed_paused(&via_roster, woken_id, true).await;
+        let via_registry = api_half_over(wired_service(
+            &registry_with_node_a(),
+            empty_binding_store(),
+            paused_row_registry(woken_id),
+        ))
+        .await;
+        seed_paused(&via_registry, woken_id, true).await;
+
+        let outcome = via_roster
+            .resume_for_data_plane(data_plane_request(woken_id))
+            .await;
+        assert_ne!(outcome, DataPlaneResume::AutoResumeDisabled);
+        assert!(
+            !matches!(outcome, DataPlaneResume::Woken { .. }),
+            "the mock backend cannot bring a paused sandbox up: {outcome:?}"
+        );
+        assert_eq!(
+            outcome,
+            via_registry
+                .resume_for_data_plane(data_plane_request(woken_id))
+                .await,
+            "the roster entry must leave the wake path exactly where the registry alone puts it"
+        );
+    }
+
     #[tokio::test]
     async fn a_paused_sandbox_with_auto_resume_off_is_refused_and_with_it_on_reaches_the_wake_path()
     {

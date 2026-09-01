@@ -75,13 +75,18 @@ else
   _fail "sandbox paused (auto-resume disabled)" "paused" "timeout"
 fi
 
-_curl_do -s --max-time 10 \
+# Outlast one heartbeat (5 s): the probe must find the sandbox listed as paused in the node's roster, not pause and probe within the same second.
+sleep 7
+_curl_do_with_headers -s --max-time 10 \
   -H "X-API-Key: ${AENV_API_KEY}" \
   -H "x-agentenv-sandbox-id: ${paused_no_resume_id}" \
   -H "x-agentenv-target-port: 49983" \
   "${AENV_PROXY_URL}/health"
 log "Proxy (paused + auto-resume disabled) returned HTTP ${HTTP_STATUS}"
 assert_status "$HTTP_STATUS" "410" "paused sandbox without auto-resume returns 410"
+# The gateway synthesizes this refusal and stamps CORS on it; a node's raw 410 carries no such header.
+assert_contains "$(printf '%s' "$HTTP_HEADERS" | tr -d '\r' | tr '[:upper:]' '[:lower:]')" \
+  "access-control-allow-origin: *" "the 410 is the gateway's own answer (CORS header present)"
 
 # -- Paused sandbox with auto-resume enabled resumes and forwards --
 paused_auto_resume_id=$(create_sandbox "$AENV_TEMPLATE_ID" 60 '{"autoResume":{"enabled":true}}'); _sync_http
@@ -98,6 +103,8 @@ else
   _fail "sandbox paused (auto-resume enabled)" "paused" "timeout"
 fi
 
+# Outlast one heartbeat (5 s) here too: the wake-up must work once the roster lists the sandbox as paused.
+sleep 7
 # Auto-resume may wait up to 60s in non-test runtime. Keep client timeout above that.
 _curl_do -s --max-time 75 \
   -H "X-API-Key: ${AENV_API_KEY}" \

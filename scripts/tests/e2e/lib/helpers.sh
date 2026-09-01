@@ -70,6 +70,15 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     HTTP_BODY=$(<"$_E2E_BODY")
   }
 
+  # _curl_do that also captures response headers into HTTP_HEADERS.
+  _curl_do_with_headers() {
+    [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
+    curl "$@" -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' > "$_E2E_STATUS" 2>/dev/null || true
+    HTTP_STATUS=$(<"$_E2E_STATUS")
+    HTTP_BODY=$(<"$_E2E_BODY")
+    HTTP_HEADERS=$(<"$_E2E_HEADERS")
+  }
+
   e2e_mode_is() {
     [[ "${E2E_MODE}" == "$1" ]]
   }

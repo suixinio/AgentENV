@@ -122,6 +122,9 @@ pub enum LookupResultLabel {
     BoundRegistry,
     Placed,
     Pinned,
+    /// Pinned by a heartbeat roster alone: the node parks the sandbox and the
+    /// paused registry has no row for it.
+    PinnedRoster,
     NotFound,
     InvalidArgument,
     UnavailableBindingStore,
@@ -142,6 +145,7 @@ impl LookupResultLabel {
             Self::BoundRegistry => "bound_registry",
             Self::Placed => "placed",
             Self::Pinned => "pinned",
+            Self::PinnedRoster => "pinned_roster",
             Self::NotFound => "not_found",
             Self::InvalidArgument => "invalid_argument",
             Self::UnavailableBindingStore => "unavailable_binding_store",
@@ -263,12 +267,20 @@ fn roster_prefers(
     execution > best_execution
 }
 
+/// The fresh heartbeat roster entry that wins `roster_prefers` for a sandbox.
+struct RosterHolder {
+    node: Node,
+    execution_id: String,
+    /// The node parks the sandbox without a VM, so nothing here is routable.
+    paused: bool,
+}
+
 fn roster_holder(
     node_registry: &dyn NodeRegistry,
     sandbox_id: &str,
     now: SystemTime,
-) -> Option<(Node, String)> {
-    let mut best: Option<(Node, String, SystemTime)> = None;
+) -> Option<RosterHolder> {
+    let mut best: Option<(RosterHolder, SystemTime)> = None;
     for node_id in node_registry.nodes_holding(sandbox_id) {
         let Some(node) = node_registry.resolve(&node_id) else {
             continue;
@@ -279,21 +291,59 @@ fn roster_holder(
         if !roster_fresh(last_seen, now) {
             continue;
         }
-        let execution = entries
-            .iter()
-            .find(|entry| entry.sandbox_id == sandbox_id)
-            .map(|entry| entry.execution_id.clone())
-            .unwrap_or_default();
+        let entry = entries.iter().find(|entry| entry.sandbox_id == sandbox_id);
+        let holder = RosterHolder {
+            node,
+            execution_id: entry
+                .map(|entry| entry.execution_id.clone())
+                .unwrap_or_default(),
+            paused: entry.is_some_and(|entry| entry.paused),
+        };
         match &best {
-            None => best = Some((node, execution, last_seen)),
-            Some((_, best_execution, best_seen)) => {
-                if roster_prefers(&execution, last_seen, best_execution, *best_seen) {
-                    best = Some((node, execution, last_seen));
+            None => best = Some((holder, last_seen)),
+            Some((best_holder, best_seen)) => {
+                if roster_prefers(
+                    &holder.execution_id,
+                    last_seen,
+                    &best_holder.execution_id,
+                    *best_seen,
+                ) {
+                    best = Some((holder, last_seen));
                 }
             }
         }
     }
-    best.map(|(node, execution, _)| (node, execution))
+    best.map(|(holder, _)| holder)
+}
+
+/// Answers a sandbox whose only copy is on `origin_node_id`, or refuses when
+/// that node cannot take the resume.
+fn pinned_to(
+    node_registry: &dyn NodeRegistry,
+    state: &str,
+    origin_node_id: String,
+    label: LookupResultLabel,
+    now: SystemTime,
+) -> LookupOutcome {
+    match schedulable_node(node_registry, &origin_node_id, now) {
+        NodeSchedulability::NotReporting => LookupOutcome::FailedPrecondition(
+            LookupResultLabel::OriginNotReporting,
+            format!("sandbox is {state} on node {origin_node_id}, which is not reporting"),
+        ),
+        NodeSchedulability::NotAcceptingWork => LookupOutcome::FailedPrecondition(
+            LookupResultLabel::OriginUnschedulable,
+            format!("sandbox is {state} on node {origin_node_id}, which is not accepting work"),
+        ),
+        NodeSchedulability::Schedulable(node) => LookupOutcome::Answer(LookupAnswer {
+            node,
+            location: SandboxLocation::Pinned,
+            origin_node_id,
+            // The stopped incarnation must not be reused.
+            execution_id: String::new(),
+            execution_authority: ExecutionAuthority::Pending,
+            label,
+        }),
+    }
 }
 
 fn lookup_absent(warm: bool) -> LookupOutcome {
@@ -342,16 +392,23 @@ pub async fn lookup_node(
         Ok(None) => {}
     }
 
-    if let Some((holder, execution_id)) = roster_holder(deps.place.node_registry, sandbox_id, now) {
-        return LookupOutcome::Answer(LookupAnswer {
-            node: holder,
-            location: SandboxLocation::Bound,
-            origin_node_id: String::new(),
-            execution_authority: authority_for(&execution_id),
-            execution_id,
-            label: LookupResultLabel::BoundRoster,
-        });
-    }
+    // A paused roster entry says where the bytes are, not where a VM is. The
+    // registry row decides how such a sandbox wakes; only when there is no row
+    // does the roster's node become the answer, as a pin.
+    let parked_on = match roster_holder(deps.place.node_registry, sandbox_id, now) {
+        Some(holder) if !holder.paused => {
+            return LookupOutcome::Answer(LookupAnswer {
+                node: holder.node,
+                location: SandboxLocation::Bound,
+                origin_node_id: String::new(),
+                execution_authority: authority_for(&holder.execution_id),
+                execution_id: holder.execution_id,
+                label: LookupResultLabel::BoundRoster,
+            });
+        }
+        Some(holder) => Some(holder.node.id),
+        None => None,
+    };
 
     let warm = deps.warmup.warmed_up(now);
 
@@ -375,7 +432,16 @@ pub async fn lookup_node(
     };
 
     let Some(entry) = entry else {
-        return lookup_absent(warm);
+        return match parked_on {
+            Some(node_id) => pinned_to(
+                deps.place.node_registry,
+                "paused",
+                node_id,
+                LookupResultLabel::PinnedRoster,
+                now,
+            ),
+            None => lookup_absent(warm),
+        };
     };
 
     match entry.state {
@@ -405,33 +471,13 @@ pub async fn lookup_node(
         }
         PausedRegistryState::Publishing | PausedRegistryState::LocalOnly => {
             // Unpublished state is pinned to the origin node.
-            match schedulable_node(deps.place.node_registry, &entry.origin_node_id, now) {
-                NodeSchedulability::NotReporting => LookupOutcome::FailedPrecondition(
-                    LookupResultLabel::OriginNotReporting,
-                    format!(
-                        "sandbox is {} on node {}, which is not reporting",
-                        entry.state.as_str(),
-                        entry.origin_node_id
-                    ),
-                ),
-                NodeSchedulability::NotAcceptingWork => LookupOutcome::FailedPrecondition(
-                    LookupResultLabel::OriginUnschedulable,
-                    format!(
-                        "sandbox is {} on node {}, which is not accepting work",
-                        entry.state.as_str(),
-                        entry.origin_node_id
-                    ),
-                ),
-                NodeSchedulability::Schedulable(node) => LookupOutcome::Answer(LookupAnswer {
-                    node,
-                    location: SandboxLocation::Pinned,
-                    origin_node_id: entry.origin_node_id,
-                    // The stopped incarnation must not be reused.
-                    execution_id: String::new(),
-                    execution_authority: ExecutionAuthority::Pending,
-                    label: LookupResultLabel::Pinned,
-                }),
-            }
+            pinned_to(
+                deps.place.node_registry,
+                entry.state.as_str(),
+                entry.origin_node_id,
+                LookupResultLabel::Pinned,
+                now,
+            )
         }
         PausedRegistryState::Running | PausedRegistryState::Resuming => {
             // The holder is always the origin node, never the claimant.
@@ -700,5 +746,269 @@ mod tests {
             })
             .collect();
         assert_eq!(rotation, vec!["node-a", "node-b", "node-a"]);
+    }
+
+    /// Stage three of `lookup_node` answered from one fixed row; every write
+    /// path panics, the same way `grpc_service.rs`'s `FakePausedRegistry` does.
+    struct OneRowRegistry {
+        entry: crate::orchestrator::PausedSandboxEntry,
+    }
+
+    #[async_trait::async_trait]
+    impl PausedSandboxRegistry for OneRowRegistry {
+        async fn get(
+            &self,
+            sandbox_id: &SandboxId,
+        ) -> crate::orchestrator::RegistryResult<Option<crate::orchestrator::PausedSandboxEntry>>
+        {
+            Ok((self.entry.sandbox_id == *sandbox_id).then(|| self.entry.clone()))
+        }
+
+        fn is_cluster_backed(&self) -> bool {
+            true
+        }
+
+        async fn begin_pause(
+            &self,
+            _entry: &crate::orchestrator::PausedSandboxEntry,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::BeganPause> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn complete_pause(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+            _snapshot_id: &crate::snapshot::SnapshotId,
+        ) -> crate::orchestrator::RegistryResult<()> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn mark_local_only(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> crate::orchestrator::RegistryResult<()> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn get_many(
+            &self,
+            _sandbox_ids: &[SandboxId],
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::PausedRegistryRows> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn claim_for_resume(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+            _execution_id: crate::types::ExecutionId,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ResumeClaim> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn release_claim(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> crate::orchestrator::RegistryResult<bool> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn renew_lease(
+            &self,
+            _node_id: &str,
+            _held: &[crate::orchestrator::HeldSandbox],
+        ) -> crate::orchestrator::RegistryResult<u64> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn reclaim_expired_holdings(
+            &self,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ReclaimedHoldings> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn mark_running(
+            &self,
+            _sandbox_id: &SandboxId,
+            _node_id: &str,
+            _holder_node_id: &str,
+            _execution_id: crate::types::ExecutionId,
+            _expires_at: Option<SystemTime>,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::MarkRunningOutcome> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn renew_sandbox_deadline(
+            &self,
+            _sandbox_id: &SandboxId,
+            _execution_id: crate::types::ExecutionId,
+            _expires_at: Option<SystemTime>,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::DeadlineRenewalOutcome>
+        {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn release_node_holdings(
+            &self,
+            _node_id: &str,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::ReleasedHoldings> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn remove(
+            &self,
+            _sandbox_id: &SandboxId,
+            _generation: i64,
+        ) -> crate::orchestrator::RegistryResult<bool> {
+            unimplemented!("lookup_node never calls this")
+        }
+        async fn list_all(
+            &self,
+        ) -> crate::orchestrator::RegistryResult<crate::orchestrator::PausedRegistryListing>
+        {
+            unimplemented!("lookup_node never calls this")
+        }
+    }
+
+    fn registry_row(
+        sandbox_id: SandboxId,
+        state: PausedRegistryState,
+        origin_node_id: &str,
+    ) -> OneRowRegistry {
+        let now = chrono::Utc::now();
+        OneRowRegistry {
+            entry: crate::orchestrator::PausedSandboxEntry {
+                sandbox_id,
+                cluster_id: uuid::Uuid::nil(),
+                state,
+                generation: 1,
+                origin_node_id: origin_node_id.to_string(),
+                claimed_by_node_id: None,
+                snapshot_id: None,
+                metadata: None,
+                execution_id: None,
+                paused_at: now,
+                updated_at: now,
+            },
+        }
+    }
+
+    /// node-a reporting one sandbox, exactly as `roster_from_heartbeat` reads
+    /// a node's `list_sandbox_roster`: parked sandboxes stay in the roster
+    /// with `paused` set.
+    fn node_a_reporting(
+        sandbox_id: SandboxId,
+        execution_id: &str,
+        paused: bool,
+    ) -> AtomicNodeRegistry {
+        let registry = AtomicNodeRegistry::new(vec![node("node-a")], DEFAULT_OBSERVED_REPORT_TTL);
+        registry
+            .heartbeat(
+                &HeartbeatRequest {
+                    roster: vec![crate::proto::scheduler::SandboxRosterEntry {
+                        sandbox_id: sandbox_id.to_string(),
+                        execution_id: execution_id.to_string(),
+                        projection_ttl_secs: 0,
+                        paused,
+                    }],
+                    ..heartbeat("node-a")
+                },
+                SystemTime::now(),
+            )
+            .expect("node-a is discovered");
+        registry
+    }
+
+    async fn look_up(
+        registry: &AtomicNodeRegistry,
+        paused_registry: Option<&dyn PausedSandboxRegistry>,
+        sandbox_id: SandboxId,
+    ) -> LookupOutcome {
+        let now = SystemTime::now();
+        let strategy = RoundRobinStrategy::new();
+        let shadow = ShadowPlacement::default();
+        let binding_store = crate::binding_store::InMemoryBindingStore::new(
+            crate::binding_store::BindingStoreSettings::default(),
+        );
+        let warmup = WarmupGate::new(
+            std::sync::Arc::new(AtomicNodeRegistry::new(vec![], DEFAULT_OBSERVED_REPORT_TTL)),
+            std::time::Duration::from_secs(1),
+            SystemTime::UNIX_EPOCH,
+        );
+        warmup.reported_in(now);
+        let deps = LookupDeps {
+            place: ScheduleDeps {
+                node_registry: registry,
+                strategy: &strategy,
+                shadow: &shadow,
+            },
+            binding_store: &binding_store,
+            paused_registry,
+            warmup: &warmup,
+        };
+        lookup_node(&deps, &sandbox_id.to_string(), now).await
+    }
+
+    fn answer(outcome: LookupOutcome) -> LookupAnswer {
+        match outcome {
+            LookupOutcome::Answer(answer) => answer,
+            other => panic!("expected an answer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_roster_entry_is_bound_only_while_the_node_runs_it() {
+        let sandbox_id = SandboxId::new();
+        let execution_id = crate::types::ExecutionId::new().to_string();
+
+        let running = answer(
+            look_up(
+                &node_a_reporting(sandbox_id, &execution_id, false),
+                None,
+                sandbox_id,
+            )
+            .await,
+        );
+        assert_eq!(running.location, SandboxLocation::Bound);
+        assert_eq!(running.label, LookupResultLabel::BoundRoster);
+        assert_eq!(running.execution_id, execution_id);
+        assert_eq!(running.execution_authority, ExecutionAuthority::Registry);
+
+        // The same entry with the flag set is where the bytes are, not a VM
+        // to route to: with no registry row, the node that parks it is the
+        // only place the sandbox can wake.
+        let parked = answer(
+            look_up(
+                &node_a_reporting(sandbox_id, &execution_id, true),
+                None,
+                sandbox_id,
+            )
+            .await,
+        );
+        assert_eq!(parked.location, SandboxLocation::Pinned);
+        assert_eq!(parked.label, LookupResultLabel::PinnedRoster);
+        assert_eq!(parked.node.id, "node-a");
+        assert_eq!(parked.origin_node_id, "node-a");
+        assert_eq!(
+            parked.execution_id, "",
+            "the paused incarnation is not reused"
+        );
+        assert_eq!(parked.execution_authority, ExecutionAuthority::Pending);
+    }
+
+    #[tokio::test]
+    async fn a_paused_roster_entry_defers_to_the_registry_row() {
+        let sandbox_id = SandboxId::new();
+        let execution_id = crate::types::ExecutionId::new().to_string();
+        let registry = node_a_reporting(sandbox_id, &execution_id, true);
+
+        let published = registry_row(sandbox_id, PausedRegistryState::Paused, "node-a");
+        let placed = answer(look_up(&registry, Some(&published), sandbox_id).await);
+        assert_eq!(placed.location, SandboxLocation::Placed);
+        assert_eq!(placed.label, LookupResultLabel::Placed);
+        assert_eq!(placed.node.id, "node-a", "the origin is preferred");
+
+        let unpublished = registry_row(sandbox_id, PausedRegistryState::LocalOnly, "node-a");
+        let pinned = answer(look_up(&registry, Some(&unpublished), sandbox_id).await);
+        assert_eq!(pinned.location, SandboxLocation::Pinned);
+        assert_eq!(pinned.label, LookupResultLabel::Pinned);
+        assert_eq!(pinned.node.id, "node-a");
+
+        // A row for some other sandbox is no row for this one.
+        let other = registry_row(SandboxId::new(), PausedRegistryState::Paused, "node-a");
+        let parked = answer(look_up(&registry, Some(&other), sandbox_id).await);
+        assert_eq!(parked.label, LookupResultLabel::PinnedRoster);
     }
 }

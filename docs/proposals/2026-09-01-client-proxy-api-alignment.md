@@ -158,6 +158,10 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   `manifest_test.go:194` `TestGatewayRestUpstreamIsDeclaredAndRequired`、
   :263 `TestAnEmptyEnvironmentValueCannotTurnTheApiUpstreamSwitchOff` 中 rest_upstream 的一半
   （**resume_addr 的一半原样保留**——`apiproxy.ResumeSandbox` 是 client-proxy 的核心行为）；
+  **实施修订**：`resume_addr` 在 `8248c8f` 上早已删除（唤醒 RPC 走 `gateway.scheduler_addr`
+  的连接），该用例整条只剩 rest_upstream 一半。红线保护的属性——「空环境值不得清掉承载
+  resume 的地址」——因此改钉在 `GATEWAY_SCHEDULER_ADDR` 上并更名
+  `TestAnEmptyEnvironmentValueCannotClearTheResumeAddress`，而不是删掉；
 - 指标 `agentenv_gateway_rest_upstream_total`（metrics.go）整条删除——D2 的「折叠标签」被
   「删指标」取代；`recordGatewaySchedulerRPC` 的 ListObservedNodes/ListRegistrySandboxes
   两个 label 取值随调用点消失。两者都要通知看板。
@@ -175,6 +179,16 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   **活沙箱的响应一律不碰**——CORS 属于 envd 或用户自己的服务器（e2b 的注释原文如此）。
 
 裁决：**api 侧控制面 REST 门禁随转发一并退役**（按上方拍序，它走在删转发之前）。
+
+> **实施修订（2026-09-01，落地时）**：`ControlPlaneGate` 在 `8248c8f` 上是**两个半边共用**的
+> 一层，不是 api 专有——`assemble` 无条件挂它，node 半边的 `/nodes`、`/nodes/{id}`（含 preStop
+> 排空）正是靠它校验 `node-gate-token`。整体删掉会连带把下面「node 侧的 gate token 不动」
+> 一并作废。因此实际落地为：`assemble` **只在不拥有用户 REST 的那半边挂门**
+> （与 `role_gate` 同一根轴），api 半边不再挂任何凭据层；`[api].control_plane_tokens` /
+> `control_plane_token_file` 两个配置项**保留**（node 半边读它们）；
+> `deploy/k8s/base/agentenv-api-deployment.yaml` 撤下 `api-gate-token` 投影与
+> `AENV_API_CONTROL_PLANE_TOKEN_FILE`。武装机制确认为配置驱动（空凭据集 ⇒ Disabled ⇒ 放行），
+> 因此回退 api 镜像时旧门在场但未武装，成立。
 
 - 对象是 `src/api/server.rs:141` `assemble` 里加在生成路由上的 `require_control_plane`
   （`ControlPlaneGate`，头 `x-agentenv-control-plane`）。它的前提是「用户 REST 只经 gateway
@@ -207,6 +221,11 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   把 rest_upstream 当必填校验（`TestTheRestUpstreamIsAlwaysSet…`），键在则 gateway 的
   纯镜像 digest 回退仍然成立（新二进制忽略不认识的键）；删除挪到收尾提交，并在
   收尾时录入 `docs/src/configuration/env-vars.md` 的 removed 清单（今日效果：被忽略）。
+  **实施修订**：`api_manifest_test.go` 的 `TestTheGatewayCanBeFlippedToTheApiHalfWithoutEditingAManifest`
+  断言的正是「gateway Deployment 声明该键且非空」——它就是回滚窗口的 manifest 侧守卫，
+  因此**保留并改写理由**（更名 `TestTheGatewayKeepsTheRestUpstreamKeyForTheRollbackWindow`），
+  由收尾提交连同键一起删除。§8 那条「断言任何工作负载不再声明 `GATEWAY_REST_UPSTREAM_ADDR`」
+  的新守卫与回滚窗口直接冲突，**归入收尾提交**，本批不加。
   api 半边同批把门禁的武装配置（control-plane token 注入 Deployment 的那份）撤下：
   回退 api 镜像时旧门在场但未武装，已迁走的直连客户端不会集体 403（实施时验证
   武装机制确为配置驱动）。P3 的完整回滚因此是「镜像 + 本批未删的配置」成对回退。

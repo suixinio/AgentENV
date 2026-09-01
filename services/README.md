@@ -23,17 +23,11 @@ see CLAUDE.md's "Distributed Control Plane" section for the full picture.
 
 ## Features
 
-- Every user-facing REST call (`sandboxes`/`snapshots`/`templates`, including
-  `GET /sandboxes` and `GET /v2/sandboxes`) is forwarded unconditionally to
-  `gateway.rest_upstream_addr` — the `aenv-api` half. 🔴 There is no more
-  per-node fan-out: `cluster_list.go`, which used to aggregate those two
-  routes across every runtime node when no api half was configured, is
-  deleted along with the position it existed for (`services/shared/config`'s
-  `Config.Validate` now refuses to load a gateway config with
-  `rest_upstream_addr` empty).
-- Gateway aggregates `GET /nodes` and resolves `GET /nodes/{id}` from the
-  Scheduler protocol's `ListObservedNodes`/`GetNode` RPCs — today always
-  answered by `aenv-api`.
+- The gateway carries the sandbox data plane and nothing else. User-facing
+  REST — `sandboxes`, `snapshots`, `templates`, `/nodes` and
+  `/registry/sandboxes` — is answered by `aenv-api` at its own address. A
+  request here that names no sandbox (no proxy host name, no routing header)
+  gets a 404.
 - Gateway routes sandbox data-plane requests to whichever node the Scheduler
   protocol names, in a single `LookupNode` call. The answer comes from the
   sandbox-to-node binding, from the heartbeat roster that seeded it, or —
@@ -152,14 +146,13 @@ listener on every current deployment, not a local Go scheduler process
 
 ## Gateway configuration
 
-- `gateway.scheduler_addr` points to whichever process answers the Scheduler protocol — `agentenv-api` on every current deployment. The gateway uses it for scheduling, assignment writes, node listing, node detail resolution, and P2P scheduler APIs.
+- `gateway.scheduler_addr` points to whichever process answers the Scheduler protocol — `agentenv-api` on every current deployment. The gateway uses it for scheduling, assignment writes, and P2P scheduler APIs, and reuses its connection for the `apiproxy.ResumeSandbox` wake-up.
 - 🔴 `gateway.query_only_scheduler_addr` is **deleted**, knob and client path both. It named a second Scheduler-protocol endpoint that `LookupNode` alone would use, for HA read traffic served by `services/scheduler`'s `--query-only` replica mode; that Go binary is gone, and the client-selection field it configured (`QueryOnlySchedulerClient`) went with it. Every `LookupNode` call now goes to `gateway.scheduler_addr`, like every other Scheduler RPC this process makes. `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR` is **inert**: this package reads no such key and refuses no such name, so a manifest that still sets it is silently ignored. The same is true of `GATEWAY_SCHEDULER_FALLBACK_DISABLED` (deleted outright — the cold-path `LookupNode` call is unconditional again) and `GATEWAY_SCHEDULER_FALLBACK_TIMEOUT` (renamed, not removed — set `GATEWAY_COLD_LOOKUP_TIMEOUT` instead, or the cap silently stays at its 3s default). The startup refusal that named all three for one release has been removed with the rest of that transition's scaffolding.
 - `gateway.request_timeout` must be a duration string such as `"30s"` in JSON config files.
 - `gateway.request_timeout` applies to regular proxied HTTP requests. Streaming requests and WebSocket connections reuse the client context and are not cut off by this timeout.
 - `gateway.forward_response_size` only limits how much of a successful `POST /sandboxes` response the gateway buffers while extracting a sandbox ID for `RecordAssignment`; it is not a global response-size cap for all proxied traffic.
-- `GET /sandboxes` and `GET /v2/sandboxes` are forwarded unconditionally to `gateway.rest_upstream_addr` (the api half) like any other user-facing REST call. 🔴 There is no more per-node fan-out or cluster-wide merge for these two routes: `cluster_list.go`, which used to aggregate them across every scheduler-known node when no api half was configured, is deleted (`rest_upstream.go` now claims both routes unconditionally).
-- `GET /nodes` returns Scheduler-protocol observed node snapshots (including runtime/resource counters), with optional `clusterID` filtering.
-- `GET /nodes/{id}` resolves the node endpoint via the Scheduler protocol and then proxies to the runtime node's admin endpoint.
+- `gateway.rest_upstream_addr` and `GATEWAY_REST_UPSTREAM_ADDR` are **inert**: the gateway reads neither. They stay declared in `deploy/k8s/base` and `deploy/docker-compose.yml` for one release because the digest this one rolls back to requires an upstream that parses, which is what keeps that rollback a pure image-digest change.
+- Responses the gateway synthesizes itself — the 404 above, resume errors, scheduler and fencing rejections — carry `Access-Control-Allow-Origin: *`, and a preflight is answered where no upstream can answer it. A response a sandbox produced is never touched: CORS there is envd's or the user's own server's.
 - `GATEWAY_REQUEST_TIMEOUT=<duration>` overrides `gateway.request_timeout` from the environment (for example, `1m30s`).
 - `gateway.sandbox_proxy_domains` enables host-based sandbox data-plane routing for `{port}-{sandboxID}.{domain}` URLs. Domains are normalized to lowercase, deduplicated, and must be valid DNS names. Sandbox IDs used in host routes must be lowercase RFC 952/1123 DNS labels, and the full `{port}-{sandboxID}` label must be at most 63 characters.
 - `GATEWAY_SANDBOX_PROXY_DOMAINS=<domain>[,<domain>...]` overrides `gateway.sandbox_proxy_domains` from the environment.

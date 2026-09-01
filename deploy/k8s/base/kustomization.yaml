@@ -285,15 +285,14 @@ configMapGenerator:
   # environment, so an `apply -k` that emptied it is a CrashLoopBackOff at
   # the next gateway restart rather than the silent REST outage —
   # discoverable only as 404s — that it used to be. The only rollback left for
-  # this half is the image-tag rollback in `services/README.md`'s "Rolling the
-  # node half back" section: a pre-阶段3a gateway image tag alongside the
-  # pre-split DaemonSet image tag, in the same apply, because a current
-  # gateway image can no longer run with this empty at all.
+  # 🔴 The current gateway reads neither this key nor the environment variable
+  # it generates. Both stay for one release: the gateway digest this one rolls
+  # back to refuses to start without an upstream that parses, so keeping them
+  # is what makes that rollback a pure image-digest change. They are deleted
+  # once the window closes.
   #
-  # `config/gateway.json` still mounts the key empty, and that stays
-  # deliberate: it is what makes losing this ConfigMap a loud, fail-fast
-  # refusal to start rather than a fallback to a value nobody meant.
-  # `services/shared/config` has tests that pin both halves of this.
+  # `config/gateway.json` still mounts the key empty, which keeps the value in
+  # one place rather than two.
   - name: api-upstream-config
     literals:
       - GATEWAY_REST_UPSTREAM_ADDR=http://agentenv-api:8000

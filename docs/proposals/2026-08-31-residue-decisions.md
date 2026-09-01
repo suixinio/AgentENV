@@ -34,6 +34,10 @@ Go binding 由 `make -C services proto` 重新生成；Rust proto 在 build 时�
 
 ## D2 — 折叠只有一个取值的 `{"upstream"}` 标签
 
+> **已被取代（2026-09-01）**：`docs/proposals/2026-09-01-client-proxy-api-alignment.md`
+> §5 P3 把 gateway 的 REST 转发整个拆掉，`agentenv_gateway_rest_upstream_total`
+> 随之整条删除，折叠标签无从谈起。下文保留为记录。
+
 `agentenv_gateway_rest_upstream_total` 的 `upstream` 标签只有一个可达取值：本包任何构建
 都无法把面向用户的 REST 交给某个 node 处理。标签描述的维度不变化，因此折叠为普通
 Counter，与本文件里另一条单维计数器 `gatewayColdLookupTimeout` 同形。

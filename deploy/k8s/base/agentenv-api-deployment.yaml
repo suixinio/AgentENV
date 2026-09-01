@@ -4,14 +4,9 @@
 # one under a flag. There is no `--role` any more; see this file's `args:` note
 # below and `services/README.md`'s rollback section.
 #
-# 🔴 History, kept because the rollback story is what it explains. 阶段 3a
-# brought this workload up while the DaemonSet still ran the pre-split single
-# process; bringing it up was not what turned 3a on — the gateway's
-# `rest_upstream_addr` was (see gateway-deployment.yaml). That separation was
-# the whole of 3a's rollback story. 3b — the DaemonSet moving to the node half
-# — was the expensive one to reverse, and it has happened
-# (`_sd-impl-phase3-role.md` §11.1, §11.2). Reversing it now means deploying
-# the pre-split image tag on the DaemonSet, not changing a value here.
+# 🔴 Reversing the split means deploying the pre-split image tag on the
+# DaemonSet, not changing a value here (`_sd-impl-phase3-role.md` §11.1,
+# §11.2).
 #
 # 🔴 `aenv-api` assembles now (`src/bin/aenv-api.rs::assemble_api`): the cluster
 # metadata store, the remote backend factory and both gRPC listeners are wired.

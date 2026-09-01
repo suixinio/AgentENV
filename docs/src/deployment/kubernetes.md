@@ -48,10 +48,9 @@ Service's `http` port: `agentenv-api`'s `grpc` (8002) and `agentenv-gateway`'s
 a LoadBalancer must front the one named port, never the whole Service.
 
 The `aenv` client names them as `url` and `proxy_url` in its credentials file.
-`proxy_url` is optional and falls back to `url`, so a client configured with a
-single address that points at the gateway keeps working unchanged: the gateway
-still forwards REST to `agentenv-api` (`GATEWAY_REST_UPSTREAM_ADDR`, below).
-Point new configuration at both addresses; that forwarding is transitional.
+`proxy_url` is optional and falls back to `url`. Point both at their own
+address: a client that names only the gateway now gets a 404 on every REST
+call, because the gateway forwards none.
 
 ### Why a DaemonSet for Runtime Nodes
 
@@ -172,27 +171,19 @@ report the same label. Two replicas each configured with a *different* non-empty
 seed pass every startup check there is, so comparing this label across the
 replicas is the only place that divergence shows up.
 
-A client that names the REST address directly reaches this Deployment without
-any gateway involvement. One switch decides where REST arriving at the *gateway*
-is sent instead, and the gateway reads it:
+This Deployment is the REST address, and it is the only one. The gateway
+carries the sandbox data plane; a request that reaches it naming no sandbox —
+no proxy host name, no routing header — is answered 404, so a client has to be
+configured with both addresses. `proxy_url` defaulting to `url` is what a
+one-address client falls back to, and that fallback now only reaches the data
+plane.
 
-| Switch | Read by | Flipping it costs |
-|--------|---------|-------------------|
-| `GATEWAY_REST_UPSTREAM_ADDR` (`api-upstream-config`) | the gateway | a gateway roll, seconds |
-
-Point the gateway at `http://agentenv-api:8000`. It rides one gateway roll, so
-there is no ordering to get right and no preparatory step to take first. It
-exists so a client that still names one address keeps working; a client
-configured with both addresses never uses it.
-
-🔴 This used to be a pair: `GATEWAY_RESUME_ADDR` sat beside it in the same
-ConfigMap, naming the api half's gRPC wake-up surface at `agentenv-api:8002`.
-That key is deleted. `SandboxResumeService` and the `Scheduler` service share
-one gRPC listener on `agentenv-api`, so the key could only ever hold
-`GATEWAY_SCHEDULER_ADDR`'s value, and the gateway now reuses that connection
-for the wake-up RPC instead of opening a second one to the same process. A
-manifest that still sets `GATEWAY_RESUME_ADDR` is ignored, not refused — the
-loader reads no such key.
+🔴 `GATEWAY_REST_UPSTREAM_ADDR` (`api-upstream-config`) is still declared in
+`deploy/k8s/base`, and this build ignores it. It stays for one release because
+the gateway digest this one rolls back to refuses to start without an upstream
+that parses — keeping the key is what makes that rollback a pure image-digest
+change. It is deleted once the window closes, and recorded in
+`docs/src/configuration/env-vars.md` then.
 
 🔴 **There is no node-side switch to throw beforehand.** Earlier revisions of
 this page opened with `AENV_NODE_SERVICE_ENABLED` (`node-service-config`), billed
@@ -215,16 +206,10 @@ and why it is retired.
 
 🔴 **Do not turn a gateway switch on by editing `config/gateway.json`.** An
 environment variable set to the empty string is ignored by the loader, so a
-value that lives in the file cannot be cleared from the environment — and
-losing `api-upstream-config` would then fall back to a real address in the
-file instead of the fail-fast refusal that emptying it is meant to produce.
-Keep the file's values empty and drive both switches from `api-upstream-config`
-or `kubectl set env`.
-
-For `GATEWAY_REST_UPSTREAM_ADDR` this holds only while the gateway forwards
-REST at all: the key goes away once clients name the REST address themselves.
-The rule stands for `GATEWAY_SCHEDULER_ADDR`, which carries the wake-up RPC and
-is part of the gateway's permanent surface.
+value that lives in the file cannot be cleared from the environment. Keep the
+file's values empty and drive the switch from its ConfigMap or `kubectl set
+env`. This matters for `GATEWAY_SCHEDULER_ADDR`, which carries the wake-up RPC
+and is part of the gateway's permanent surface.
 
 The API half reaches a node's gRPC service by substituting
 `AENV_NODE_SERVICE_PORT` into the address the scheduler gives it, which is the

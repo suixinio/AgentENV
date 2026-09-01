@@ -29,17 +29,31 @@ pub enum MissingLocalResume {
     Busy { holder: String },
     /// The registry could not determine the answer.
     Undecided(String),
+    /// A rebuild from the row's published snapshot was attempted and failed.
+    Failed(String),
 }
 
 /// Pure classification of registry and local-store observations.
+#[derive(Debug, PartialEq, Eq)]
 enum MissingLocalVerdict {
     Unknown,
     Ready,
-    Wait { holder: String },
-    Busy { holder: String },
+    /// The row is parked with a published snapshot, so any claimant can rebuild it.
+    Rebuildable,
+    Wait {
+        holder: String,
+    },
+    Busy {
+        holder: String,
+    },
 }
 
 /// Classifies a missing local resume without converting uncertainty into absence.
+///
+/// Parked rows are classified by what their snapshot allows, never by whether
+/// `origin_node_id` happens to match the reader: that comparison is an identity
+/// mismatch in a split deployment, where the claimant is a process and the
+/// origin is a machine.
 fn missing_local_verdict(
     entry: Option<&PausedSandboxEntry>,
     local: Option<&SandboxMetadata>,
@@ -51,6 +65,10 @@ fn missing_local_verdict(
 
     if local.is_some_and(|m| m.state == SandboxState::Running) {
         return MissingLocalVerdict::Ready;
+    }
+
+    if entry.state == PausedRegistryState::Paused && entry.snapshot_id.is_some() {
+        return MissingLocalVerdict::Rebuildable;
     }
 
     let holder = entry
@@ -172,7 +190,11 @@ impl ApiImpl {
     /// Retry cadence while startup release remains safely fenced.
     const STALE_RELEASE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 
-    pub async fn resolve_missing_local_resume(&self, sandbox_id: SandboxId) -> MissingLocalResume {
+    pub async fn resolve_missing_local_resume(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: NewTimeout,
+    ) -> MissingLocalResume {
         if !self.paused.registry().is_cluster_backed() {
             return MissingLocalResume::Unknown;
         }
@@ -201,6 +223,9 @@ impl ApiImpl {
                         None => MissingLocalResume::Busy { holder },
                     };
                 }
+                MissingLocalVerdict::Rebuildable => {
+                    return self.claim_and_restore(sandbox_id, timeout).await
+                }
                 MissingLocalVerdict::Busy { holder } => return MissingLocalResume::Busy { holder },
                 MissingLocalVerdict::Wait { holder: who } => {
                     holder = who;
@@ -224,6 +249,82 @@ impl ApiImpl {
     /// Releases a resume claim after the corresponding resume failed.
     pub(in crate::api) async fn abandon_claim(&self, sandbox_id: SandboxId, generation: i64) {
         self.release_claim(&sandbox_id, generation).await;
+    }
+
+    /// Takes a claim on a parked row this process holds no copy of and rebuilds it.
+    ///
+    /// The claim CAS is the mutual exclusion: a caller that loses it reports the
+    /// winner rather than starting a second copy.
+    async fn claim_and_restore(
+        &self,
+        sandbox_id: SandboxId,
+        timeout: NewTimeout,
+    ) -> MissingLocalResume {
+        let entry = match self.arbitrate_resume(sandbox_id).await {
+            ResumeArbitration::Held(entry, _) => entry,
+            // No row left to rebuild from.
+            ResumeArbitration::Proceed(_) => return MissingLocalResume::Unknown,
+            ResumeArbitration::Blocked { origin_node_id }
+            | ResumeArbitration::NotReady { origin_node_id } => {
+                return MissingLocalResume::Busy {
+                    holder: origin_node_id,
+                }
+            }
+            ResumeArbitration::Unavailable { reason } => {
+                return MissingLocalResume::Undecided(reason)
+            }
+        };
+
+        match self.restore_claimed_sandbox(*entry, timeout).await {
+            CrossNodeResume::Restored(metadata) => MissingLocalResume::Resumed(metadata),
+            CrossNodeResume::NotFound => MissingLocalResume::Unknown,
+            CrossNodeResume::Failed(reason) => MissingLocalResume::Failed(reason),
+        }
+    }
+
+    /// Rebuilds a claimed sandbox whose holding node no longer has the capture.
+    ///
+    /// The stale local record is dropped first: it names a capture that is gone,
+    /// and the rebuild writes a new one.
+    pub(in crate::api) async fn rebuild_after_absent_capture(
+        &self,
+        entry: Box<PausedSandboxEntry>,
+        timeout: NewTimeout,
+    ) -> CrossNodeResume {
+        let sandbox_id = entry.sandbox_id;
+        let generation = entry.generation;
+
+        info!(
+            %sandbox_id,
+            origin_node_id = %entry.origin_node_id,
+            "the node holding this paused sandbox no longer has its capture; rebuilding it \
+             from the published snapshot"
+        );
+
+        match self
+            .orchestrator()
+            .discard_local_paused_record(sandbox_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                self.release_claim(&sandbox_id, generation).await;
+
+                return CrossNodeResume::Failed(
+                    "the paused record left its parked state before it could be rebuilt"
+                        .to_string(),
+                );
+            }
+            Err(err) => {
+                self.release_claim(&sandbox_id, generation).await;
+
+                return CrossNodeResume::Failed(format!(
+                    "failed to drop the paused record whose capture is gone: {err}"
+                ));
+            }
+        }
+
+        self.restore_claimed_sandbox(*entry, timeout).await
     }
 
     /// Rebuilds a sandbox from a claim already held by this node.
@@ -1924,7 +2025,6 @@ mod tests {
         for row in [
             entry(PausedRegistryState::Resuming, "other", Some("other")),
             entry(PausedRegistryState::Running, "other", None),
-            entry(PausedRegistryState::Paused, "other", None),
             entry(PausedRegistryState::Publishing, "other", None),
             entry(PausedRegistryState::LocalOnly, "other", None),
         ] {
@@ -1938,12 +2038,34 @@ mod tests {
     }
 
     #[test]
-    fn our_own_paused_row_is_busy_not_missing() {
-        let row = entry(PausedRegistryState::Paused, "self", None);
-        assert!(matches!(
-            missing_local_verdict(Some(&row), None, "self"),
-            MissingLocalVerdict::Busy { .. }
-        ));
+    fn a_parked_row_is_rebuildable_from_whichever_process_reads_it() {
+        // Production shapes: the origin is a machine, the claimant a process.
+        // The two never match, so a verdict that turned on them matching would
+        // report the same lie to every replica.
+        let row = entry(PausedRegistryState::Paused, HOLDER, None);
+
+        for reader in [SELF, OTHER, HOLDER] {
+            assert_eq!(
+                missing_local_verdict(Some(&row), None, reader),
+                MissingLocalVerdict::Rebuildable,
+                "a published parked row is rebuildable, and 'is being resumed by {HOLDER}' is \
+                 a statement about nothing that is happening"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parked_row_with_nothing_published_stays_busy() {
+        let mut row = entry(PausedRegistryState::Paused, HOLDER, None);
+        row.snapshot_id = None;
+
+        assert!(
+            matches!(
+                missing_local_verdict(Some(&row), None, SELF),
+                MissingLocalVerdict::Busy { .. }
+            ),
+            "the control: with no published snapshot there is nothing to rebuild from"
+        );
     }
 }
 
@@ -2330,6 +2452,204 @@ mod cross_node_resume_source_tests {
             "🔴 the assertion. This manager's runtime resolver fails every call, so a restore \
              that touched it could not have got here — restoring over it is the proof that this \
              path never turned the catalog row into local bytes, got {outcome:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod absent_capture_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use agentenv_http_server::apis::sandboxes::{Sandboxes, SandboxesSandboxIdResumePostResponse};
+    use agentenv_http_server::models;
+    use chrono::Utc;
+
+    use super::super::paused_coordinator::test_support::CountingRegistry;
+    use super::*;
+    use crate::identity::NodeIdentity;
+    use crate::orchestrator::{
+        FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator, PausedSandboxRegistry,
+        SandboxPersister,
+    };
+    use crate::sandbox::mock::{MockBackendFactory, MockBehavior, MockSnapshot};
+    use crate::snapshot::mock::unresolvable_snapshot_manager;
+    use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
+
+    /// The machine that took the capture. Never a claimant identity.
+    const ORIGIN: &str = "aenv-node-203";
+
+    /// Where the holding node keeps the record a reopen needs.
+    fn record_path(root: &Path, sandbox_id: SandboxId) -> PathBuf {
+        root.join("records").join(format!("{sandbox_id}.json"))
+    }
+
+    fn parked_row(sandbox_id: SandboxId, snapshot_id: Option<SnapshotId>) -> PausedSandboxEntry {
+        PausedSandboxEntry {
+            sandbox_id,
+            cluster_id: uuid::Uuid::nil(),
+            state: match snapshot_id {
+                Some(_) => PausedRegistryState::Paused,
+                None => PausedRegistryState::LocalOnly,
+            },
+            generation: 3,
+            origin_node_id: ORIGIN.to_string(),
+            claimed_by_node_id: None,
+            snapshot_id,
+            metadata: Some(SandboxMetadata {
+                id: sandbox_id,
+                ..Default::default()
+            }),
+            execution_id: None,
+            paused_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Writes the capture record and artifacts a node holds for a paused sandbox.
+    ///
+    /// Call before building the orchestrator: startup is what loads it.
+    async fn seed_capture(root: &Path, sandbox_id: SandboxId) {
+        let persister = FileBackedSandboxPersister::new_for_test(root.to_path_buf());
+        let artifacts = root.join("artifacts").join(sandbox_id.to_string());
+        std::fs::create_dir_all(&artifacts).expect("an artifact directory");
+
+        persister
+            .persist_paused(
+                &SandboxMetadata {
+                    id: sandbox_id,
+                    ..Default::default()
+                },
+                Some(&artifacts),
+                &MockSnapshot,
+            )
+            .await
+            .expect("a persisted capture");
+        persister
+            .mark_cluster_registered(&sandbox_id, ORIGIN)
+            .await
+            .expect("a registered capture");
+    }
+
+    async fn api_over_capture(
+        root: &Path,
+        sandbox_id: SandboxId,
+        registry: Arc<CountingRegistry>,
+    ) -> Arc<ApiImpl> {
+        let behavior = Arc::new(MockBehavior::new());
+        behavior.reopen_needs_capture_record(record_path(root, sandbox_id), ORIGIN, sandbox_id);
+
+        let orchestrator = Orchestrator::new(
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(behavior),
+            FileBackedSandboxPersister::new_for_test(root.to_path_buf()),
+            crate::image::DisabledRuntimeImageRefs::shared(),
+        )
+        .await
+        .expect("an orchestrator");
+
+        let snapshot_manager: Arc<SnapshotManager> = Arc::new(unresolvable_snapshot_manager(
+            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+        ));
+
+        Arc::new(ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                registry as Arc<dyn PausedSandboxRegistry>,
+                snapshot_manager,
+                &NodeIdentity::from_config(&Default::default()),
+            ),
+            Vec::new(),
+            crate::api::ResumeWiring::api_half_for_test(),
+        ))
+    }
+
+    async fn resume(api: &ApiImpl, sandbox_id: SandboxId) -> SandboxesSandboxIdResumePostResponse {
+        api.sandboxes_sandbox_id_resume_post(
+            &http::Method::POST,
+            &headers::Host::from(http::uri::Authority::from_static("localhost")),
+            &axum_extra::extract::CookieJar::new(),
+            &super::super::Claims,
+            &models::SandboxesSandboxIdResumePostPathParams {
+                sandbox_id: sandbox_id.to_string(),
+            },
+            &models::ResumedSandbox::new(),
+        )
+        .await
+        .expect("the handler answers rather than failing the request")
+    }
+
+    #[tokio::test]
+    async fn a_published_sandbox_whose_node_lost_its_capture_resumes_by_rebuilding() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let sandbox_id = SandboxId::new();
+        seed_capture(root.path(), sandbox_id).await;
+
+        let snapshot_id = SnapshotId::generate();
+        let registry = Arc::new(CountingRegistry::holding(parked_row(
+            sandbox_id,
+            Some(snapshot_id),
+        )));
+        let api = api_over_capture(root.path(), sandbox_id, Arc::clone(&registry)).await;
+
+        // The pve-mf failure, reproduced: the row and the repository bytes are
+        // intact, and only the holding node's capture record is gone.
+        std::fs::remove_file(record_path(root.path(), sandbox_id))
+            .expect("the capture record was written by the seed");
+
+        let answer = resume(&api, sandbox_id).await;
+
+        assert!(
+            matches!(
+                answer,
+                SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully { .. }
+            ),
+            "🔴 the assertion. A published row plus repository bytes is everything a rebuild \
+             needs; answering anything else here is the deterministic 500 this branch exists \
+             to remove, got {answer:?}"
+        );
+        assert_eq!(
+            registry.claimed_as(),
+            vec![api.paused.node_id().to_string()],
+            "the rebuild has to run under the claim this process took, not under the origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpublished_sandbox_whose_node_lost_its_capture_is_still_refused() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let sandbox_id = SandboxId::new();
+        seed_capture(root.path(), sandbox_id).await;
+
+        let registry = Arc::new(CountingRegistry::holding(parked_row(sandbox_id, None)));
+        let api = api_over_capture(root.path(), sandbox_id, Arc::clone(&registry)).await;
+
+        std::fs::remove_file(record_path(root.path(), sandbox_id))
+            .expect("the capture record was written by the seed");
+
+        let answer = resume(&api, sandbox_id).await;
+
+        let SandboxesSandboxIdResumePostResponse::Status409_Conflict(error) = answer else {
+            panic!(
+                "the control. Nothing outside the origin has these bytes, so this resume must \
+                 still be refused, got {answer:?}"
+            );
+        };
+        assert!(
+            error.message.contains(ORIGIN),
+            "the refusal has to name the machine that holds the only copy: {error:?}"
+        );
+        assert!(
+            api.orchestrator()
+                .get_sandbox(&sandbox_id)
+                .await
+                .expect("the store answers")
+                .is_some(),
+            "a refused resume must leave the local record alone; discarding it here would \
+             throw away the only pointer to the only copy"
         );
     }
 }

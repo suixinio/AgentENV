@@ -266,6 +266,35 @@ impl ApiImpl {
             .map(|domain| Nullable::Present(domain.clone()));
         sandbox
     }
+
+    /// Maps a snapshot-backed rebuild onto the resume endpoint's responses.
+    fn rebuilt_resume_response(
+        &self,
+        rebuilt: CrossNodeResume,
+        sandbox_id: SandboxId,
+    ) -> SandboxesSandboxIdResumePostResponse {
+        match rebuilt {
+            CrossNodeResume::Restored(metadata) => {
+                let routing = RoutingHeaders::of(&metadata);
+
+                SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
+                    body: self.sandbox_model(*metadata),
+                    x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                    x_agentenv_execution_id: Some(routing.execution_id),
+                    x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                }
+            }
+            CrossNodeResume::NotFound => SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                sandbox_not_found(sandbox_id.to_string()),
+            ),
+            CrossNodeResume::Failed(reason) => {
+                SandboxesSandboxIdResumePostResponse::Status500_ServerError(Self::error(
+                    500,
+                    format!("failed to restore paused sandbox: {reason}"),
+                ))
+            }
+        }
+    }
 }
 
 fn parse_metadata_filter(raw: &Option<String>) -> Option<HashMap<String, String>> {
@@ -735,9 +764,12 @@ impl Sandboxes<()> for ApiImpl {
         }
 
         // Arbitrate every resume path before touching the local sandbox.
-        let (claimed, connect_held) = match self.arbitrate_resume(sandbox_id).await {
-            ResumeArbitration::Proceed(claimed) => (claimed, None),
-            ResumeArbitration::Held(entry, claimed) => (claimed, Some(entry.generation)),
+        let (entry, claimed, connect_held) = match self.arbitrate_resume(sandbox_id).await {
+            ResumeArbitration::Proceed(claimed) => (None, claimed, None),
+            ResumeArbitration::Held(entry, claimed) => {
+                let generation = entry.generation;
+                (Some(entry), claimed, Some(generation))
+            }
             ResumeArbitration::Blocked { origin_node_id } => {
                 return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
                     Self::error(400, format!("sandbox is held by node '{origin_node_id}'")),
@@ -823,6 +855,42 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
             Err(err) => {
+                // The capture is gone but the row's snapshot is not; rebuild instead.
+                if let Some(entry) = entry.filter(|_| err.is_paused_capture_absent()) {
+                    let rebuilt = self
+                        .rebuild_after_absent_capture(
+                            entry,
+                            NewTimeout::Set(Duration::from_secs(body.timeout as u64)),
+                        )
+                        .await;
+
+                    return Ok(match rebuilt {
+                        CrossNodeResume::Restored(metadata) => {
+                            let routing = RoutingHeaders::of(&metadata);
+
+                            SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully {
+                                body: self.sandbox_model(*metadata),
+                                x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                                x_agentenv_execution_id: Some(routing.execution_id),
+                                x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                            }
+                        }
+                        CrossNodeResume::NotFound => {
+                            SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
+                                sandbox_not_found(sandbox_id.to_string()),
+                            )
+                        }
+                        CrossNodeResume::Failed(reason) => {
+                            SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
+                                Self::error(
+                                    500,
+                                    format!("failed to restore paused sandbox: {reason}"),
+                                ),
+                            )
+                        }
+                    });
+                }
+
                 if let Some(generation) = connect_held {
                     self.abandon_claim(sandbox_id, generation).await;
                 }
@@ -1392,71 +1460,61 @@ impl Sandboxes<()> for ApiImpl {
                 let Some(entry) = entry else {
                     // A concurrent resume loser can arrive here while the winner starts the sandbox.
                     // Confirm cluster absence before returning 404, which permits rebuild.
-                    return Ok(match self.resolve_missing_local_resume(sandbox_id).await {
-                        MissingLocalResume::Unknown => {
-                            SandboxesSandboxIdResumePostResponse::Status404_NotFound(
-                                sandbox_not_found(id),
-                            )
-                        }
-                        MissingLocalResume::Resumed(metadata) => {
-                            let routing = RoutingHeaders::of(&metadata);
+                    return Ok(
+                        match self
+                            .resolve_missing_local_resume(sandbox_id, NewTimeout::Set(timeout))
+                            .await
+                        {
+                            MissingLocalResume::Unknown => {
+                                SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                                    sandbox_not_found(id),
+                                )
+                            }
+                            MissingLocalResume::Resumed(metadata) => {
+                                let routing = RoutingHeaders::of(&metadata);
 
-                            SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
+                                SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
                                 body: self.sandbox_model(*metadata),
                                 x_agentenv_sandbox_id: Some(routing.sandbox_id),
                                 x_agentenv_execution_id: Some(routing.execution_id),
                                 x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
                             }
-                        }
-                        MissingLocalResume::Busy { holder } => {
-                            SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
-                                409,
-                                format!("sandbox is being resumed by node '{holder}'"),
-                            ))
-                        }
-                        MissingLocalResume::Undecided(reason) => {
-                            SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                                Self::error(
-                                    500,
-                                    format!(
+                            }
+                            MissingLocalResume::Busy { holder } => {
+                                SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                                    Self::error(
+                                        409,
+                                        format!("sandbox is being resumed by node '{holder}'"),
+                                    ),
+                                )
+                            }
+                            MissingLocalResume::Undecided(reason) => {
+                                SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                                    Self::error(
+                                        500,
+                                        format!(
                                     "cannot determine whether the sandbox still exists: {reason}"
                                 ),
-                                ),
-                            )
-                        }
-                    });
+                                    ),
+                                )
+                            }
+                            MissingLocalResume::Failed(reason) => {
+                                SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                                    Self::error(
+                                        500,
+                                        format!("failed to restore paused sandbox: {reason}"),
+                                    ),
+                                )
+                            }
+                        },
+                    );
                 };
 
-                return Ok(
-                    match self
-                        .restore_claimed_sandbox(*entry, NewTimeout::Set(timeout))
-                        .await
-                    {
-                        CrossNodeResume::Restored(metadata) => {
-                            let routing = RoutingHeaders::of(&metadata);
+                let rebuilt = self
+                    .restore_claimed_sandbox(*entry, NewTimeout::Set(timeout))
+                    .await;
 
-                            SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
-                            body: self.sandbox_model(*metadata),
-                            x_agentenv_sandbox_id: Some(routing.sandbox_id),
-                            x_agentenv_execution_id: Some(routing.execution_id),
-                            x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
-                        }
-                        }
-                        CrossNodeResume::NotFound => {
-                            SandboxesSandboxIdResumePostResponse::Status404_NotFound(
-                                sandbox_not_found(id),
-                            )
-                        }
-                        CrossNodeResume::Failed(reason) => {
-                            SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                                Self::error(
-                                    500,
-                                    format!("failed to restore paused sandbox: {reason}"),
-                                ),
-                            )
-                        }
-                    },
-                );
+                return Ok(self.rebuilt_resume_response(rebuilt, sandbox_id));
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 if let Some(generation) = held {
@@ -1471,6 +1529,15 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
             Err(err) => {
+                // The capture is gone but the row's snapshot is not; rebuild instead.
+                if let Some(entry) = entry.filter(|_| err.is_paused_capture_absent()) {
+                    let rebuilt = self
+                        .rebuild_after_absent_capture(entry, NewTimeout::Set(timeout))
+                        .await;
+
+                    return Ok(self.rebuilt_resume_response(rebuilt, sandbox_id));
+                }
+
                 if let Some(generation) = held {
                     self.abandon_claim(sandbox_id, generation).await;
                 }

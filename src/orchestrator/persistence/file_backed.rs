@@ -173,9 +173,8 @@ impl FileBackedSandboxPersister {
             .get(&sandbox_id.to_string())
             .await
             .map_err(|source| SandboxPersistenceError::store("read paused sandbox record", source))?
-            .ok_or_else(|| SandboxPersistenceError::InvalidRecord {
-                reason: format!("paused sandbox record {sandbox_id} not found"),
-                source: None,
+            .ok_or(SandboxPersistenceError::RecordAbsent {
+                sandbox_id: *sandbox_id,
             })?;
         decode_record(&bytes)
     }

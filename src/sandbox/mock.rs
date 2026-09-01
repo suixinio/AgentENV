@@ -88,6 +88,8 @@ pub struct MockBehavior {
     last_custom_extension_params: Mutex<Option<Option<CustomExtensionParams>>>,
     captures_are_stageable: AtomicBool,
     holding_node_id: Mutex<Option<&'static str>>,
+    /// Record file a reopen needs, with the node and sandbox it belongs to.
+    capture_record: Mutex<Option<(std::path::PathBuf, String, crate::types::SandboxId)>>,
 }
 
 impl MockBehavior {
@@ -103,6 +105,44 @@ impl MockBehavior {
     /// Makes every capture from here on something a repository can stage.
     pub fn make_captures_stageable(&self) {
         self.captures_are_stageable.store(true, Ordering::SeqCst);
+    }
+
+    /// Ties reopening to `record`, so deleting that file reproduces a node that
+    /// answers a resume with the capture-absent refusal.
+    pub fn reopen_needs_capture_record(
+        &self,
+        record: std::path::PathBuf,
+        node_id: &str,
+        sandbox_id: crate::types::SandboxId,
+    ) {
+        *self
+            .capture_record
+            .lock()
+            .expect("mock behavior mutex poisoned") =
+            Some((record, node_id.to_string(), sandbox_id));
+    }
+
+    /// The refusal a node produces when the record a reopen names is gone.
+    fn absent_capture(&self) -> Option<anyhow::Error> {
+        let guard = self
+            .capture_record
+            .lock()
+            .expect("mock behavior mutex poisoned");
+        let (record, node_id, sandbox_id) = guard.as_ref()?;
+        if record.exists() {
+            return None;
+        }
+
+        // Classify through the same path a real node status takes.
+        Some(anyhow::Error::new(
+            crate::node_client::wire::RemoteResumeFailure::from_status(
+                node_id,
+                *sandbox_id,
+                tonic::Status::not_found(format!(
+                    "sandbox {sandbox_id} is not paused on this node"
+                )),
+            ),
+        ))
     }
 
     fn capture(&self) -> CapturedSandboxSnapshot {
@@ -320,6 +360,8 @@ pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
     execution_id: ExecutionId,
+    /// Only a backend built from paused state reopens a capture.
+    reopens_a_capture: bool,
 }
 
 impl MockSandboxBackend {
@@ -340,6 +382,23 @@ impl MockSandboxBackend {
             behavior,
             host_ip,
             execution_id,
+            reopens_a_capture: false,
+        }
+    }
+
+    fn reopening(mut self) -> Self {
+        self.reopens_a_capture = true;
+        self
+    }
+
+    /// The capture-absent refusal, when this backend reopens a record that is gone.
+    fn refuse_absent_capture(&self) -> Result<()> {
+        match self
+            .reopens_a_capture
+            .then(|| self.behavior.absent_capture())
+        {
+            Some(Some(refusal)) => Err(refusal),
+            _ => Ok(()),
         }
     }
 }
@@ -351,10 +410,12 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     async fn start(&mut self) -> Result<()> {
+        self.refuse_absent_capture()?;
         self.behavior.apply_async(MockOperation::Start).await
     }
 
     async fn start_nowait(&mut self) -> Result<()> {
+        self.refuse_absent_capture()?;
         self.behavior.apply_async(MockOperation::StartNowait).await
     }
 
@@ -563,11 +624,14 @@ impl SandboxBackendFactory for MockBackendFactory {
         _envd_access_token: Option<super::EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
         self.behavior.apply_sync(MockOperation::BuildFromSnapshot)?;
-        Ok(Box::new(MockSandboxBackend::new_with_host_ip(
-            Arc::clone(&self.behavior),
-            self.host_ip,
-            execution_id,
-        )))
+        Ok(Box::new(
+            MockSandboxBackend::new_with_host_ip(
+                Arc::clone(&self.behavior),
+                self.host_ip,
+                execution_id,
+            )
+            .reopening(),
+        ))
     }
 
     fn decode_paused_state(

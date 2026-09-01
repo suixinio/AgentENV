@@ -2107,9 +2107,9 @@ where
                 .store
                 .update_state_if_state(&sandbox_id, SandboxState::Paused, &[SandboxState::Resuming])
                 .await;
-            return Err(OrchestratorError::InternalError(format!(
-                "failed to mark persisted sandbox record as resuming: {err:#}"
-            )));
+            // Kept typed: an absent record is a capture the caller may rebuild from
+            // the published snapshot, and flattening it to a string hides that.
+            return Err(OrchestratorError::SandboxPersistenceFailed(err));
         }
 
         let resumed_execution_id = claimed.execution_id();

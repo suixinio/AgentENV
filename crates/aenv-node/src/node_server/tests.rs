@@ -6,10 +6,10 @@ use std::time::Duration;
 use tonic::{Code, Request, Status};
 
 use crate::orchestrator::{
-    ControlPlaneConfig, CreateSandboxRequest, DisabledSandboxPersister, ForkChildAssignment,
-    ForkChildren, InMemoryMetadataStore, NewTimeout, Orchestrator, RecordingCall,
-    RecordingPersister, SandboxExpiry, SandboxLaunchSource, SandboxMetadata, SandboxOrchestration,
-    SandboxTimeoutAction,
+    ControlPlaneConfig, CreateSandboxRequest, DisabledSandboxPersister, FileBackedSandboxPersister,
+    ForkChildAssignment, ForkChildren, InMemoryMetadataStore, NewTimeout, Orchestrator,
+    RecordingCall, RecordingPersister, SandboxExpiry, SandboxLaunchSource, SandboxMetadata,
+    SandboxOrchestration, SandboxTimeoutAction,
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxService as _;
@@ -1700,6 +1700,59 @@ async fn a_resume_reopens_the_capture_under_the_run_the_caller_claimed() {
     assert_eq!(
         sandboxes[0].control_plane_config, b"owned",
         "the sandbox came back without the record that says whose it is"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_whose_capture_record_is_gone_answers_not_found() {
+    crate::logging::init_for_tests();
+    let root = tempfile::tempdir().expect("a temp dir");
+    let orchestrator = Orchestrator::new(
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+        crate::image::DisabledRuntimeImageRefs::shared(),
+    )
+    .await
+    .expect("an orchestrator that keeps records");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let service = NodeSandboxService::new(
+        Arc::clone(&orchestration),
+        Arc::new(mock_snapshot_manager()),
+        NODE.to_string(),
+    );
+
+    let paused = pause(&orchestration, b"owned").await;
+    std::fs::remove_file(
+        root.path()
+            .join("records")
+            .join(format!("{}.json", paused.id)),
+    )
+    .expect("pausing wrote the record this deletes");
+
+    let err = service
+        .resume(Request::new(resume_request(
+            paused.id,
+            paused.execution_id,
+            ExecutionId::new(),
+            0,
+        )))
+        .await
+        .expect_err("the capture this resume needs is gone");
+
+    assert_eq!(
+        err.code(),
+        Code::NotFound,
+        "the api half rebuilds only an absence it can classify, and every other code reaches \
+         the caller as a 500 instead: {err}"
+    );
+    assert!(
+        matches!(
+            crate::node_client::wire::RemoteResumeFailure::from_status(NODE, paused.id, err),
+            crate::node_client::wire::RemoteResumeFailure::CaptureAbsent { .. }
+        ),
+        "the two halves have to agree: this status is what the api half classifies"
     );
 }
 

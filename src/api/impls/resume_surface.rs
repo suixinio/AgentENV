@@ -493,19 +493,22 @@ impl ApiImpl {
                 let Some(entry) = entry else {
                     return self.resolve_missing(sandbox_id, placement).await;
                 };
-                match self
-                    .restore_claimed_sandbox(
-                        *entry,
-                        NewTimeout::EnsureMinimum(auto_resume_min_sandbox_timeout()),
-                    )
-                    .await
-                {
-                    CrossNodeResume::Restored(metadata) => self.woken(*metadata, placement),
-                    CrossNodeResume::NotFound => DataPlaneResume::NotFound,
-                    CrossNodeResume::Failed(reason) => DataPlaneResume::Failed(reason),
-                }
+                let rebuilt = self
+                    .restore_claimed_sandbox(*entry, Self::wake_timeout())
+                    .await;
+
+                self.woken_from_rebuild(rebuilt, placement)
             }
             Err(err) => {
+                // The capture is gone but the row's snapshot is not; rebuild instead.
+                if let Some(entry) = entry.filter(|_| err.is_paused_capture_absent()) {
+                    let rebuilt = self
+                        .rebuild_after_absent_capture(entry, Self::wake_timeout())
+                        .await;
+
+                    return self.woken_from_rebuild(rebuilt, placement);
+                }
+
                 warn!(%sandbox_id, error = %err, "waking a sandbox for the data plane failed");
                 if let Some(generation) = held {
                     self.abandon_claim(sandbox_id, generation).await;
@@ -515,17 +518,38 @@ impl ApiImpl {
         }
     }
 
+    /// The timeout floor a traffic-triggered wake-up gives the sandbox it starts.
+    fn wake_timeout() -> NewTimeout {
+        NewTimeout::EnsureMinimum(auto_resume_min_sandbox_timeout())
+    }
+
+    fn woken_from_rebuild(
+        &self,
+        rebuilt: CrossNodeResume,
+        placement: &ResumePlacement,
+    ) -> DataPlaneResume {
+        match rebuilt {
+            CrossNodeResume::Restored(metadata) => self.woken(*metadata, placement),
+            CrossNodeResume::NotFound => DataPlaneResume::NotFound,
+            CrossNodeResume::Failed(reason) => DataPlaneResume::Failed(reason),
+        }
+    }
+
     /// Resolves a no-local-copy, no-claim outcome without turning races into 404.
     async fn resolve_missing(
         &self,
         sandbox_id: SandboxId,
         placement: &ResumePlacement,
     ) -> DataPlaneResume {
-        match self.resolve_missing_local_resume(sandbox_id).await {
+        match self
+            .resolve_missing_local_resume(sandbox_id, Self::wake_timeout())
+            .await
+        {
             MissingLocalResume::Unknown => DataPlaneResume::NotFound,
             MissingLocalResume::Resumed(metadata) => self.woken(*metadata, placement),
             MissingLocalResume::Busy { holder } => DataPlaneResume::TransitionInProgress { holder },
             MissingLocalResume::Undecided(reason) => DataPlaneResume::Undecided(reason),
+            MissingLocalResume::Failed(reason) => DataPlaneResume::Failed(reason),
         }
     }
 

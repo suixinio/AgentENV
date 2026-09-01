@@ -13,7 +13,7 @@ use crate::image::ImageResolver;
 use crate::orchestrator::{
     ClaimedExecution, CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox,
     NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxMetadata, SandboxOperation,
-    SandboxOrchestration,
+    SandboxOrchestration, SandboxPersistenceError,
 };
 use crate::proto::node as pb;
 use crate::sandbox::{
@@ -456,6 +456,12 @@ fn orchestrator_status(err: &OrchestratorError) -> Status {
         OrchestratorError::SandboxNotFound(sandbox_id) => {
             Status::not_found(format!("sandbox {sandbox_id} is not on this node"))
         }
+        // Absence, not node failure: a claim holder can rebuild a published row.
+        OrchestratorError::SandboxPersistenceFailed(SandboxPersistenceError::RecordAbsent {
+            sandbox_id,
+        }) => Status::not_found(format!(
+            "sandbox {sandbox_id} is not holding a paused capture on this node"
+        )),
         OrchestratorError::InvalidRequest(message) => Status::invalid_argument(message.clone()),
         OrchestratorError::InvalidSandboxState { .. }
         | OrchestratorError::SandboxOperationConflict { .. }

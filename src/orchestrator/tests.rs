@@ -4353,7 +4353,10 @@ async fn resume_mark_resuming_failure_restores_paused_metadata() -> Result<()> {
         .await
         .expect_err("resume should fail when persister cannot mark record resuming");
 
-    assert!(matches!(err, OrchestratorError::InternalError(_)));
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxPersistenceFailed(_)
+    ));
     assert_eq!(persister.calls(), vec![RecordingCall::MarkResuming]);
     let metadata = orchestrator
         .get_sandbox(&created.id)

@@ -2047,6 +2047,8 @@ pub mod test_support {
         /// Deadline-renewal calls observed by the fixture.
         renewed_deadlines:
             std::sync::Mutex<Vec<(SandboxId, ExecutionId, Option<std::time::SystemTime>)>>,
+        /// Parked row this fixture both answers reads with and grants claims on.
+        parked: Option<PausedSandboxEntry>,
     }
 
     /// Programmed response for registry reads.
@@ -2072,6 +2074,15 @@ pub mod test_support {
                 conflict_origin: None,
                 renew_deadline_fails: false,
                 renewed_deadlines: std::sync::Mutex::new(Vec::new()),
+                parked: None,
+            }
+        }
+
+        /// Answers reads with `parked` and grants every claim on it.
+        pub fn holding(parked: PausedSandboxEntry) -> Self {
+            Self {
+                parked: Some(parked),
+                ..Self::new(0, false)
             }
         }
 
@@ -2172,6 +2183,13 @@ pub mod test_support {
         async fn get(&self, sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>> {
             self.get_calls.fetch_add(1, Ordering::SeqCst);
 
+            if let Some(parked) = &self.parked {
+                return Ok(Some(PausedSandboxEntry {
+                    sandbox_id: *sandbox_id,
+                    ..parked.clone()
+                }));
+            }
+
             match &self.get_answer {
                 GetAnswer::Missing => Ok(None),
                 GetAnswer::Unreachable => Err(unreachable_backend("get")),
@@ -2200,9 +2218,9 @@ pub mod test_support {
 
         async fn claim_for_resume(
             &self,
-            _sandbox_id: &SandboxId,
+            sandbox_id: &SandboxId,
             node_id: &str,
-            _execution_id: ExecutionId,
+            execution_id: ExecutionId,
         ) -> RegistryResult<ResumeClaim> {
             self.claimed_as.lock().unwrap().push(node_id.to_string());
 
@@ -2214,6 +2232,29 @@ pub mod test_support {
                 return Ok(ResumeClaim::Conflict {
                     origin_node_id: origin_node_id.clone(),
                     reason: ConflictReason::Unspecified,
+                });
+            }
+
+            if let Some(parked) = &self.parked {
+                // Mirrors the backend's `snapshot_id IS NOT NULL` guard: a row
+                // whose bytes never left its machine is not claimable elsewhere.
+                if parked.snapshot_id.is_none() {
+                    return Ok(ResumeClaim::NotReady {
+                        origin_node_id: parked.origin_node_id.clone(),
+                    });
+                }
+
+                // The claimant is the calling process; the origin stays the machine.
+                return Ok(ResumeClaim::Claimed {
+                    entry: Box::new(PausedSandboxEntry {
+                        sandbox_id: *sandbox_id,
+                        state: crate::orchestrator::PausedRegistryState::Resuming,
+                        generation: parked.generation + 1,
+                        claimed_by_node_id: Some(node_id.to_string()),
+                        execution_id: Some(execution_id),
+                        ..parked.clone()
+                    }),
+                    previous_state: parked.state,
                 });
             }
 

@@ -135,6 +135,25 @@ pub enum OrchestratorError {
     InternalError(String),
 }
 
+impl OrchestratorError {
+    /// Whether the capture a resume needed is not on the node that was supposed
+    /// to hold it, found either locally or in a node's answer.
+    ///
+    /// Callers holding a claim on a published row may rebuild from the
+    /// repository instead of surfacing this.
+    pub fn is_paused_capture_absent(&self) -> bool {
+        let source = match self {
+            Self::SandboxPersistenceFailed(SandboxPersistenceError::RecordAbsent { .. }) => {
+                return true
+            }
+            Self::SandboxOperationFailed { source, .. } | Self::ConfigLoadFailed(source) => source,
+            _ => return false,
+        };
+
+        crate::node_client::wire::capture_absent(source)
+    }
+}
+
 impl From<store::StoreError> for OrchestratorError {
     fn from(value: store::StoreError) -> Self {
         match value {

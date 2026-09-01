@@ -30,6 +30,9 @@ pub enum SandboxPersistenceError {
         #[source]
         source: Option<anyhow::Error>,
     },
+    /// No record names this capture, so nothing local can reopen it.
+    #[error("paused sandbox record {sandbox_id} not found")]
+    RecordAbsent { sandbox_id: SandboxId },
     #[error("invalid paused sandbox runtime state: {reason}")]
     RuntimeState { reason: &'static str },
     #[error("paused sandbox store operation failed: {operation}: {source}")]

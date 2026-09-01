@@ -103,6 +103,26 @@ impl RemoteResumeFailure {
             detail,
         }
     }
+
+    /// Whether the node answered that the capture this reopen needed is not on it.
+    ///
+    /// A row whose snapshot is published can still be rebuilt from the
+    /// repository, so this classification is a fallback signal rather than a
+    /// verdict about the sandbox.
+    pub fn is_capture_absent(&self) -> bool {
+        matches!(self, Self::CaptureAbsent { .. })
+    }
+}
+
+/// Whether anything in this chain says the capture a reopen needed is not on
+/// the node that was supposed to hold it.
+///
+/// Walks the chain because callers add context around the reopen failure.
+pub fn capture_absent(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<RemoteResumeFailure>())
+        .any(RemoteResumeFailure::is_capture_absent)
 }
 
 pub fn serialize<T: serde::Serialize>(value: &T, what: &str) -> Result<pb::SerializedValue> {

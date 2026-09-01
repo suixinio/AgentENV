@@ -22,15 +22,11 @@ pub struct Client {
 impl Client {
     pub fn from_env() -> Result<Self> {
         let creds = Credentials::load()?;
-        Self::with_proxy(&creds.url, creds.data_plane_url(), &creds.api_key)
-    }
-
-    pub fn new(url: &str, api_key: &str) -> Result<Self> {
-        Self::with_proxy(url, url, api_key)
+        Self::new(&creds.url, creds.data_plane_url(), &creds.api_key)
     }
 
     /// `url` answers REST; `proxy_url` carries sandbox data-plane traffic.
-    pub fn with_proxy(url: &str, proxy_url: &str, api_key: &str) -> Result<Self> {
+    pub fn new(url: &str, proxy_url: &str, api_key: &str) -> Result<Self> {
         let base = url.trim_end_matches('/').to_string();
         let proxy_base = proxy_url.trim_end_matches('/').to_string();
         let agent = ureq::AgentBuilder::new()
@@ -120,7 +116,8 @@ mod tests {
 
     #[test]
     fn one_address_still_carries_both_surfaces() {
-        let client = Client::new("http://gateway:8000/", "k").expect("a client");
+        let url = "http://gateway:8000/";
+        let client = Client::new(url, url, "k").expect("a client");
 
         assert_eq!(client.url("/sandboxes"), "http://gateway:8000/sandboxes");
         assert_eq!(client.proxy_base(), "http://gateway:8000");
@@ -128,8 +125,7 @@ mod tests {
 
     #[test]
     fn a_data_plane_address_does_not_move_the_rest_address() {
-        let client =
-            Client::with_proxy("http://api:8010", "http://gateway:8000/", "k").expect("a client");
+        let client = Client::new("http://api:8010", "http://gateway:8000/", "k").expect("a client");
 
         assert_eq!(client.url("/sandboxes"), "http://api:8010/sandboxes");
         assert_eq!(client.proxy_base(), "http://gateway:8000");

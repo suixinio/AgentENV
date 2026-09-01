@@ -71,14 +71,25 @@ where
                 node_id,
                 node_address,
                 execution_id,
+                already_running,
             } => {
-                info!(
-                    target: "agentenv",
-                    %sandbox_id,
-                    %node_id,
-                    %execution_id,
-                    "woke a paused sandbox for the data plane"
-                );
+                if already_running {
+                    info!(
+                        target: "agentenv",
+                        %sandbox_id,
+                        %node_id,
+                        %execution_id,
+                        "answered a running sandbox for the data plane"
+                    );
+                } else {
+                    info!(
+                        target: "agentenv",
+                        %sandbox_id,
+                        %node_id,
+                        %execution_id,
+                        "woke a paused sandbox for the data plane"
+                    );
+                }
                 record("ok");
                 Ok(Response::new(pb::SandboxResumeResponse {
                     node_id,

@@ -368,6 +368,8 @@ pub(in crate::api) enum DataPlaneResume {
         node_id: String,
         node_address: String,
         execution_id: ExecutionId,
+        /// It was running before this call; nothing was woken.
+        already_running: bool,
     },
     /// The caller did not present the sandbox's envd access token.
     Unauthorized,
@@ -471,6 +473,7 @@ impl ApiImpl {
                 node_id: node.node_id.clone(),
                 node_address: node.address.clone(),
                 execution_id: *execution_id,
+                already_running: true,
             };
         }
         if let Some(refused) = self.refuse_unhonourable_pin(sandbox_id, &placement) {
@@ -720,6 +723,7 @@ impl ApiImpl {
             node_id: node.node_id,
             node_address: node.address,
             execution_id: metadata.execution_id,
+            already_running: false,
         }
     }
 
@@ -1839,6 +1843,7 @@ mod tests {
                 node_id: NODE_A.to_string(),
                 node_address: NODE_A_ADDRESS.to_string(),
                 execution_id,
+                already_running: true,
             },
             "🔴 autoResume governs starting a sandbox, never routing to one that is \
              running; a refusal here is the flag silently breaking the data plane"
@@ -1888,6 +1893,7 @@ mod tests {
                 node_id: NODE_A.to_string(),
                 node_address: NODE_A_ADDRESS.to_string(),
                 execution_id,
+                already_running: true,
             }
         );
         assert_eq!(store.writes(), 1, "a running miss is repaired on the spot");

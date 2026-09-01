@@ -1633,8 +1633,18 @@ func (x *SandboxRosterEntry) GetPaused() bool {
 type HeartbeatResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CpuConfigJson string                 `protobuf:"bytes,1,opt,name=cpu_config_json,json=cpuConfigJson,proto3" json:"cpu_config_json,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Sandboxes this heartbeat reported paused that the control plane's registry
+	// says this node does not hold: nothing names them, or a row names another
+	// node. The node drops its record and artifacts for each.
+	//
+	// Silence means keep, and it is the only safe default. An api half with no
+	// cluster-backed registry, or one whose registry could not answer, names
+	// nothing here. A node must never turn an absence it observed itself into a
+	// deletion: only this side can tell a sandbox that was never recorded from
+	// one whose record moved to another machine.
+	DisownedSandboxIds []string `protobuf:"bytes,2,rep,name=disowned_sandbox_ids,json=disownedSandboxIds,proto3" json:"disowned_sandbox_ids,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *HeartbeatResponse) Reset() {
@@ -1672,6 +1682,13 @@ func (x *HeartbeatResponse) GetCpuConfigJson() string {
 		return x.CpuConfigJson
 	}
 	return ""
+}
+
+func (x *HeartbeatResponse) GetDisownedSandboxIds() []string {
+	if x != nil {
+		return x.DisownedSandboxIds
+	}
+	return nil
 }
 
 type SandboxEvent struct {
@@ -3047,9 +3064,10 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
 	"\fexecution_id\x18\x02 \x01(\tR\vexecutionId\x12.\n" +
 	"\x13projection_ttl_secs\x18\x03 \x01(\rR\x11projectionTtlSecs\x12\x16\n" +
-	"\x06paused\x18\x04 \x01(\bR\x06paused\";\n" +
+	"\x06paused\x18\x04 \x01(\bR\x06paused\"m\n" +
 	"\x11HeartbeatResponse\x12&\n" +
-	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\x9c\x02\n" +
+	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\x120\n" +
+	"\x14disowned_sandbox_ids\x18\x02 \x03(\tR\x12disownedSandboxIds\"\x9c\x02\n" +
 	"\fSandboxEvent\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12=\n" +

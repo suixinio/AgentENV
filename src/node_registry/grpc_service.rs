@@ -118,6 +118,54 @@ impl NodeRegistryGrpcService {
         self
     }
 
+    // The judgement belongs here and is named explicitly rather than left for the
+    // node to derive: only this side can tell a sandbox that was never recorded
+    // from one whose row moved to another machine. Everything this side cannot
+    // settle — no registry, one that is not cluster-backed, a read that failed, an
+    // id the batch did not answer for — is left out, so a node that hears nothing
+    // keeps everything.
+    async fn disowned_paused_sandboxes(
+        &self,
+        node_id: &str,
+        roster: &[crate::node_registry::types::RosterEntry],
+    ) -> Vec<String> {
+        let Some(registry) = self.paused_registry.as_ref() else {
+            return Vec::new();
+        };
+        if !registry.is_cluster_backed() {
+            return Vec::new();
+        }
+        let paused: Vec<crate::types::SandboxId> = roster
+            .iter()
+            .filter(|entry| entry.paused)
+            .filter_map(|entry| crate::types::SandboxId::parse_str(entry.sandbox_id.trim()).ok())
+            .collect();
+        if paused.is_empty() {
+            return Vec::new();
+        }
+        let rows = match registry.get_many(&paused).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(
+                    node_id = %node_id,
+                    error = %err,
+                    "could not read the paused registry for this node's roster; naming nothing"
+                );
+                return Vec::new();
+            }
+        };
+        let answered = rows.answered();
+        paused
+            .iter()
+            .filter(|sandbox_id| match answered.get(sandbox_id) {
+                None => false,
+                Some(None) => true,
+                Some(Some(entry)) => entry.origin_node_id != node_id,
+            })
+            .map(|sandbox_id| sandbox_id.to_string())
+            .collect()
+    }
+
     /// Reserves a sandbox's routing record before the node that will run it is asked to.
     ///
     /// In-process only: it is the create path's half of the invariant that every
@@ -449,9 +497,10 @@ impl Scheduler for NodeRegistryGrpcService {
             }
         };
 
+        let roster = super::registry::roster_from_heartbeat(&req);
+
         // Warm-up means bindings were seeded when a binding store is configured.
         if let Some(binding_store) = &self.binding_store {
-            let roster = super::registry::roster_from_heartbeat(&req);
             // Paused entries must renew their registry leases but must not become routing
             // projections. Reconciliation also removes projections for newly paused entries.
             let routable: Vec<_> = roster.iter().filter(|e| !e.paused).cloned().collect();
@@ -484,7 +533,10 @@ impl Scheduler for NodeRegistryGrpcService {
             self.warmup.reported_in(now);
         }
 
-        Ok(Response::new(HeartbeatResponse { cpu_config_json }))
+        Ok(Response::new(HeartbeatResponse {
+            cpu_config_json,
+            disowned_sandbox_ids: self.disowned_paused_sandboxes(node_id, &roster).await,
+        }))
     }
 
     async fn list_observed_nodes(
@@ -1758,8 +1810,8 @@ mod tests {
         ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
             Ok(BindingDeleteOutcome::Absent)
         }
-        /// Carries the real state fence so a reservation test cannot pass on a
-        /// fake that withdraws confirmations too.
+        // Carries the real state fence so a reservation test cannot pass on a
+        // fake that withdraws confirmations too.
         async fn release_reservation(
             &self,
             sandbox_id: &str,
@@ -1818,6 +1870,135 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    fn heartbeat_holding(paused: SandboxId, running: SandboxId) -> HeartbeatRequest {
+        HeartbeatRequest {
+            node_id: "node-a".to_string(),
+            cluster_id: "cluster-a".to_string(),
+            service_instance_id: "node-a-instance".to_string(),
+            roster: vec![
+                scheduler::SandboxRosterEntry {
+                    sandbox_id: running.to_string(),
+                    execution_id: "0199a000-0000-7000-8000-000000000001".to_string(),
+                    paused: false,
+                    ..Default::default()
+                },
+                scheduler::SandboxRosterEntry {
+                    sandbox_id: paused.to_string(),
+                    execution_id: "0199a000-0000-7000-8000-000000000002".to_string(),
+                    paused: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn disowned_by(
+        registry: FakePausedRegistry,
+        paused: SandboxId,
+        running: SandboxId,
+    ) -> Vec<String> {
+        let (_registry, service) = service_with_registry(
+            vec![node("node-a", "http://node-a")],
+            in_memory_binding_store(),
+        );
+        service
+            .with_paused_registry(Arc::new(registry))
+            .heartbeat(Request::new(heartbeat_holding(paused, running)))
+            .await
+            .expect("node-a heartbeats")
+            .into_inner()
+            .disowned_sandbox_ids
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_names_a_paused_sandbox_no_row_records() {
+        let paused = SandboxId::new();
+        let running = SandboxId::new();
+        assert_eq!(
+            disowned_by(FakePausedRegistry::empty(true), paused, running).await,
+            vec![paused.to_string()],
+            "a paused sandbox the registry has no row for is this node's alone and unreachable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_names_a_paused_sandbox_whose_row_names_another_node() {
+        let paused = SandboxId::new();
+        let running = SandboxId::new();
+        let registry = FakePausedRegistry::with_entry(
+            paused_entry(paused, PausedRegistryState::Running, "node-b", None),
+            true,
+        );
+        assert_eq!(
+            disowned_by(registry, paused, running).await,
+            vec![paused.to_string()],
+            "the row names node-b, so node-a is holding a ghost of it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_names_nothing_while_the_row_still_names_this_node() {
+        let paused = SandboxId::new();
+        let running = SandboxId::new();
+        let registry = FakePausedRegistry::with_entry(
+            paused_entry(paused, PausedRegistryState::Paused, "node-a", None),
+            true,
+        );
+        assert!(disowned_by(registry, paused, running).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_names_nothing_when_the_registry_could_not_answer() {
+        let paused = SandboxId::new();
+        let running = SandboxId::new();
+        assert!(
+            disowned_by(FakePausedRegistry::erroring(), paused, running)
+                .await
+                .is_empty(),
+            "a registry that could not be read named a sandbox for deletion"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_names_nothing_when_the_batch_did_not_answer_for_the_sandbox() {
+        let paused = SandboxId::new();
+        let running = SandboxId::new();
+        assert!(
+            disowned_by(
+                FakePausedRegistry::not_answering_for(paused),
+                paused,
+                running
+            )
+            .await
+            .is_empty(),
+            "an id the batch left out of its coverage was read as a confirmed absence"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_names_nothing_without_a_cluster_backed_registry() {
+        let paused = SandboxId::new();
+        let running = SandboxId::new();
+        assert!(
+            disowned_by(FakePausedRegistry::empty(false), paused, running)
+                .await
+                .is_empty(),
+            "a deployment whose rows are node-local would have every paused sandbox deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_never_names_a_running_sandbox() {
+        let paused = SandboxId::new();
+        let running = SandboxId::new();
+        let named = disowned_by(FakePausedRegistry::empty(true), paused, running).await;
+        assert!(
+            !named.contains(&running.to_string()),
+            "a running sandbox has no registry row by design; naming it would tear down live VMs"
+        );
     }
 
     #[tokio::test]
@@ -2376,6 +2557,8 @@ mod tests {
         entries: StdHashMap<SandboxId, PausedSandboxEntry>,
         cluster_backed: bool,
         erroring: bool,
+        // Ids a batch read leaves out of its coverage, as an undecodable row does.
+        uncovered: std::collections::HashSet<SandboxId>,
     }
 
     impl FakePausedRegistry {
@@ -2386,7 +2569,23 @@ mod tests {
                 entries,
                 cluster_backed,
                 erroring: false,
+                uncovered: Default::default(),
             }
+        }
+
+        fn empty(cluster_backed: bool) -> Self {
+            Self {
+                entries: StdHashMap::new(),
+                cluster_backed,
+                erroring: false,
+                uncovered: Default::default(),
+            }
+        }
+
+        fn not_answering_for(sandbox_id: SandboxId) -> Self {
+            let mut registry = Self::empty(true);
+            registry.uncovered.insert(sandbox_id);
+            registry
         }
 
         fn erroring() -> Self {
@@ -2394,6 +2593,7 @@ mod tests {
                 entries: StdHashMap::new(),
                 cluster_backed: true,
                 erroring: true,
+                uncovered: Default::default(),
             }
         }
     }
@@ -2432,8 +2632,26 @@ mod tests {
         ) -> RegistryResult<()> {
             unimplemented!("lookup_node never calls this")
         }
-        async fn get_many(&self, _sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
-            unimplemented!("lookup_node never calls this")
+        // `uncovered` ids are left out of both the entries and the coverage list,
+        // so a caller acting on their absence is acting on an answer this fixture
+        // never gave.
+        async fn get_many(&self, sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
+            if self.erroring {
+                return Err(PausedRegistryError::Backend {
+                    operation: "test",
+                    source: anyhow::anyhow!("boom"),
+                });
+            }
+            let covered: Vec<SandboxId> = sandbox_ids
+                .iter()
+                .copied()
+                .filter(|id| !self.uncovered.contains(id))
+                .collect();
+            let entries = covered
+                .iter()
+                .filter_map(|id| self.entries.get(id).map(|entry| (*id, entry.clone())))
+                .collect();
+            Ok(PausedRegistryRows { entries, covered })
         }
         async fn claim_for_resume(
             &self,
@@ -3408,10 +3626,9 @@ mod tests {
         entry
     }
 
-    /// The other half of "a runtime always has a record older than itself": on the
-    /// resume path the claim CAS writes the row before anything is restored, and a
-    /// row in any state must keep the lookup off `NotFound` — which is what the
-    /// delete path reads as a verdict.
+    // The resume path's half of the invariant: the claim CAS writes the row before
+    // anything is restored, so a row in any state must keep the lookup off the
+    // absence the delete path reads as a verdict.
     #[tokio::test]
     async fn a_registry_row_in_any_state_is_never_a_warm_absence() {
         for state in [

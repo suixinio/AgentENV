@@ -403,10 +403,8 @@ impl RemoteSandboxStub {
         }
     }
 
-    /// Withdraws the reservation a failed launch wrote.
-    ///
-    /// Best-effort: a reservation that outlives this call expires on its own, and
-    /// one the node meanwhile confirmed names a runtime that really is there.
+    // Best-effort: a reservation that outlives this call expires on its own, and
+    // one the node meanwhile confirmed names a runtime that really is there.
     async fn withdraw_reservation(&self) {
         if let Err(error) = self
             .placement

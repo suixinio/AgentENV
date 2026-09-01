@@ -58,6 +58,27 @@ impl ObservabilityService {
         self.pending_cpu_config.lock().unwrap().take()
     }
 
+    /// Drops this node's paused record and artifacts for a sandbox the control
+    /// plane says it no longer holds. The caller supplies the judgement; this
+    /// carries it out, guarded on the sandbox still being paused here.
+    pub async fn discard_disowned_paused_sandbox(&self, sandbox_id: crate::types::SandboxId) {
+        match Arc::clone(&self.orchestrator)
+            .discard_local_paused_record(sandbox_id)
+            .await
+        {
+            Ok(true) => tracing::info!(
+                %sandbox_id,
+                "discarded a paused sandbox the control plane records elsewhere"
+            ),
+            Ok(false) => tracing::debug!(%sandbox_id, "nothing paused here to discard"),
+            Err(error) => tracing::warn!(
+                %sandbox_id,
+                error = %error,
+                "could not discard a paused sandbox the control plane records elsewhere"
+            ),
+        }
+    }
+
     pub fn store_cluster_cpu_config(&self, config: String) {
         *self.cluster_cpu_config.write().unwrap() = Some(config);
     }

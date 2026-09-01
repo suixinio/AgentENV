@@ -432,9 +432,9 @@ mod tests {
         assert!(absent.is_none(), "nothing was ever recorded for this id");
     }
 
-    /// Two creates of one sandbox id are unreachable — every id is a server-minted
-    /// UUIDv7 and no request carries one — so the reservation refuses a colliding
-    /// launch outright instead of joining it to the one already in flight.
+    // Two creates of one sandbox id are unreachable — every id is a server-minted
+    // UUIDv7 and no request carries one — so a collision is refused outright
+    // rather than joined to the launch already in flight.
     #[tokio::test]
     async fn a_colliding_reservation_is_refused_rather_than_joined() {
         let registry = Arc::new(AtomicNodeRegistry::new(

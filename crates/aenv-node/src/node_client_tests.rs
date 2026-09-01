@@ -3364,7 +3364,7 @@ impl ClusterPlacement {
         Arc::new(placement)
     }
 
-    /// A cluster whose binding store refuses the reservation write.
+    // A cluster whose binding store refuses the reservation write.
     fn refusing_reservations(node: NodeEndpoint) -> Arc<Self> {
         let mut placement = Arc::try_unwrap(Self::recording(node))
             .ok()
@@ -3373,7 +3373,7 @@ impl ClusterPlacement {
         Arc::new(placement)
     }
 
-    /// A cluster that records confirmations but never reservations.
+    // A cluster that records confirmations but never reservations.
     fn never_reserving(node: NodeEndpoint) -> Arc<Self> {
         let mut placement = Arc::try_unwrap(Self::recording(node))
             .ok()
@@ -3425,14 +3425,14 @@ impl ClusterPlacement {
         self.reservations.lock().expect("lock").contains(&id)
     }
 
-    /// Drops every record of a sandbox, as a pause plus an expired reservation does.
+    // Drops every record of a sandbox, as a pause plus an expired reservation does.
     fn forget(&self, id: crate::types::SandboxId) {
         self.bindings.lock().expect("lock").remove(&id);
         self.reservations.lock().expect("lock").remove(&id);
     }
 
-    /// Installs a reservation without a launch, as another replica's in-flight
-    /// rebuild of this sandbox looks from here.
+    // Installs a reservation without a launch, as another replica's in-flight
+    // rebuild of this sandbox looks from here.
     fn reserve_elsewhere(&self, id: crate::types::SandboxId) {
         self.reservations.lock().expect("lock").insert(id);
     }
@@ -3817,9 +3817,9 @@ async fn a_resume_tells_the_cluster_the_sandbox_is_live_again() {
     );
 }
 
-/// Both sides of the invariant a create-time reservation establishes: a sandbox
-/// nothing in a warm cluster names has no runtime left to protect and is reaped,
-/// while one a reservation names has a runtime on the way and is not.
+// Both sides of the invariant a create-time reservation establishes: a sandbox
+// nothing in a warm cluster names has no runtime left to protect, while one a
+// reservation names has a runtime on the way.
 #[tokio::test]
 async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
     let node = real_node().await;
@@ -3944,11 +3944,29 @@ async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
             .is_some(),
         "the refused delete forgot the sandbox anyway"
     );
+
+    // Face 5: one heartbeat later the node has acknowledged that same start, which
+    // promotes the reservation. The same delete on the same sandbox through the
+    // same replica now goes through — which is what says face 4 refused over the
+    // reservation and not over the sandbox.
+    racing.heartbeat(&[contested.id]);
+    Arc::clone(&replica)
+        .delete_sandbox(contested.id)
+        .await
+        .expect("the node acknowledged the start and the delete still could not reach it");
+    assert!(
+        on_the_node
+            .get_sandbox(&contested.id)
+            .await
+            .expect("the node's own record")
+            .is_none(),
+        "the delete answered success without telling the machine"
+    );
 }
 
-/// The counterfactual face 3 rests on: reaping on a warm absence is only safe
-/// because a create reserves first. A build that skips the reservation reaches
-/// the same absence with a runtime still on the machine, and reaps it.
+// The counterfactual face 3 rests on: reaping on a warm absence is safe only
+// because a create reserves first. A build that skips the reservation reaches the
+// same absence with a runtime still on the machine, and reaps it.
 #[tokio::test]
 async fn without_the_create_time_reservation_the_delete_verdict_reaps_a_live_sandbox() {
     let node = real_node().await;

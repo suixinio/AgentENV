@@ -960,6 +960,45 @@ mod tests {
         Ok(())
     }
 
+    // A record that outlives the process restores the sandbox again on the next
+    // start, so the startup artifact scrub never sees its artifacts as an orphan.
+    #[tokio::test]
+    async fn a_record_that_survives_a_restart_stops_restoring_once_discarded() -> anyhow::Result<()>
+    {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let snapshot_root = persister
+            .sandbox_artifact_root(&sandbox_id)
+            .join("snapshot");
+        let paused_state = paused_state(&snapshot_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .await?;
+        assert_eq!(
+            persister.load_all(&MockBackendFactory::new()).await?.len(),
+            1,
+            "control: a restart restores this sandbox from its own record"
+        );
+
+        persister.delete_record_and_artifacts(&sandbox_id).await?;
+
+        assert!(
+            persister
+                .load_all(&MockBackendFactory::new())
+                .await?
+                .is_empty(),
+            "the discarded sandbox came back on the next start"
+        );
+        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+        Ok(())
+    }
+
     #[tokio::test]
     async fn delete_record_and_artifacts_removes_artifacts_without_record() -> anyhow::Result<()> {
         let temp = TempDir::new()?;

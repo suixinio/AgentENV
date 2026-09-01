@@ -346,6 +346,17 @@ message SandboxRosterEntry {
 
 message HeartbeatResponse {
   string cpu_config_json = 1;
+
+  // Sandboxes this heartbeat reported paused that the control plane's registry
+  // says this node does not hold: nothing names them, or a row names another
+  // node. The node drops its record and artifacts for each.
+  //
+  // Silence means keep, and it is the only safe default. An api half with no
+  // cluster-backed registry, or one whose registry could not answer, names
+  // nothing here. A node must never turn an absence it observed itself into a
+  // deletion: only this side can tell a sandbox that was never recorded from
+  // one whose record moved to another machine.
+  repeated string disowned_sandbox_ids = 2;
 }
 
 enum SandboxEventType {

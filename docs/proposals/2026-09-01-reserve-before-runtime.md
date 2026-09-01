@@ -88,3 +88,88 @@ e2b 同位答案是 reconciler 方向：节点持有态对账控制面真相。�
 
 栈于 `refactor/origin-as-hint-resume`@836432b（已集群复验 PASS）。dev 合并
 裁决独立进行，不阻塞本稿实施。
+
+## 实施纪要（as-built）
+
+### 占位写点：前后对照
+
+原先：`RemoteSandboxStub::start`（`src/node_client/stub.rs`）依次 `place_new`
+→ `connect` → `client.create` → 校验 incarnation → `announce_placement`。绑定
+写在**节点确认之后**，且是 best-effort（`record_placement` 失败只 warn，靠心跳
+补写）。整条链路 `place_new → record_assignment → binding_store.record` 都在
+api 进程内，`record_assignment` 只是 `NodeRegistryGrpcService` 上的一次进程内
+调用，不走 socket。
+
+现在：`place_new` 之后、`connect` 之前多一次 `reserve_placement`，且**硬失败**
+——占位写不进去就不启动运行时。`connect`/`create` 失败与 incarnation 不符三条
+臂都撤销占位；`announce_placement` 原地不动，成为占位的翻正。
+
+### 方向稿没预见的一处：心跳对账会把占位删掉
+
+`reconcile_node` 的既有语义是"节点花名册里没有的绑定就删"。占位期节点尚未
+确认，花名册本来就没有它——不加围栏的话，创建途中的一次心跳就把刚写下的占位
+抹掉，不变量当场失效。两个后端的对账都加了"`Starting` 只由 TTL 退休"这条围栏，
+这是 `BindingState` 必须落在绑定值里、而不能另起一套键的真正原因。
+
+### 与 e2b 的三处有据偏离
+
+1. **不建 `waitForStart`**。沙箱 id 全部由服务端 `SandboxId::new()`（UUIDv7）
+   铸造，REST 的 `NewSandbox`/`NewColdSandbox` 都不收 id，fork 子沙箱的 id 也
+   由 api 半边铸造（`ForkChildren::Fresh`）——同 id 并发创建理论不可达。占位
+   仍按 incarnation 仲裁，撞上就**拒绝而不是等待**，比参照实现简一层。
+2. **占位与绑定同键**。e2b 的 pending zset 与 sandbox storage 是两套键空间；
+   这里 DELETE 的判据读的正是绑定视图，占位若另起键空间就看不见，所以做成
+   绑定值上的 `state` 字段。确认态不序列化该字段，旧值与新写的确认记录逐字节
+   相同，Go 侧 `ParseRecord` 无感。
+3. **`reserve` 硬失败**。e2b 的 Reserve 失败同样直接 500；这与 AgentENV 原先
+   "记录是 best-effort"的取向相反，但正是这条把"找不到"变成判决的前提。
+
+### 刻意未复用的既有机制
+
+`src/orchestrator/store/redis/reserve.rs` 已有一套 e2b 形状的预留实现
+（`Reservation::Reserved/AlreadyPending/AlreadyInStorage` + `ReservationGuard`
++ `WaitForStart`），生产路径无调用方。它写在编排器元数据键空间（`agentenv:api`），
+而 DELETE 的 500 出自绑定视图查询，元数据侧的预留改变不了 `absent_handle` 的
+判断，故未复用。该残留的去留是独立裁决项。
+
+### 不变量核实（W2）
+
+- **claim 即 Reserve**：`cross_node_resume` 里 `restore_request(..., entry.execution_id)`
+  消费 claim 已分配的 incarnation，重建在类型上就取不到一个不存在的 `entry`，
+  顺序由编译期保证。行的另一面用穷举测试钉住：`paused/publishing/local_only/
+  running/resuming` 五个状态 × origin 在场与否，warm 查询都不得答 `NotFound`。
+- **并发同 id create**：见上"有据偏离 1"。不可达，故不建等待机制。
+
+### DELETE 判据扩大的暴露面
+
+绑定 TTL 与花名册新鲜度都是 30s，心跳间隔 5s。一台仅仅**静默**（尚未被发现
+机制摘除）超过 30s 的节点，其运行中沙箱同样落进 warm 缺席，于是 DELETE 从
+"500 拒绝"变成"收割记录"。这些沙箱此刻本就不可路由、网关对它们已答 404，改动
+让 DELETE 与之一致；但 e2b 的反向安全网（节点上报而控制面不认的按 orphan 杀，
+`sandboxes.go:633`）没有同步建，所以收割后节点上的 VM 无人回收。这是本轮已知
+且刻意接受的代价，集群验收应实测。
+
+### D4 对账的 RPC 形状
+
+不新增 Scheduler 方法。`HeartbeatResponse` 增一个字段：
+
+```proto
+repeated string disowned_sandbox_ids = 2;
+```
+
+api 半边在 `heartbeat` 里，对本次心跳中 `paused=true` 的花名册项批量读
+paused 注册表（`get_many` 的 `AnsweredRows`），逐条判定"行不存在"或
+"`origin_node_id ≠ 本节点`"，把结论**显式点名**回给节点。fail-closed 是结构性的：
+没有注册表、注册表非 cluster-backed、读失败、批次未覆盖该 id——四种情况都不点名，
+节点听不到就什么都不删。节点永远不从自己观察到的缺席推导删除。
+
+节点侧要求**连续两次**被点名才动手（`DisownedCandidates`）。理由：`begin_pause`
+写行发生在节点已经把沙箱报成 paused 之后，中间落一次心跳就会看见"无行"，一次
+点名与那个窗口不可区分；隔一整个心跳间隔的两次点名则不然。代价是每次真实回收
+多等一个间隔。
+
+**与方向稿的偏离**：方向稿写"启动清扫扩展 + 周期对账"，实施只做了后者。启动
+时向控制面求证要么阻塞启动，要么在够不着控制面时按 fail-closed 什么都不删——
+等价于不做；而第一次心跳本身就是启动后的第一次对账，一个间隔内即完成。α（记录
+幸存）与 β（记录已失）两变体走同一条 `discard_local_paused_record`，差别只在
+记录文件在不在，两侧都有测试。

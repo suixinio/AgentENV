@@ -30,6 +30,29 @@ const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 #[error("node is not in the scheduler's configured node list")]
 struct HeartbeatNodeNotConfigured;
 
+// Sandboxes the control plane named as no longer this node's, carried between
+// heartbeats so a naming has to survive one.
+//
+// A pause registers its row only after the node has already begun reporting the
+// sandbox paused, and one heartbeat can land in that window. Requiring two
+// consecutive namings puts a whole interval between them, which is longer than
+// that window, and costs one extra interval on every real discard.
+#[derive(Default)]
+struct DisownedCandidates(std::collections::HashSet<crate::types::SandboxId>);
+
+impl DisownedCandidates {
+    // Replaces the candidates with `named` and returns those named last time too.
+    fn confirm(&mut self, named: Vec<crate::types::SandboxId>) -> Vec<crate::types::SandboxId> {
+        let repeated: Vec<_> = named
+            .iter()
+            .copied()
+            .filter(|sandbox_id| self.0.contains(sandbox_id))
+            .collect();
+        self.0 = named.into_iter().collect();
+        repeated
+    }
+}
+
 #[derive(Clone)]
 struct ReporterConfig {
     scheduler_endpoint: String,
@@ -110,6 +133,7 @@ impl ObservabilityReporter {
             let mut backoff = config.interval;
             let mut wait = Duration::from_millis(100);
             let mut pending_cpu_config_json = service.take_cpu_config_json();
+            let mut disowned = DisownedCandidates::default();
 
             loop {
                 if wait > Duration::ZERO {
@@ -133,6 +157,7 @@ impl ObservabilityReporter {
                     &current_endpoint,
                     &mut pending_cpu_config_json,
                     p2p_endpoint.as_ref(),
+                    &mut disowned,
                 )
                 .await
                 {
@@ -268,6 +293,7 @@ impl ObservabilityReporter {
         scheduler_endpoint: &str,
         cpu_config_json: &mut Option<String>,
         p2p_endpoint: Option<&P2pEndpoint>,
+        disowned: &mut DisownedCandidates,
     ) -> Result<()> {
         let mut snapshot = service
             .node_snapshot()
@@ -304,6 +330,17 @@ impl ObservabilityReporter {
                 node_id = %node_id,
                 "received cluster cpu config intersection from scheduler"
             );
+        }
+
+        // Ids this side cannot parse are dropped rather than guessed at: the
+        // control plane names sandboxes, and anything else is not one.
+        let named = response
+            .disowned_sandbox_ids
+            .iter()
+            .filter_map(|raw| crate::types::SandboxId::parse_str(raw.trim()).ok())
+            .collect();
+        for sandbox_id in disowned.confirm(named) {
+            service.discard_disowned_paused_sandbox(sandbox_id).await;
         }
 
         trace!(
@@ -542,6 +579,42 @@ mod tests {
     use crate::observability::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
     use crate::orchestrator::SandboxRosterEntry;
     use crate::types::{ExecutionId, SandboxId, SandboxResources};
+
+    #[test]
+    fn a_sandbox_named_once_is_not_discarded_until_the_next_heartbeat_names_it_again() {
+        let mut candidates = DisownedCandidates::default();
+        let sandbox_id = SandboxId::new();
+
+        assert!(
+            candidates.confirm(vec![sandbox_id]).is_empty(),
+            "one naming can be the window between a node reporting a pause and the row for it \
+             being written"
+        );
+        assert_eq!(candidates.confirm(vec![sandbox_id]), vec![sandbox_id]);
+    }
+
+    #[test]
+    fn a_sandbox_the_control_plane_stops_naming_is_forgotten_rather_than_accumulated() {
+        let mut candidates = DisownedCandidates::default();
+        let sandbox_id = SandboxId::new();
+
+        candidates.confirm(vec![sandbox_id]);
+        assert!(candidates.confirm(Vec::new()).is_empty());
+        assert!(
+            candidates.confirm(vec![sandbox_id]).is_empty(),
+            "two namings a heartbeat apart with a denial between them are not consecutive"
+        );
+    }
+
+    #[test]
+    fn confirming_names_only_the_sandboxes_named_twice() {
+        let mut candidates = DisownedCandidates::default();
+        let repeated = SandboxId::new();
+        let fresh = SandboxId::new();
+
+        candidates.confirm(vec![repeated]);
+        assert_eq!(candidates.confirm(vec![repeated, fresh]), vec![repeated]);
+    }
 
     pub fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
         make_cluster_config_with_file(endpoint, None)

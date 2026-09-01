@@ -83,11 +83,11 @@ func (r *Reader) Close() error {
 //     of several things that know where a sandbox is, and the others have to be
 //     asked before anybody says "nowhere".
 //   - (zero, false, err):   could not look. Also not an absence, and in
-//     particular not a reason to fail the request: the caller falls back to the
-//     scheduler, which is what it did before this reader existed.
+//     particular not a reason to fail the request: the caller goes on to ask
+//     the api half, exactly as it does on a miss.
 //
 // An undecodable record is a miss. It names nowhere to forward to, and the
-// fallback will produce a real answer. So is a record whose create has not
+// api half will produce a real answer. So is a record whose create has not
 // finished: see ParseRecord.
 func (r *Reader) Get(ctx context.Context, sandboxID string) (Record, bool, error) {
 	sandboxID = strings.TrimSpace(sandboxID)

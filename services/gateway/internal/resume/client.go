@@ -5,10 +5,9 @@
 // The gateway resolves a sandbox to a node out of its routing projection. When
 // that misses, the sandbox is paused, gone, or somewhere the projection has not
 // caught up with — and the gateway cannot tell which from anything it holds.
-// Before this package, the only thing it could do was ask the scheduler for a
-// node and forward the request there, where the node woke the sandbox itself.
-// That is the arrangement `aenv-node` exists to end (`_sd-impl-phase3-role.md`
-// §6.1): a node that decides when a sandbox should be alive is not an executor.
+// A node cannot be asked to find out: `aenv-node` has no wake-up surface, on
+// purpose (`_sd-impl-phase3-role.md` §6.1) — a node that decides when a
+// sandbox should be alive is not an executor.
 //
 // So the question goes to the half that owns sandboxes, over one RPC, and this
 // package is the caller.
@@ -254,8 +253,7 @@ func (c *Client) Wake(ctx context.Context, req Request) Result {
 	case codes.Unavailable, codes.DeadlineExceeded, codes.Canceled:
 		// 🔴 The third state. The API half was unreachable, too slow, or said
 		// so itself. None of that is evidence about the sandbox, so the gateway
-		// falls back to the path it used before this package existed rather
-		// than answering the client anything at all.
+		// answers a 502 that says nothing about whether it exists, never a 404.
 		result.Verdict = VerdictUndecided
 	case codes.PermissionDenied, codes.FailedPrecondition, codes.ResourceExhausted,
 		codes.InvalidArgument, codes.Internal, codes.Unimplemented:

@@ -74,9 +74,8 @@ type ServerOptions struct {
 	// unconditionally, so it can no longer construct a `*Server` with this
 	// nil. It stays nil-able here purely
 	// because this package's own tests use an unconfigured `*Server` as their
-	// baseline fixture for exercising the data-plane routing paths — the
-	// projection, this wake-up client, and the cold-path LookupNode call
-	// below — none of which has ever depended on RestUpstreamAddr.
+	// baseline fixture for exercising the data-plane routing paths, the
+	// projection and this wake-up client.
 	ResumeClient *resume.Client
 }
 
@@ -818,11 +817,11 @@ func resumeTargetPort(r *http.Request, route *hostRoute) string {
 
 // writeResumeError turns the API half's refusal into a status code.
 //
-// 🔴 The distinctions here are the same ones writeSchedulerError guards, and
-// they matter for the same reason. A 404 on a resume is the end of that sandbox
-// as far as any client is concerned — the platform's contract for it is
-// "rebuild from the template", which resets the user's workspace — so it is
-// spent only on a verdict that positively says the sandbox is gone.
+// 🔴 A 404 on a resume is the end of that sandbox as far as any client is
+// concerned — the platform's contract for it is "rebuild from the template",
+// which resets the user's workspace — so it is spent only on a verdict that
+// positively says the sandbox is gone: NotFound, the one code the resume
+// client maps to VerdictGone.
 //
 // 🔴 A FailedPrecondition is a 503 and never a retry against another node. For
 // a sandbox whose snapshot never reached shared storage there is no second copy
@@ -882,9 +881,9 @@ func (s *Server) writeResumeError(w http.ResponseWriter, r *http.Request, sandbo
 	default:
 		// 🔴 Unimplemented lands here, and that is load-bearing: §12 P3's
 		// control C stubs this RPC out with Unimplemented and requires the data
-		// plane to *fail*. If it fell through to the scheduler the probe would
-		// pass while a second wake-up path was quietly doing the work, which is
-		// the exact thing the control is designed to detect.
+		// plane to *fail*. Anything but a failure here would mean a second
+		// wake-up path was quietly doing the work, which is the exact thing the
+		// control is designed to detect.
 		cors.Error(w, "sandbox wake-up failed", http.StatusBadGateway)
 	}
 }

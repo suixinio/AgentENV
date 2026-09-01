@@ -19,16 +19,17 @@ type projectionReader interface {
 // it could not.
 //
 // 🔴 Three outcomes, and only one of them is an answer. A miss is not an
-// absence and an error is not a failure: both mean "ask the scheduler", which
-// is what this gateway did for every request before the projection existed.
+// absence and an error is not a failure: both mean "ask the api half", which
+// is the resume RPC the caller makes next.
 //
 // 🔴 In particular this never produces a status code. 404 and 503 have exactly
-// one source in this package — writeSchedulerError, on the scheduler's own
+// one source in this package — writeResumeError, on the api half's own
 // answer — and that has to stay true. A gateway that answered 404 from a miss
 // would be turning "I did not find a cached record" into "this sandbox does not
 // exist", which for a resume is the end of that sandbox as far as any client is
-// concerned. It would also cut out the scheduler's roster fallback, which
-// covers the window a heartbeat is late for and the window another node's
+// concerned. It would also skip everything the api half walks before it says
+// gone — the binding, the heartbeat roster, the paused registry — which is
+// what covers the window a heartbeat is late for and the window another node's
 // reconciliation dropped a binding this node still lists.
 func (s *Server) resolveFromProjection(ctx context.Context, sandboxID string) *schedulerv1.LookupNodeResponse {
 	if s.projectionReader == nil {

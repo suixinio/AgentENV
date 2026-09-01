@@ -447,15 +447,15 @@ type executionRefusalBody struct {
 //
 //   - 404 is the hard one. The platform treats a 404 from resume as proof that
 //     the sandbox is gone and that it may rebuild the workspace from scratch,
-//     and the 404 it reads is produced here, by writeSchedulerError, without the
+//     and the 404 it reads is produced here, by writeResumeError, without the
 //     request ever reaching a node. A fencing refusal wearing a 404 therefore
 //     ends with a user's workspace deleted and nothing logged as an error.
 //   - 410 already means "not proxyable in its current state" on the node's own
 //     /proxy. A second meaning on the same code cannot be told from the first.
-//   - 503 is reserved, by the comment on writeSchedulerError, for "the scheduler
-//     could not look" and "the only node that could serve this will not" — both
-//     things that may have changed a moment later. A superseded incarnation is a
-//     settled fact, not a temporary inability.
+//   - 503 is reserved, by the comment on writeResumeError, for "the only node
+//     that could serve this will not" — a thing that may have changed a moment
+//     later. A superseded incarnation is a settled fact, not a temporary
+//     inability.
 //   - 502 says the upstream is broken. It is not; we are declining to use it.
 //
 // 409 fits on every count: the state of the resource conflicts with the request,

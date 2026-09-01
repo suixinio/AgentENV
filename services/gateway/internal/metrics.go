@@ -66,19 +66,18 @@ var (
 	// How each resolved sandbox route was answered: out of the routing
 	// projection, or by asking the api half.
 	//
-	// 🔴 This exists because turning the direct read on drives the scheduler's
-	// own lookup counters towards zero, and those counters were half of a
-	// two-sided reconciliation. This is the other half restored on this side.
-	// In a window where nothing has changed:
+	// 🔴 One side of a two-sided reconciliation with the api half. Every miss
+	// and every read error is followed by exactly one wake-up RPC, so in a
+	// window where nothing has changed:
 	//
-	//	Δ{redis_miss} + Δ{redis_error} ≈ Δ agentenv_api_lookup_node_total
+	//	Δ{redis_miss} + Δ{redis_error} ≈ Δ agentenv_gateway_resume_total ≈ Δ agentenv_api_resume_grpc_total
 	//
-	// A persistent disagreement means one of the two sides is counting
-	// something it is not doing.
+	// A persistent disagreement means one of the sides is counting something
+	// it is not doing.
 	//
 	// 🔴 redis_error is not a failure mode of the request. It is the count of
-	// times the fallback earned its place: the request still went to the
-	// scheduler and the client saw nothing. Alert on its rate, never on its
+	// times the read could not be made and the request went to the api half
+	// anyway, with the client seeing nothing. Alert on its rate, never on its
 	// existence.
 	gatewayRouteResolution = promauto.NewCounterVec(
 		prometheus.CounterOpts{

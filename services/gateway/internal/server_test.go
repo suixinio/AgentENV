@@ -213,17 +213,6 @@ func serve(t *testing.T, server *Server, req *http.Request) *http.Response {
 	return rec.Result()
 }
 
-// TestLookupNodeGoesToTheConfiguredScheduler pins the cold path's client
-// selection now that there is only one client to select: lookupNodeColdPath
-// calls LookupNode on the scheduler client NewServer was given (s.scheduler)
-// and forwards its answer, the same client every other Scheduler RPC in this
-// package uses. This replaces
-// TestLookupNodeUsesQueryOnlySchedulerClient, which pinned the opposite
-// behaviour — that LookupNode went to a second, separately configured
-// client (QueryOnlySchedulerClient) instead of s.scheduler — back when that
-// field existed. It does not any more: the query-only-scheduler client
-// selection is deleted along with the Go scheduler it existed to
-// decommission.
 func TestARoutedHealthRequestReachesTheNode(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
@@ -945,28 +934,6 @@ func TestHandleProxyHostBasedRoutingRejectsInvalidHost(t *testing.T) {
 		t.Fatalf("body = %q, want %q", got, want)
 	}
 }
-
-// 🔴 TestHandleProxyHTTPForwardingAndRecordAssignment and
-// TestHandleProxyColdSandboxCreateRecordsAssignment used to live here: a create
-// and a cold create, scheduled by this gateway (via scheduleFunc, against an
-// unconfigured, restUpstream=="" fixture) and proxied straight to whichever
-// node the stub named, asserting the forwarded method/path/query/host/body/
-// forwarded-headers and the resulting RecordAssignment call. Both routes are
-// routeSourceSchedule calls and are now always forwarded to the api half by
-// isUserFacingRestRequest before the gateway ever builds a schedule hint or
-// calls Schedule — see the removed "else" branch in handleProxy — so neither
-// request reaches a node this package resolves any more, and the assignment
-// each test recorded is now the api half's own
-// NodePlacement::record_placement, outside this package's reach.
-//
-// The generic proxy mechanics both tests incidentally covered — forwarded
-// method/path/query/host/content-type/body, the X-Forwarded-* headers, and the
-// debug node-id header — are not REST-specific: they run through the same
-// proxyRequest/Rewrite/ModifyResponse path for every forwarded exchange, REST
-// or data plane, and stay covered by TestHandleProxyWebSocketForwarding,
-// TestHandleProxyHostBasedRoutingForwardsToSandboxProxy and
-// TestDebugModeExposesBackendNodeIDOnResponse (added above, since the debug
-// header had no other test once these two were deleted).
 
 func TestHandleProxyWebSocketForwarding(t *testing.T) {
 	type upstreamRequestSnapshot struct {

@@ -636,7 +636,7 @@ func TestLogExecutionMismatchWritesTheFrozenFieldSet(t *testing.T) {
 //
 // The platform decides that a sandbox is gone, and that it may rebuild the
 // user's workspace from scratch, on exactly one signal: a 404 from resume. That
-// 404 is produced by this service, in writeSchedulerError, without the request
+// 404 is produced by this service, in writeResumeError, without the request
 // ever reaching a node. A fencing refusal that arrives as a 404 is therefore read
 // as "the sandbox no longer exists", and the cost of the misreading is a user's
 // workspace deleted with nothing logged as an error.
@@ -830,20 +830,6 @@ func TestGatewayStampsTheControlPlaneTokenOnForwardedRequests(t *testing.T) {
 		})
 	}
 }
-
-// 🔴 TestRecordedAssignmentCarriesTheNodesExecution used to live here: a
-// `POST /sandboxes` create, scheduled by this gateway against an
-// unconfigured (restUpstream=="") fixture, whose recorded assignment had to
-// carry the node's reported incarnation. Create is a routeSourceSchedule
-// call and is now always forwarded to the api half — which records its own
-// placements — before the gateway ever schedules or records anything for
-// it, so this specific request no longer reaches recordAssignmentFromResponse
-// at all. The property this pinned — a recorded assignment carries whatever
-// incarnation the response named, not a placeholder — survives for the one
-// case that still writes an assignment from this package: a data-plane
-// request to a PLACED/PINNED sandbox. See
-// TestPlacedSandboxDataPlaneRequestRecordsTheAssignment in server_test.go,
-// which asserts the recorded execution id the same way this test did.
 
 // 🔴 An unrecognised mode stops the process. Falling back to a default would let
 // one mistyped letter switch fencing off with nothing to say it happened, and

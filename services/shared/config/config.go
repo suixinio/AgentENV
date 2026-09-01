@@ -93,20 +93,17 @@ func ParseRoutingProjectionSwitch(raw string) (bool, error) {
 type GatewayRoutingConfig struct {
 	ExecutionFencing GatewayExecutionFencing `json:"execution_fencing"`
 	// ProjectionRead lets the gateway answer a sandbox route from the routing
-	// projection directly, falling back to the scheduler on a miss or an error.
-	// Off leaves every request going through LookupNode, which is what shipped
-	// before this existed.
+	// projection directly, asking the api half's resume RPC only on a miss or
+	// an error. Off sends every request naming a sandbox to that RPC.
 	//
-	// 🔴 Turning this on must be paired with whatever now answers LookupNode
-	// staying in its enforcing mode. That used to be the Go scheduler's
-	// routing.execution_arbitration; the equivalent on aenv-api's own
-	// in-process registry (`[cluster].node_placement_source = "native"`) is
-	// `[binding_store].arbitration` (src/cfg.rs) — its rollback works by
-	// blanking the two incarnation fields on the way out of LookupNode, and a
-	// gateway reading the projection itself never sees that blanking, so it
-	// would go on fencing against incarnations arbitration has stopped
-	// judging. There is no mechanism for it — the pairing is an operational
-	// rule, written here because this is where somebody reads it.
+	// 🔴 Turning this on must be paired with the api half's
+	// `[binding_store].arbitration` (src/cfg.rs) staying in its enforcing
+	// mode: its rollback works by blanking the two incarnation fields on the
+	// way out of the api half's LookupNode, and a gateway reading the
+	// projection itself never sees that blanking, so it would go on fencing
+	// against incarnations arbitration has stopped judging. There is no
+	// mechanism for it — the pairing is an operational rule, written here
+	// because this is where somebody reads it.
 	ProjectionRead bool `json:"projection_read"`
 	// ProjectionAuthoritative is read by no gateway binary any more: the
 	// gateway writes no projection, the api half writes its own on wake and

@@ -2595,10 +2595,10 @@ paths:
       description: |
         List the cluster paused-sandbox registry.
 
-        The parameter set below is closed. In particular there is no filter on
-        `executionID`: an incarnation a caller can supply is stale by
-        construction, and a filter that silently fails to apply returns an
-        answer that still looks like an answer.
+        The parameters below are the whole filter vocabulary; undeclared query
+        parameters are ignored, as they are across this API. `executionID` is
+        deliberately not a filter: an incarnation a caller can supply is stale
+        by construction.
       tags: [admin]
       security:
         - AdminApiKeyAuth: []

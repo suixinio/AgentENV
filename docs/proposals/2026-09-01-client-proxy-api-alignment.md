@@ -5,7 +5,7 @@
 > [`2026-08-31-residue-decisions.md`](2026-08-31-residue-decisions.md)（本方案落地后取代其 D2）、
 > [`2026-09-01-bidirectional-reconciler.md`](2026-09-01-bidirectional-reconciler.md)（并行项，见 §7）。
 > e2b 侧事实来自本地 `/home/debian/e2b-infra`@`fdc3359` 逐行核对 + DeepWiki（e2b-dev/infra）交叉确认，
-> AgentENV 侧全部 file:line 已在 `8248c8f` 上验证。
+> AgentENV 侧全部 file:line 已在 `8248c8f` 上验证；§4 与 P4 的行号已在 `feat/client-proxy-alignment` HEAD 上重新核对。
 
 ## 1. 目标与依据
 
@@ -65,25 +65,59 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 | execution fencing、内部 header 加盖 | ✔ 保留（喂源 P4 后收为 projection + resume 响应） | — | 无同位物，永久偏离 |
 | 路由修复 | ✂ RecordAssignment 移交（P4） | wake 与 running-miss 时自写投影；reconciler 只作命中率优化 | catalog 只由 api 写 |
 
-## 4. 与 e2b 的偏离：永久两项，过渡三项
+## 4. 与 e2b 的偏离：HEAD 上的唯一完整清单
 
-「对齐」指职责与连边，不是逐行抄写。偏离分两类：
+「对齐」指职责与连边，不是逐行抄写。下面是本分支 HEAD 上**全部**有意偏离——不在此表的差异
+不是偏离，是待对齐项或疏漏。每条一行理由、两侧 file:line（AgentENV 侧按本分支 HEAD 核对，
+e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过渡三项在 P4 折叠，其余保留。
 
-**永久偏离**（e2b 没有、我们必须有，理由是暂停/占位/收口状态机更复杂）：
-
-1. **execution fencing**（`execution_fencing.go`）——拒旧 incarnation。P4 后喂源收窄为
-   projection 记录（自带 `execution_id`，`services/shared/routing/record.go:71`）与 resume
-   响应（`apiproxy.proto` 的 `execution_id`，:84-90），不再依赖任何 scheduler RPC。
-2. **apiproxy 不加 OIDC edge 鉴权**——e2b 的 `requireEdgeClientProxyAuth` 服务跨集群 edge；
-   我们单集群内网。「一个 RPC」纪律不变。
-
-**过渡偏离**（本方案 P1–P3 不动、P4 折叠——依据见 §1 的第二处作废论证）：
-
-3. **LookupNode 第三级**（`server.go:558`）——剩余承重只有「Wake 答 Undecided 但
-   LookupNode 仍可答」的窗口（wake 需要 PG，LookupNode 可从 Redis binding/心跳清册应答）。
-4. **RecordAssignment**（`server.go:940-960`，触发在 node 代理路径的 ModifyResponse，
-   门控 `assignment != None` + 2xx）——修复职责与 reconciler 重叠。
-5. **gateway → scheduler.v1 拨号本身**——上两项的载体。
+1. **execution fencing**（`services/gateway/internal/execution_fencing.go`）——拒旧 incarnation；
+   e2b 无同位物。永久：暂停/占位/收口状态机更复杂。P4 后喂源收窄为 projection 记录
+   （自带 `execution_id`，`services/shared/routing/record.go:71`）与 resume 响应
+   （`services/api/proto/apiproxy/apiproxy.proto:90` 的 `execution_id`），不再依赖任何
+   scheduler RPC。
+2. **apiproxy 不加 OIDC edge 鉴权**（`services/gateway/internal/resume/client.go:224` 一条裸
+   RPC）；e2b `packages/api/internal/handlers/proxy_grpc.go:34-41` 的
+   `requireEdgeClientProxyAuth` 服务跨集群 edge，我们单集群内网。永久；「一个 RPC」纪律不变。
+3. **LookupNode 第三级**（`services/gateway/internal/server.go:491` `lookupNodeColdPath`）；
+   e2b 的 client-proxy 只有 catalog 直读 → resume 两级
+   （`packages/client-proxy/internal/proxy/proxy.go:77`）。过渡，P4 折叠：剩余承重只有
+   「Wake 答 Undecided 但 LookupNode 仍可答」的窗口（wake 需要 PG，LookupNode 可从 Redis
+   binding/心跳清册应答）。
+4. **RecordAssignment**（`server.go:882`，触发在 node 代理路径的 ModifyResponse，门控
+   `assignment != None` + 2xx）；e2b 的 catalog 只由 api 写
+   （`packages/api/internal/sandbox/store.go:43-44`）。过渡，P4 移交 api 自写投影；修复职责与
+   reconciler 重叠。
+5. **gateway → scheduler.v1 拨号本身**（`services/shared/config/config.go:164`
+   `scheduler_addr`）；e2b client-proxy 的连边只有 Redis + apiproxy。过渡，上两项的载体。
+6. **无沙箱的请求答 404**（`server.go:265-274`：无 Host 路由、无路由头 → 404）；e2b 没有
+   proxy 域名允许表，任何不合形的 Host 一律 400 "Invalid host"
+   （`packages/shared/pkg/proxy/host.go:74-88`、`handler.go:36-41`）。保留：
+   `sandbox_proxy_domains` 允许表让「这不是数据面地址」成为一个真实、可区分的状态，
+   残余 REST 调用方拿到的信号也更清楚。
+7. **运维可设的节点状态只有 `ready`/`draining`**，在 `node.proto` 的
+   `NodeStatusOverrideRequest` 里是一个 bool，409 表示「不可设」
+   （`src/api/impls/admin.rs:106-115`）；e2b 转发 `ready|draining|unhealthy|standby`
+   （`packages/api/internal/orchestrator/nodemanager/status.go:21-26`，:145-146 打
+   `ServiceStatusOverride`），409 留给 orchestrator 对 draining→standby 的 FailedPrecondition
+   （`packages/orchestrator/pkg/service/info.go:63-65`）。`lingering` 无 e2b 同位物。保留现状。
+8. **api 半边只查 admin 头是否存在**（`src/api/impls/auth.rs:26-28`）；e2b 对 admin token
+   做等值比较（`packages/api/main.go:176-183` 的 `NewAdminApiKeyAuthenticator(config.AdminToken)`）。
+   按 §6 条件项保留。
+9. **node 半边仍以 `x-agentenv-control-plane` 门禁 `/nodes*`**（`src/api/server.rs:144-148`
+   只在不拥有用户 REST 的半边挂 `require_control_plane`，头名在
+   `src/api/control_plane_gate.rs:23`）；e2b 的 orchestrator 没有 REST 面，其 gRPC 不鉴权。
+   按 P3 实施修订保留。
+10. **冷路径先查 running、再看 autoResume 门控**（P4 的 api 侧判定）；e2b
+    `packages/api/internal/handlers/proxy_grpc.go:99-125` 的 `getAutoResumeSnapshot` 跑在
+    `GetSandbox`（:179-208）之前，政策非 Any 时连从未暂停的 running 沙箱在 catalog miss 上
+    也答 NotFound。保留（P4 明确项）：autoResume:false + running 必须可路由。
+11. **running-miss 时 api 回写投影**（P4 的 api 侧）；e2b 的 edge 从不回写，
+    `packages/client-proxy/internal/proxy/proxy.go:77` 是唯一一次 catalog 调用，miss 即重发
+    RPC。保留（P4 明确项）：对命中率的既定改良。
+12. **CLI 取两个显式地址**（`crates/aenv/src/auth.rs` 的 `url` + `proxy_url`，缺一拒绝运行）；
+    e2b 从一个域名推导两个入口（`api.<domain>` / `<port>-<id>.<domain>`），外加每沙箱可选的
+    `domain` 字段。按部署无关裁决（§2）保留：仓库不预设任何域名产品。
 
 ## 5. 分阶段实施
 
@@ -251,13 +285,30 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
   已是 e2b 形状）。**两趟读、门控不同的语义必须原样保住**：autoResume:false + running 可
   路由，autoResume:false + paused 拒绝——这正是当年 autoResume 静默失效修复的形状，
   折叠进一个 RPC 不许把它折没（e2b 此处更弱：政策非 Any 时 miss 连 running 都答
-  NotFound/502，我们不跟，这是有据的既证偏离）。wake 成功与 running-miss 修复时
+  NotFound，我们不跟，这是有据的既证偏离，§4 第 10 条）。wake 成功与 running-miss 修复时
   api 都自写投影（它拥有 Redis 写权），取代 gateway 的 RecordAssignment——e2b 的
-  edge 不回写、每次 miss 重发 RPC，回写是我们对命中率的既定改良。投影 TTL 采
-  e2b 写法：写入时覆盖沙箱剩余寿命（e2b `lifetime = MaxLengthInHours` 进 Redis
-  `SET EX`），条目不在沙箱存活期内过期，api 不可达窗口撞上 miss 的概率压到与
-  e2b 同水平；`projectionTTLToRecord` 的 api 半边按此实现。
-- **gateway 侧删除**：`lookupNodeColdPath`（:558）与 VerdictUndecided 的第三级回落——
+  edge 不回写、每次 miss 重发 RPC，回写是我们对命中率的既定改良（§4 第 11 条）。
+- **api 不可达时 gateway 答 502**：e2b 把 api 的 NotFound 与传输失败都渲染成 502
+  （`packages/shared/pkg/proxy/template/sandbox_not_found.go:31`）；我们 `writeResumeError`
+  的 default 分支已经答 502（`server.go:1478-1484`），P4 只需把 VerdictUndecided 收进这一
+  分支，不另设状态码。
+- **投影 TTL**：「覆盖沙箱剩余寿命」就是现有的 `src/orchestrator/store/metadata.rs:319-333`
+  `projection_ttl_secs`——`max_sandbox_lifetime_secs` 上限的剩余量 + grace（SetTimeout 永远
+  越不过这个上限），与 e2b `packages/api/internal/orchestrator/lifecycle.go:36-40`
+  `lifetime = MaxLengthInHours` 同形；api 半边的 `resolve_projection_ttl`
+  （`src/node_registry/grpc_service.rs:254`）也已经存在。P4 的 api 侧在 wake 与 running-miss
+  写投影时调用它，不新实现任何东西。两条注记：
+  (i) 上限为 0 时 TTL 回落到 `binding_ttl`（30 s，`src/cfg.rs:949`），P4 后每次 miss 花一次
+  resume RPC——只影响命中率，正确性不受影响；e2b 的「不足一小时的最大寿命 → TTL 0 =
+  永不过期」（`packages/shared/pkg/sandbox-catalog/catalog_redis.go:98` 的 `SET` 带 0 过期）
+  **不得照抄**。(ii) e2b 在 store 插入回调里**同步**写 catalog
+  （`packages/api/internal/sandbox/store.go:43-44`，"should be called sync to prevent race
+  conditions"）——投影写入必须在 resume 响应返回之前完成。
+- **transitioning 一腿**：e2b 的 api 对 Pausing/Snapshotting 最多等 60 s / 3 次重试
+  （`packages/api/internal/orchestrator/autoresume.go:43-97`，预算 `proxy_grpc.go:97`）才答
+  FailedPrecondition；本分支在边缘立即答 503 + `Retry-After: 1`（`server.go:1468-1475`）。
+  裁决：保持立即 503 + Retry-After，api 不引入等待预算。
+- **gateway 侧删除**：`lookupNodeColdPath`（`server.go:491`）与 VerdictUndecided 的第三级回落——
   Undecided 收窄为纯传输失败 → 请求失败（e2b 形状：api 不可答则数据面冷路径失败；
   PG 降级窗口内 running 沙箱的冷路由损失是接受的代价，冷路径命中率列为监控项）；
   `recordAssignmentFromResponse` 两腿（response_header /
@@ -320,13 +371,15 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 - P2/P3：pve-mf 全量 e2e（109+8 基线）双地址通过；数据面五项冒烟——Host 路由、路由头路由、
   暂停自动唤醒（resume curl 注意 Content-Type，历史 415 坑）、fencing 拒旧 incarnation、
   RecordAssignment 后 projection 收敛。
-- P3 后：404 兜底行为 + 合成响应携带 CORS 头（preflight 只在无上游处应答）；
+- P3 后：404 兜底行为 + 合成响应携带 CORS 头（preflight 在 gateway 合成失败的每一处应答，
+  且只在无上游处应答）；
   gateway 访问日志观察一个发布周期，确认无残余 REST 流量。
 - P3 后守卫：新增 manifest 测试断言任何工作负载不再声明 `GATEWAY_REST_UPSTREAM_ADDR`
   （沿 `snapshot_catalog_manifest_test.go` 形制；锚定语法而非裸子串）。
 - P4：autoResume 双门控行为保持（false+running 可路由、false+paused 拒绝，两个用例
   显式断言）；wake 后投影由 api 写入并收敛；冷路径命中率与失败率上监控；
-  fencing 在 projection/resume 两个喂源下拒旧 incarnation 的用例保持全绿。
+  fencing 在 projection/resume 两个喂源下拒旧 incarnation 的用例保持全绿；api 不可达答 502、
+  transitioning 仍答 503 + `Retry-After: 1` 各一个显式用例；投影写入在 resume 响应返回前完成。
 
 ## 9. 风险
 
@@ -338,4 +391,4 @@ P4 后 gateway 的全部连边：Redis routing projection（直读）＋ `apipro
 | 指标/label 消失打断看板 | P3/P4 变更说明各列全部消失序列 |
 | P3 后残余流量打到 gateway 的 REST 路径 | 定义 404 行为并在 gateway 访问日志观察一个发布周期 |
 | P4 折没 autoResume 双门控（历史上删掉那趟读时 1397 个测试全绿） | 两个门控用例显式断言 + 变异证据；不许以「测试全绿」为删除依据 |
-| P4 后 PG 降级窗口 running 沙箱冷路由失败 | e2b 同形的接受代价；投影 TTL 覆盖沙箱剩余寿命（e2b 同款）+ 冷路径命中率监控，恶化再议 |
+| P4 后 PG 降级窗口 running 沙箱冷路由失败 | e2b 同形的接受代价；投影 TTL = `projection_ttl_secs`（剩余寿命 + grace，e2b 同形）+ 冷路径命中率监控，恶化再议 |

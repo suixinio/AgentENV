@@ -854,11 +854,11 @@ impl From<PlacementRefusal> for DataPlaneResume {
 
 /// The floor a woken sandbox's timeout is raised to.
 ///
-/// Declared in `crate::api::proxy` and read here rather than restated: the
-/// deleted `try_auto_resume` raised a woken sandbox's timeout to exactly this
-/// floor, and reading the same accessor is what keeps a wake-up over the
-/// gateway's cold path from handing out a different lifetime than the one the
-/// data plane used to hand out itself.
+/// Declared in `crate::api::proxy` beside the other `auto_resume_*` settings
+/// and read here rather than restated: a traffic-triggered wake-up hands out
+/// this one lifetime whether it reopens a capture or rebuilds from a snapshot,
+/// and the projection this surface writes afterwards is budgeted from the
+/// record that lifetime lands in.
 fn auto_resume_min_sandbox_timeout() -> std::time::Duration {
     crate::api::proxy::auto_resume_min_sandbox_timeout()
 }

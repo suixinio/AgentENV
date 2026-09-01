@@ -189,8 +189,8 @@ node_service_addr = "0.0.0.0:8001"
 
 # Where `aenv-api` serves the data plane's wake-up surface. Bound by
 # `aenv-api` only (`assemble_api`, `crates/aenv-api/src/bin/aenv-api.rs`).
-# The gateway's cold path calls it, and nodes' heartbeats land on the same
-# listener — one port, two gRPC services multiplexed by HTTP/2 path
+# The gateway's `apiproxy.ResumeSandbox` and the nodes' heartbeats land on
+# this listener — one port, two gRPC services multiplexed by HTTP/2 path
 # (`src/api/grpc/mod.rs`).
 api_grpc_addr = "0.0.0.0:8002"
 

@@ -30,6 +30,7 @@ use crate::proto::scheduler::{
     UnregisterNodeRequest, UnregisterNodeResponse,
 };
 
+use super::fleet;
 use super::placement::{ShadowPlacement, ShadowSource};
 use super::registry::{
     AtomicNodeRegistry, NodeNotInRegistry, NodeRegistry, ServiceInstanceMismatch,
@@ -544,9 +545,8 @@ impl Scheduler for NodeRegistryGrpcService {
         request: Request<ListObservedNodesRequest>,
     ) -> Result<Response<ListObservedNodesResponse>, Status> {
         let req = request.into_inner();
-        let nodes = self
-            .registry
-            .list_observed(&req.cluster_id, SystemTime::now());
+        let nodes =
+            fleet::observed_nodes(self.registry.as_ref(), &req.cluster_id, SystemTime::now());
         Ok(Response::new(ListObservedNodesResponse { nodes }))
     }
 
@@ -559,10 +559,13 @@ impl Scheduler for NodeRegistryGrpcService {
         if node_id.is_empty() {
             return Err(Status::invalid_argument("node_id is required"));
         }
-        let node = self
-            .registry
-            .get_observed(node_id, &req.cluster_id, SystemTime::now())
-            .ok_or_else(|| Status::not_found("observed node not found"))?;
+        let node = fleet::observed_node(
+            self.registry.as_ref(),
+            node_id,
+            &req.cluster_id,
+            SystemTime::now(),
+        )
+        .ok_or_else(|| Status::not_found("observed node not found"))?;
         Ok(Response::new(GetNodeResponse { node: Some(node) }))
     }
 

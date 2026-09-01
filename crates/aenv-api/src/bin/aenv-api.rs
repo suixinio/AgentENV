@@ -234,7 +234,10 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             // Clone only after the binding, artifact, and paused-registry builders.
             ResumeWiring::cluster_in_process(node_registry_grpc_service.clone()),
         )
-        .with_node_placement(placement),
+        .with_node_placement(placement)
+        // This half observes the cluster, so `/nodes` reports the fleet rather
+        // than the one replica answering the request.
+        .with_node_fleet(Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>),
     );
 
     // Replica identities must be unique because stale-release is identity-scoped.

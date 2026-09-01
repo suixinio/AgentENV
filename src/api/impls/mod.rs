@@ -19,6 +19,8 @@ use async_trait::async_trait;
 use super::proxy::{build_proxy_client, ProxyClient};
 use crate::identity::NodeIdentity;
 use crate::node_client::NodePlacement;
+use crate::node_registry::fleet::NodeFleetView;
+use crate::node_registry::registry::NodeRegistry;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::{PausedSandboxPublisher, PausedSandboxRegistry, SandboxOrchestration};
 use crate::snapshot::repository::RepositoryError;
@@ -79,6 +81,8 @@ pub struct ApiImpl {
     resume_wiring: ResumeWiring,
     /// Placement for template builds this process cannot run locally.
     node_placement: Option<Arc<dyn NodePlacement>>,
+    /// Whose nodes `/nodes` reports: the cluster's, or this process's own.
+    node_fleet: NodeFleetView,
 }
 
 impl ApiImpl {
@@ -99,12 +103,23 @@ impl ApiImpl {
             sandbox_proxy_domains,
             resume_wiring,
             node_placement: None,
+            node_fleet: NodeFleetView::self_report(),
         }
     }
 
     /// Configures remote placement for template builds.
     pub fn with_node_placement(mut self, node_placement: Arc<dyn NodePlacement>) -> Self {
         self.node_placement = Some(node_placement);
+        self
+    }
+
+    /// Makes `/nodes` answer the cluster's inventory from this registry.
+    ///
+    /// Without it the endpoints answer this process's own observability report,
+    /// which is what a node's self-report surface is for.
+    #[must_use]
+    pub fn with_node_fleet(mut self, registry: Arc<dyn NodeRegistry>) -> Self {
+        self.node_fleet = NodeFleetView::cluster(registry);
         self
     }
 
@@ -121,6 +136,11 @@ impl ApiImpl {
     /// Returns remote template-build placement, if configured.
     pub fn node_placement(&self) -> Option<Arc<dyn NodePlacement>> {
         self.node_placement.as_ref().map(Arc::clone)
+    }
+
+    /// Returns the handle that decides whose nodes `/nodes` reports.
+    pub fn node_fleet(&self) -> &NodeFleetView {
+        &self.node_fleet
     }
 
     pub fn orchestrator(&self) -> Arc<dyn SandboxOrchestration> {

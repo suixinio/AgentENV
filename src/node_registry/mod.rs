@@ -5,6 +5,7 @@
 
 pub mod cpu_template;
 pub mod filter;
+pub mod fleet;
 pub mod grpc_service;
 pub mod kubernetes_discovery;
 pub mod placement;

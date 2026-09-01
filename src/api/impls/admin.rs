@@ -1,3 +1,5 @@
+use std::time::SystemTime;
+
 use async_trait::async_trait;
 use axum_extra::extract::CookieJar;
 use chrono::{DateTime, Utc};
@@ -6,8 +8,10 @@ use http::Method;
 
 use tracing::info;
 
+use crate::node_registry::fleet::{FleetNode, FleetNodes};
 use crate::observability::{DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
 use crate::orchestrator::{PausedRegistryListEntry, PausedRegistryState};
+use crate::proto::scheduler as scheduler_proto;
 use crate::snapshot::CatalogReadScope;
 use agentenv_http_server::types::Nullable;
 use agentenv_http_server::{apis::admin::*, models};
@@ -87,6 +91,111 @@ impl From<NodeSnapshot> for models::Node {
     }
 }
 
+/// Renders the optional `clusterID` filter the way the registry reads it.
+///
+/// An empty filter spans every cluster, which is what an absent parameter means.
+fn cluster_filter(cluster_id: Option<uuid::Uuid>) -> String {
+    cluster_id.map(|id| id.to_string()).unwrap_or_default()
+}
+
+/// Maps a scheduler-observed status to its REST spelling.
+///
+/// The gateway spells the same statuses out of the same RPC
+/// (`services/gateway/internal/node_list.go`); one node must not read
+/// differently by which address asked.
+fn observed_status(status: scheduler_proto::NodeStatus) -> models::NodeStatus {
+    match status {
+        scheduler_proto::NodeStatus::Ready => models::NodeStatus::NodeStatusReady,
+        scheduler_proto::NodeStatus::Draining => models::NodeStatus::NodeStatusDraining,
+        scheduler_proto::NodeStatus::Unhealthy => models::NodeStatus::NodeStatusUnhealthy,
+        scheduler_proto::NodeStatus::Lingering => models::NodeStatus::NodeStatusLingering,
+        // A derived observed view never leaves the status unspecified.
+        scheduler_proto::NodeStatus::Connecting | scheduler_proto::NodeStatus::Unspecified => {
+            models::NodeStatus::NodeStatusConnecting
+        }
+    }
+}
+
+fn observed_machine_info(
+    machine_info: Option<scheduler_proto::MachineInfo>,
+) -> models::MachineInfo {
+    let machine_info = machine_info.unwrap_or_default();
+    models::MachineInfo::new(
+        machine_info.cpu_family,
+        machine_info.cpu_model,
+        machine_info.cpu_model_name,
+        machine_info.cpu_architecture,
+    )
+}
+
+fn observed_metrics(snapshot: &scheduler_proto::NodeSnapshot) -> models::NodeMetrics {
+    models::NodeMetrics::new(
+        snapshot.allocated_cpu,
+        snapshot.cpu_percent,
+        snapshot.cpu_count,
+        snapshot.allocated_memory_bytes,
+        snapshot.memory_used_bytes,
+        snapshot.memory_total_bytes,
+        snapshot
+            .disks
+            .iter()
+            .map(|disk| {
+                models::DiskMetrics::new(
+                    disk.mount_point.clone(),
+                    disk.device.clone(),
+                    disk.filesystem_type.clone(),
+                    disk.used_bytes,
+                    disk.total_bytes,
+                )
+            })
+            .collect(),
+        snapshot.paused_allocated_cpu,
+        snapshot.paused_allocated_memory_bytes,
+    )
+}
+
+/// Renders one cluster-observed node as a collection entry.
+fn observed_node_model(observed: scheduler_proto::ObservedNode) -> models::Node {
+    let snapshot = observed.snapshot.unwrap_or_default();
+    models::Node::new(
+        observed.version,
+        observed.commit,
+        observed.node_id,
+        observed.service_instance_id,
+        observed.cluster_id,
+        observed_machine_info(observed.machine_info),
+        observed_status(snapshot.status()),
+        snapshot.sandbox_count,
+        observed_metrics(&snapshot),
+        snapshot.create_successes,
+        snapshot.create_fails,
+        snapshot.sandbox_starting_count,
+        snapshot.paused_sandbox_count,
+    )
+}
+
+/// Renders one cluster-observed node as its detail view.
+///
+/// Cached builds are a node-local inventory the heartbeat does not carry.
+fn observed_node_detail(observed: scheduler_proto::ObservedNode) -> models::NodeDetail {
+    let snapshot = observed.snapshot.unwrap_or_default();
+    models::NodeDetail::new(
+        observed.cluster_id,
+        observed.version,
+        observed.commit,
+        observed.node_id,
+        observed.service_instance_id,
+        observed_machine_info(observed.machine_info),
+        observed_status(snapshot.status()),
+        snapshot.sandbox_count,
+        observed_metrics(&snapshot),
+        vec![],
+        snapshot.create_successes,
+        snapshot.create_fails,
+        snapshot.paused_sandbox_count,
+    )
+}
+
 /// Renders an absent deadline as JSON null.
 ///
 /// An absent lease means "already expired" and an absent sandbox deadline means
@@ -152,6 +261,8 @@ fn registry_state_filter(raw: Option<&str>) -> Result<Option<PausedRegistryState
 impl Admin<()> for ApiImpl {
     type Claims = super::Claims;
 
+    /// Lists the cluster's nodes, or this process's own report when it keeps no
+    /// cluster view — a node's `/nodes` is its self-report surface.
     async fn nodes_get(
         &self,
         _method: &Method,
@@ -160,6 +271,13 @@ impl Admin<()> for ApiImpl {
         _claims: &Self::Claims,
         query_params: &models::NodesGetQueryParams,
     ) -> Result<NodesGetResponse, ()> {
+        let cluster_id = cluster_filter(query_params.cluster_id);
+        if let FleetNodes::Cluster(nodes) = self.node_fleet().list(&cluster_id, SystemTime::now()) {
+            return Ok(NodesGetResponse::Status200_SuccessfullyReturnedAllNodes(
+                nodes.into_iter().map(observed_node_model).collect(),
+            ));
+        }
+
         let Some(observability) = self.observability() else {
             // When observability is disabled, the collection endpoint exposes
             // no nodes rather than returning a partial or synthetic record.
@@ -189,6 +307,8 @@ impl Admin<()> for ApiImpl {
         ))
     }
 
+    /// Reads one cluster node, or this process's own report when it keeps no
+    /// cluster view.
     async fn nodes_node_id_get(
         &self,
         _method: &Method,
@@ -198,6 +318,27 @@ impl Admin<()> for ApiImpl {
         path_params: &models::NodesNodeIdGetPathParams,
         query_params: &models::NodesNodeIdGetQueryParams,
     ) -> Result<NodesNodeIdGetResponse, ()> {
+        let cluster_id = cluster_filter(query_params.cluster_id);
+        match self
+            .node_fleet()
+            .get(&path_params.node_id, &cluster_id, SystemTime::now())
+        {
+            FleetNode::Observed(observed) => {
+                return Ok(
+                    NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(
+                        observed_node_detail(*observed),
+                    ),
+                );
+            }
+            FleetNode::Absent => {
+                return Ok(NodesNodeIdGetResponse::Status404_NotFound(Self::error(
+                    404,
+                    format!("node {} not found", path_params.node_id),
+                )));
+            }
+            FleetNode::SelfReport => {}
+        }
+
         let Some(observability) = self.observability() else {
             // A disabled observability service behaves like node details are
             // unavailable on this process.
@@ -1228,5 +1369,318 @@ mod registry_listing_tests {
             state.is_none() && node_id.is_none() && limit.is_none() && next_token.is_none(),
             "the default page asks for nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod fleet_node_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use axum_extra::extract::CookieJar;
+    use headers::Host;
+    use http::Method;
+    use serde_json::{json, Value};
+
+    use agentenv_http_server::apis::admin::*;
+    use agentenv_http_server::models;
+
+    use super::{observed_node_detail, observed_node_model, observed_status, ApiImpl};
+    use crate::identity::NodeIdentity;
+    use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
+    use crate::node_registry::types::Node as DiscoveredNode;
+    use crate::orchestrator::{
+        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
+        Orchestrator,
+    };
+    use crate::proto::scheduler as scheduler_proto;
+    use crate::sandbox::mock::MockBackendFactory;
+    use crate::snapshot::mock::mock_snapshot_manager;
+
+    /// An observed node whose every field carries a value distinct from the rest.
+    fn sentinel_observed() -> scheduler_proto::ObservedNode {
+        scheduler_proto::ObservedNode {
+            node_id: "node-a".to_string(),
+            endpoint: "http://10.0.0.1:8080".to_string(),
+            cluster_id: "cluster-1".to_string(),
+            service_instance_id: "svc-a".to_string(),
+            version: "0.1.2".to_string(),
+            commit: "abcdef0".to_string(),
+            machine_info: Some(scheduler_proto::MachineInfo {
+                cpu_family: "6".to_string(),
+                cpu_model: "143".to_string(),
+                cpu_model_name: "Xeon Platinum".to_string(),
+                cpu_architecture: "x86_64".to_string(),
+                cpu_config_json: "{}".to_string(),
+            }),
+            snapshot: Some(scheduler_proto::NodeSnapshot {
+                status: scheduler_proto::NodeStatus::Ready as i32,
+                allocated_cpu: 11,
+                allocated_memory_bytes: 12,
+                cpu_percent: 13,
+                cpu_count: 14,
+                memory_used_bytes: 15,
+                memory_total_bytes: 16,
+                disks: vec![scheduler_proto::DiskMetric {
+                    mount_point: "/".to_string(),
+                    device: "/dev/sda1".to_string(),
+                    filesystem_type: "ext4".to_string(),
+                    used_bytes: 17,
+                    total_bytes: 18,
+                }],
+                sandbox_count: 19,
+                sandbox_starting_count: 20,
+                create_successes: 21,
+                create_fails: 22,
+                reported_at_unix_ms: 1_700_000_000_000,
+                paused_sandbox_count: 23,
+                paused_allocated_cpu: 24,
+                paused_allocated_memory_bytes: 25,
+            }),
+            last_seen_unix_ms: 1_700_000_000_001,
+        }
+    }
+
+    fn value(model: impl serde::Serialize) -> Value {
+        serde_json::to_value(model).expect("the model serializes")
+    }
+
+    #[test]
+    fn a_listed_node_carries_every_field_the_gateway_renders() {
+        // 🔴 Mirrors `nodeListItem`'s JSON tags in
+        // services/gateway/internal/node_list.go. Two addresses, one shape.
+        assert_eq!(
+            value(observed_node_model(sentinel_observed())),
+            json!({
+                "version": "0.1.2",
+                "commit": "abcdef0",
+                "id": "node-a",
+                "serviceInstanceID": "svc-a",
+                "clusterID": "cluster-1",
+                "machineInfo": {
+                    "cpuFamily": "6",
+                    "cpuModel": "143",
+                    "cpuModelName": "Xeon Platinum",
+                    "cpuArchitecture": "x86_64",
+                },
+                "status": "ready",
+                "sandboxCount": 19,
+                "metrics": {
+                    "allocatedCPU": 11,
+                    "cpuPercent": 13,
+                    "cpuCount": 14,
+                    "allocatedMemoryBytes": 12,
+                    "memoryUsedBytes": 15,
+                    "memoryTotalBytes": 16,
+                    "disks": [{
+                        "mountPoint": "/",
+                        "device": "/dev/sda1",
+                        "filesystemType": "ext4",
+                        "usedBytes": 17,
+                        "totalBytes": 18,
+                    }],
+                    "pausedAllocatedCPU": 24,
+                    "pausedAllocatedMemoryBytes": 25,
+                },
+                "createSuccesses": 21,
+                "createFails": 22,
+                "sandboxStartingCount": 20,
+                "sandboxPausedCount": 23,
+            })
+        );
+    }
+
+    #[test]
+    fn a_node_detail_carries_the_same_reading_without_the_starting_count() {
+        let detail = value(observed_node_detail(sentinel_observed()));
+        let listed = value(observed_node_model(sentinel_observed()));
+
+        let models::NodeDetail {
+            cluster_id: _,
+            version: _,
+            commit: _,
+            id: _,
+            service_instance_id: _,
+            machine_info: _,
+            status: _,
+            sandbox_count: _,
+            metrics: _,
+            cached_builds,
+            create_successes: _,
+            create_fails: _,
+            sandbox_paused_count: _,
+        } = observed_node_detail(sentinel_observed());
+        assert!(
+            cached_builds.is_empty(),
+            "the heartbeat carries no cached-build inventory"
+        );
+
+        for (key, value) in listed.as_object().expect("an object") {
+            if key == "sandboxStartingCount" {
+                assert!(
+                    !detail.as_object().expect("an object").contains_key(key),
+                    "the detail schema has no starting count"
+                );
+                continue;
+            }
+            assert_eq!(detail.get(key), Some(value), "{key} disagrees");
+        }
+    }
+
+    #[test]
+    fn every_observed_status_keeps_the_gateway_spelling() {
+        // 🔴 The right column is `nodeStatusToString` in node_list.go.
+        for (observed, spelling) in [
+            (scheduler_proto::NodeStatus::Ready, "ready"),
+            (scheduler_proto::NodeStatus::Connecting, "connecting"),
+            (scheduler_proto::NodeStatus::Unhealthy, "unhealthy"),
+            (scheduler_proto::NodeStatus::Lingering, "lingering"),
+            (scheduler_proto::NodeStatus::Draining, "draining"),
+        ] {
+            assert_eq!(
+                observed_status(observed).to_string(),
+                spelling,
+                "{observed:?} must read the same through either address"
+            );
+        }
+    }
+
+    fn observing(nodes: &[&str]) -> Arc<AtomicNodeRegistry> {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            nodes
+                .iter()
+                .map(|id| DiscoveredNode {
+                    id: (*id).to_string(),
+                    endpoint: format!("http://{id}:8080"),
+                    pod_name: (*id).to_string(),
+                })
+                .collect(),
+            Duration::from_secs(30),
+        ));
+        for id in nodes {
+            registry
+                .heartbeat(
+                    &scheduler_proto::HeartbeatRequest {
+                        node_id: (*id).to_string(),
+                        cluster_id: String::new(),
+                        service_instance_id: format!("svc-{id}"),
+                        snapshot: Some(scheduler_proto::NodeSnapshot {
+                            status: scheduler_proto::NodeStatus::Ready as i32,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    SystemTime::now(),
+                )
+                .expect("the heartbeat lands");
+        }
+        registry
+    }
+
+    async fn api(fleet: Option<Arc<AtomicNodeRegistry>>) -> ApiImpl {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let orchestrator = Orchestrator::new(
+            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
+            crate::image::DisabledRuntimeImageRefs::shared(),
+        )
+        .await
+        .expect("an orchestrator");
+        std::mem::forget(root);
+        let snapshot_manager = Arc::new(mock_snapshot_manager());
+        let identity = NodeIdentity::from_config(&Default::default());
+
+        let api = ApiImpl::new(
+            orchestrator,
+            Arc::clone(&snapshot_manager),
+            None,
+            crate::api::PausedSandboxWiring::new(
+                Arc::new(DisabledPausedSandboxRegistry),
+                snapshot_manager,
+                &identity,
+            ),
+            Vec::new(),
+            crate::api::ResumeWiring::node_local(identity.id.clone()),
+        );
+        match fleet {
+            Some(registry) => api.with_node_fleet(registry as Arc<dyn NodeRegistry>),
+            None => api,
+        }
+    }
+
+    async fn list(api: &ApiImpl) -> Vec<models::Node> {
+        let response = api
+            .nodes_get(
+                &Method::GET,
+                &Host::from(http::uri::Authority::from_static("localhost")),
+                &CookieJar::new(),
+                &super::super::Claims,
+                &models::NodesGetQueryParams { cluster_id: None },
+            )
+            .await
+            .expect("the handler answers");
+        match response {
+            NodesGetResponse::Status200_SuccessfullyReturnedAllNodes(nodes) => nodes,
+            other => panic!("expected a listing, got {other:?}"),
+        }
+    }
+
+    async fn detail(api: &ApiImpl, node_id: &str) -> NodesNodeIdGetResponse {
+        api.nodes_node_id_get(
+            &Method::GET,
+            &Host::from(http::uri::Authority::from_static("localhost")),
+            &CookieJar::new(),
+            &super::super::Claims,
+            &models::NodesNodeIdGetPathParams {
+                node_id: node_id.to_string(),
+            },
+            &models::NodesNodeIdGetQueryParams { cluster_id: None },
+        )
+        .await
+        .expect("the handler answers")
+    }
+
+    #[tokio::test]
+    async fn a_fleet_view_lists_every_observed_node() {
+        let api = api(Some(observing(&["node-a", "node-b"]))).await;
+
+        let mut ids: Vec<String> = list(&api).await.into_iter().map(|node| node.id).collect();
+        ids.sort();
+
+        assert_eq!(ids, vec!["node-a".to_string(), "node-b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn without_a_fleet_view_the_local_report_still_answers() {
+        // Observability is off here, so the self-report surface has nothing to
+        // show — but it is still the surface being asked.
+        let api = api(None).await;
+
+        assert!(list(&api).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_fleet_view_reads_one_node_from_the_cluster() {
+        let api = api(Some(observing(&["node-a", "node-b"]))).await;
+
+        match detail(&api, "node-b").await {
+            NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(node) => {
+                assert_eq!(node.id, "node-b");
+                assert_eq!(node.status, models::NodeStatus::NodeStatusReady);
+            }
+            other => panic!("expected the node, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fleet_view_that_does_not_observe_a_node_is_a_404() {
+        let api = api(Some(observing(&["node-a"]))).await;
+
+        assert!(matches!(
+            detail(&api, "node-z").await,
+            NodesNodeIdGetResponse::Status404_NotFound(_)
+        ));
     }
 }

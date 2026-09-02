@@ -238,3 +238,17 @@ binding 都不再需要。
   缓解：先删后改，先让 `make check-crate-boundaries`、`make test-unit`、`make -C services test` 在删除态全绿，再改写流程。
 - `resume_surface.rs` 和 gateway 冷路径刚在 P4 收口（`790620b`），本稿再改一次应答形状。缓解：apiproxy 应答只减枚举值不加，Go 侧按 `2026-09-01-client-proxy-api-alignment.md` §4 的偏离清单同步更新第 1、3 条。
 - `/sandboxes-cold` 的引用型提交若做成选项 b，会让冷沙箱复制模板层的 manifest；层本身仍零拷贝，风险仅在 GC 引用计数。
+
+## 12. 实施纪要（as-built）
+
+记录落地代码相对 §4 的偏离。§5 的审查表保持原样，本节只记「做成了什么」。
+
+- **pause 是同步的，没有 `building` 行。** §4.2 写的是节点落 capture 后立刻应答、异步 `stage` 上传、上传完成后 `commit_staged` 把行翻 `ready`。实际：节点 `Pause` RPC 在 `StagingPausePublisher` 把 capture 落到自己的快照仓库之后才应答，应答只有 `staged`（没有 `publish` 标志，也没有 `PausedState`）；然后节点停 VM、忘掉沙箱。api 半边拿到应答即由 `CommittingPausePublisher` 提交进 catalog，再删活跃记录和路由 binding。行一落地就是 ready，§4.2 的两步塌成一步。发布失败时沙箱原地 resume，pause 报为失败（`OrchestratorError::PausePublicationFailed`）；VM 拉不回来才拆除。§4.2 的「Pause 失败一律 kill、行翻 `error`」没有以那个形状落地。
+- **没有加 `sandbox_config` 列。** §4.1 留给实施定的两个位置，取的是 `committed_payload`：`PausedSandboxConfig`（`src/snapshot/types/paused.rs`：模板 id、创建时间、timeout 与到期动作、`auto_resume`、用户 metadata、网络策略、`secure`、控制面标记、生命周期预算与已计运行时间）随提交载荷落行。`snapshots` 表形状未变；`origin_node_id` 总是记录 staged 字节的节点，resume 落到别处时改写（`SnapshotCatalog::set_origin_node_id`，即 E6）。`paused_sandboxes`、`paused_registry_grace` 表，`[orchestrator.paused_registry]` 配置段与 `AENV_PAUSED_REGISTRY_BACKEND` 全部删除；`persisted_sandbox_store_path` 只剩 capture 的暂存根与节点 reclaim 的扫描范围。
+- **`/sandboxes-cold` 是误读，未改。** §4.2 末段与 §7 第 1 项把它当成「不启动、直接造一条 sandbox 来源的行」；它一直是从 OCI 镜像 create 一个沙箱，与暂停无关。引用型提交没有做，也不需要做。
+- **resume 就是 create。** `POST /sandboxes/{id}/resume`、`/connect` 与 gateway 的 `apiproxy.ResumeSandbox` 冷路径都读该沙箱最新的 ready paused 行，从 `PausedSandboxConfig` 构造 `CreateSandboxRequest`，`preferred_node_id = origin_node_id`，调 `restore_sandbox`；放置（`Schedule` 的 `NewSandboxHint.preferred_node_id`）在该节点可调度时偏好它，否则正常放置；节点跑带 `SnapshotSource` 的 `Create`。行不删（E7），下一次 pause 写新行；生命周期预算与已计运行时间从行上带过来。
+- **单活闸门是 `Starting` 占位。** 与 §4.3 一致：reserve-before-runtime 的 `Starting` binding 是唯一执法者，行上没有任何 claim。同 id 并发 resume 第二个得 409（§8 第 4 条）。
+- **节点关机是 kill，不是 drain。** §4.2 写「只 drain」；实际节点优雅关闭对每个沙箱执行 stop，节点重启丢失其上运行中的沙箱（§8 第 2 条已接受）。节点也不再在启动时恢复任何暂停沙箱：没有 `records/`，没有 `Paused`/`Resuming` 状态，心跳没有 `paused` roster 标志与 `paused_*` 指标（proto 字段 reserved），心跳应答不再点名 disowned 沙箱，`RuntimeImageOwner::PausedSandbox` 与镜像缓存的 paused-hold 对账一并删除。
+- **`/registry/sandboxes` 保留，改由 catalog 供数。** 列 catalog 的 paused 行，state 恒为 `paused`，lease 与 claim 字段为空。其余 REST 面：`GET /sandboxes/{id}` 在无活跃记录时把 paused 行渲染为 `paused`；对已暂停沙箱 `POST /pause` 得 409；`DELETE` 先 kill running（如有）再删该沙箱全部 paused 快照，任一发生即 204，都没有才 404；`GET /v2/sandboxes` 合并活跃记录与 paused 行，已恢复的沙箱只出现一次。
+- **pin 拒绝理由删除；gateway 指标标签未动。** 「只能在 origin 恢复」的状态没有了，`origin_not_reporting` 一类 pin 拒绝随之从 resume RPC 删除；节点半边对自己没在跑的沙箱一律答 `NotFound`；`Resume` RPC 从 `node.proto` 删除。数据面唤醒里 api 半边多了两道门：`secure` 行在请求指向控制面端口时要求 envd access token，行的 `auto_resume` 为 false 则以 `auto_resume_disabled` 拒绝。Go 侧 `agentenv_gateway_*` 的标签集合未改。
+- **接受的取舍（§8）如实落地。** origin 在 staged 字节提交前硬死，该次 pause 丢失；没有「只能在 origin 恢复」的状态；并发 resume 得 409 而不是等待。

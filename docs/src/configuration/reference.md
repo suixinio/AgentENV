@@ -338,7 +338,7 @@ Sandbox lifecycle management.
 | `auto_evict_interval_ms` | integer | `1000` | Poll interval (ms) for background timeout eviction |
 | `default_sandbox_timeout_secs` | integer | `15` | Default keep-alive timeout for sandboxes |
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
-| `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |
+| `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Node-local scratch root for capture artifacts and node reclaim. Nothing under it survives a pause: the pause's bytes are staged on the snapshot repository and committed to the catalog, and startup reclaim sweeps the directory |
 
 ## `[pool]`
 
@@ -536,18 +536,12 @@ Stage B cutover and holds byte artifacts alone now — so an api replica with no
 `dsn` has no catalog and refuses to start rather than answering "no such
 snapshot" to everything. The refusal is at construction: `build_pg_pool`
 (`crates/aenv-api/src/bin/aenv-api.rs`) yields a pool or an error, never
-"no pool", so startup stops before the catalog build reaper and the
-paused-registry machinery are wired rather than after. It also backs the
-`postgres` cluster-wide paused-sandbox registry backend
-(`[orchestrator.paused_registry].backend = "postgres"`, which also needs a
-heartbeat roster — `aenv-api`'s own node registry, which it always builds)
-and the `aenv-snapshot-image` operator tool. See
+"no pool", so startup stops before the catalog build reaper is wired rather
+than after. The same catalog is where a paused sandbox lives: a sandbox-source
+snapshot row whose committed payload carries the sandbox's configuration, read
+back when the sandbox is resumed, listed, or deleted. It also backs the
+`aenv-snapshot-image` operator tool. See
 `deploy/k8s/base/agentenv-api-deployment.yaml` for the deployed shape.
-
-🔴 Configuring `[pg]` does not *select* the `postgres` paused registry.
-`[orchestrator.paused_registry].backend` alone decides that, and `"local"`
-remains a supported value on an api replica with a pool: the `local` arm builds
-the disabled registry and never touches the PostgreSQL factory it is handed.
 
 🔴 `aenv-node` must never hold it: that binary links no PostgreSQL client and
 refuses to start if `dsn` is configured.

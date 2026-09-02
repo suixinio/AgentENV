@@ -3,13 +3,12 @@
 Go implementation of the AgentENV Gateway.
 
 🔴 **阶段四 status**: `services/scheduler` — the Go implementation of the
-`Scheduler`/`PausedRegistry`/`SnapshotCatalog` RPCs — has been deleted.
+`Scheduler`/`SnapshotCatalog` RPCs — has been deleted.
 `docs/proposals/2026-08-20-service-decomposition.md`'s phase four folded node
 discovery, heartbeat receipt (including the cluster CPU-config intersection),
-placement, P2P peer/artifact lookup, and the cluster-wide paused-sandbox
-registry into the Rust `aenv-api` binary (`src/node_registry/`,
-`crates/aenv-api/src/orchestrator/paused_registry/postgres/`) before this
-deletion, so the deletion changes no deployed behaviour: every RPC on
+placement and P2P peer/artifact lookup into the Rust `aenv-api` binary
+(`src/node_registry/`) before this deletion, so the deletion changes no
+deployed behaviour: every RPC on
 `services/api/proto/scheduler.proto` was already answered by `aenv-api` on
 every current deployment. `services/gateway` is the only Go binary this
 module ships now; it dials `gateway.scheduler_addr` — `agentenv-api` on every
@@ -26,10 +25,10 @@ is the node-to-api face, with `aenv-node` its only client. See CLAUDE.md's
   gets a 404.
 - Gateway routes sandbox data-plane requests out of the Redis routing
   projection (`aenv-api`'s sandbox-to-node bindings, read directly). A miss
-  goes to `aenv-api`'s `apiproxy.ResumeSandbox`, which walks the binding, the
-  heartbeat roster and the paused-sandbox registry, answers a sandbox that is
-  running as it stands, wakes one that is paused, and writes the projection
-  back so the next request is a hit. That is the gateway's whole control
+  goes to `aenv-api`'s `apiproxy.ResumeSandbox`, which walks the binding and
+  the heartbeat roster, answers a sandbox that is running as it stands,
+  restores one that is paused from its snapshot-catalog row (a create under
+  the same id), and writes the projection back so the next request is a hit. That is the gateway's whole control
   plane: the projection read and that one RPC; it calls no scheduler.v1 RPC.
   An api half it cannot ask is a 502 (there is no fallback), a positive
   "no such sandbox" is a 404, and a refusal keeps its
@@ -172,7 +171,7 @@ LOG_FORMAT=json make run-gateway
 
 ## Deploy with Docker Compose
 
-From **repository root**, start gateway + `agentenv-api` + two backend nodes (`agentenv-api` serves the `Scheduler`/`PausedRegistry` RPCs; there is no separate scheduler container). `deploy/docker-compose.yml` also runs `redis` and `postgres` (`postgres:17-alpine`) containers that `agentenv-api` depends on — it requires a reachable `[pg]` unconditionally, the same as every other deployment of it:
+From **repository root**, start gateway + `agentenv-api` + two backend nodes (`agentenv-api` serves the `Scheduler` RPCs; there is no separate scheduler container). `deploy/docker-compose.yml` also runs `redis` and `postgres` (`postgres:17-alpine`) containers that `agentenv-api` depends on — it requires a reachable `[pg]` unconditionally, the same as every other deployment of it:
 
 ```bash
 make deploy-up
@@ -296,7 +295,7 @@ Deployment model:
 
 - `gateway`: Deployment + ClusterIP Service
 - `agentenv-node`: privileged DaemonSet with `/dev/kvm` and hostPath `/var/lib/agentenv`
-- `agentenv-api`: Deployment answering the `Scheduler`/`PausedRegistry` RPCs unconditionally, in-process — see CLAUDE.md's "Distributed Control Plane" section for the rest of that fold
+- `agentenv-api`: Deployment answering the `Scheduler` RPCs unconditionally, in-process — see CLAUDE.md's "Distributed Control Plane" section for the rest of that fold
 - `agentenv-nodes`: headless Service used by Kubernetes-mode node discovery
 
 Operational notes:

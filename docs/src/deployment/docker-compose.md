@@ -1,6 +1,6 @@
 # Docker Compose (Multi-Node Simulation)
 
-Run a full multi-node stack on a single host using Docker Compose. This simulates a production-like topology with a gateway, `aenv-api` (serving the `Scheduler`/`PausedRegistry` RPCs), and multiple AgentENV backend nodes.
+Run a full multi-node stack on a single host using Docker Compose. This simulates a production-like topology with a gateway, `aenv-api` (serving the `Scheduler` and `apiproxy.ResumeSandbox` RPCs), and multiple AgentENV backend nodes.
 
 For a real multi-machine deployment without Kubernetes, see
 [Static Multi-Node](./static-multi-node.md).

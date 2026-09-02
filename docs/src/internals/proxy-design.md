@@ -66,8 +66,9 @@ Lookup behavior (`proxy_lookup_for`):
 2. Else read metadata:
    - no metadata: `NotFound`
    - metadata state is `Running`: `RouteMissing`
-   - metadata state is `Paused`: `Paused { auto_resume }`
    - other states: `Unavailable(state)`
+
+A paused sandbox has no metadata on any node (it is a snapshot-catalog row), so it lands on `NotFound`.
 
 This keeps hot-path reads lock-light and avoids reading sandbox instance internals in API request paths.
 
@@ -77,22 +78,23 @@ This keeps hot-path reads lock-light and avoids reading sandbox instance interna
 sandbox should be alive belongs to the half that owns sandboxes, and the data
 plane reaches that decision over the gateway's cold path
 (`SandboxResumeService`, `src/api/grpc/resume.rs`) before traffic ever arrives
-at a proxy. `try_auto_resume` used to take the same decision on the proxy's own
-request path and is deleted, along with the
-`agentenv_proxy_auto_resume_total` counter that measured it.
+at a proxy. A paused sandbox is a snapshot-catalog row, not anything a node
+holds, so the node proxy has no paused state to report.
 
 Request outcomes for paused sandboxes:
 
-- `410 Gone`, whatever `auto_resume` says. From the caller's side "this process
-  does not wake sandboxes" and "this sandbox does not wake on traffic" are one
-  fact: the sandbox is paused and this request will not change that.
+- `404 Not Found`, whatever `auto_resume` says: the node is not running the
+  sandbox, and this request will not change that. The wake-up is a create
+  from the row on `aenv-api` (refused with `auto_resume_disabled` when the
+  row's `auto_resume` is false); the proxy only ever sees the sandbox once it
+  is running.
 
 The lifetime a woken sandbox gets and the bound the wake-up runs under are
 still declared in `src/api/proxy.rs` — `auto_resume_min_sandbox_timeout()`
 (`EnsureMinimum`, `orchestrator.auto_resume_min_sandbox_timeout_secs`, 5
 minutes by default) and `auto_resume_deadline()` (`60s` outside test builds) —
-and read from there by `crate::api::impls::resume_surface`, so a wake-up over
-the gateway hands out exactly what the data plane's own wake-up used to.
+and read from there by `crate::api::impls::resume_surface` for every wake-up
+over the gateway.
 
 ## Lifecycle Hooks and Race Hardening
 
@@ -175,9 +177,8 @@ Handshake failure behavior:
   - Missing/invalid target port header
   - Invalid upstream URI construction
 - `404 Not Found`
-  - Sandbox not found
+  - Sandbox not found, which includes every paused sandbox (regardless of `auto_resume`)
 - `410 Gone`
-  - Sandbox is paused (regardless of `auto_resume`)
   - Sandbox exists but is not proxyable in current state
 - `502 Bad Gateway`
   - Upstream transport/connect failure

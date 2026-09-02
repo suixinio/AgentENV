@@ -7,11 +7,10 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, an api Deployment, a
 been deleted. `aenv-api` (`agentenv-api-deployment.yaml`) always answers node
 discovery/placement/heartbeat from its own in-process node registry now (the
 `[cluster].node_placement_source` switch that used to select this is deleted
-too — there is no alternative left to choose), and runs with
-`[orchestrator.paused_registry].backend = "postgres"` by default, folding
-node discovery, heartbeat receipt, placement, and the paused-sandbox registry
-into itself over the shared `[pg]` pool instead of dialling a scheduler
-process; the gateway's own `scheduler_addr` points at `agentenv-api:8002`
+too — there is no alternative left to choose), folding node discovery,
+heartbeat receipt and placement into itself instead of dialling a scheduler
+process, and keeps paused sandboxes as rows of the snapshot catalog over the
+shared `[pg]` pool; the gateway's own `scheduler_addr` points at `agentenv-api:8002`
 instead of `agentenv-scheduler:9090` for the same reason, and
 `GET /registry/sandboxes` is served by `aenv-api` on its own REST surface —
 see `services/README.md` for the current status. The rest of this page describes the architecture as
@@ -25,7 +24,7 @@ separate Go process.
 | Workload | Kind | Description |
 |----------|------|-------------|
 | `agentenv-gateway` | Deployment + ClusterIP Service | HTTP reverse proxy for client traffic |
-| `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, and (阶段四) node discovery/placement/paused-registry — the Go scheduler's former job, folded in, unconditionally |
+| `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, the snapshot catalog (whose sandbox-source rows are the paused sandboxes), and (阶段四) node discovery/placement — the Go scheduler's former job, folded in, unconditionally |
 | `agentenv-node` | DaemonSet (privileged) | One runtime Pod per Kubernetes node |
 | `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery, by `agentenv-api`'s own `src/node_registry/kubernetes_discovery.rs` |
 
@@ -136,7 +135,7 @@ The make targets build a temporary Kustomize context so runtime Pods mount the r
 The runtime DaemonSet injects heartbeat-report wiring for each node Pod:
 
 - `AENV_UBLK_DAEMON_BINARY_PATH=/usr/local/bin/uvm-ublk-daemon` so the Pod uses the `uvm-ublk-daemon` binary included in the runtime image
-- `AENV_NODE_ID` from the node the Pod is on (`fieldRef: spec.nodeName`), not the Pod's own name — a paused sandbox's registry row records it as the holder, and it has to survive the Pod being replaced
+- `AENV_NODE_ID` from the node the Pod is on (`fieldRef: spec.nodeName`), not the Pod's own name — a paused sandbox's catalog row records it as `origin_node_id`, the node a resume prefers while its cache is warm, and it has to survive the Pod being replaced
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true`
 - `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-api:8002`
 - `AENV_SANDBOX_PROXY_DOMAINS` from the shared sandbox proxy ConfigMap
@@ -215,20 +214,14 @@ node Pod's own IP. No Service fronts that port, and none should: every one of
 those calls is addressed to one named machine, and a ClusterIP would
 load-balance them across the fleet.
 
-## Cluster-wide Paused Sandboxes
+## Paused Sandboxes
 
-By default a paused sandbox is resumable only on the node that paused it — the `"local"` backend. Cluster-wide resume publishes a pause's snapshot to the shared repository and records the sandbox cluster-wide, so any node can resume it under its original ID.
+A paused sandbox has no record anywhere except the snapshot catalog. Pausing stages the capture on the node's snapshot repository, and `aenv-api` commits it as a sandbox-source snapshot row whose payload carries the sandbox's configuration (`PausedSandboxConfig`: template, timeout and timeout action, `autoResume`, metadata, network policy, lifetime budget and running time so far); the node then stops the VM and forgets it. Resume is a create under the sandbox's own ID from that row: `aenv-api` builds the create request from the row, prefers the row's `origin_node_id` while that node is schedulable and otherwise places normally, and the chosen node runs the ordinary `Create` RPC with a `SnapshotSource`. Any node can resume any paused sandbox; the shared repository (`[snapshot].repository_backend`) is what makes the bytes reachable from every node. The row stays until the sandbox is deleted, and the next pause writes a new one.
 
-🔴 **This is now entirely an `aenv-api`-side setting; there is no per-node opt-in step.** Through 阶段三 this was a *node*-side choice (`AENV_PAUSED_REGISTRY_BACKEND=central` via a `paused-registry-config` ConfigMap, each node dialling the standalone Go scheduler's own registry service over gRPC). 阶段四 replaced that with a `"postgres"` backend that lives entirely on `aenv-api`, and the node-side switch stopped doing anything:
-
-- The `paused-registry-config` ConfigMap and the `AENV_PAUSED_REGISTRY_BACKEND` key on the DaemonSet are gone from `deploy/k8s/base` (`02117b9`).
-- `aenv-node`'s `assemble_node` (`crates/aenv-node/src/bin/aenv-node.rs`) ignores `[orchestrator.paused_registry].backend` whenever it is anything other than `"local"`: it logs one `warn!` naming the configured value and wires in a registry that claims and records nothing, because cluster-wide paused-sandbox state belongs to the API half alone now. A node never refuses to start over this setting — only over a configured `[pg].dsn` (`refuse_configured_pg_dsn`), which a node must never hold regardless of this backend.
-- Cluster-wide resume is controlled entirely by `aenv-api`'s own `[orchestrator.paused_registry].backend = "postgres"`. `deploy/k8s/base/agentenv-api-deployment.yaml` sets `AENV_PAUSED_REGISTRY_BACKEND=postgres` unconditionally; that backend requires a heartbeat-roster `NodeRegistry` handle (`build_paused_registry`), which `aenv-api` always builds now, with no separate switch to keep in step.
-- `aenv-api` reaches PostgreSQL directly over the shared `[pg]` pool — the same pool the snapshot catalog uses — instead of dialling a separate scheduler process. No node ever holds a `[pg]` DSN, a database connection, or any say over the schema.
-
-In short: on the `deploy/k8s/base` overlay, cluster-wide paused-sandbox resume is on by default and there is no ConfigMap toggle or kubectl step left to run to enable it. See `config/default.toml`'s `[orchestrator.paused_registry]` comment block (the authoritative description of `"local"`/`"postgres"`) and CLAUDE.md's "Distributed Control Plane" section.
-
-🔴 **`"central"` is gone, not merely unused.** It was already dead on every current deployment when this doc first described the 阶段四 switch above — the Go scheduler it dialled no longer exists in this repository — and the cleanup that followed removed `PausedRegistryBackendKind::Central` and its implementation (`CentralPausedSandboxRegistry`) from the code entirely: `AENV_PAUSED_REGISTRY_BACKEND=central` is now a startup-refusing typo like any other unrecognised value, not a legal-but-unreachable option. Both node and api Deployments read the same `cluster-identity-config/CLUSTER_ID` key as `AENV_CLUSTER_ID` today (`[node_identity].cluster_id` in `config/default.toml` is what a node falls back to if that ConfigMap is absent); there is no longer a second, scheduler-specific cluster-id variable.
+- Nothing to switch on: there is no ConfigMap toggle and no per-node step. `deploy/k8s/base` declares no paused-registry variable, and `AENV_PAUSED_REGISTRY_BACKEND` is a removed switch that nothing reads (`docs/src/configuration/env-vars.md`).
+- `aenv-api` reaches PostgreSQL directly over the shared `[pg]` pool. No node ever holds a `[pg]` DSN, a database connection, or any say over the schema; a node refuses to start over a configured `[pg].dsn` (`refuse_configured_pg_dsn`).
+- Both node and api Deployments read the same `cluster-identity-config/CLUSTER_ID` key as `AENV_CLUSTER_ID` (`[node_identity].cluster_id` in `config/default.toml` is what a node falls back to if that ConfigMap is absent).
+- A node restart or roll loses the sandboxes that were running on it and nothing else: no paused sandbox lives on a node. The one exception is a pause whose staged bytes had not yet been committed when its origin died; that pause is lost.
 
 ## The node API is protected by the network, not by its headers
 

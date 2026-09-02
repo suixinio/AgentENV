@@ -67,7 +67,7 @@ Deployment model:
 - `gateway`: Deployment + ClusterIP Service
 - `agentenv-node`: privileged DaemonSet with `/dev/kvm`, one host-compatible
   KVM/PVM mode, and hostPath
-- `agentenv-api`: Deployment answering the `Scheduler`/`PausedRegistry` RPCs
+- `agentenv-api`: Deployment answering the `Scheduler` RPCs
 - `agentenv-nodes`: headless Service for Kubernetes-mode node discovery
 
 ## gRPC API
@@ -76,7 +76,7 @@ Proto contract: `services/api/proto/scheduler.proto`
 
 RPCs: `Schedule`, `Heartbeat`, `ReportSandboxEvent`, `ListP2pPeers`, `RecordP2pArtifact`, `ForgetP2pArtifact`, `LookupP2pArtifact`, `GetNode`, `UnregisterNode`. This is the node-to-api face: `aenv-node` is its only client.
 
-The gateway calls none of them: its control-plane edges are the Redis routing projection, read directly, and `apiproxy.ResumeSandbox` (`services/api/proto/apiproxy/apiproxy.proto`), which answers a running sandbox as it stands, wakes a paused one, and writes the projection back. The sandbox lookup and the projection writes behind that surface are in-process methods on `NodeRegistryGrpcService` (`lookup_sandbox`, `record_running`, `record_assignment`), not RPCs; `/nodes` and `/registry/sandboxes` read the registry in-process on `aenv-api`'s REST surface.
+The gateway calls none of them: its control-plane edges are the Redis routing projection, read directly, and `apiproxy.ResumeSandbox` (`services/api/proto/apiproxy/apiproxy.proto`), which answers a running sandbox as it stands, restores a paused one from its snapshot-catalog row (a create under the same id, placed with the row's `origin_node_id` as a preference), and writes the projection back. The sandbox lookup and the projection writes behind that surface are in-process methods on `NodeRegistryGrpcService` (`lookup_sandbox`, `record_running`, `record_assignment`), not RPCs; `/nodes` and `/registry/sandboxes` read the registry in-process on `aenv-api`'s REST surface.
 
 Runtime node heartbeats may include an opaque `P2pEndpoint` containing a backend name and backend-specific address. `aenv-api`'s native registry stores that endpoint with the observed-node record and returns ready peers through `ListP2pPeers(cluster_id, backend, exclude_node_id)`. It does not query artifact catalogs and never forwards artifact data.
 

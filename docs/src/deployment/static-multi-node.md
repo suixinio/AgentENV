@@ -3,9 +3,8 @@
 🔴 **This guide is out of date and not currently actionable.** It carried a
 systemd walkthrough for `services/scheduler` — the Go Scheduler binary — and
 that package is **deleted from the repository**, not merely superseded:
-`Scheduler`/`PausedRegistry` RPC handling now lives entirely in the Rust
-`aenv-api` binary (`src/node_registry/`,
-`crates/aenv-api/src/orchestrator/paused_registry/postgres/`), which requires
+`Scheduler` RPC handling now lives entirely in the Rust
+`aenv-api` binary (`src/node_registry/`), which requires
 a reachable PostgreSQL (`[pg]`) unconditionally and today ships as a container
 image (`deploy/docker/Dockerfile.aenv-api`), not as a bare systemd-friendly
 binary with a config story equivalent to what this page describes. Kubernetes
@@ -21,7 +20,7 @@ topology is no longer blocked on a Kubernetes API to discover nodes against.
 The pieces confirmed to exist and to be exercised by a real deployment today
 (`deploy/docker-compose.yml`) are:
 
-- `aenv-api` answers node placement/heartbeat/paused-registry itself,
+- `aenv-api` answers node placement/heartbeat itself,
   unconditionally, instead of dialing a Scheduler process — there is none to
   dial any more, and no switch left to choose otherwise (the
   `[cluster].node_placement_source` field this used to require setting to

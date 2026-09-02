@@ -11,9 +11,7 @@ stateDiagram-v2
     [*] --> Creating
     Creating --> Running
     Running --> Pausing
-    Pausing --> Paused
-    Paused --> Resuming
-    Resuming --> Running
+    Pausing --> [*]
     Running --> Snapshotting
     Snapshotting --> Running
     Running --> Forking
@@ -26,11 +24,11 @@ stateDiagram-v2
 |-------|-------------|
 | **Creating** | VM is booting, block devices are being attached, networking is being configured |
 | **Running** | VM is ready. Commands can be executed, proxy traffic is routed, timeout is ticking |
-| **Pausing** | Memory and disk snapshots are being captured |
-| **Paused** | VM is stopped. Snapshot artifacts are stored. No resources consumed |
-| **Resuming** | Sandbox is being restored from its paused snapshot |
+| **Pausing** | Memory and disk snapshots are being captured and published; the VM is then stopped and the running sandbox ceases to exist |
 | **Snapshotting** | A persistent snapshot is being captured; sandbox returns to Running after |
 | **Forking** | Sandbox is being cloned into child sandboxes; source returns to Running after |
+
+A paused sandbox is not a state of a running sandbox. It is a row in the snapshot catalog — the sandbox's newest paused snapshot, carrying its configuration — and consumes no node resources. `GET /sandboxes/{id}` renders that row with state `paused`. Resuming is a create under the same sandbox ID from that row, so a resumed sandbox enters at `Creating` like any other.
 | **Killing** | VM is being torn down and resources released |
 
 ---
@@ -81,7 +79,7 @@ Pausing a sandbox captures:
 - **Memory snapshot** of the running VM state
 - **Disk snapshot** of the writable filesystem layer
 
-Resuming restores the VM from these snapshots in milliseconds. The sandbox picks up exactly where it left off, including running processes and open network connections.
+Resuming creates a new VM under the same sandbox ID from the newest paused snapshot — on the node that paused it when that node is schedulable, otherwise wherever placement decides. The sandbox picks up exactly where it left off, including running processes; its lifetime budget and the running time already charged carry over. The paused snapshot is kept until the sandbox is deleted, and the next pause writes a new one. Pausing an already-paused sandbox is a `409`; deleting a sandbox removes every paused snapshot of it.
 
 
 ```bash
@@ -222,5 +220,5 @@ Omitting both fields clears all per-sandbox egress rules and restores the defaul
 | Path | Contents | Config |
 |------|----------|--------|
 | `$AENV_HOME/snapshot-store/` | Committed snapshot and template artifacts (rootfs layers, memory snapshots, metadata) | `[backend.posix_fs].snapshot_store` |
-| `$AENV_HOME/persisted-sandboxes/` | Paused sandbox state persisted across server restarts | `[orchestrator].persisted_sandbox_store_path` |
+| `$AENV_HOME/persisted-sandboxes/` | Scratch root for capture artifacts and node reclaim; nothing here survives a pause | `[orchestrator].persisted_sandbox_store_path` |
 | `$AENV_HOME/image-cache/` | Converted OCI image layers (overlaybd format) cached after first cold start or template build | `[image.cache].root_dir` |

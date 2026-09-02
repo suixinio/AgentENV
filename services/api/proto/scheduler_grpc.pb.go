@@ -19,49 +19,39 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Scheduler_Schedule_FullMethodName              = "/scheduler.v1.Scheduler/Schedule"
-	Scheduler_LookupNode_FullMethodName            = "/scheduler.v1.Scheduler/LookupNode"
-	Scheduler_RecordAssignment_FullMethodName      = "/scheduler.v1.Scheduler/RecordAssignment"
-	Scheduler_Heartbeat_FullMethodName             = "/scheduler.v1.Scheduler/Heartbeat"
-	Scheduler_ReportSandboxEvent_FullMethodName    = "/scheduler.v1.Scheduler/ReportSandboxEvent"
-	Scheduler_ListObservedNodes_FullMethodName     = "/scheduler.v1.Scheduler/ListObservedNodes"
-	Scheduler_ListP2PPeers_FullMethodName          = "/scheduler.v1.Scheduler/ListP2pPeers"
-	Scheduler_RecordP2PArtifact_FullMethodName     = "/scheduler.v1.Scheduler/RecordP2pArtifact"
-	Scheduler_ForgetP2PArtifact_FullMethodName     = "/scheduler.v1.Scheduler/ForgetP2pArtifact"
-	Scheduler_LookupP2PArtifact_FullMethodName     = "/scheduler.v1.Scheduler/LookupP2pArtifact"
-	Scheduler_GetNode_FullMethodName               = "/scheduler.v1.Scheduler/GetNode"
-	Scheduler_UnregisterNode_FullMethodName        = "/scheduler.v1.Scheduler/UnregisterNode"
-	Scheduler_ListRegistrySandboxes_FullMethodName = "/scheduler.v1.Scheduler/ListRegistrySandboxes"
+	Scheduler_Schedule_FullMethodName           = "/scheduler.v1.Scheduler/Schedule"
+	Scheduler_Heartbeat_FullMethodName          = "/scheduler.v1.Scheduler/Heartbeat"
+	Scheduler_ReportSandboxEvent_FullMethodName = "/scheduler.v1.Scheduler/ReportSandboxEvent"
+	Scheduler_ListP2PPeers_FullMethodName       = "/scheduler.v1.Scheduler/ListP2pPeers"
+	Scheduler_RecordP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/RecordP2pArtifact"
+	Scheduler_ForgetP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/ForgetP2pArtifact"
+	Scheduler_LookupP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/LookupP2pArtifact"
+	Scheduler_GetNode_FullMethodName            = "/scheduler.v1.Scheduler/GetNode"
+	Scheduler_UnregisterNode_FullMethodName     = "/scheduler.v1.Scheduler/UnregisterNode"
 )
 
 // SchedulerClient is the client API for Scheduler service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Scheduler is the placement and observation surface: gateways and nodes ask
-// it where a sandbox is, tell it where one ended up, and report what they hold.
+// Scheduler is the node-to-api face: a node asks aenv-api where to place a
+// sandbox, reports what it holds, and records artifact hints. Nothing else
+// dials it.
 //
 // 🔴 No method on this service may answer with codes.PermissionDenied. That
-// code means "a superseded incarnation tried to write" (see ExecutionAuthority
-// below) — that fencing is enforced by aenv-api's own in-process paused
-// registry, never by this service, so this service itself has no such
-// refusal to make. The gateway's scheduler error mapping has no branch for it
-// and falls through to a 502, so returning it here turns a precise refusal
-// into a misdiagnosed server fault.
+// code means "a superseded incarnation tried to write" — that fencing is
+// enforced by aenv-api's own in-process paused registry, never by this
+// service, so this service itself has no such refusal to make.
 type SchedulerClient interface {
 	Schedule(ctx context.Context, in *ScheduleRequest, opts ...grpc.CallOption) (*ScheduleResponse, error)
-	LookupNode(ctx context.Context, in *LookupNodeRequest, opts ...grpc.CallOption) (*LookupNodeResponse, error)
-	RecordAssignment(ctx context.Context, in *RecordAssignmentRequest, opts ...grpc.CallOption) (*RecordAssignmentResponse, error)
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
 	ReportSandboxEvent(ctx context.Context, in *ReportSandboxEventRequest, opts ...grpc.CallOption) (*ReportSandboxEventResponse, error)
-	ListObservedNodes(ctx context.Context, in *ListObservedNodesRequest, opts ...grpc.CallOption) (*ListObservedNodesResponse, error)
 	ListP2PPeers(ctx context.Context, in *ListP2PPeersRequest, opts ...grpc.CallOption) (*ListP2PPeersResponse, error)
 	RecordP2PArtifact(ctx context.Context, in *RecordP2PArtifactRequest, opts ...grpc.CallOption) (*RecordP2PArtifactResponse, error)
 	ForgetP2PArtifact(ctx context.Context, in *ForgetP2PArtifactRequest, opts ...grpc.CallOption) (*ForgetP2PArtifactResponse, error)
 	LookupP2PArtifact(ctx context.Context, in *LookupP2PArtifactRequest, opts ...grpc.CallOption) (*LookupP2PArtifactResponse, error)
 	GetNode(ctx context.Context, in *GetNodeRequest, opts ...grpc.CallOption) (*GetNodeResponse, error)
 	UnregisterNode(ctx context.Context, in *UnregisterNodeRequest, opts ...grpc.CallOption) (*UnregisterNodeResponse, error)
-	ListRegistrySandboxes(ctx context.Context, in *ListRegistrySandboxesRequest, opts ...grpc.CallOption) (*ListRegistrySandboxesResponse, error)
 }
 
 type schedulerClient struct {
@@ -82,26 +72,6 @@ func (c *schedulerClient) Schedule(ctx context.Context, in *ScheduleRequest, opt
 	return out, nil
 }
 
-func (c *schedulerClient) LookupNode(ctx context.Context, in *LookupNodeRequest, opts ...grpc.CallOption) (*LookupNodeResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(LookupNodeResponse)
-	err := c.cc.Invoke(ctx, Scheduler_LookupNode_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *schedulerClient) RecordAssignment(ctx context.Context, in *RecordAssignmentRequest, opts ...grpc.CallOption) (*RecordAssignmentResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RecordAssignmentResponse)
-	err := c.cc.Invoke(ctx, Scheduler_RecordAssignment_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *schedulerClient) Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(HeartbeatResponse)
@@ -116,16 +86,6 @@ func (c *schedulerClient) ReportSandboxEvent(ctx context.Context, in *ReportSand
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ReportSandboxEventResponse)
 	err := c.cc.Invoke(ctx, Scheduler_ReportSandboxEvent_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *schedulerClient) ListObservedNodes(ctx context.Context, in *ListObservedNodesRequest, opts ...grpc.CallOption) (*ListObservedNodesResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ListObservedNodesResponse)
-	err := c.cc.Invoke(ctx, Scheduler_ListObservedNodes_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -192,44 +152,28 @@ func (c *schedulerClient) UnregisterNode(ctx context.Context, in *UnregisterNode
 	return out, nil
 }
 
-func (c *schedulerClient) ListRegistrySandboxes(ctx context.Context, in *ListRegistrySandboxesRequest, opts ...grpc.CallOption) (*ListRegistrySandboxesResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ListRegistrySandboxesResponse)
-	err := c.cc.Invoke(ctx, Scheduler_ListRegistrySandboxes_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // SchedulerServer is the server API for Scheduler service.
 // All implementations must embed UnimplementedSchedulerServer
 // for forward compatibility.
 //
-// Scheduler is the placement and observation surface: gateways and nodes ask
-// it where a sandbox is, tell it where one ended up, and report what they hold.
+// Scheduler is the node-to-api face: a node asks aenv-api where to place a
+// sandbox, reports what it holds, and records artifact hints. Nothing else
+// dials it.
 //
 // 🔴 No method on this service may answer with codes.PermissionDenied. That
-// code means "a superseded incarnation tried to write" (see ExecutionAuthority
-// below) — that fencing is enforced by aenv-api's own in-process paused
-// registry, never by this service, so this service itself has no such
-// refusal to make. The gateway's scheduler error mapping has no branch for it
-// and falls through to a 502, so returning it here turns a precise refusal
-// into a misdiagnosed server fault.
+// code means "a superseded incarnation tried to write" — that fencing is
+// enforced by aenv-api's own in-process paused registry, never by this
+// service, so this service itself has no such refusal to make.
 type SchedulerServer interface {
 	Schedule(context.Context, *ScheduleRequest) (*ScheduleResponse, error)
-	LookupNode(context.Context, *LookupNodeRequest) (*LookupNodeResponse, error)
-	RecordAssignment(context.Context, *RecordAssignmentRequest) (*RecordAssignmentResponse, error)
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)
 	ReportSandboxEvent(context.Context, *ReportSandboxEventRequest) (*ReportSandboxEventResponse, error)
-	ListObservedNodes(context.Context, *ListObservedNodesRequest) (*ListObservedNodesResponse, error)
 	ListP2PPeers(context.Context, *ListP2PPeersRequest) (*ListP2PPeersResponse, error)
 	RecordP2PArtifact(context.Context, *RecordP2PArtifactRequest) (*RecordP2PArtifactResponse, error)
 	ForgetP2PArtifact(context.Context, *ForgetP2PArtifactRequest) (*ForgetP2PArtifactResponse, error)
 	LookupP2PArtifact(context.Context, *LookupP2PArtifactRequest) (*LookupP2PArtifactResponse, error)
 	GetNode(context.Context, *GetNodeRequest) (*GetNodeResponse, error)
 	UnregisterNode(context.Context, *UnregisterNodeRequest) (*UnregisterNodeResponse, error)
-	ListRegistrySandboxes(context.Context, *ListRegistrySandboxesRequest) (*ListRegistrySandboxesResponse, error)
 	mustEmbedUnimplementedSchedulerServer()
 }
 
@@ -243,20 +187,11 @@ type UnimplementedSchedulerServer struct{}
 func (UnimplementedSchedulerServer) Schedule(context.Context, *ScheduleRequest) (*ScheduleResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Schedule not implemented")
 }
-func (UnimplementedSchedulerServer) LookupNode(context.Context, *LookupNodeRequest) (*LookupNodeResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method LookupNode not implemented")
-}
-func (UnimplementedSchedulerServer) RecordAssignment(context.Context, *RecordAssignmentRequest) (*RecordAssignmentResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method RecordAssignment not implemented")
-}
 func (UnimplementedSchedulerServer) Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Heartbeat not implemented")
 }
 func (UnimplementedSchedulerServer) ReportSandboxEvent(context.Context, *ReportSandboxEventRequest) (*ReportSandboxEventResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReportSandboxEvent not implemented")
-}
-func (UnimplementedSchedulerServer) ListObservedNodes(context.Context, *ListObservedNodesRequest) (*ListObservedNodesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ListObservedNodes not implemented")
 }
 func (UnimplementedSchedulerServer) ListP2PPeers(context.Context, *ListP2PPeersRequest) (*ListP2PPeersResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListP2PPeers not implemented")
@@ -275,9 +210,6 @@ func (UnimplementedSchedulerServer) GetNode(context.Context, *GetNodeRequest) (*
 }
 func (UnimplementedSchedulerServer) UnregisterNode(context.Context, *UnregisterNodeRequest) (*UnregisterNodeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UnregisterNode not implemented")
-}
-func (UnimplementedSchedulerServer) ListRegistrySandboxes(context.Context, *ListRegistrySandboxesRequest) (*ListRegistrySandboxesResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ListRegistrySandboxes not implemented")
 }
 func (UnimplementedSchedulerServer) mustEmbedUnimplementedSchedulerServer() {}
 func (UnimplementedSchedulerServer) testEmbeddedByValue()                   {}
@@ -318,42 +250,6 @@ func _Scheduler_Schedule_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Scheduler_LookupNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(LookupNodeRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SchedulerServer).LookupNode(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Scheduler_LookupNode_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SchedulerServer).LookupNode(ctx, req.(*LookupNodeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Scheduler_RecordAssignment_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RecordAssignmentRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SchedulerServer).RecordAssignment(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Scheduler_RecordAssignment_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SchedulerServer).RecordAssignment(ctx, req.(*RecordAssignmentRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _Scheduler_Heartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(HeartbeatRequest)
 	if err := dec(in); err != nil {
@@ -386,24 +282,6 @@ func _Scheduler_ReportSandboxEvent_Handler(srv interface{}, ctx context.Context,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(SchedulerServer).ReportSandboxEvent(ctx, req.(*ReportSandboxEventRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Scheduler_ListObservedNodes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListObservedNodesRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SchedulerServer).ListObservedNodes(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Scheduler_ListObservedNodes_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SchedulerServer).ListObservedNodes(ctx, req.(*ListObservedNodesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -516,24 +394,6 @@ func _Scheduler_UnregisterNode_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Scheduler_ListRegistrySandboxes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListRegistrySandboxesRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(SchedulerServer).ListRegistrySandboxes(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Scheduler_ListRegistrySandboxes_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SchedulerServer).ListRegistrySandboxes(ctx, req.(*ListRegistrySandboxesRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // Scheduler_ServiceDesc is the grpc.ServiceDesc for Scheduler service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -546,24 +406,12 @@ var Scheduler_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Scheduler_Schedule_Handler,
 		},
 		{
-			MethodName: "LookupNode",
-			Handler:    _Scheduler_LookupNode_Handler,
-		},
-		{
-			MethodName: "RecordAssignment",
-			Handler:    _Scheduler_RecordAssignment_Handler,
-		},
-		{
 			MethodName: "Heartbeat",
 			Handler:    _Scheduler_Heartbeat_Handler,
 		},
 		{
 			MethodName: "ReportSandboxEvent",
 			Handler:    _Scheduler_ReportSandboxEvent_Handler,
-		},
-		{
-			MethodName: "ListObservedNodes",
-			Handler:    _Scheduler_ListObservedNodes_Handler,
 		},
 		{
 			MethodName: "ListP2pPeers",
@@ -588,10 +436,6 @@ var Scheduler_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UnregisterNode",
 			Handler:    _Scheduler_UnregisterNode_Handler,
-		},
-		{
-			MethodName: "ListRegistrySandboxes",
-			Handler:    _Scheduler_ListRegistrySandboxes_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -908,7 +908,7 @@ mod tests {
             assert!(
                 at(builder) < resume,
                 "🔴 {builder} runs after the clone handed to resume placement, so the \
-                 wake-up path holds a service that cannot answer LookupNode the way \
+                 wake-up path holds a service that cannot answer a sandbox lookup the way \
                  the served one does"
             );
         }

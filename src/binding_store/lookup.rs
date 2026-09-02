@@ -1,4 +1,5 @@
-//! Shared node-selection and lookup logic for `Schedule` and `LookupNode`.
+//! Shared node-selection and sandbox-lookup logic for `Schedule` and the
+//! in-process sandbox lookup.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -14,7 +15,7 @@ use crate::node_registry::strategy::{NoNodesAvailable, RoundRobinStrategy};
 use crate::node_registry::types::{Node, RichNode};
 use crate::node_registry::warmup::WarmupGate;
 use crate::orchestrator::{PausedRegistryState, PausedSandboxRegistry};
-use crate::proto::scheduler::{ExecutionAuthority, SandboxLocation, ScheduleRequestHint};
+use crate::proto::scheduler::ScheduleRequestHint;
 use crate::types::SandboxId;
 
 /// Maximum age of a heartbeat roster entry eligible for routing.
@@ -158,6 +159,36 @@ impl LookupResultLabel {
             Self::HolderUnreachable => "holder_unreachable",
         }
     }
+}
+
+/// Where a lookup answer places the sandbox relative to the node it names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxLocation {
+    /// A node is known to hold the sandbox: from its binding, from the roster
+    /// it reported in its last heartbeat, or from a registry row naming it.
+    Bound,
+    /// The sandbox is paused with its snapshot published, so any node can
+    /// rebuild it; the node named is a placement decision taken with the
+    /// origin as a soft preference.
+    Placed,
+    /// The only copy of the sandbox is on the origin node's disk (publishing,
+    /// or local_only after a failed upload): that node or nothing.
+    Pinned,
+}
+
+/// Whether an answer's `execution_id` may be used to refuse traffic. Only
+/// `Registry` says yes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionAuthority {
+    /// Nobody can name the current incarnation; the caller lets the request
+    /// through.
+    Unknown,
+    /// `execution_id` names the incarnation that should be alive on the node
+    /// named, right now. Never reported with an empty id.
+    Registry,
+    /// The node is about to mint a new incarnation (Placed and Pinned); any
+    /// value carried names the previous one and must never refuse.
+    Pending,
 }
 
 /// Successful lookup result.

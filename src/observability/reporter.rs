@@ -897,18 +897,6 @@ mod against_a_scheduler {
         ) -> Result<Response<scheduler::UnregisterNodeResponse>, Status> {
             Ok(Response::new(scheduler::UnregisterNodeResponse::default()))
         }
-        async fn record_assignment(
-            &self,
-            _request: Request<scheduler::RecordAssignmentRequest>,
-        ) -> Result<Response<scheduler::RecordAssignmentResponse>, Status> {
-            Err(Status::unimplemented("not used by this test"))
-        }
-        async fn lookup_node(
-            &self,
-            _request: Request<scheduler::LookupNodeRequest>,
-        ) -> Result<Response<scheduler::LookupNodeResponse>, Status> {
-            Err(Status::unimplemented("not used by this test"))
-        }
         async fn get_node(
             &self,
             _request: Request<scheduler::GetNodeRequest>,
@@ -925,12 +913,6 @@ mod against_a_scheduler {
             &self,
             _request: Request<scheduler::ReportSandboxEventRequest>,
         ) -> Result<Response<scheduler::ReportSandboxEventResponse>, Status> {
-            Err(Status::unimplemented("not used by this test"))
-        }
-        async fn list_observed_nodes(
-            &self,
-            _request: Request<scheduler::ListObservedNodesRequest>,
-        ) -> Result<Response<scheduler::ListObservedNodesResponse>, Status> {
             Err(Status::unimplemented("not used by this test"))
         }
         async fn list_p2p_peers(
@@ -955,12 +937,6 @@ mod against_a_scheduler {
             &self,
             _request: Request<scheduler::LookupP2pArtifactRequest>,
         ) -> Result<Response<scheduler::LookupP2pArtifactResponse>, Status> {
-            Err(Status::unimplemented("not used by this test"))
-        }
-        async fn list_registry_sandboxes(
-            &self,
-            _request: Request<scheduler::ListRegistrySandboxesRequest>,
-        ) -> Result<Response<scheduler::ListRegistrySandboxesResponse>, Status> {
             Err(Status::unimplemented("not used by this test"))
         }
     }

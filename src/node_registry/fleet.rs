@@ -1,9 +1,7 @@
 //! The one registry read path behind node reads, whichever surface asks.
 //!
-//! `scheduler.v1`'s `ListObservedNodes`/`GetNode` — which the gateway aggregates
-//! `GET /nodes` from — and the api half's own REST `/nodes` both read through
-//! here, so a directly addressed REST answer and a gateway-aggregated one cannot
-//! diverge in what they saw.
+//! `scheduler.v1`'s `GetNode` and the api half's REST `/nodes` both read
+//! through here, so the two cannot diverge in what they saw.
 
 use std::sync::Arc;
 use std::time::SystemTime;

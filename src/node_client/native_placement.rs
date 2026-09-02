@@ -111,19 +111,21 @@ impl NativeNodePlacement {
         node: Option<scheduler::Node>,
     ) -> Result<NodeEndpoint> {
         let node = node.ok_or_else(|| anyhow!("the local scheduler named no node"))?;
-        if node.node_id.is_empty() {
+        self.node_service_endpoint_for(node.node_id, node.endpoint)
+    }
+
+    /// Converts a node the local surface named into its sandbox-service endpoint.
+    fn node_service_endpoint_for(&self, node_id: String, endpoint: String) -> Result<NodeEndpoint> {
+        if node_id.is_empty() {
             bail!("the local scheduler named a node with no id");
         }
-        if node.endpoint.is_empty() {
-            bail!(
-                "the local scheduler named node {} with no address",
-                node.node_id
-            );
+        if endpoint.is_empty() {
+            bail!("the local scheduler named node {node_id} with no address");
         }
         Ok(NodeEndpoint {
-            endpoint: rewrite_port(&node.endpoint, self.node_service_port)?,
-            advertised_endpoint: node.endpoint,
-            node_id: node.node_id,
+            endpoint: rewrite_port(&endpoint, self.node_service_port)?,
+            advertised_endpoint: endpoint,
+            node_id,
         })
     }
 }
@@ -158,14 +160,8 @@ impl NodePlacement for NativeNodePlacement {
 
     /// Locates an existing sandbox; only `NotFound` becomes `Ok(None)`.
     async fn place_existing(&self, sandbox_id: SandboxId) -> Result<Option<NodeEndpoint>> {
-        let response = match self
-            .local
-            .lookup_node(tonic::Request::new(scheduler::LookupNodeRequest {
-                sandbox_id: sandbox_id.to_string(),
-            }))
-            .await
-        {
-            Ok(response) => response.into_inner(),
+        let answer = match self.local.lookup_sandbox(&sandbox_id.to_string()).await {
+            Ok(answer) => answer,
             Err(status) if status.code() == Code::NotFound => return Ok(None),
             // Keep the status in the chain: its code is what separates a verdict
             // about this sandbox from a scheduler that could not answer.
@@ -174,7 +170,7 @@ impl NodePlacement for NativeNodePlacement {
                     .context(format!("the local scheduler could not locate {sandbox_id}")))
             }
         };
-        self.node_service_endpoint_from_wire(response.node)
+        self.node_service_endpoint_for(answer.node.id, answer.node.endpoint)
             .map(Some)
     }
 
@@ -223,15 +219,12 @@ impl NodePlacement for NativeNodePlacement {
         projection_ttl_secs: u32,
     ) -> Result<()> {
         self.local
-            .record_assignment(tonic::Request::new(scheduler::RecordAssignmentRequest {
-                sandbox_id: sandbox_id.to_string(),
-                node: Some(scheduler::Node {
-                    node_id: node.node_id.clone(),
-                    endpoint: node.advertised_endpoint.clone(),
-                }),
-                execution_id: execution_id.to_string(),
+            .record_assignment(
+                &sandbox_id.to_string(),
+                &node.node_id,
+                &execution_id.to_string(),
                 projection_ttl_secs,
-            }))
+            )
             .await
             .map_err(|status| {
                 anyhow!("the local scheduler refused an assignment for {sandbox_id}: {status}")

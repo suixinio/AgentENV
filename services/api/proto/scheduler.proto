@@ -4,30 +4,24 @@ package scheduler.v1;
 
 option go_package = "agentenv/services/api/proto;schedulerv1";
 
-// Scheduler is the placement and observation surface: gateways and nodes ask
-// it where a sandbox is, tell it where one ended up, and report what they hold.
+// Scheduler is the node-to-api face: a node asks aenv-api where to place a
+// sandbox, reports what it holds, and records artifact hints. Nothing else
+// dials it.
 //
 // 🔴 No method on this service may answer with codes.PermissionDenied. That
-// code means "a superseded incarnation tried to write" (see ExecutionAuthority
-// below) — that fencing is enforced by aenv-api's own in-process paused
-// registry, never by this service, so this service itself has no such
-// refusal to make. The gateway's scheduler error mapping has no branch for it
-// and falls through to a 502, so returning it here turns a precise refusal
-// into a misdiagnosed server fault.
+// code means "a superseded incarnation tried to write" — that fencing is
+// enforced by aenv-api's own in-process paused registry, never by this
+// service, so this service itself has no such refusal to make.
 service Scheduler {
   rpc Schedule(ScheduleRequest) returns (ScheduleResponse);
-  rpc LookupNode(LookupNodeRequest) returns (LookupNodeResponse);
-  rpc RecordAssignment(RecordAssignmentRequest) returns (RecordAssignmentResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportSandboxEvent(ReportSandboxEventRequest) returns (ReportSandboxEventResponse);
-  rpc ListObservedNodes(ListObservedNodesRequest) returns (ListObservedNodesResponse);
   rpc ListP2pPeers(ListP2pPeersRequest) returns (ListP2pPeersResponse);
   rpc RecordP2pArtifact(RecordP2pArtifactRequest) returns (RecordP2pArtifactResponse);
   rpc ForgetP2pArtifact(ForgetP2pArtifactRequest) returns (ForgetP2pArtifactResponse);
   rpc LookupP2pArtifact(LookupP2pArtifactRequest) returns (LookupP2pArtifactResponse);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
-  rpc ListRegistrySandboxes(ListRegistrySandboxesRequest) returns (ListRegistrySandboxesResponse);
 }
 
 message Node {
@@ -90,119 +84,6 @@ message ScheduleRequest {
 message ScheduleResponse {
   Node node = 1;
 }
-
-message LookupNodeRequest {
-  string sandbox_id = 1;
-}
-
-// SandboxLocation says how the scheduler arrived at the node it names, which is
-// what decides whether that node is known to hold the sandbox or has merely
-// been chosen to rebuild it.
-//
-// The distinction matters to the caller: a node that already holds the sandbox
-// also holds its binding, while a node that was picked or pinned holds neither
-// and has to have the assignment recorded against it as soon as it answers.
-enum SandboxLocation {
-  // The scheduler did not classify this answer. Only an older scheduler
-  // produces it; it is equivalent to BOUND, since that is all a scheduler
-  // without the registry could ever answer.
-  SANDBOX_LOCATION_UNSPECIFIED = 0;
-  // A node is known to hold the sandbox — from its binding, from the roster it
-  // reported in its last heartbeat, or from a registry row that names it as
-  // the holder.
-  SANDBOX_LOCATION_BOUND = 1;
-  // The registry has the sandbox paused with its snapshot published, so any
-  // node can rebuild it. The node named here is a placement decision, taken
-  // with origin_node_id as a soft preference so the layers already on that
-  // machine get reused when it can still take work.
-  SANDBOX_LOCATION_PLACED = 2;
-  // The registry has the sandbox parked on origin_node_id with no snapshot in
-  // shared storage (publishing, or local_only after a failed upload). The only
-  // copy is on that machine's disk, so the answer is that node or nothing.
-  SANDBOX_LOCATION_PINNED = 3;
-}
-
-// ExecutionAuthority says how strong the source of an execution_id is.
-//
-// 🔴 It is not a confidence level. It is the answer to "may this be used to
-// refuse traffic", and only REGISTRY answers yes.
-enum ExecutionAuthority {
-  // A scheduler from before this field existed. Equivalent to UNKNOWN, and
-  // that equivalence is hard: a caller that handles 0 separately gives two
-  // behaviours for one situation for the length of a rolling upgrade.
-  EXECUTION_AUTHORITY_UNSPECIFIED = 0;
-  // The scheduler cannot name the current incarnation — the sandbox has never
-  // entered the registry, or the binding or roster this answer came from was
-  // written before incarnations were recorded. The caller must let the request
-  // through and count the pass as unprotected.
-  EXECUTION_AUTHORITY_UNKNOWN = 1;
-  // execution_id comes from an authoritative source and names the incarnation
-  // that should be alive, right now, on the node the answer names. This is the
-  // only value that licenses a refusal, and it is never reported with an empty
-  // execution_id — an authoritative source that has no incarnation to name is
-  // UNKNOWN, not an authoritative claim that there is none.
-  EXECUTION_AUTHORITY_REGISTRY = 2;
-  // The node is about to mint a new incarnation, which is what PLACED and
-  // PINNED both mean. execution_id is left empty; a non-empty one would name
-  // the previous incarnation and must never be used to refuse.
-  //
-  // 🔴 Both of those locations report PENDING, and the branch says so
-  // explicitly rather than letting the row's value decide. Under PLACED, and
-  // under the local_only half of PINNED, the registry's CHECK constraint pins
-  // execution_id to NULL, so there is nothing to report. Under the publishing
-  // half of PINNED the column is non-empty — and it names a VM that is already
-  // stopped, because a pause stops the VM before it uploads. Inferring
-  // authority from "is the value empty" therefore gives one location two
-  // authority levels, and the stronger of them refuses every data-plane auto
-  // resume that branch exists to serve.
-  EXECUTION_AUTHORITY_PENDING = 3;
-}
-
-message LookupNodeResponse {
-  Node node = 1;
-  SandboxLocation location = 2;
-  // The node that holds the sandbox's local artifacts, as the registry records
-  // it. Carried whenever the answer came from a registry row — for PLACED it is
-  // the preference the placement was taken against, which may or may not be the
-  // node above.
-  string origin_node_id = 3;
-  // The incarnation this answer points at: the one the scheduler holds as the
-  // one that should be alive on the node named above, right now.
-  //
-  // Not "the value a client should send", and not "an incarnation that once
-  // existed". Empty says the scheduler cannot name one, which is what
-  // execution_authority = UNKNOWN says as well.
-  //
-  // Shape follows NodeIdentity.service_instance_id: the string form of a
-  // UUIDv7, lowercase canonical, validated server-side.
-  string execution_id = 4;
-  // What the caller is licensed to do with execution_id. Read this before
-  // reading the field above, never after: an empty execution_id is a different
-  // fact under UNKNOWN than under PENDING, and REGISTRY never carries one.
-  ExecutionAuthority execution_authority = 5;
-}
-
-message RecordAssignmentRequest {
-  string sandbox_id = 1;
-  Node node = 2;
-  // Optional: the incarnation the node reported for this sandbox, when the
-  // caller could read it off the node's response. Empty is an ordinary answer
-  // and only costs authority for the window between the create and the node's
-  // first heartbeat — during which the sandbox is brand new and has exactly
-  // one incarnation, so nothing can be confused with anything.
-  string execution_id = 3;
-  // How long the routing projection for this sandbox should live, in whole
-  // seconds, as the node that owns the sandbox computed it from its own
-  // lifetime ceiling. The node is the only source of truth for this number;
-  // the scheduler stores it and never defines it.
-  //
-  // 🔴 <= 0 means "use the receiver's binding_ttl". It never means "never
-  // expires" — a projection that outlives every path that could delete it is
-  // a route pointing at a sandbox nobody can reach.
-  uint32 projection_ttl_secs = 4;
-}
-
-message RecordAssignmentResponse {}
 
 message MachineInfo {
   string cpu_family = 1;
@@ -319,7 +200,7 @@ message SandboxRosterEntry {
   string execution_id = 2;
   // How long this sandbox's routing projection should live, in whole seconds,
   // as computed by this node. This is the repair path for the same number
-  // RecordAssignmentRequest carries: a projection write that was lost gets
+  // the api half's own projection writes carry: a write that was lost gets
   // reinstalled by heartbeat reconciliation, and it must be reinstalled with
   // the sandbox's real budget rather than with the receiver's default.
   //
@@ -396,14 +277,6 @@ message ReportSandboxEventRequest {
 
 message ReportSandboxEventResponse {}
 
-message ListObservedNodesRequest {
-  string cluster_id = 1;
-}
-
-message ListObservedNodesResponse {
-  repeated ObservedNode nodes = 1;
-}
-
 message P2pPeer {
   string node_id = 1;
   P2pEndpoint endpoint = 2;
@@ -463,75 +336,4 @@ message UnregisterNodeRequest {
 }
 
 message UnregisterNodeResponse {}
-
-// RegistrySandbox is one row of the node-owned `paused_sandboxes` table, read
-// only. The scheduler never writes this table; every value here is what the
-// nodes agreed on among themselves.
-message RegistrySandbox {
-  string sandbox_id = 1;
-  string cluster_id = 2;
-  // One of publishing, paused, resuming, local_only, running. Carried as a
-  // string rather than an enum because the set is pinned by a CHECK constraint
-  // the nodes own: a value this build has not heard of has to survive the trip
-  // to an operator's screen, not be flattened to UNSPECIFIED.
-  string state = 3;
-  int64 generation = 4;
-  // The real machine holding the local artifacts — always the answer to "who
-  // owns this row now". A claim deliberately leaves this pointing at the
-  // previous holder until mark_running repoints it at the new one, which is
-  // the honest continuation of "where the bytes are right now", not a stale
-  // value superseded by claimed_by_node_id.
-  string origin_node_id = 5;
-  // The claimant bringing the sandbox back up: the identity claim_for_resume
-  // was called under (an api-replica process, not necessarily a machine that
-  // reports a heartbeat). Only set while state is resuming. This is a
-  // mutual-exclusion identity, not a routing target — see origin_node_id /
-  // holder_node_id for where the sandbox actually is.
-  string claimed_by_node_id = 6;
-  // Empty while publishing, and while local_only after a failed upload.
-  string snapshot_id = 7;
-  int64 paused_at_unix_ms = 8;
-  int64 updated_at_unix_ms = 9;
-  // 0 means the column is NULL, which the nodes treat as already expired.
-  int64 lease_expires_at_unix_ms = 10;
-  // 0 means the column is NULL, which never matches a reclaim condition.
-  int64 sandbox_expires_at_unix_ms = 11;
-  // The node this row makes authoritative: always origin_node_id. Derived,
-  // not stored.
-  //
-  // This used to branch on state and answer claimed_by_node_id while
-  // resuming. That read as "the claimant is who owns this now", which holds
-  // only when the claimant and the holder are the same process — true in the
-  // pre-split single process, false across aenv-api/aenv-node, where
-  // claimed_by_node_id is an api-replica Pod name that never appears in a
-  // heartbeat roster. See the registry.go Holder() doc comment and the
-  // design-doc revision note at
-  // docs/proposals/_design-phase3-gateway.md §5-S5.
-  string holder_node_id = 12;
-  // The incarnation this row is fenced against. Empty when the row's state
-  // pins the column to NULL. Read-only exposure: when one sandbox turns out to
-  // be live in two places, this is the only per-row thing to reconcile them
-  // against.
-  string execution_id = 13;
-}
-
-message ListRegistrySandboxesRequest {
-  // Optional exact-match filter on state.
-  string state = 1;
-  // Optional filter on holder_node_id.
-  string node_id = 2;
-  // 0 means no limit.
-  int32 page_size = 3;
-  // The next_page_token of the previous response.
-  string page_token = 4;
-}
-
-message ListRegistrySandboxesResponse {
-  repeated RegistrySandbox sandboxes = 1;
-  // Empty when the last page has been returned.
-  string next_page_token = 2;
-  // The database clock the rows were read against. Every lease field above is
-  // only meaningful relative to this, never to the reader's own clock.
-  int64 database_now_unix_ms = 3;
-}
 

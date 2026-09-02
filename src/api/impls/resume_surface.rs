@@ -4,7 +4,7 @@
 //! A sandbox the cluster already has running is answered as it stands, before
 //! any wake-up policy; published snapshots may prefer an origin, while
 //! unpublished captures are pinned to their sole machine. Placement therefore
-//! consumes the fully wired in-process `LookupNode` service rather than
+//! consumes the fully wired in-process sandbox lookup rather than
 //! reimplementing its policy, and the api half writes the routing projection
 //! itself on every wake and on every running answer the projection missed.
 
@@ -16,14 +16,15 @@ use tracing::{debug, warn};
 
 use super::paused_recovery::{CrossNodeResume, MissingLocalResume};
 use super::{ApiImpl, ResumeArbitration};
-use crate::binding_store::lookup::LookupResultLabel;
+use crate::binding_store::lookup::{
+    ExecutionAuthority, LookupAnswer, LookupResultLabel, SandboxLocation,
+};
 use crate::cfg::ConfigManager;
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::orchestrator::{
     ClaimedExecution, NewTimeout, OrchestratorError, PausedSandboxEntry, SandboxMetadata,
     SandboxState,
 };
-use crate::proto::scheduler;
 use crate::types::{ExecutionId, SandboxId};
 
 /// A node the placement source named.
@@ -190,7 +191,7 @@ impl ResumeWiring {
         }
     }
 
-    /// API-half wiring using the fully configured in-process `LookupNode` service.
+    /// API-half wiring using the fully configured in-process sandbox lookup.
     ///
     /// The remote orchestration surface honors any returned pin, and the same
     /// service writes the projection back.
@@ -205,7 +206,8 @@ impl ResumeWiring {
     }
 }
 
-/// In-process `LookupNode` placement source preserving pin/prefer policy.
+/// Placement source over the registry's in-process sandbox lookup, preserving
+/// pin/prefer policy.
 struct NativePlacementSource {
     local: NodeRegistryGrpcService,
 }
@@ -214,10 +216,10 @@ struct NativePlacementSource {
 impl ResumePlacementSource for NativePlacementSource {
     async fn locate(&self, sandbox_id: SandboxId) -> Result<ResumePlacement, PlacementRefusal> {
         match self.local.lookup_sandbox(&sandbox_id.to_string()).await {
-            Ok(lookup) => placement_from_lookup(
-                lookup.response,
-                lookup.label == LookupResultLabel::BoundBinding,
-            ),
+            Ok(answer) => {
+                let answered_by_binding = answer.label == LookupResultLabel::BoundBinding;
+                placement_from_lookup(answer, answered_by_binding)
+            }
             Err(status) => Err(refusal_from_status(&status)),
         }
     }
@@ -244,35 +246,25 @@ impl RoutingProjectionWriter for NativePlacementSource {
     }
 }
 
-/// Converts a `LookupNode` response into wake-up placement.
+/// Converts a sandbox lookup answer into wake-up placement.
 ///
-/// `BOUND` under registry authority is a sandbox running right now; any other
-/// `BOUND` is a preference, not an unpublished-data pin. `answered_by_binding`
-/// says the response came from the routing projection rather than the roster
+/// `Bound` under registry authority is a sandbox running right now; any other
+/// `Bound` is a preference, not an unpublished-data pin. `answered_by_binding`
+/// says the answer came from the routing projection rather than the roster
 /// or the paused registry.
 fn placement_from_lookup(
-    response: scheduler::LookupNodeResponse,
+    answer: LookupAnswer,
     answered_by_binding: bool,
 ) -> Result<ResumePlacement, PlacementRefusal> {
-    let location = response.location();
-    let authority = response.execution_authority();
-    let node = response.node.map(|node| PlacedNode {
-        node_id: node.node_id,
-        address: node.endpoint,
-    });
-    let Some(node) = node else {
-        // A success without a node is retryable absence of an answer.
-        return Err(PlacementRefusal::Unavailable(
-            "the placement source answered without naming a node".to_string(),
-        ));
+    let node = PlacedNode {
+        node_id: answer.node.id,
+        address: answer.node.endpoint,
     };
 
-    match location {
-        scheduler::SandboxLocation::Pinned => Ok(ResumePlacement::Pinned { node }),
-        scheduler::SandboxLocation::Bound
-            if authority == scheduler::ExecutionAuthority::Registry =>
-        {
-            match ExecutionId::parse_str(&response.execution_id) {
+    match answer.location {
+        SandboxLocation::Pinned => Ok(ResumePlacement::Pinned { node }),
+        SandboxLocation::Bound if answer.execution_authority == ExecutionAuthority::Registry => {
+            match ExecutionId::parse_str(&answer.execution_id) {
                 Ok(execution_id) => Ok(ResumePlacement::Running {
                     node,
                     execution_id,
@@ -283,23 +275,21 @@ fn placement_from_lookup(
                     // answer as the preference it would have been before the
                     // incarnation was recorded.
                     warn!(
-                        execution_id = %response.execution_id,
+                        execution_id = %answer.execution_id,
                         error = %err,
                         "the placement source vouched for an incarnation it cannot spell; \
                          taking the bound node as a preference instead"
                     );
                     Ok(ResumePlacement::Preferred {
                         node,
-                        origin_node_id: response.origin_node_id,
+                        origin_node_id: answer.origin_node_id,
                     })
                 }
             }
         }
-        scheduler::SandboxLocation::Placed
-        | scheduler::SandboxLocation::Bound
-        | scheduler::SandboxLocation::Unspecified => Ok(ResumePlacement::Preferred {
+        SandboxLocation::Placed | SandboxLocation::Bound => Ok(ResumePlacement::Preferred {
             node,
-            origin_node_id: response.origin_node_id,
+            origin_node_id: answer.origin_node_id,
         }),
     }
 }
@@ -867,6 +857,8 @@ fn auto_resume_min_sandbox_timeout() -> std::time::Duration {
 mod tests {
     use super::*;
 
+    use crate::proto::scheduler;
+
     use crate::binding_store::BindingStore as _;
     use crate::orchestrator::PausedRegistryState;
 
@@ -878,28 +870,31 @@ mod tests {
         format!("sandbox is {state} on node {node:?}, which is not accepting work")
     }
 
-    fn response(
-        node: Option<(&str, &str)>,
-        location: scheduler::SandboxLocation,
+    fn answer(
+        (node_id, endpoint): (&str, &str),
+        location: SandboxLocation,
         origin_node_id: &str,
-    ) -> scheduler::LookupNodeResponse {
-        scheduler::LookupNodeResponse {
-            node: node.map(|(node_id, endpoint)| scheduler::Node {
-                node_id: node_id.to_string(),
+    ) -> LookupAnswer {
+        LookupAnswer {
+            node: crate::node_registry::types::Node {
+                id: node_id.to_string(),
                 endpoint: endpoint.to_string(),
-            }),
-            location: location as i32,
+                pod_name: String::new(),
+            },
+            location,
             origin_node_id: origin_node_id.to_string(),
-            ..Default::default()
+            execution_id: String::new(),
+            execution_authority: ExecutionAuthority::Unknown,
+            label: LookupResultLabel::BoundRegistry,
         }
     }
 
     #[test]
-    fn only_a_pinned_location_pins_and_the_other_three_are_preferences() {
+    fn only_a_pinned_location_pins_and_the_other_two_are_preferences() {
         let pinned = placement_from_lookup(
-            response(
-                Some(("origin", "http://origin:8000")),
-                scheduler::SandboxLocation::Pinned,
+            answer(
+                ("origin", "http://origin:8000"),
+                SandboxLocation::Pinned,
                 "origin",
             ),
             false,
@@ -916,13 +911,9 @@ mod tests {
             "publishing/local_only rows have exactly one copy of the bytes"
         );
 
-        for location in [
-            scheduler::SandboxLocation::Placed,
-            scheduler::SandboxLocation::Bound,
-            scheduler::SandboxLocation::Unspecified,
-        ] {
+        for location in [SandboxLocation::Placed, SandboxLocation::Bound] {
             let placement = placement_from_lookup(
-                response(Some(("chosen", "http://chosen:8000")), location, "origin"),
+                answer(("chosen", "http://chosen:8000"), location, "origin"),
                 false,
             )
             .expect("a non-pinned answer still names a node");
@@ -941,30 +932,14 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_with_no_node_is_unavailable_rather_than_a_placement_on_nobody() {
-        let nameless = placement_from_lookup(
-            response(None, scheduler::SandboxLocation::Placed, "origin"),
-            false,
-        )
-        .expect_err("half an answer is not an address");
-        assert!(
-            matches!(nameless, PlacementRefusal::Unavailable(_)),
-            "a resume placed on a node called \"\" fails in a way that looks like \
-             the sandbox is broken; {nameless:?}"
-        );
-
+    fn an_answer_with_an_empty_address_is_still_a_placement() {
         assert!(
             placement_from_lookup(
-                response(
-                    Some(("chosen", "")),
-                    scheduler::SandboxLocation::Placed,
-                    "origin",
-                ),
+                answer(("chosen", ""), SandboxLocation::Placed, "origin"),
                 false,
             )
             .is_ok(),
-            "an empty *address* is fine — the gateway resolves the node itself. \
-             It is a missing node that is not an answer"
+            "an empty address is fine: the gateway resolves the node itself"
         );
     }
 
@@ -1480,7 +1455,7 @@ mod tests {
             }) as Arc<dyn crate::orchestrator::PausedSandboxRegistry>
         };
 
-        // No binding store: `LookupNode` is `Unimplemented` before it looks at
+        // No binding store: the lookup is `Unimplemented` before it looks at
         // anything.
         let bare = source_over(NodeRegistryGrpcService::new(
             Arc::clone(&registry),
@@ -1766,14 +1741,10 @@ mod tests {
         let execution_id = ExecutionId::new();
         let running = |answered_by_binding: bool| {
             placement_from_lookup(
-                scheduler::LookupNodeResponse {
+                LookupAnswer {
                     execution_id: execution_id.to_string(),
-                    execution_authority: scheduler::ExecutionAuthority::Registry as i32,
-                    ..response(
-                        Some((NODE_A, NODE_A_ADDRESS)),
-                        scheduler::SandboxLocation::Bound,
-                        "",
-                    )
+                    execution_authority: ExecutionAuthority::Registry,
+                    ..answer((NODE_A, NODE_A_ADDRESS), SandboxLocation::Bound, "")
                 },
                 answered_by_binding,
             )
@@ -1796,14 +1767,10 @@ mod tests {
         // Registry authority with an id that is not an incarnation is the
         // preference it would have been before incarnations were recorded.
         let unspellable = placement_from_lookup(
-            scheduler::LookupNodeResponse {
+            LookupAnswer {
                 execution_id: "not-a-uuid".to_string(),
-                execution_authority: scheduler::ExecutionAuthority::Registry as i32,
-                ..response(
-                    Some((NODE_A, NODE_A_ADDRESS)),
-                    scheduler::SandboxLocation::Bound,
-                    "",
-                )
+                execution_authority: ExecutionAuthority::Registry,
+                ..answer((NODE_A, NODE_A_ADDRESS), SandboxLocation::Bound, "")
             },
             true,
         )

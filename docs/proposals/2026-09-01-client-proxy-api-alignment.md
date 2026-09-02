@@ -274,6 +274,8 @@ e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过
 `ListObservedNodes`/`ListRegistrySandboxes` 两个 RPC，连同 `grpc_service.rs` 的实现、
 `reporter.rs` 的测试桩、两侧生成码（`make -C services`、`build.rs`）；
 `rest_upstream_addr` 键与 `GATEWAY_REST_UPSTREAM_ADDR` 至此才删。
+**已完成（2026-09-02）**：`b8c42dd`（proto 与 Rust 侧）、`69af828`（键、manifest、
+回滚窗口守卫换成 `gateway_removed_keys_manifest_test.go` 的反向守卫）。
 
 ### P4 — 连边折叠：gateway 掉线 scheduler.v1（前置：P3 上线稳定）
 
@@ -330,6 +332,12 @@ e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过
   降格为并行项**——P4 的前置只剩 P3 稳定，正确性由 (a) 的演练直接证明。
 - **收尾提交**：`scheduler.proto` 删 `LookupNode`、`RecordAssignment`，连同
   `grpc_service.rs` 实现与生成码。scheduler.v1 至此只剩 node↔api 面。
+  **已完成（2026-09-02）**：`a937ea3`（gateway 改用 `routing.Answer`，不再携带 proto
+  类型）、`b8c42dd`（四个 RPC 连同 `SandboxLocation`/`ExecutionAuthority`/
+  `RegistrySandbox` 等消息删除，Rust 侧改走 `lookup_sandbox`/`record_assignment`/
+  `record_running`）、`69af828`（`GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE`、
+  `forward_response_size` 等键删除）。回滚窗口随之关闭：P3 之前的 gateway 镜像
+  要求 `rest_upstream_addr` 非空才能启动，键已删，仅靠镜像 digest 无法再回退到它。
 
 > **实施修订（2026-09-01，落地时；四个提交，api 先行可独立滚集群）**
 >
@@ -434,10 +442,11 @@ e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过
   `resume_for_data_plane` 的按请求修复接收（e2b StateRunning 同形），reconciler
   收窄为命中率优化 + 杀孤儿，按它自己的方案推进。
 - **discard 竞态**：不同子系统；P3/P4 与它不要同一批滚集群，避免归因混叠。
-- **scheduler 面**：P3 净减两个 RPC，P4 再减两个（**待收尾提交**：gateway 已于
-  2026-09-01 停止调用 `LookupNode`/`RecordAssignment`，proto、`grpc_service.rs`
-  实现与生成码仍在，随回滚窗口关闭后的收尾提交删除）；此后仅剩 node↔api 的
-  Heartbeat/ReportSandboxEvent/ListSandboxes/p2p hints 等。
+- **scheduler 面**：P3 净减两个 RPC，P4 再减两个（**已完成，2026-09-02**：
+  `b8c42dd` 删除 `LookupNode`/`RecordAssignment`/`ListObservedNodes`/
+  `ListRegistrySandboxes` 与只有它们使用的消息，`grpc_service.rs` 实现、
+  `reporter.rs` 测试桩与两侧生成码同步删除）；此后仅剩 node↔api 的
+  Schedule/Heartbeat/ReportSandboxEvent/GetNode/UnregisterNode/p2p hints。
 
 ## 8. 验收
 

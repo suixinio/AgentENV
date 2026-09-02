@@ -12,11 +12,9 @@ too — there is no alternative left to choose), and runs with
 node discovery, heartbeat receipt, placement, and the paused-sandbox registry
 into itself over the shared `[pg]` pool instead of dialling a scheduler
 process; the gateway's own `scheduler_addr` points at `agentenv-api:8002`
-instead of `agentenv-scheduler:9090` for the same reason, including for
-`ListRegistrySandboxes` (`services/gateway/internal/registry_list.go`'s
-debug endpoint), which `aenv-api` now answers too — and also serves directly as
-`GET /registry/sandboxes` on its own REST surface — see `services/README.md`
-for the current status. The rest of this page describes the architecture as
+instead of `agentenv-scheduler:9090` for the same reason, and
+`GET /registry/sandboxes` is served by `aenv-api` on its own REST surface —
+see `services/README.md` for the current status. The rest of this page describes the architecture as
 it runs today; where it still names "the scheduler" or "the Scheduler
 protocol" generically, that is describing the `services/api/proto/scheduler.proto`
 gRPC contract itself, which `aenv-api` answers in-process rather than a
@@ -179,12 +177,11 @@ has to be configured with both addresses, and the `aenv` client enforces it:
 with only one address in its credentials file it refuses to run and points at
 `aenv auth`.
 
-🔴 `GATEWAY_REST_UPSTREAM_ADDR` (`api-upstream-config`) is still declared in
-`deploy/k8s/base`, and this build ignores it. It stays for one release because
-the gateway digest this one rolls back to refuses to start without an upstream
-that parses — keeping the key is what makes that rollback a pure image-digest
-change. It is deleted once the window closes, and recorded in
-`docs/src/configuration/env-vars.md` then.
+`GATEWAY_REST_UPSTREAM_ADDR`, `GATEWAY_COLD_LOOKUP_TIMEOUT` and
+`GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE` are gone from `deploy/k8s/base`
+(`docs/src/configuration/env-vars.md` records each). A gateway image from
+before this split, which refused to start without an upstream address, can no
+longer be rolled back to by image digest alone.
 
 🔴 **There is no node-side switch to throw beforehand.** Earlier revisions of
 this page opened with `AENV_NODE_SERVICE_ENABLED` (`node-service-config`), billed

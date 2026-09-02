@@ -5,8 +5,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-
-	schedulerv1 "agentenv/services/api/proto"
 )
 
 func TestParseRecordCases(t *testing.T) {
@@ -262,49 +260,45 @@ func TestSynthesizeFillsEveryFieldTheReaderCannotSee(t *testing.T) {
 		Node:        Node{ID: "node-a", Endpoint: "http://node-a", PodName: podName},
 		ExecutionID: "0198b7cc-1111-7000-8000-000000000001",
 	}
-	resp := Synthesize(record)
+	answer := Synthesize(record)
 
-	if resp.GetNode().GetNodeId() != "node-a" || resp.GetNode().GetEndpoint() != "http://node-a" {
-		t.Fatalf("node not carried through: %+v", resp.GetNode())
+	if answer.Node.ID != "node-a" || answer.Node.Endpoint != "http://node-a" {
+		t.Fatalf("node not carried through: %+v", answer.Node)
 	}
-	// 🔴 The pod name is an identity, not an address. Putting it in a lookup
+	// 🔴 The pod name is an identity, not an address. Putting it in a route
 	// answer would invite a caller to forward to it.
 	//
-	// Asserted over the whole marshalled message rather than over the one
-	// field that could hold it today: the wire node has no pod field at all
-	// just now, so a field-by-field check would be a check of nothing, and the
-	// day something grows one this is what notices.
-	raw, err := json.Marshal(resp)
+	// Asserted over the whole marshalled answer rather than over the one field
+	// that could hold it: the day the answer grows another place for it, this
+	// is what notices.
+	raw, err := json.Marshal(answer)
 	if err != nil {
 		t.Fatalf("marshal the synthesized answer: %v", err)
 	}
 	if strings.Contains(string(raw), podName) {
-		t.Fatalf("the pod name reached the lookup answer: %s", raw)
+		t.Fatalf("the pod name reached the route answer: %s", raw)
 	}
-	if resp.GetLocation() != schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND {
-		t.Fatalf("location = %v, want BOUND: the binding hit this stands in for has exactly one location", resp.GetLocation())
+	if answer.Location != LocationBound {
+		t.Fatalf("location = %v, want bound: a projection record has exactly one location", answer.Location)
 	}
-	if resp.GetOriginNodeId() != "" {
-		t.Fatalf("origin node id = %q, want empty: the binding hit never names one", resp.GetOriginNodeId())
+	if answer.ExecutionID != record.ExecutionID {
+		t.Fatalf("execution id = %q, want %q", answer.ExecutionID, record.ExecutionID)
 	}
-	if resp.GetExecutionId() != record.ExecutionID {
-		t.Fatalf("execution id = %q, want %q", resp.GetExecutionId(), record.ExecutionID)
-	}
-	if resp.GetExecutionAuthority() != schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY {
-		t.Fatalf("authority = %v, want REGISTRY", resp.GetExecutionAuthority())
+	if answer.Authority != AuthorityRegistry {
+		t.Fatalf("authority = %v, want registry", answer.Authority)
 	}
 }
 
 func TestSynthesizeWithNoIncarnationClaimsNoAuthority(t *testing.T) {
-	resp := Synthesize(Record{Node: Node{ID: "node-a", Endpoint: "http://node-a"}})
-	if resp.GetExecutionId() != "" {
-		t.Fatalf("execution id = %q, want empty", resp.GetExecutionId())
+	answer := Synthesize(Record{Node: Node{ID: "node-a", Endpoint: "http://node-a"}})
+	if answer.ExecutionID != "" {
+		t.Fatalf("execution id = %q, want empty", answer.ExecutionID)
 	}
-	if resp.GetExecutionAuthority() != schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN {
-		t.Fatalf("authority = %v, want UNKNOWN: REGISTRY is never reported without a value", resp.GetExecutionAuthority())
+	if answer.Authority != AuthorityUnknown {
+		t.Fatalf("authority = %v, want unknown: registry is never reported without a value", answer.Authority)
 	}
-	if resp.GetLocation() != schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND {
-		t.Fatalf("location = %v, want BOUND even with no incarnation", resp.GetLocation())
+	if answer.Location != LocationBound {
+		t.Fatalf("location = %v, want bound even with no incarnation", answer.Location)
 	}
 }
 

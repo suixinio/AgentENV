@@ -1,10 +1,6 @@
 package routing
 
-import (
-	"strings"
-
-	schedulerv1 "agentenv/services/api/proto"
-)
+import "strings"
 
 // NormalizeExecutionID puts an incarnation into the one shape the ordering is
 // defined over.
@@ -23,14 +19,13 @@ func NormalizeExecutionID(raw string) string {
 // against; when this side cannot name one, the honest answer is that it does
 // not know.
 //
-// 🔴 It lives here, and only here. It used to live beside the scheduler's
-// lookup, which is the only place that needed it — until the gateway started
-// reading the projection directly and had to derive the same authority from the
-// same field. Two copies of a three-line rule drift silently, and the drift
-// shows up as a gateway refusing an exchange the scheduler would have allowed.
-func AuthorityFor(executionID string) schedulerv1.ExecutionAuthority {
+// 🔴 It lives here, and only here: the projection reader and the wake-up
+// adapter both derive an authority from the same field, and two copies of a
+// three-line rule drift silently — the drift shows up as the gateway refusing
+// an exchange the api half would have allowed.
+func AuthorityFor(executionID string) Authority {
 	if strings.TrimSpace(executionID) == "" {
-		return schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN
+		return AuthorityUnknown
 	}
-	return schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY
+	return AuthorityRegistry
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"net/http"
 
-	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/config"
 	"agentenv/services/shared/routing"
 
@@ -184,7 +183,7 @@ type fencingPlan struct {
 	// on its own. Empty means the answer comes back from the node.
 	decision string
 	// authority is carried for the log line only.
-	authority schedulerv1.ExecutionAuthority
+	authority routing.Authority
 }
 
 // stampedExecutionID is the only way the expect value reaches a header.
@@ -220,11 +219,11 @@ func fencingPlaneFor(source routeSource) fencingPlane {
 }
 
 // decideFencing turns one routing answer into one plan. The answer is a
-// projection record or a wake-up result, both rendered as the LookupNodeResponse
-// shape. Pure: every input is a value and it performs no IO, so the whole
-// decision table can be enumerated in a test and every mutation of it shows up
-// in exactly one place.
-func decideFencing(mode fencingMode, plane fencingPlane, resp *schedulerv1.LookupNodeResponse) fencingPlan {
+// projection record or a wake-up result, both rendered as routing.Answer.
+// Pure: every input is a value and it performs no IO, so the whole decision
+// table can be enumerated in a test and every mutation of it shows up in
+// exactly one place.
+func decideFencing(mode fencingMode, plane fencingPlane, answer routing.Answer) fencingPlan {
 	// 🔴 The rollback is this line and nothing else. Spreading the check across
 	// the stamping site, the response site and the metrics site would make "off"
 	// itself a piece of new code that has to be verified before it can be
@@ -233,7 +232,7 @@ func decideFencing(mode fencingMode, plane fencingPlane, resp *schedulerv1.Looku
 		return fencingPlan{decision: fencingDecisionOff}
 	}
 
-	authority := resp.GetExecutionAuthority()
+	authority := answer.Authority
 	if plane != fencingPlaneData {
 		// Resolved and recorded, so an operator can see which incarnation a
 		// control-plane call was routed against — but not put on the wire. Once
@@ -241,14 +240,14 @@ func decideFencing(mode fencingMode, plane fencingPlane, resp *schedulerv1.Looku
 		// then there are two gates disagreeing, with the staler one in front.
 		return fencingPlan{
 			decision:  fencingDecisionObserved,
-			expect:    normalizeExecutionID(resp.GetExecutionId()),
+			expect:    normalizeExecutionID(answer.ExecutionID),
 			authority: authority,
 		}
 	}
 
 	switch authority {
-	case schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY:
-		expect := normalizeExecutionID(resp.GetExecutionId())
+	case routing.AuthorityRegistry:
+		expect := normalizeExecutionID(answer.ExecutionID)
 		if expect == "" {
 			// The contract says REGISTRY never arrives empty. If it does, the
 			// answer is unusable rather than authoritative — stamping an empty
@@ -271,14 +270,13 @@ func decideFencing(mode fencingMode, plane fencingPlane, resp *schedulerv1.Looku
 			expect:    expect,
 			authority: authority,
 		}
-	case schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_PENDING:
-		// PLACED and PINNED. The node is about to mint a new incarnation — the
-		// data plane resumes a paused sandbox on demand — so any value here names
-		// the previous one, and expecting it would refuse every auto-resume.
+	case routing.AuthorityPending:
+		// The node is about to mint a new incarnation — the data plane resumes
+		// a paused sandbox on demand — so any value here names the previous
+		// one, and expecting it would refuse every auto-resume.
 		return fencingPlan{decision: fencingDecisionPending, authority: authority}
 	default:
-		// UNKNOWN, UNSPECIFIED, and any value a newer scheduler grows. All three
-		// mean the centre cannot name the incarnation, and all three pass.
+		// Unknown: nobody could name the incarnation, so the request passes.
 		return fencingPlan{decision: fencingDecisionUnfencedNoAuthority, authority: authority}
 	}
 }
@@ -349,7 +347,7 @@ func (s *Server) stampOutboundGatewayHeaders(h http.Header, expectExecutionID st
 // the error to the error handler, which is what guarantees the node's body never
 // reaches the client — and it is the only way to refuse a 101 without racing the
 // upgrade path.
-func (s *Server) fenceProxyResponse(plan fencingPlan, sandboxID string, node *schedulerv1.Node, resp *http.Response) error {
+func (s *Server) fenceProxyResponse(plan fencingPlan, sandboxID string, node routing.Node, resp *http.Response) error {
 	if !plan.fenced {
 		// No authoritative incarnation to compare against, so no response header
 		// is read at all. This is the branch off, the control plane and every
@@ -526,10 +524,10 @@ const logMsgExecutionRefused = "gateway refused a request against a superseded e
 // preflight refusal is the node's, caught before anything ran, and an echo
 // refusal is the gateway's, caught after. That distinction is what a client
 // reading the refusal body needs, and it is the one this function is told.
-func (s *Server) logExecutionMismatch(sandboxID string, node *schedulerv1.Node, expected string, observed string, refusedBy string) {
+func (s *Server) logExecutionMismatch(sandboxID string, node routing.Node, expected string, observed string, refusedBy string) {
 	s.logger.Warn(logMsgExecutionRefused,
 		zap.String("sandbox_id", sandboxID),
-		zap.String("node_id", node.GetNodeId()),
+		zap.String("node_id", node.ID),
 		zap.String("expected_execution_id", expected),
 		zap.String("observed_execution_id", observed),
 		zap.String("refusal_code", refusalCodeExecutionSuperseded),

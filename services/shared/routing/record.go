@@ -19,8 +19,6 @@ package routing
 import (
 	"encoding/json"
 	"strings"
-
-	schedulerv1 "agentenv/services/api/proto"
 )
 
 // Node is where a sandbox is, as a routing record names it.
@@ -44,24 +42,6 @@ type Node struct {
 	PodName string `json:"pod_name,omitempty"`
 }
 
-// ToProto is the one conversion from a stored node to the wire node.
-//
-// 🔴 PodName is deliberately absent: it is an identity the registry uses to
-// recognise a heartbeat, not an address anything routes to, and putting it in a
-// lookup answer would invite a caller to forward to it.
-func (n Node) ToProto() *schedulerv1.Node {
-	return &schedulerv1.Node{
-		NodeId:   n.ID,
-		Endpoint: n.Endpoint,
-	}
-}
-
-// 🔴 There is no inverse. NodeFromProto used to sit here, and nothing outside
-// a test of itself ever called it: this package decodes a stored record and
-// converts it *towards* the wire, never back. A wire node has no pod name and
-// no stored form to return to, so the only thing the reverse could produce is a
-// half-populated Node that reads like a stored one.
-//
 // Record is one routing projection: where a sandbox is, and which incarnation
 // of it is there.
 type Record struct {
@@ -161,27 +141,22 @@ func ParseRecord(raw []byte) (Record, bool) {
 // processes is the problem. The tests now feed literals, pinned against
 // `marshal_record`'s own output — see record_test.go's storedRecord* constants.
 //
-// Synthesize turns a record into the lookup answer the scheduler would have
-// given for it, so a gateway reading the projection directly returns the same
-// thing it would have been told.
+// Synthesize turns a record into the route answer the gateway forwards on.
 //
-// The two fields a flat record does not carry are both constants at the one
-// exit this stands in for — the binding hit in the scheduler's lookup, which
-// always answers BOUND and always names no origin node:
-//
-//   - location:       BOUND
-//   - origin_node_id: ""
+// A record is always a Bound answer: it names the node the sandbox is running
+// on. The pod name stays behind — it is an identity the registry recognises a
+// heartbeat by, not an address, and an answer carrying it would invite a caller
+// to forward to it.
 //
 // 🔴 The incarnation travels through untouched rather than being normalised
 // here. Normalisation belongs to the write path, which already does it, and
-// doing it a second time on the read side would make this and the scheduler's
-// own answer differ for exactly the inputs where it matters.
-func Synthesize(record Record) *schedulerv1.LookupNodeResponse {
-	return &schedulerv1.LookupNodeResponse{
-		Node:               record.Node.ToProto(),
-		Location:           schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-		OriginNodeId:       "",
-		ExecutionId:        record.ExecutionID,
-		ExecutionAuthority: AuthorityFor(record.ExecutionID),
+// doing it a second time on the read side would make this answer and the api
+// half's own differ for exactly the inputs where it matters.
+func Synthesize(record Record) Answer {
+	return Answer{
+		Node:        Node{ID: record.Node.ID, Endpoint: record.Node.Endpoint},
+		Location:    LocationBound,
+		ExecutionID: record.ExecutionID,
+		Authority:   AuthorityFor(record.ExecutionID),
 	}
 }

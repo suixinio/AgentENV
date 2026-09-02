@@ -1,10 +1,6 @@
 package routing
 
-import (
-	"testing"
-
-	schedulerv1 "agentenv/services/api/proto"
-)
+import "testing"
 
 func TestNormalizeExecutionID(t *testing.T) {
 	cases := map[string]string{
@@ -37,13 +33,13 @@ func TestNormalizeExecutionIDPreservesMintOrder(t *testing.T) {
 }
 
 func TestAuthorityFor(t *testing.T) {
-	if got := AuthorityFor(""); got != schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN {
-		t.Fatalf("empty must be UNKNOWN, got %v", got)
+	if got := AuthorityFor(""); got != AuthorityUnknown {
+		t.Fatalf("empty must be unknown, got %v", got)
 	}
-	if got := AuthorityFor("   "); got != schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_UNKNOWN {
-		t.Fatalf("blank must be UNKNOWN, got %v", got)
+	if got := AuthorityFor("   "); got != AuthorityUnknown {
+		t.Fatalf("blank must be unknown, got %v", got)
 	}
-	if got := AuthorityFor("0198b7cc-1111-7000-8000-000000000001"); got != schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY {
-		t.Fatalf("a named incarnation must be REGISTRY, got %v", got)
+	if got := AuthorityFor("0198b7cc-1111-7000-8000-000000000001"); got != AuthorityRegistry {
+		t.Fatalf("a named incarnation must be registry, got %v", got)
 	}
 }

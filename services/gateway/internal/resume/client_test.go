@@ -7,6 +7,7 @@ import (
 	"time"
 
 	apiproxyv1 "agentenv/services/api/proto/apiproxy"
+	"agentenv/services/shared/routing"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -320,10 +321,10 @@ func TestAnUnparseableTargetPortIsForwardedUntouched(t *testing.T) {
 // The shape handed back to the routing path
 // ---------------------------------------------------------------------------
 
-// A woken sandbox is BOUND: it is running on a named node under a named
-// incarnation. PLACED or PINNED would describe a decision about where it should
+// A woken sandbox is Bound: it is running on a named node under a named
+// incarnation. Placed or Pinned would describe a decision about where it should
 // go, and by this point that decision has been taken and acted on.
-func TestLookupResponseIsBoundWithTheIncarnation(t *testing.T) {
+func TestAnswerIsBoundWithTheIncarnation(t *testing.T) {
 	result := Result{
 		Verdict:     VerdictWoken,
 		NodeID:      "node-a",
@@ -331,23 +332,23 @@ func TestLookupResponseIsBoundWithTheIncarnation(t *testing.T) {
 		ExecutionID: "01a02fe3-1f29-7420-91ec-d6c001c3910d",
 	}
 
-	resp := result.LookupResponse()
-	if resp.GetNode().GetNodeId() != "node-a" {
-		t.Fatalf("node id = %q", resp.GetNode().GetNodeId())
+	answer := result.Answer()
+	if answer.Node.ID != "node-a" {
+		t.Fatalf("node id = %q", answer.Node.ID)
 	}
-	if resp.GetNode().GetEndpoint() != "http://node-a:8000" {
-		t.Fatalf("endpoint = %q", resp.GetNode().GetEndpoint())
+	if answer.Node.Endpoint != "http://node-a:8000" {
+		t.Fatalf("endpoint = %q", answer.Node.Endpoint)
 	}
-	if resp.GetLocation().String() != "SANDBOX_LOCATION_BOUND" {
-		t.Fatalf("location = %s, want BOUND", resp.GetLocation())
+	if answer.Location != routing.LocationBound {
+		t.Fatalf("location = %s, want bound", answer.Location)
 	}
-	if resp.GetExecutionId() != result.ExecutionID {
-		t.Fatalf("execution id = %q", resp.GetExecutionId())
+	if answer.ExecutionID != result.ExecutionID {
+		t.Fatalf("execution id = %q", answer.ExecutionID)
 	}
 	// The authority must not claim more than the incarnation supports; an empty
 	// one has to degrade rather than be asserted.
-	empty := Result{Verdict: VerdictWoken, NodeID: "node-a"}.LookupResponse()
-	if empty.GetExecutionAuthority() == resp.GetExecutionAuthority() {
+	empty := Result{Verdict: VerdictWoken, NodeID: "node-a"}.Answer()
+	if empty.Authority == answer.Authority {
 		t.Fatal("an answer naming no incarnation must not carry the same " +
 			"authority as one that names a real incarnation")
 	}

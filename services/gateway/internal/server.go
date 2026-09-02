@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/gateway/internal/cors"
 	"agentenv/services/gateway/internal/resume"
 	"agentenv/services/shared/config"
+	"agentenv/services/shared/routing"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -227,12 +227,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// The two ways a sandbox route gets answered, in order: the routing
 	// projection, then the api half's resume RPC. A hit and a woken sandbox
-	// are rendered in one shape — routing.Synthesize and resume.Result's
-	// LookupResponse both answer BOUND — so nothing below this block needs to
-	// know which of the two answered.
+	// are rendered in one shape — routing.Synthesize and resume.Result.Answer
+	// both answer Bound — so nothing below this block needs to know which of
+	// the two answered.
 	source := routeResolutionRedisHit
-	resp := s.resolveFromProjection(routingCtx, sandboxID)
-	if resp == nil {
+	answer, resolved := s.resolveFromProjection(routingCtx, sandboxID)
+	if !resolved {
 		// 🔴 Everything the projection could not answer lands here, and that
 		// includes a read error. A miss is not an absence: the api half walks
 		// the binding, then the heartbeat roster, then the paused registry,
@@ -256,17 +256,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			zap.String("node_id", woke.NodeID),
 			zap.String("execution_id", woke.ExecutionID),
 		)
-		resp = woke.LookupResponse()
+		answer = woke.Answer()
 		source = routeResolutionResumeWoken
 	}
 	recordRouteResolution(source)
-	node := resp.GetNode()
-	location := resp.GetLocation()
+	node := answer.Node
+	location := answer.Location
 	recordGatewaySandboxLocation(location)
 	// Decided once, from the one routing answer, and carried to both ends of
 	// the proxied exchange.
 	plane := fencingPlaneFor(routeSource)
-	fencing := decideFencing(s.executionFencing, plane, resp)
+	fencing := decideFencing(s.executionFencing, plane, answer)
 	recordExecutionFencing(plane, fencing.decision)
 
 	s.logger.Debug("gateway routed request",
@@ -275,8 +275,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		zap.String("route_source", string(routeSource)),
 		zap.String("location", gatewaySandboxLocationLabel(location)),
 		zap.String("sandbox_id", sandboxID),
-		zap.String("node_id", node.GetNodeId()),
-		zap.String("upstream_endpoint", node.GetEndpoint()),
+		zap.String("node_id", node.ID),
+		zap.String("upstream_endpoint", node.Endpoint),
 		// The control plane resolves an incarnation and never acts on it, so
 		// this line is the only place it is visible for those requests.
 		zap.String("expected_execution_id", fencing.expect),
@@ -287,7 +287,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
 	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
-	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
+	upstreamURL, err := joinUpstream(node.Endpoint, decodedPath, escapedPath, r.URL.RawQuery)
 	if err != nil {
 		cors.Fail(w, r, "invalid upstream endpoint", http.StatusBadGateway)
 		return
@@ -400,7 +400,7 @@ func (s *Server) proxyRequest(
 	w http.ResponseWriter,
 	proxyReq *http.Request,
 	target string,
-	node *schedulerv1.Node,
+	node routing.Node,
 	options proxyRequestOptions,
 ) {
 	upstreamURL, err := url.Parse(target)
@@ -436,7 +436,7 @@ func (s *Server) proxyRequest(
 			// This is purely for debugging/observability and is not consumed
 			// by the client.
 			if s.debugMode {
-				if nodeID := node.GetNodeId(); nodeID != "" {
+				if nodeID := node.ID; nodeID != "" {
 					resp.Header.Set(headerNodeID, nodeID)
 				}
 			}
@@ -450,7 +450,7 @@ func (s *Server) proxyRequest(
 				}
 				s.logger.Log(logLevel, "proxy request closed by client",
 					zap.Error(err),
-					zap.String("node", node.GetNodeId()),
+					zap.String("node", node.ID),
 					zap.String("path", proxyReq.URL.Path),
 					zap.String("target", upstreamURL.String()),
 				)
@@ -460,7 +460,7 @@ func (s *Server) proxyRequest(
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(proxyReq.Context().Err(), context.DeadlineExceeded) {
 				s.logger.Warn("proxy request timed out",
 					zap.Error(err),
-					zap.String("node", node.GetNodeId()),
+					zap.String("node", node.ID),
 					zap.String("path", proxyReq.URL.Path),
 					zap.String("target", upstreamURL.String()),
 				)
@@ -476,7 +476,7 @@ func (s *Server) proxyRequest(
 
 			s.logger.Warn("proxy request failed",
 				zap.Error(err),
-				zap.String("node", node.GetNodeId()),
+				zap.String("node", node.ID),
 				zap.String("path", proxyReq.URL.Path),
 				zap.String("target", upstreamURL.String()),
 			)

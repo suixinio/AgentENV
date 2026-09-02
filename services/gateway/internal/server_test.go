@@ -15,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/routing"
 
 	"go.uber.org/zap"
@@ -1190,7 +1189,7 @@ func TestProxyRequestContextDeadlineReturnsGatewayTimeout(t *testing.T) {
 		recorder,
 		proxyReq,
 		"http://127.0.0.1:1/sandboxes/sbx-timeout",
-		&schedulerv1.Node{NodeId: "node-1", Endpoint: "http://127.0.0.1:1"},
+		routing.Node{ID: "node-1", Endpoint: "http://127.0.0.1:1"},
 		proxyRequestOptions{},
 	)
 
@@ -1216,9 +1215,6 @@ func TestGatewayClassifiesClientCanceledProxyErrors(t *testing.T) {
 	}
 }
 
-// lookupNodeReturning builds a stub whose LookupNode answers with one node and
-// one location. Every other RPC is left unset, so any call the gateway makes
-// beyond the single lookup fails the test by itself.
 // 🔴 A 503 is right; the gRPC client's own dial error is not a body.
 //
 // Measured on the dev cluster with the control plane scaled to zero replicas:

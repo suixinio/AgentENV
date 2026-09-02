@@ -47,7 +47,6 @@ import (
 	"context"
 	"time"
 
-	schedulerv1 "agentenv/services/api/proto"
 	apiproxyv1 "agentenv/services/api/proto/apiproxy"
 	"agentenv/services/shared/routing"
 
@@ -146,23 +145,20 @@ type Result struct {
 	Status       *status.Status
 }
 
-// LookupResponse renders a woken sandbox in the shape the rest of the routing
-// path already speaks, so nothing downstream needs to know a wake-up happened.
+// Answer renders a woken sandbox in the shape the rest of the routing path
+// already speaks, so nothing downstream needs to know a wake-up happened.
 //
-// 🔴 BOUND, matching what routing.Synthesize answers for a projection hit. The
+// 🔴 Bound, matching what routing.Synthesize answers for a projection hit. The
 // sandbox is running on a named node under a named incarnation, which is what
-// BOUND means; PLACED or PINNED would describe a decision about where it should
+// Bound means; Placed or Pinned would describe a decision about where it should
 // go, and that decision has already been taken and acted on by the time this is
 // called.
-func (r Result) LookupResponse() *schedulerv1.LookupNodeResponse {
-	return &schedulerv1.LookupNodeResponse{
-		Node: &schedulerv1.Node{
-			NodeId:   r.NodeID,
-			Endpoint: r.NodeAddress,
-		},
-		Location:           schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-		ExecutionId:        r.ExecutionID,
-		ExecutionAuthority: routing.AuthorityFor(r.ExecutionID),
+func (r Result) Answer() routing.Answer {
+	return routing.Answer{
+		Node:        routing.Node{ID: r.NodeID, Endpoint: r.NodeAddress},
+		Location:    routing.LocationBound,
+		ExecutionID: r.ExecutionID,
+		Authority:   routing.AuthorityFor(r.ExecutionID),
 	}
 }
 

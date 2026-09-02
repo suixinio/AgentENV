@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	schedulerv1 "agentenv/services/api/proto"
 	apiproxyv1 "agentenv/services/api/proto/apiproxy"
 	"agentenv/services/shared/config"
+	"agentenv/services/shared/routing"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
@@ -578,7 +578,7 @@ func TestLogExecutionMismatchWritesTheFrozenFieldSet(t *testing.T) {
 			server := newTestServerWithLogger(t, zap.New(logs), 5*time.Second, 4<<20)
 
 			server.logExecutionMismatch(
-				"sbx-1", &schedulerv1.Node{NodeId: "node-a"},
+				"sbx-1", routing.Node{ID: "node-a"},
 				executionNewer, executionOlder, refusedBy,
 			)
 
@@ -931,11 +931,11 @@ func TestWebSocketHandshakeAgainstASupersededExecutionIsRefused(t *testing.T) {
 // it is reached only by refusals, which the control plane never produces).
 func TestControlPlaneRequestsAreCountedUnderTheObservedLabel(t *testing.T) {
 	// The plan half. Pure, so the whole decision is one call.
-	resolved := &schedulerv1.LookupNodeResponse{
-		Node:               &schedulerv1.Node{NodeId: "node-a", Endpoint: "http://node-a"},
-		Location:           schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND,
-		ExecutionId:        executionNewer,
-		ExecutionAuthority: schedulerv1.ExecutionAuthority_EXECUTION_AUTHORITY_REGISTRY,
+	resolved := routing.Answer{
+		Node:        routing.Node{ID: "node-a", Endpoint: "http://node-a"},
+		Location:    routing.LocationBound,
+		ExecutionID: executionNewer,
+		Authority:   routing.AuthorityRegistry,
 	}
 	plan := decideFencing(fencingEnforce, fencingPlaneControl, resolved)
 	if plan.decision != "observed" {

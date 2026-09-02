@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 
-	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/routing"
 
 	"go.uber.org/zap"
@@ -31,13 +30,13 @@ type projectionReader interface {
 // gone — the binding, the heartbeat roster, the paused registry — which is
 // what covers the window a heartbeat is late for and the window another node's
 // reconciliation dropped a binding this node still lists.
-func (s *Server) resolveFromProjection(ctx context.Context, sandboxID string) *schedulerv1.LookupNodeResponse {
+func (s *Server) resolveFromProjection(ctx context.Context, sandboxID string) (routing.Answer, bool) {
 	if s.projectionReader == nil {
 		// The read switch is off. Nothing is counted here: the caller counts
 		// the answer it is about to get from the api half, and counting a
 		// read that was never attempted would put a decision in the series
 		// nobody made.
-		return nil
+		return routing.Answer{}, false
 	}
 
 	record, ok, err := s.projectionReader.Get(ctx, sandboxID)
@@ -52,14 +51,14 @@ func (s *Server) resolveFromProjection(ctx context.Context, sandboxID string) *s
 			zap.String("sandbox_id", sandboxID),
 			zap.Error(err),
 		)
-		return nil
+		return routing.Answer{}, false
 	case ok:
 		// Counted by the caller, as routeResolutionRedisHit: a hit is the
 		// answer, so it belongs in the same place the api half's answer is
 		// counted rather than half a level down.
-		return routing.Synthesize(record)
+		return routing.Synthesize(record), true
 	default:
 		recordRouteResolution(routeResolutionRedisMiss)
-		return nil
+		return routing.Answer{}, false
 	}
 }

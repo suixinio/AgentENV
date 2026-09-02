@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/gateway/internal/resume"
 	"agentenv/services/shared/observability"
+	"agentenv/services/shared/routing"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -206,7 +206,7 @@ func (s *Server) isLocalGatewayEndpointRequest(r *http.Request) bool {
 	return hostRoute == nil && hostRouteErr == nil
 }
 
-func recordGatewaySandboxLocation(location schedulerv1.SandboxLocation) {
+func recordGatewaySandboxLocation(location routing.Location) {
 	gatewaySandboxLocations.WithLabelValues(gatewaySandboxLocationLabel(location)).Inc()
 }
 
@@ -311,19 +311,18 @@ func recordRouteResolution(source string) {
 	gatewayRouteResolution.WithLabelValues(source).Inc()
 }
 
-// gatewaySandboxLocationLabel keeps the label set closed. An enum value this
-// build does not know is reported as "other" rather than as its number, so a
-// newer scheduler cannot grow the cardinality of this series.
-func gatewaySandboxLocationLabel(location schedulerv1.SandboxLocation) string {
+// gatewaySandboxLocationLabel keeps the label set closed. A value outside the
+// enum is reported as "other" rather than as its number, so nothing can grow
+// the cardinality of this series.
+func gatewaySandboxLocationLabel(location routing.Location) string {
 	switch location {
-	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_BOUND:
+	case routing.LocationBound:
 		return "bound"
-	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_PLACED:
+	case routing.LocationPlaced:
 		return "placed"
-	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_PINNED:
+	case routing.LocationPinned:
 		return "pinned"
-	case schedulerv1.SandboxLocation_SANDBOX_LOCATION_UNSPECIFIED:
-		// An older scheduler, which could only ever answer from a binding.
+	case routing.LocationUnspecified:
 		return "unspecified"
 	default:
 		return "other"

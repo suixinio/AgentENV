@@ -44,10 +44,9 @@ const (
 	gatewayFenceEnv = "GATEWAY_ROUTING_EXECUTION_FENCING"
 )
 
-// projectionEnvs are the two environment variables the gateway's half of the
-// routing projection is carried by: one write-side switch and one read switch.
+// projectionEnvs are the environment variables the gateway's half of the
+// routing projection is carried by: the read switch.
 var projectionEnvs = []string{
-	"GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE",
 	"GATEWAY_ROUTING_PROJECTION_READ",
 }
 
@@ -67,7 +66,6 @@ func TestTheExecutionSwitchesShipTheStateTheClusterRuns(t *testing.T) {
 		// Flipped after the node-side gate was verified.
 		{configMap: fencingConfigMap, key: gatewayFenceEnv, want: "enforce", starting: "off"},
 		{configMap: projectionConfigMap, key: projectionEnvs[0], want: "on", starting: "off"},
-		{configMap: projectionConfigMap, key: projectionEnvs[1], want: "on", starting: "off"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			got := generatedLiteral(t, tc.configMap, tc.key)
@@ -151,7 +149,7 @@ func TestTheTwoSwitchConfigMapsStandInOppositeRelationsToTheCode(t *testing.T) {
 	}
 
 	// Load("") is the code's own opinion, with no file and no environment.
-	if gateway.Gateway.Routing.ProjectionRead || gateway.Gateway.Routing.ProjectionAuthoritative {
+	if gateway.Gateway.Routing.ProjectionRead {
 		t.Fatal("the routing projection no longer defaults off in code. That default is what stops " +
 			"a cluster acquiring record-deleting powers by rolling an image; if it has moved " +
 			"deliberately, this test and the literals it guards need deciding on together")

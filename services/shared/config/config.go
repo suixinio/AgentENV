@@ -99,21 +99,12 @@ type GatewayRoutingConfig struct {
 	// 🔴 Turning this on must be paired with the api half's
 	// `[binding_store].arbitration` (src/cfg.rs) staying in its enforcing
 	// mode: its rollback works by blanking the two incarnation fields on the
-	// way out of the api half's LookupNode, and a gateway reading the
+	// way out of the api half's sandbox lookup, and a gateway reading the
 	// projection itself never sees that blanking, so it would go on fencing
 	// against incarnations arbitration has stopped judging. There is no
 	// mechanism for it — the pairing is an operational rule, written here
 	// because this is where somebody reads it.
 	ProjectionRead bool `json:"projection_read"`
-	// ProjectionAuthoritative is read by no gateway binary any more: the
-	// gateway writes no projection, the api half writes its own on wake and
-	// on a running miss. The key stays parsed and declared in the manifests
-	// for the rollback window, the same way GATEWAY_REST_UPSTREAM_ADDR does.
-	//
-	// 🔴 The write side is one logical switch across two processes and each
-	// holds half of it. Neither ordering is unsafe — see the note in the stage
-	// plan — so they do not have to be flipped together.
-	ProjectionAuthoritative bool `json:"projection_authoritative"`
 }
 
 type GatewayConfig struct {
@@ -136,7 +127,6 @@ type GatewayConfig struct {
 	// that arbitrates one.
 	RedisAddr           string        `json:"redis_addr"`
 	RequestTimeout      time.Duration `json:"request_timeout"`
-	ForwardResponseSize int64         `json:"forward_response_size"`
 	SandboxProxyDomains []string      `json:"sandbox_proxy_domains"`
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
 	// the backend node id on proxied responses. It is off by default.
@@ -162,16 +152,14 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		SchedulerAddr       *string         `json:"scheduler_addr"`
 		RedisAddr           *string         `json:"redis_addr"`
 		RequestTimeout      json.RawMessage `json:"request_timeout"`
-		ForwardResponseSize *int64          `json:"forward_response_size"`
 		SandboxProxyDomains *[]string       `json:"sandbox_proxy_domains"`
 		DebugMode           *bool           `json:"debug_mode"`
 		// Nested one pointer deep on each side, so a config file that names the
 		// block without naming the key inside it leaves the default alone rather
 		// than blanking it.
 		Routing *struct {
-			ExecutionFencing        *string `json:"execution_fencing"`
-			ProjectionRead          *bool   `json:"projection_read"`
-			ProjectionAuthoritative *bool   `json:"projection_authoritative"`
+			ExecutionFencing *string `json:"execution_fencing"`
+			ProjectionRead   *bool   `json:"projection_read"`
 		} `json:"routing"`
 	}
 
@@ -192,9 +180,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	if parsed.RedisAddr != nil {
 		g.RedisAddr = *parsed.RedisAddr
 	}
-	if parsed.ForwardResponseSize != nil {
-		g.ForwardResponseSize = *parsed.ForwardResponseSize
-	}
 	if parsed.SandboxProxyDomains != nil {
 		g.SandboxProxyDomains = *parsed.SandboxProxyDomains
 	}
@@ -210,9 +195,6 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.Routing != nil && parsed.Routing.ProjectionRead != nil {
 		g.Routing.ProjectionRead = *parsed.Routing.ProjectionRead
-	}
-	if parsed.Routing != nil && parsed.Routing.ProjectionAuthoritative != nil {
-		g.Routing.ProjectionAuthoritative = *parsed.Routing.ProjectionAuthoritative
 	}
 
 	if len(bytes.TrimSpace(parsed.RequestTimeout)) > 0 {
@@ -305,7 +287,6 @@ func defaultConfig() Config {
 			MetricsListenAddr:   ":9102",
 			SchedulerAddr:       "127.0.0.1:9090",
 			RequestTimeout:      30 * time.Second,
-			ForwardResponseSize: 4 << 20,
 			SandboxProxyDomains: []string{},
 			// The default points at the end state rather than at the cautious
 			// first step. Starting a release on observe is release discipline,
@@ -359,8 +340,8 @@ func overrideWithEnv(cfg *Config) error {
 		cfg.Gateway.Routing.ExecutionFencing = mode
 	}
 
-	// 🔴 The three projection switches arrive as environment variables and
-	// never as a mounted file. The two are not interchangeable here: a mounted
+	// 🔴 The projection switch arrives as an environment variable and never
+	// as a mounted file. The two are not interchangeable here: a mounted
 	// value that cannot be read is deliberately held at its last good value by
 	// the consumer that reads one, and kubelet refreshes volumes minutes apart
 	// and unevenly across nodes — so deleting a key and writing an empty string
@@ -375,14 +356,6 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid GATEWAY_ROUTING_PROJECTION_READ: %w", err)
 		}
 		cfg.Gateway.Routing.ProjectionRead = on
-	}
-
-	if v := strings.TrimSpace(os.Getenv("GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE")); v != "" {
-		on, err := ParseRoutingProjectionSwitch(v)
-		if err != nil {
-			return fmt.Errorf("invalid GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE: %w", err)
-		}
-		cfg.Gateway.Routing.ProjectionAuthoritative = on
 	}
 
 	return nil

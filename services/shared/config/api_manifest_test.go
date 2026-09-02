@@ -358,56 +358,6 @@ func TestEachHalfRunsItsOwnImage(t *testing.T) {
 	}
 }
 
-// The rollback window's manifest half: this build ignores the key, and the
-// build before it requires one that parses.
-//
-// 🔴 Keeping the key declared and non-empty is what makes rolling the gateway
-// back a pure image-digest change. Remove it while an older digest is still a
-// rollback target and that gateway refuses to start, with the manifest edit
-// that would fix it happening during the incident.
-func TestTheGatewayKeepsTheRestUpstreamKeyForTheRollbackWindow(t *testing.T) {
-	var gateway appsv1.Deployment
-	decodeManifest(t, filepath.Join(manifestDir, "gateway-deployment.yaml"), &gateway)
-	container := onlyContainer(t, "the gateway Deployment", gateway.Spec.Template.Spec.Containers)
-
-	// GATEWAY_COLD_LOOKUP_TIMEOUT is in the same window: this build calls no
-	// LookupNode and reads no timeout for it, the digest before it does both.
-	for _, name := range []string{"GATEWAY_REST_UPSTREAM_ADDR", "GATEWAY_COLD_LOOKUP_TIMEOUT"} {
-		t.Run(name, func(t *testing.T) {
-			declared, ok := envValue(container, name)
-			if !ok {
-				t.Fatalf("the gateway Deployment does not declare %s. This build ignores it, but "+
-					"the digest it rolls back to requires it", name)
-			}
-			if declared.ValueFrom == nil || declared.ValueFrom.ConfigMapKeyRef == nil {
-				t.Fatalf("%s is not read from a ConfigMap key (%+v); it is an address rather than a "+
-					"credential, and an operator has to be able to change it in one place", name, declared)
-			}
-			ref := declared.ValueFrom.ConfigMapKeyRef
-			if ref.Optional == nil || !*ref.Optional {
-				t.Fatalf("%s is a required ConfigMap key; a cluster that has not created that "+
-					"ConfigMap would fail to start its gateway", name)
-			}
-			if value := generatedLiteral(t, ref.Name, ref.Key); value == "" {
-				t.Fatalf("%s/%s is generated empty. The digest this deployment rolls back to "+
-					"refuses to start on an empty one", ref.Name, ref.Key)
-			}
-		})
-	}
-
-	// The control for the value above: generatedLiteral does tell
-	// "generated empty" from "generated with something in it". Without this,
-	// the assertion would also pass against a lookup that returned a non-empty
-	// placeholder for everything, including keys that are not there.
-	//
-	// SANDBOX_PROXY_DOMAINS is the empty literal in this tree that is meant to
-	// be empty, so it is the one that proves the lookup can still say so.
-	if value := generatedLiteral(t, "sandbox-proxy-config", "SANDBOX_PROXY_DOMAINS"); value != "" {
-		t.Fatalf("the generator lookup returned %q for a literal that ships empty; the "+
-			"assertion above is measuring the lookup rather than the manifests", value)
-	}
-}
-
 // 🔴 A manifest that has never been parsed is not a manifest.
 //
 // Every file this phase adds or edits is decoded here into the typed object the

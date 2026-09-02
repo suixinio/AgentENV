@@ -295,17 +295,9 @@ spec:
             # `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT=http://agentenv-api:8002`
             # (both literals in kustomization.yaml).
             #
-            # 🔴 A replica that came up without this listener refuses both.
-            # The resume client reads its connection refused as
-            # VerdictUndecided and falls through to the cold `LookupNode` path
-            # — which, since `gateway.scheduler_addr` also names
-            # `agentenv-api:8002` now, dials this same address rather than a
-            # separate scheduler. This is no longer the latency-not-availability
-            # trade it was when that path could lead somewhere else; the switch
-            # that used to be able to skip it entirely
-            # (`gateway.scheduler_fallback_disabled`) is deleted, so the call
-            # is unconditional now — see the `cold-lookup-config` note in
-            # kustomization.yaml for the timeout that still bounds it.
+            # 🔴 A replica that came up without this listener refuses both:
+            # the resume client reads its connection refused as
+            # VerdictUndecided and answers a 502, never a 404.
             - name: AENV_API_GRPC_ADDR
               value: "0.0.0.0:8002"
             # The port this half dials a machine's node sandbox service on.

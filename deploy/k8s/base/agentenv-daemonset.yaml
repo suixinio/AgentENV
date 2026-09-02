@@ -35,24 +35,17 @@ spec:
           imagePullPolicy: IfNotPresent
           # 阶段 3b: this machine serves the node sandbox service and nothing
           # else. The user-facing REST routes answer 404 here
-          # (`src/api/role_gate.rs`); the gateway reaches them through the api
-          # half instead, which is what `api-upstream-config` in
-          # kustomization.yaml points at.
-          #
-          # 🔴 `api-upstream-config` must carry real addresses, and must not
-          # be emptied: this image never serves user-facing REST, so a gateway
-          # still fanning REST out to these nodes gets 404 from every one of
-          # them. That used to be conditional on the `aenv-node` argument this
-          # container passed; it is unconditional now, because the binary this
-          # image runs is `aenv-node` and there is no argument that could make
-          # it answer those routes. Pinned by
-          # `execution_switches_manifest_test.go`.
+          # (`src/api/role_gate.rs`); clients reach them at the api half's own
+          # address, and the gateway forwards none of them. That used to be
+          # conditional on the `aenv-node` argument this container passed; it
+          # is unconditional now, because the binary this image runs is
+          # `aenv-node` and there is no argument that could make it answer
+          # those routes. Pinned by `execution_switches_manifest_test.go`.
           #
           # 🔴 Rolling back is an **image tag**, not an argument. The pre-split
           # single-process image is the thing that re-serves REST on every node;
           # `services/README.md` has the procedure. It is a serial DaemonSet
-          # roll with an hour of grace per machine, and the gateway has to be
-          # pointed back at the nodes in the same step, or the 404s simply move.
+          # roll with an hour of grace per machine.
           #
           # 🔴 No `args:`. `aenv-node` no longer declares `--role`, so a manifest
           # that still passed it would be refused by clap before the process

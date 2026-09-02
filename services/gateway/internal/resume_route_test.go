@@ -104,7 +104,7 @@ func TestAWakeUpAnswerDecidesWhetherTheRequestIsRoutedAtAll(t *testing.T) {
 		upstream, hits := newUpstream(t)
 		service := runningAt("node-a", upstream.URL)
 
-		server := newTestServer(t, 5*time.Second, 1<<20,
+		server := newTestServer(t, 5*time.Second,
 			withProjectionReader(missingProjection()),
 			withResumeClient(service),
 		)
@@ -130,7 +130,7 @@ func TestAWakeUpAnswerDecidesWhetherTheRequestIsRoutedAtAll(t *testing.T) {
 		_, hits := newUpstream(t)
 		service := &stubResumeService{err: status.Error(codes.Unavailable, "api half is restarting")}
 
-		server := newTestServer(t, 5*time.Second, 1<<20,
+		server := newTestServer(t, 5*time.Second,
 			withProjectionReader(missingProjection()),
 			withResumeClient(service),
 		)
@@ -168,7 +168,7 @@ func TestAnUnreachableApiHalfIsFiveOhTwo(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, hits := newUpstream(t)
-			server := newTestServer(t, 5*time.Second, 1<<20,
+			server := newTestServer(t, 5*time.Second,
 				withProjectionReader(missingProjection()),
 				withResumeClient(service),
 			)
@@ -197,7 +197,7 @@ func TestOnlyAPositiveGoneAnswers404(t *testing.T) {
 	t.Run("gone: 404", func(t *testing.T) {
 		service := &stubResumeService{err: status.Error(codes.NotFound, "sandbox sbx-1 not found")}
 
-		server := newTestServer(t, 5*time.Second, 1<<20,
+		server := newTestServer(t, 5*time.Second,
 			withProjectionReader(missingProjection()),
 			withResumeClient(service),
 		)
@@ -212,7 +212,7 @@ func TestOnlyAPositiveGoneAnswers404(t *testing.T) {
 	t.Run("unreachable: never 404", func(t *testing.T) {
 		service := &stubResumeService{err: status.Error(codes.DeadlineExceeded, "too slow")}
 
-		server := newTestServer(t, 5*time.Second, 1<<20,
+		server := newTestServer(t, 5*time.Second,
 			withProjectionReader(missingProjection()),
 			withResumeClient(service),
 		)
@@ -245,7 +245,7 @@ func TestAPinRefusalIs503AndNeverRoutedAnywhere(t *testing.T) {
 		),
 	}
 
-	server := newTestServer(t, 5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -274,7 +274,7 @@ func TestATransitionInProgressCarriesRetryAfter(t *testing.T) {
 		),
 	}
 
-	server := newTestServer(t, 5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -298,7 +298,7 @@ func TestATransitionInProgressCarriesRetryAfter(t *testing.T) {
 func TestAnUnimplementedWakeUpFails(t *testing.T) {
 	service := &stubResumeService{err: status.Error(codes.Unimplemented, "not implemented")}
 
-	server := newTestServer(t, 5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -313,7 +313,7 @@ func TestAnUnimplementedWakeUpFails(t *testing.T) {
 // A gateway with no resume client has nobody to ask on a miss: the request
 // fails rather than being routed anywhere.
 func TestNoResumeClientFailsTheMissRatherThanRoutingAnywhere(t *testing.T) {
-	server := newTestServer(t, 5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second,
 		withProjectionReader(missingProjection()),
 	)
 	resp := serveDataPlaneRequest(t, server.Handler(), "sbx-1")
@@ -330,7 +330,7 @@ func TestTheTargetPortReachesTheApiHalf(t *testing.T) {
 	upstream, _ := newUpstream(t)
 	service := runningAt("node-a", upstream.URL)
 
-	server := newTestServer(t, 5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -364,7 +364,7 @@ func TestAutoResumeDisabledIs410AndNotRetryable(t *testing.T) {
 		),
 	}
 
-	server := newTestServer(t, 5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)

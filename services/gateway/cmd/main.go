@@ -80,7 +80,6 @@ func main() {
 
 	serverOptions := gateway.ServerOptions{
 		RequestTimeout:      cfg.Gateway.RequestTimeout,
-		MaxResponseSize:     cfg.Gateway.ForwardResponseSize,
 		DebugMode:           cfg.Gateway.DebugMode,
 		SandboxProxyDomains: cfg.Gateway.SandboxProxyDomains,
 		ExecutionFencing:    string(cfg.Gateway.Routing.ExecutionFencing),

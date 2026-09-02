@@ -44,7 +44,6 @@ func TestInstrumentGatewayHTTPSkipsOnlyLocalEndpoints(t *testing.T) {
 	server := newTestServer(
 		t,
 		time.Second,
-		1024,
 		withSandboxProxyDomains("sandbox-proxy.example.invalid"),
 	)
 

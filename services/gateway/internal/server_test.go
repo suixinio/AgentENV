@@ -24,9 +24,9 @@ import (
 
 type testServerOption func(*ServerOptions)
 
-func newTestServer(t *testing.T, timeout time.Duration, maxRespSize int64, opts ...testServerOption) *Server {
+func newTestServer(t *testing.T, timeout time.Duration, opts ...testServerOption) *Server {
 	t.Helper()
-	return newTestServerWithLogger(t, zap.NewNop(), timeout, maxRespSize, opts...)
+	return newTestServerWithLogger(t, zap.NewNop(), timeout, opts...)
 }
 
 // newTestServerWithLogger is newTestServer for the tests that assert on what the
@@ -38,14 +38,12 @@ func newTestServerWithLogger(
 	t *testing.T,
 	logger *zap.Logger,
 	timeout time.Duration,
-	maxRespSize int64,
 	opts ...testServerOption,
 ) *Server {
 	t.Helper()
 
 	options := ServerOptions{
-		RequestTimeout:  timeout,
-		MaxResponseSize: maxRespSize,
+		RequestTimeout: timeout,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -218,7 +216,7 @@ func TestARoutedHealthRequestReachesTheNode(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, time.Second, 1024, routedTo("sbx-1", "node-1", upstream.URL))
+	server := newTestServer(t, time.Second, routedTo("sbx-1", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -248,7 +246,7 @@ func TestDebugModeExposesBackendNodeIDOnResponse(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, time.Second, 1024, routedTo("sbx-1", "node-1", upstream.URL), withDebugMode(true))
+	server := newTestServer(t, time.Second, routedTo("sbx-1", "node-1", upstream.URL), withDebugMode(true))
 
 	req := httptest.NewRequest(http.MethodGet, "/anything", nil)
 	req.Header.Set(headerSandboxID, "sbx-1")
@@ -295,7 +293,7 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, time.Second, 1024, routedTo("sbx-path", "node-1", upstream.URL))
+	server := newTestServer(t, time.Second, routedTo("sbx-path", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -633,7 +631,7 @@ func TestFlushInterval(t *testing.T) {
 }
 
 func TestMetricsEndpointReturnsNotFoundWithoutProxyRouting(t *testing.T) {
-	server := newTestServer(t, time.Second, 1024)
+	server := newTestServer(t, time.Second)
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -649,7 +647,7 @@ func TestMetricsEndpointReturnsNotFoundWithoutProxyRouting(t *testing.T) {
 }
 
 func TestHealthEndpointReturnsGatewayHealthWithoutProxyHeaders(t *testing.T) {
-	server := newTestServer(t, time.Second, 1024)
+	server := newTestServer(t, time.Second)
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -687,7 +685,7 @@ func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T)
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, time.Second, 1024, routedTo("sbx-service", "node-1", upstream.URL))
+	server := newTestServer(t, time.Second, routedTo("sbx-service", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -726,7 +724,7 @@ func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T)
 }
 
 func TestHealthAndMetricsEndpointsWithProxyHeadersMissingSandboxIDReturnBadRequest(t *testing.T) {
-	server := newTestServer(t, time.Second, 1024)
+	server := newTestServer(t, time.Second)
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -769,7 +767,7 @@ func TestHealthAndMetricsEndpointsWithHostRoutingProxyToSandbox(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, time.Second, 1024, routedTo("sbx-service", "node-1", upstream.URL), withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	server := newTestServer(t, time.Second, routedTo("sbx-service", "node-1", upstream.URL), withSandboxProxyDomains("sandbox-proxy.example.invalid"))
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -835,7 +833,7 @@ func TestHandleProxyHostBasedRoutingForwardsToSandboxProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, time.Second, 1024, routedTo(sandboxID, "node-1", upstream.URL), withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	server := newTestServer(t, time.Second, routedTo(sandboxID, "node-1", upstream.URL), withSandboxProxyDomains("sandbox-proxy.example.invalid"))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -884,7 +882,7 @@ func TestHandleProxyHostBasedRoutingForwardsToSandboxProxy(t *testing.T) {
 }
 
 func TestHandleProxyHostBasedRoutingRejectsInvalidHost(t *testing.T) {
-	server := newTestServer(t, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
+	server := newTestServer(t, time.Second, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
@@ -991,7 +989,7 @@ func TestHandleProxyWebSocketForwarding(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, time.Second, 1024, routedTo("sbx-1", "node-1", upstream.URL))
+	server := newTestServer(t, time.Second, routedTo("sbx-1", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -1095,7 +1093,7 @@ func TestHandleProxyPreservesEncodedPathSegments(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, time.Second, 1024, routedTo("sbx-enc", "node-1", upstream.URL))
+	server := newTestServer(t, time.Second, routedTo("sbx-enc", "node-1", upstream.URL))
 
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
@@ -1178,7 +1176,7 @@ func websocketAccept(key string) string {
 }
 
 func TestProxyRequestContextDeadlineReturnsGatewayTimeout(t *testing.T) {
-	server := newTestServer(t, time.Second, 1024)
+	server := newTestServer(t, time.Second)
 
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
@@ -1243,7 +1241,7 @@ func TestTransportTextInAResumeRefusalIsNotHandedToTheClient(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			service := &stubResumeService{err: status.Error(codes.FailedPrecondition, tc.message)}
-			server := newTestServer(t, 5*time.Second, 4<<20,
+			server := newTestServer(t, 5*time.Second,
 				withProjectionReader(missingProjection()),
 				withResumeClient(service),
 			)
@@ -1275,7 +1273,7 @@ func TestTransportTextInAResumeRefusalIsNotHandedToTheClient(t *testing.T) {
 func TestAnEndpointInAResumeRefusalIsRedacted(t *testing.T) {
 	service := &stubResumeService{err: status.Error(codes.FailedPrecondition,
 		"upstream 10.43.165.31:9090 said no, and so did [fd00::1]:8443")}
-	server := newTestServer(t, 5*time.Second, 4<<20,
+	server := newTestServer(t, 5*time.Second,
 		withProjectionReader(missingProjection()),
 		withResumeClient(service),
 	)
@@ -1305,7 +1303,7 @@ func TestAnEndpointInAResumeRefusalIsRedacted(t *testing.T) {
 // Routing headers that name no sandbox are refused where the /health branch
 // refuses them, not carried into the resolver to fail on an empty upstream.
 func TestRoutingHeadersNamingNoSandboxAreRefusedNotProxied(t *testing.T) {
-	server := newTestServer(t, 5*time.Second, 4<<20,
+	server := newTestServer(t, 5*time.Second,
 		withResumeClient(refusingResume(t, "nothing named a sandbox to look up")))
 
 	request := httptest.NewRequest(http.MethodGet, "/anything", nil)

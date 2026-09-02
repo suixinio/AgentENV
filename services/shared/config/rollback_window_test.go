@@ -6,47 +6,37 @@ import (
 	"testing"
 )
 
-// The gateway no longer forwards user-facing REST, so it reads no upstream
-// address, and it no longer calls LookupNode, so it reads no cold-lookup
-// timeout. The keys and the environment variables stay in the deployed
-// manifests for one release, because the digest this one rolls back to
-// requires an upstream that parses and a timeout it can read — see
-// `TestTheGatewayKeepsTheRestUpstreamKeyForTheRollbackWindow`.
-//
-// 🔴 That only holds while this build ignores both harmlessly. A loader that
-// refused an unknown key, or an environment overlay that failed on an unclaimed
-// variable, would turn the manifest that makes rollback possible into a gateway
-// that will not start.
-func TestALeftoverRestUpstreamDoesNotStopTheGatewayLoading(t *testing.T) {
+// The gateway's rollback window is closed: it forwards no REST, calls no
+// sandbox lookup, writes no projection and caps no response, so the keys that
+// configured those are gone from GatewayConfig. docs/src/configuration/env-vars.md
+// promises that a config or environment still carrying one loads and is
+// ignored, and this is the pin for that promise: json.Unmarshal drops a key no
+// field claims, and overrideWithEnv reads only the names it knows.
+func TestRemovedGatewayKeysAreIgnored(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.json")
-	if err := os.WriteFile(path, []byte(
-		`{"gateway":{"scheduler_addr":"agentenv-api:8002","rest_upstream_addr":"http://agentenv-api:8000","cold_lookup_timeout":"3s"}}`,
-	), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"gateway":{
+		"scheduler_addr":"agentenv-api:8002",
+		"rest_upstream_addr":"http://agentenv-api:8000",
+		"cold_lookup_timeout":"3s",
+		"forward_response_size":4194304,
+		"routing":{"projection_authoritative":true}
+	}}`), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	t.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "http://agentenv-api:8000")
 	t.Setenv("GATEWAY_COLD_LOOKUP_TIMEOUT", "3s")
+	t.Setenv("GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE", "on")
 
 	cfg, err := Load(path)
 	if err != nil {
-		t.Fatalf("a config carrying the leftover key did not load: %v", err)
+		t.Fatalf("a config carrying removed keys did not load: %v", err)
 	}
 	if err := cfg.Validate(); err != nil {
-		t.Fatalf("a config carrying the leftover key did not validate: %v", err)
+		t.Fatalf("a config carrying removed keys did not validate: %v", err)
 	}
-	// Resolution: the load above read this file rather than falling back to
-	// defaults, so the tolerance it demonstrates is about this file's contents.
+	// The load above read this file rather than falling back to defaults, so
+	// the tolerance it demonstrates is about this file's contents.
 	if cfg.Gateway.SchedulerAddr != "agentenv-api:8002" {
 		t.Fatalf("the loader did not read the file: scheduler_addr came out %q", cfg.Gateway.SchedulerAddr)
-	}
-
-	// The mounted manifest config is the one a deployed gateway actually reads,
-	// and it still carries the key.
-	mounted, err := Load(filepath.Join(manifestDir, "config", "gateway.json"))
-	if err != nil {
-		t.Fatalf("the mounted gateway config did not load: %v", err)
-	}
-	if err := mounted.Validate(); err != nil {
-		t.Fatalf("the mounted gateway config did not validate: %v", err)
 	}
 }

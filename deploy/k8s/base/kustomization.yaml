@@ -161,8 +161,7 @@ configMapGenerator:
   # VMs) — but it is a *loud*, discoverable one rather than a crash, the same
   # trade `cluster-identity-config` above makes for `AENV_CLUSTER_ID`.
   #
-  # `http://agentenv-api:8002` is this cluster's real, running value —
-  # tracked here the same way `api-upstream-config`'s addresses are, not a
+  # `http://agentenv-api:8002` is this cluster's real, running value, not a
   # placeholder.
   - name: node-heartbeat-config
     literals:
@@ -209,27 +208,27 @@ configMapGenerator:
       # Flipped after the node-side gate was switched on and verified. The
       # gateway injects the control-plane token and refuses what fails it.
       - GATEWAY_ROUTING_EXECUTION_FENCING=enforce
-  # The routing projection's three switches — two logical ones, split across two
-  # processes, so three environment variables. Kept apart from the fencing
+  # The routing projection's two switches — the api half's write side and the
+  # gateway's read side, one per process. Kept apart from the fencing
   # ConfigMap above because they belong to a different change and are flipped on
   # a different day; an operator reading either one should see one release.
   #
-  # 🔴 All three are `on` here and `off` in the code, and that disagreement is
+  # 🔴 Both are `on` here and `off` in the code, and that disagreement is
   # the entire point of this ConfigMap. `off` remains the only safe code
   # default — switching the write side on gives ReportSandboxEvent, which every
   # node is already sending, the power to delete routing records, and a cluster
   # that merely rolled the image must not acquire that at the next pod restart.
   # So the projection is switched on *here*, per cluster, deliberately.
   #
-  # These three were flipped on the live cluster by hand (`kubectl patch`,
+  # These were flipped on the live cluster by hand (`kubectl patch`,
   # 08-20) and left out of this file, which made every `apply -k` a silent
   # rollback to `off`: the gateway would go back to reading routes it no longer
   # writes, and nothing would report the change. Written at the running state
   # for the same reason `execution-fencing-config` is — `off` here would not
   # be the cautious choice, it would perform the regression.
   #
-  # Order to flip them in: the two write-side switches first, in either order,
-  # then the read switch. Rolling back is `kubectl set env` on the Deployment,
+  # Order to flip them in: the write-side switch first, then the read switch.
+  # Rolling back is `kubectl set env` on the Deployment,
   # which rolls it and is loud — editing this ConfigMap in a live cluster does
   # nothing until something restarts the pods, and is undone by the next apply.
   #
@@ -242,10 +241,9 @@ configMapGenerator:
   # above.
   - name: routing-projection-config
     literals:
-      - GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE=on
       - GATEWAY_ROUTING_PROJECTION_READ=on
-      # 🔴 The write-side switch again, for the half that now owns the
-      # registry. This ConfigMap used to also declare
+      # 🔴 The write-side switch, for the half that owns the registry. This
+      # ConfigMap used to also declare
       # SCHEDULER_ROUTING_PROJECTION_AUTHORITATIVE, the scheduler process's own
       # half of this same logical switch — but that key never reached anything
       # once `services/scheduler` (the workload it was scoped to) was deleted
@@ -262,74 +260,6 @@ configMapGenerator:
       # read as a quiet `false` — loud, but only if you spell it right in the
       # first place.
       - AENV_BINDING_STORE_PROJECTION_AUTHORITATIVE=true
-  # 阶段 3a, in one key: which upstream the gateway sends user-facing REST to.
-  #
-  # 🔴 This ConfigMap *is* 3a's switch, and 3a is **on**, permanently now. The
-  # key carries a real address because the cluster has been running it since
-  # 08-24: the gateway sends user-facing REST to the api half rather than
-  # fanning out to whichever node the scheduler names.
-  #
-  # 🔴 It used to carry a second key, `GATEWAY_RESUME_ADDR`, naming the api
-  # half's wake-up surface at `agentenv-api:8002`. That is deleted, not
-  # emptied: `SandboxResumeService` and the `Scheduler` service share one gRPC
-  # listener, so the key could only ever hold `gateway.scheduler_addr`'s value,
-  # and the gateway now reuses that connection for the wake-up RPC.
-  #
-  # 🔴 Emptying this key is no longer a rollback, and no longer possible at
-  # all. The DaemonSet has since moved to `aenv-node` (3b, see
-  # agentenv-daemonset.yaml), so the nodes answer 404 on the sandboxes routes
-  # — the shape of rollback this ConfigMap used to offer (empty the key, roll
-  # the gateway, leave the DaemonSet alone) would point the gateway at a target
-  # that cannot serve the call. `services/shared/config`'s `Config.Validate`
-  # now refuses to load a gateway config with it empty, from the file or the
-  # environment, so an `apply -k` that emptied it is a CrashLoopBackOff at
-  # the next gateway restart rather than the silent REST outage —
-  # discoverable only as 404s — that it used to be. The only rollback left for
-  # 🔴 The current gateway reads neither this key nor the environment variable
-  # it generates. Both stay for one release: the gateway digest this one rolls
-  # back to refuses to start without an upstream that parses, so keeping them
-  # is what makes that rollback a pure image-digest change. They are deleted
-  # once the window closes.
-  #
-  # `config/gateway.json` still mounts the key empty, which keeps the value in
-  # one place rather than two.
-  - name: api-upstream-config
-    literals:
-      - GATEWAY_REST_UPSTREAM_ADDR=http://agentenv-api:8000
-  # The cold LookupNode path a projection miss and an undecided wake-up both
-  # fall through to — declared here at the code default (3s) so losing this
-  # ConfigMap is safe rather than a quiet change, the same reasoning
-  # `execution-fencing-config` above gives for doing this instead of leaving
-  # the key undeclared.
-  #
-  # 🔴 This ConfigMap used to be named `scheduler-fallback-config` and to also
-  # carry GATEWAY_SCHEDULER_FALLBACK_DISABLED, a switch that could skip this
-  # call entirely — billed at the time as "阶段四 slice 1's decommissioning
-  # lever," which turned out to be the wrong lever for that job:
-  # decommissioning the scheduler process was `gateway.scheduler_addr` itself
-  # moving off it (`gateway-k8s-config` above), not skipping this call. That
-  # switch (and the client-selection field it worked alongside,
-  # `QueryOnlySchedulerClient`) is deleted from `services/shared/config`
-  # outright, not merely defaulted off — the call is unconditional again,
-  # exactly as it was before either existed.
-  #
-  # GATEWAY_COLD_LOOKUP_TIMEOUT — this ConfigMap's one remaining key — is not
-  # decommissioning scaffolding: it bounds this one RPC on its own, separately
-  # from GATEWAY_REQUEST_TIMEOUT, so a slow or unreachable target on this path
-  # (a bad rollout, a brief outage on whichever api replica answers) cannot
-  # hold it open for gRPC's own connection backoff. It is the same setting
-  # that used to be named GATEWAY_SCHEDULER_FALLBACK_TIMEOUT — renamed, not
-  # removed, once the call it bounds stopped being a fallback to a process
-  # that might not exist. Safe to lower once this cluster's real LookupNode
-  # p99 is known; 3s is deliberately far above it and far below
-  # GATEWAY_REQUEST_TIMEOUT's 30s.
-  #
-  # `gateway-deployment.yaml` references this key with `optional: true`, so
-  # retuning it later is one literal edited here and a restart, never a
-  # Deployment edit.
-  - name: cold-lookup-config
-    literals:
-      - GATEWAY_COLD_LOOKUP_TIMEOUT=3s
   # 🔴 There was a third switch here — node-service-config, carrying
   # AENV_NODE_SERVICE_ENABLED — and it is gone rather than set to `false`. It
   # was meant to let the pre-split single process serve the node sandbox

@@ -99,30 +99,19 @@ spec:
             # the flip entirely.
             - name: GATEWAY_REDIS_ADDR
               value: agentenv-redis:6379
-            # The two halves of the routing projection the gateway owns: whether
-            # it may answer a sandbox route out of the projection instead of
-            # asking the scheduler, and whether it writes the projection as a
-            # record with a lifetime of its own.
+            # Whether the gateway may answer a sandbox route out of the routing
+            # projection instead of asking the api half's resume RPC.
             #
-            # 🔴 Both start `off`, and unlike the fencing switches above the
-            # *code* defaults to off as well. The reason is written out in
-            # services/shared/config: turning the write side on makes
-            # ReportSandboxEvent — an RPC every node in the fleet is already
-            # sending — stop being a guaranteed no-op and start deleting
-            # records. A cluster that rolled this image without asking for that
-            # would acquire the behaviour the moment a pod restarted.
-            #
-            # 🔴 The read switch is paired with the scheduler's
-            # SCHEDULER_ROUTING_EXECUTION_ARBITRATION: it may only be on while
-            # that one is anything other than `off`. The arbitration rollback
-            # works by blanking the incarnation fields on the way out of
-            # LookupNode, and a gateway reading the projection itself never
-            # passes through that code — it would go on fencing against
-            # incarnations the scheduler has stopped arbitrating. Nothing
-            # enforces the pairing; it is an operational rule.
+            # 🔴 Starts `off`, and unlike the fencing switches above the *code*
+            # defaults to off as well, so a cluster that rolled this image
+            # without asking for projection reads does not acquire them at the
+            # next pod restart. The read side is paired with the api half's
+            # `[binding_store].arbitration` staying in its enforcing mode; see
+            # services/shared/config for why. Nothing enforces the pairing; it
+            # is an operational rule.
             #
             # As with the fencing switches, the ConfigMap carries the release's
-            # starting values and these environment variables exist so a
+            # starting value and this environment variable exists so a
             # rollback is `kubectl set env` — which rolls the deployment and is
             # loud — rather than an edit to a mounted file, which would not take
             # effect at all until something restarted the pod anyway.
@@ -131,45 +120,6 @@ spec:
                 configMapKeyRef:
                   name: routing-projection-config
                   key: GATEWAY_ROUTING_PROJECTION_READ
-                  optional: true
-            - name: GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE
-              valueFrom:
-                configMapKeyRef:
-                  name: routing-projection-config
-                  key: GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE
-                  optional: true
-            # 🔴 Inert in this build — the gateway forwards no REST and reads
-            # no upstream. It stays declared and non-empty for one release
-            # because the digest this one rolls back to refuses to start
-            # without an upstream that parses; see api-upstream-config's note
-            # in kustomization.yaml.
-            - name: GATEWAY_REST_UPSTREAM_ADDR
-              valueFrom:
-                configMapKeyRef:
-                  name: api-upstream-config
-                  key: GATEWAY_REST_UPSTREAM_ADDR
-                  optional: true
-            # The cap on the same cold path's last resort: the LookupNode call
-            # an undecided wake-up (or a nil ResumeClient) falls through to.
-            # See cold-lookup-config in kustomization.yaml for why it is
-            # declared at the code default rather than left off this list —
-            # `optional: true` here is what lets that ConfigMap be edited and
-            # this Deployment restarted, instead of this file, to retune it.
-            #
-            # 🔴 This used to be a pair — GATEWAY_SCHEDULER_FALLBACK_DISABLED
-            # alongside GATEWAY_SCHEDULER_FALLBACK_TIMEOUT, sourced from a
-            # ConfigMap named scheduler-fallback-config — because the call
-            # this bounds used to also have a switch that could skip it
-            # entirely. That switch is deleted outright along with the Go
-            # scheduler it existed to decommission; only the timeout survives,
-            # renamed to GATEWAY_COLD_LOOKUP_TIMEOUT because it stopped being a
-            # fallback-specific setting the moment it stopped being able to
-            # point at a process that might not exist.
-            - name: GATEWAY_COLD_LOOKUP_TIMEOUT
-              valueFrom:
-                configMapKeyRef:
-                  name: cold-lookup-config
-                  key: GATEWAY_COLD_LOOKUP_TIMEOUT
                   optional: true
           readinessProbe:
             httpGet:

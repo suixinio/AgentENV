@@ -111,7 +111,7 @@ func TestTheFencingCounterProbeCanTellSeriesApart(t *testing.T) {
 	passBefore := fencingCounter(t, fencingPlaneData, fencingDecisionEnforcedPass)
 	refusedBefore := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedEcho)
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -146,7 +146,7 @@ func TestDataPlaneRequestCarriesTheExpectedExecutionHeader(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -214,7 +214,7 @@ func TestGatewayStripsClientSuppliedExecutionHeaders(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			server := newTestServer(t, 5*time.Second, 4<<20,
+			server := newTestServer(t, 5*time.Second,
 				routedToExecution("sbx-1", "node-a", upstream.URL, tc.execution),
 				withExecutionFencing(tc.mode))
 
@@ -252,7 +252,7 @@ func TestHostRoutedDataPlaneIsFencedLikeHeaderRouted(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, 5*time.Second, 4<<20,
+	server := newTestServer(t, 5*time.Second,
 		routedToExecution("11111111-2222-3333-4444-555555555555", "node-a", upstream.URL, executionNewer),
 		withExecutionFencing(config.GatewayExecutionFencingEnforce),
 		withSandboxProxyDomains("sandbox-proxy.example.invalid"),
@@ -302,7 +302,7 @@ func TestDataPlaneRequestRefusesWhenNodeEchoesAnOlderExecution(t *testing.T) {
 
 	refusedBefore := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedEcho)
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -351,7 +351,7 @@ func TestDataPlaneRequestTranslatesNodePreconditionRefusal(t *testing.T) {
 
 	refusedBefore := fencingCounter(t, fencingPlaneData, fencingDecisionRefusedPreflight)
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -386,7 +386,7 @@ func TestMatchingExecutionPassesThrough(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -418,7 +418,7 @@ func TestNodeAheadOfTheControlPlanePassesThrough(t *testing.T) {
 
 	aheadBefore := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNodeAhead)
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionOlder), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionOlder), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -450,7 +450,7 @@ func TestIncarnationsAreComparedAfterBeingLowerCased(t *testing.T) {
 
 	aheadBefore := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNodeAhead)
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionOlder), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionOlder), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -491,7 +491,7 @@ func TestUnfencedRequestIsCountedNotSilentlyAllowed(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			before := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNoAuthority)
 
-			server := newTestServer(t, 5*time.Second, 4<<20,
+			server := newTestServer(t, 5*time.Second,
 				append(feed, withExecutionFencing(config.GatewayExecutionFencingEnforce))...)
 
 			response := httptest.NewRecorder()
@@ -519,7 +519,7 @@ func TestNodeWithoutEchoHeaderIsCountedAsUnfenced(t *testing.T) {
 
 	before := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNodeSilent)
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -575,7 +575,7 @@ func TestLogExecutionMismatchWritesTheFrozenFieldSet(t *testing.T) {
 	for _, refusedBy := range []string{refusedByNode, refusedByGateway} {
 		t.Run(refusedBy, func(t *testing.T) {
 			logs, logged := observer.New(zap.WarnLevel)
-			server := newTestServerWithLogger(t, zap.New(logs), 5*time.Second, 4<<20)
+			server := newTestServerWithLogger(t, zap.New(logs), 5*time.Second)
 
 			server.logExecutionMismatch(
 				"sbx-1", routing.Node{ID: "node-a"},
@@ -659,7 +659,7 @@ func TestFencingRefusalIsNeverFourOhFour(t *testing.T) {
 			upstream := httptest.NewServer(tc.upstream)
 			defer upstream.Close()
 
-			server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+			server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 			response := httptest.NewRecorder()
 			server.Handler().ServeHTTP(response, dataPlaneRequest("sbx-1"))
@@ -715,7 +715,7 @@ func TestFencingOffMatchesLegacyBehaviour(t *testing.T) {
 	silentBefore := fencingCounter(t, fencingPlaneData, fencingDecisionUnfencedNodeSilent)
 	offBefore := fencingCounter(t, fencingPlaneData, fencingDecisionOff)
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingOff))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingOff))
 
 	request := dataPlaneRequest("sbx-1")
 	request.Header.Set(headerExpectExecutionID, "forged-expect")
@@ -790,7 +790,7 @@ func TestGatewayStampsTheControlPlaneTokenOnForwardedRequests(t *testing.T) {
 			}))
 			defer upstream.Close()
 
-			server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withControlPlaneToken(tc.token))
+			server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withControlPlaneToken(tc.token))
 
 			request := dataPlaneRequest("sbx-1")
 			if tc.clientSet != "" {
@@ -873,7 +873,7 @@ func TestWebSocketHandshakeAgainstASupersededExecutionIsRefused(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	gateway := httptest.NewServer(server.Handler())
 	defer gateway.Close()
@@ -959,7 +959,7 @@ func TestControlPlaneRequestsAreCountedUnderTheObservedLabel(t *testing.T) {
 	observedBefore := fencingCounter(t, fencingPlaneControl, "observed")
 	offBefore := fencingCounter(t, fencingPlaneControl, "off")
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
+	server := newTestServer(t, 5*time.Second, routedToExecution("sbx-1", "node-a", upstream.URL, executionNewer), withExecutionFencing(config.GatewayExecutionFencingEnforce))
 
 	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-1/pause", nil)
 	request.Header.Set(headerSandboxID, "sbx-1")

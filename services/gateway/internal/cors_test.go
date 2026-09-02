@@ -18,7 +18,7 @@ import (
 const headerAllowOrigin = "Access-Control-Allow-Origin"
 
 func TestASynthesizedRefusalIsReadableByBrowserJS(t *testing.T) {
-	server := newTestServer(t, 5*time.Second, 4<<20)
+	server := newTestServer(t, 5*time.Second)
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/sandboxes", nil))
@@ -40,7 +40,7 @@ func TestASynthesizedRefusalIsReadableByBrowserJS(t *testing.T) {
 }
 
 func TestAPreflightIsAnsweredWhereNoUpstreamCan(t *testing.T) {
-	server := newTestServer(t, 5*time.Second, 4<<20)
+	server := newTestServer(t, 5*time.Second)
 
 	request := httptest.NewRequest(http.MethodOptions, "/sandboxes", nil)
 	request.Header.Set("Access-Control-Request-Method", "POST")
@@ -68,7 +68,7 @@ func TestAPreflightIsAnsweredWhereNoUpstreamCan(t *testing.T) {
 // A bare OPTIONS is an ordinary request. Answering it as a preflight would
 // invent a 204 for a method the caller asked nothing about.
 func TestABareOptionsIsNotAPreflight(t *testing.T) {
-	server := newTestServer(t, 5*time.Second, 4<<20)
+	server := newTestServer(t, 5*time.Second)
 
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodOptions, "/sandboxes", nil))
@@ -91,7 +91,7 @@ func TestAProxiedResponseIsNeverGivenCORSHeaders(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedTo("sbx-1", "node-a", upstream.URL))
+	server := newTestServer(t, 5*time.Second, routedTo("sbx-1", "node-a", upstream.URL))
 
 	// A plain data-plane request, and a preflight addressed the same way: both
 	// have an upstream, so both are the sandbox's to answer.
@@ -185,7 +185,7 @@ func TestAPreflightIsAnsweredAtEverySynthesizedFailure(t *testing.T) {
 		{
 			name: "a malformed host inside a configured proxy domain",
 			server: func(t *testing.T) *Server {
-				return newTestServer(t, 5*time.Second, 4<<20,
+				return newTestServer(t, 5*time.Second,
 					withSandboxProxyDomains("sandbox.test"))
 			},
 			request: func(method string) *http.Request {
@@ -198,7 +198,7 @@ func TestAPreflightIsAnsweredAtEverySynthesizedFailure(t *testing.T) {
 		{
 			name: "routing headers naming no sandbox",
 			server: func(t *testing.T) *Server {
-				return newTestServer(t, 5*time.Second, 4<<20,
+				return newTestServer(t, 5*time.Second,
 					withResumeClient(refusingResume(t, "nothing named a sandbox to ask about")))
 			},
 			request: func(method string) *http.Request {
@@ -219,7 +219,7 @@ func TestAPreflightIsAnsweredAtEverySynthesizedFailure(t *testing.T) {
 						"x-agentenv-resume-origin-node", "",
 					),
 				}
-				return newTestServer(t, 5*time.Second, 4<<20,
+				return newTestServer(t, 5*time.Second,
 					withProjectionReader(missingProjection()),
 					withResumeClient(service),
 				)
@@ -235,7 +235,7 @@ func TestAPreflightIsAnsweredAtEverySynthesizedFailure(t *testing.T) {
 			name: "an unreachable upstream",
 			server: func(t *testing.T) *Server {
 				endpoint := unreachableEndpoint(t)
-				return newTestServer(t, 5*time.Second, 4<<20, routedTo("sbx-1", "node-a", endpoint))
+				return newTestServer(t, 5*time.Second, routedTo("sbx-1", "node-a", endpoint))
 			},
 			request: func(method string) *http.Request {
 				request := httptest.NewRequest(method, "/anything", nil)

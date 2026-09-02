@@ -224,8 +224,7 @@ services:
     # is configured with.
     #
     # The gateway forwards none of it: a client that names only 8000 gets a 404
-    # on every REST call. `GATEWAY_REST_UPSTREAM_ADDR` below is inert, kept for
-    # the rollback window — see `services/README.md`.
+    # on every REST call.
     #
     # 🔴 This stack runs PostgreSQL (`postgres` above), which `agentenv-api`
     # requires; the note on `AENV_CONFIG_OVERLAY_PATH` above says how `[pg]`
@@ -267,11 +266,6 @@ services:
       # the gateway opened two connections to one process. That key is deleted;
       # the gateway reuses this connection.
       GATEWAY_SCHEDULER_ADDR: agentenv-api:8002
-      # 🔴 No longer optional (R9, `services/shared/config`'s `Config.Validate`):
-      # `aenv-node` answers 404 on user-facing REST, so this address must name
-      # the api half. Same value
-      # `deploy/k8s/base/kustomization.yaml`'s `api-upstream-config` uses.
-      GATEWAY_REST_UPSTREAM_ADDR: http://agentenv-api:8000
       GATEWAY_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     # 🔴 8000 is the sandbox data-plane entry point: Host-routed
     # (`{port}-{sandboxID}.<domain>`) and routing-header

@@ -32,7 +32,7 @@ func TestARequestThatNamesNoSandboxIsNotFound(t *testing.T) {
 		{name: "registry listing", method: http.MethodGet, target: "/registry/sandboxes"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			server := newTestServer(t, 5*time.Second, 4<<20,
+			server := newTestServer(t, 5*time.Second,
 				withResumeClient(refusingResume(t, "a request that names no sandbox has nothing to ask about")))
 
 			response := httptest.NewRecorder()
@@ -55,7 +55,7 @@ func TestTheSameRequestWithARoutingHeaderStillReachesANode(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	server := newTestServer(t, 5*time.Second, 4<<20, routedTo("sbx-1", "node-a", upstream.URL))
+	server := newTestServer(t, 5*time.Second, routedTo("sbx-1", "node-a", upstream.URL))
 
 	for _, target := range []string{"/sandboxes/sbx-1/pause", "/nodes", "/anything"} {
 		request := httptest.NewRequest(http.MethodPost, target, nil)

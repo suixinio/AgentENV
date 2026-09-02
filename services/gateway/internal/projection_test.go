@@ -94,7 +94,7 @@ func TestProjectionHitDoesNotAskTheApiHalf(t *testing.T) {
 		"sbx-1": {Node: routing.Node{ID: "node-a", Endpoint: upstream.URL}, ExecutionID: "0198b7cc-1111-7000-8000-000000000001"},
 	}}
 
-	server := newTestServer(t, 5*time.Second, 1<<20,
+	server := newTestServer(t, 5*time.Second,
 		withProjectionReader(reader),
 		withResumeClient(refusingResume(t, "a projection hit must not reach the api half")),
 	)
@@ -127,7 +127,7 @@ func TestProjectionMissAsksTheApiHalf(t *testing.T) {
 	reader := &stubProjectionReader{records: map[string]routing.Record{}}
 	service := runningAt("node-a", upstream.URL)
 
-	server := newTestServer(t, 5*time.Second, 1<<20, withProjectionReader(reader), withResumeClient(service))
+	server := newTestServer(t, 5*time.Second, withProjectionReader(reader), withResumeClient(service))
 	resp := serveDataPlaneRequest(t, server.Handler(), "sbx-1")
 	defer resp.Body.Close()
 
@@ -151,7 +151,7 @@ func TestProjectionReadErrorAsksTheApiHalf(t *testing.T) {
 	reader := &stubProjectionReader{err: errors.New("redis is down")}
 	service := runningAt("node-a", upstream.URL)
 
-	server := newTestServer(t, 5*time.Second, 1<<20, withProjectionReader(reader), withResumeClient(service))
+	server := newTestServer(t, 5*time.Second, withProjectionReader(reader), withResumeClient(service))
 	resp := serveDataPlaneRequest(t, server.Handler(), "sbx-1")
 	defer resp.Body.Close()
 
@@ -172,7 +172,7 @@ func TestProjectionMissOnAnUnknownSandboxStillAnswers404(t *testing.T) {
 	reader := &stubProjectionReader{records: map[string]routing.Record{}}
 	service := &stubResumeService{err: status.Error(codes.NotFound, "sandbox never-existed not found")}
 
-	server := newTestServer(t, 5*time.Second, 1<<20, withProjectionReader(reader), withResumeClient(service))
+	server := newTestServer(t, 5*time.Second, withProjectionReader(reader), withResumeClient(service))
 	resp := serveDataPlaneRequest(t, server.Handler(), "never-existed")
 	defer resp.Body.Close()
 
@@ -187,7 +187,7 @@ func TestProjectionReadSwitchOffNeverReads(t *testing.T) {
 	upstream, _ := newUpstream(t)
 	service := runningAt("node-a", upstream.URL)
 
-	server := newTestServer(t, 5*time.Second, 1<<20, withResumeClient(service))
+	server := newTestServer(t, 5*time.Second, withResumeClient(service))
 	if server.projectionReader != nil {
 		t.Fatal("the read switch defaults on")
 	}
@@ -218,7 +218,7 @@ func TestProjectionHitCarriesTheIncarnationIntoFencing(t *testing.T) {
 	reader := &stubProjectionReader{records: map[string]routing.Record{
 		"sbx-1": {Node: routing.Node{ID: "node-a", Endpoint: upstream.URL}, ExecutionID: executionID},
 	}}
-	server := newTestServer(t, 5*time.Second, 1<<20, withProjectionReader(reader))
+	server := newTestServer(t, 5*time.Second, withProjectionReader(reader))
 
 	resp := serveDataPlaneRequest(t, server.Handler(), "sbx-1")
 	defer resp.Body.Close()

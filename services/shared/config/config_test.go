@@ -9,24 +9,6 @@ import (
 	"time"
 )
 
-// 阶段 3a's REST upstream (`GATEWAY_REST_UPSTREAM_ADDR`) has no code-level
-// default — see defaultConfig and GatewayConfig — because there is no sensible
-// default for a specific api Service address, so `Config.Validate` refuses to
-// load a "gateway" config with it empty. Most of this package's tests load or
-// build a "gateway" config to exercise something that has nothing to do with
-// that switch, so this sets a placeholder-but-valid value for the whole test
-// binary; the handful of tests that are specifically about
-// `rest_upstream_addr` override it locally with `t.Setenv`, which restores
-// this default once the subtest ends.
-//
-// It used to seed a second variable, GATEWAY_RESUME_ADDR, under the same
-// reasoning. That address is deleted: the wake-up RPC rides
-// `gateway.scheduler_addr`'s connection, so there is nothing left to seed.
-func TestMain(m *testing.M) {
-	os.Setenv("GATEWAY_REST_UPSTREAM_ADDR", "http://agentenv-api.default.svc.cluster.local:8000")
-	os.Exit(m.Run())
-}
-
 func TestDefaultConfigUsesAutoLogFormat(t *testing.T) {
 	cfg := defaultConfig()
 	if cfg.LogFormat != "auto" {
@@ -143,7 +125,7 @@ func TestLoadRejectsInvalidGatewayRequestTimeoutEnvDuration(t *testing.T) {
 func TestAConfigStillNamingItsServiceLoads(t *testing.T) {
 	const gatewayBody = `{
 		"log_level": "debug",
-		"gateway": {"http_listen_addr": ":8081", "rest_upstream_addr": "http://agentenv-api:8000"}
+		"gateway": {"http_listen_addr": ":8081"}
 	}`
 
 	want, err := Load(writeGatewayConfig(t, gatewayBody))
@@ -156,7 +138,7 @@ func TestAConfigStillNamingItsServiceLoads(t *testing.T) {
 			body := `{
 				"service": "` + stale + `",
 				"log_level": "debug",
-				"gateway": {"http_listen_addr": ":8081", "rest_upstream_addr": "http://agentenv-api:8000"}
+				"gateway": {"http_listen_addr": ":8081"}
 			}`
 			got, err := Load(writeGatewayConfig(t, body))
 			if err != nil {

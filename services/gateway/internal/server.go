@@ -45,7 +45,6 @@ const (
 
 type ServerOptions struct {
 	RequestTimeout      time.Duration
-	MaxResponseSize     int64
 	DebugMode           bool
 	SandboxProxyDomains []string
 	// ExecutionFencing is the raw configured mode. It is parsed in NewServer so
@@ -83,7 +82,6 @@ type Server struct {
 	logger         *zap.Logger
 	httpClient     *http.Client
 	requestTimeout time.Duration
-	maxRespSize    int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
 	// the backend node id on proxied responses via the x-agentenv-node-id
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
@@ -118,7 +116,6 @@ func NewServer(logger *zap.Logger, options ServerOptions) (*Server, error) {
 		logger:              logger,
 		httpClient:          &http.Client{},
 		requestTimeout:      options.RequestTimeout,
-		maxRespSize:         options.MaxResponseSize,
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 		executionFencing:    executionFencing,

@@ -18,11 +18,7 @@ func writeProjectionConfig(t *testing.T, name string, body string) string {
 
 func clearProjectionEnv(t *testing.T) {
 	t.Helper()
-	for _, key := range []string{
-		"GATEWAY_ROUTING_PROJECTION_READ",
-		"GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE",
-		"GATEWAY_REDIS_ADDR",
-	} {
+	for _, key := range []string{"GATEWAY_ROUTING_PROJECTION_READ", "GATEWAY_REDIS_ADDR"} {
 		t.Setenv(key, "")
 	}
 }
@@ -46,20 +42,17 @@ func TestProjectionSwitchesDefaultOff(t *testing.T) {
 	if gateway.Gateway.Routing.ProjectionRead {
 		t.Fatal("gateway.routing.projection_read defaults on")
 	}
-	if gateway.Gateway.Routing.ProjectionAuthoritative {
-		t.Fatal("gateway.routing.projection_authoritative defaults on")
-	}
 }
 
 func TestProjectionSwitchesReadBothTheFileAndTheEnvironment(t *testing.T) {
 	clearProjectionEnv(t)
 
-	path := writeProjectionConfig(t, "gateway.json", `{"gateway":{"redis_addr":"127.0.0.1:6379","routing":{"projection_read":true,"projection_authoritative":true}}}`)
+	path := writeProjectionConfig(t, "gateway.json", `{"gateway":{"redis_addr":"127.0.0.1:6379","routing":{"projection_read":true}}}`)
 	cfg, err := Load(path)
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if !cfg.Gateway.Routing.ProjectionRead || !cfg.Gateway.Routing.ProjectionAuthoritative {
+	if !cfg.Gateway.Routing.ProjectionRead {
 		t.Fatalf("file values did not land: %+v", cfg.Gateway.Routing)
 	}
 	if cfg.Gateway.RedisAddr != "127.0.0.1:6379" {
@@ -128,10 +121,7 @@ func TestParseRoutingProjectionSwitch(t *testing.T) {
 
 func TestProjectionSwitchEnvironmentRejectsGarbage(t *testing.T) {
 	clearProjectionEnv(t)
-	for _, key := range []string{
-		"GATEWAY_ROUTING_PROJECTION_READ",
-		"GATEWAY_ROUTING_PROJECTION_AUTHORITATIVE",
-	} {
+	for _, key := range []string{"GATEWAY_ROUTING_PROJECTION_READ"} {
 		t.Setenv(key, "observe")
 		if _, err := Load(""); err == nil || !strings.Contains(err.Error(), key) {
 			t.Fatalf("%s=observe was accepted or the error did not name it: %v", key, err)

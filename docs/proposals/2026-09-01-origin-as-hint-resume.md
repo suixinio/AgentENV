@@ -1,5 +1,10 @@
 # Resume 重构方向：origin 从锁降为提示
 
+> **已被取代（2026-09-02）**：`2026-09-02-pause-model-e2b-alignment.md` 一步到位采用
+> e2b 的暂停模型（pause 即死亡、resume 即 create、无 `paused_sandboxes` 表），本稿的
+> 阶段 A/B/C 与「刻意不照抄 e2b 的两处」全部作废；已合入的 A/B 代码列入该稿删除清单。
+> 保留本稿只为记录缺陷的结构与 pve-mf 实证。
+
 **日期**：2026-09-01（方向稿，未实施）
 **参照实现**：e2b-dev/infra `fdc33599b`（本地 `/home/debian/e2b-infra`，只读引用）
 **触发**：pve-mf 上 `refactor/node-embedded-db-removal` 的滚动验证实证——已发布

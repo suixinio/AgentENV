@@ -9,6 +9,7 @@ use crate::virtualization::VirtualizationMode;
 use shell_util::shell_quote;
 
 use super::drive::CommittedAttachedDrive;
+use super::paused::PausedSandboxConfig;
 use super::value::{SnapshotAlias, SnapshotId};
 use super::version::SnapshotRuntimeVersions;
 use crate::types::{ImageConfigs, SandboxResources};
@@ -30,6 +31,11 @@ pub struct SnapshotPublishMetadata {
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Template launches inherit it unless overridden at create time.
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// The sandbox's own configuration when this snapshot is a pause, so a
+    /// resume can rebuild it from the row alone. Absent for checkpoints and
+    /// template builds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_sandbox: Option<PausedSandboxConfig>,
 }
 
 #[doc(hidden)]
@@ -51,6 +57,7 @@ impl SnapshotPublishMetadata {
             virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
             image_configs: ImageConfigs::new(),
             custom_extension_params: None,
+            paused_sandbox: None,
         }
     }
 }
@@ -298,6 +305,9 @@ pub struct CommittedSnapshot {
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Present only on a pause: what a resume needs beyond the bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_sandbox: Option<PausedSandboxConfig>,
 }
 
 #[doc(hidden)]
@@ -319,6 +329,7 @@ impl CommittedSnapshot {
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            paused_sandbox: None,
         }
     }
 }
@@ -332,6 +343,11 @@ pub struct SnapshotRecord {
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
     pub committed: Option<CommittedSnapshot>,
+    /// The node whose disk staged the bytes, and where a resume of a paused
+    /// sandbox is placed by preference. Rewritten when a resume lands
+    /// elsewhere; never a constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
 }
 
 impl SnapshotRecord {
@@ -351,6 +367,7 @@ impl SnapshotRecord {
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
             committed: None,
+            origin_node_id: None,
         }
     }
 
@@ -378,6 +395,11 @@ impl SnapshotRecord {
 
     /// Returns the published rootfs OCI image reference, if source-registry
     /// image publication produced one for this snapshot.
+    /// The pause configuration a resume rebuilds from, when this row is one.
+    pub fn paused_sandbox(&self) -> Option<&PausedSandboxConfig> {
+        self.committed.as_ref()?.paused_sandbox.as_ref()
+    }
+
     pub fn published_rootfs_image_ref(&self) -> Option<&str> {
         let committed = self.committed.as_ref()?;
         let expected_tag = rootfs_snapshot_image_tag(&self.id);
@@ -405,6 +427,7 @@ impl SnapshotRecord {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             committed: Some(committed),
+            origin_node_id: None,
         }
     }
 }

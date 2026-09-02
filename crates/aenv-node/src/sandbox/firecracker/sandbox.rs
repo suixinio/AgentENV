@@ -32,9 +32,8 @@ use crate::cfg::ConfigManager;
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
-    CapturedSandboxSnapshot, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
-    SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
-    SandboxForkSpec, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, RuntimeArtifactSet, SandboxBackend, SandboxCaptureError,
+    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{
@@ -209,42 +208,6 @@ pub struct FirecrackerCapturedSnapshot {
     _snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
 }
 
-#[derive(Clone, Debug)]
-pub struct FirecrackerPausedState {
-    snapshot_config: FirecrackerSnapshotConfig,
-}
-
-impl FirecrackerPausedState {
-    pub fn new(snapshot_config: FirecrackerSnapshotConfig) -> Self {
-        Self { snapshot_config }
-    }
-
-    pub fn decode(_artifact_root: PathBuf, state: serde_json::Value) -> Result<Self> {
-        let snapshot_config: FirecrackerSnapshotConfig =
-            serde_json::from_value(state).context("deserialize Firecracker paused state")?;
-        snapshot_config
-            .validate_persisted()
-            .context("validate Firecracker paused state artifacts")?;
-        Ok(Self::new(snapshot_config))
-    }
-
-    pub fn snapshot_config(&self) -> &FirecrackerSnapshotConfig {
-        &self.snapshot_config
-    }
-}
-
-impl PausedSandboxState for FirecrackerPausedState {
-    fn encode(&self) -> Result<serde_json::Value> {
-        serde_json::to_value(&self.snapshot_config).context("serialize Firecracker paused state")
-    }
-
-    fn runtime_artifacts(&self) -> RuntimeArtifactSet {
-        RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
-            &self.snapshot_config.common,
-        ))
-    }
-}
-
 impl FirecrackerCapturedSnapshot {
     pub fn new(
         manifest: FirecrackerSnapshotManifest,
@@ -295,30 +258,16 @@ impl SandboxBackend for FirecrackerSandbox {
         FirecrackerSandbox::wait_for_ready(self).await
     }
 
-    /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
-    /// `_committer_waiting` is deliberately ignored: this capture reuses artifacts
-    /// already written by the persister without copying or writing them.
-    async fn pause(
-        &mut self,
-        artifact_root: Option<&Path>,
-        _committer_waiting: bool,
-    ) -> SandboxCaptureResult<PausedSandboxCapture> {
-        // Both arms capture the sandbox exactly once. The caller-managed arm
-        // also keeps the manifest: its artifacts live in a directory that
-        // outlives this runtime, so the very same capture can be published to
-        // the snapshot repository and resumed on another node. The managed arm
-        // captures into a temporary root that is reclaimed with the paused
-        // state, which nothing outside this node may reference.
-        let pause_result = match artifact_root {
-            Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root)
-                .await
-                .map(|(snapshot_config, manifest)| (snapshot_config, Some(manifest))),
-            None => FirecrackerSandbox::pause(self)
-                .await
-                .map(|snapshot_config| (snapshot_config, None)),
-        };
-        let (snapshot_config, manifest) = match pause_result {
-            Ok(captured) => captured,
+    /// Pauses the VM in place and captures it into a managed snapshot root the
+    /// capture keeps alive until the repository has staged it.
+    async fn pause(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+        let live_snapshot_root = self
+            .live_snapshot_root()
+            .await
+            .map_err(SandboxCaptureError::from)?;
+        let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
+        let (_, manifest) = match self.pause_to_dir(&snapshot_dir).await {
+            Ok(snapshot) => snapshot,
             Err(err) => {
                 let pause_err = SandboxCaptureError::from(err);
                 if pause_err.is_terminal() {
@@ -332,14 +281,9 @@ impl SandboxBackend for FirecrackerSandbox {
                 return Err(pause_err);
             }
         };
-        Ok(PausedSandboxCapture {
-            state: Arc::new(FirecrackerPausedState::new(snapshot_config)),
-            publishable: manifest.map(|manifest| {
-                CapturedSandboxSnapshot::local(FirecrackerCapturedSnapshot::in_caller_owned_dir(
-                    manifest,
-                ))
-            }),
-        })
+        Ok(CapturedSandboxSnapshot::local(
+            FirecrackerCapturedSnapshot::new(manifest, live_snapshot_root),
+        ))
     }
 
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
@@ -2120,34 +2064,6 @@ mod tests {
     }
 
     #[test]
-    fn paused_state_image_cache_paths_use_snapshot_artifact_config() {
-        let mut common = fresh_config().common;
-        common
-            .rootfs_image_config
-            .as_mut()
-            .expect("fresh config has a rootfs")
-            .image_config_path = "snapshot/rootfs/image.json".into();
-        let state = FirecrackerPausedState::new(FirecrackerSnapshotConfig {
-            common,
-            vm_state_path: "snapshot/vm_state.bin".into(),
-            mem_overlaybd_config: OverlaybdConfig {
-                image_config_path: "snapshot/mem_image.json".into(),
-                read_only: true,
-                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
-            },
-            mem_virtual_size: 4096,
-            managed_snapshot_root: None,
-        });
-
-        assert_eq!(
-            state.runtime_artifacts(),
-            RuntimeArtifactSet::from_overlaybd_image_configs(vec![PathBuf::from(
-                "snapshot/rootfs/image.json"
-            )])
-        );
-    }
-
-    #[test]
     fn snapshot_config_runtime_identity_replaces_source_auth() -> Result<()> {
         let source_id = SandboxId::new();
         let child_id = SandboxId::new();
@@ -2192,60 +2108,6 @@ mod tests {
                 .with_access_token(Some(&source_token))
                 .access_token_hash
         );
-        Ok(())
-    }
-
-    #[test]
-    fn paused_state_without_tools_drive_version_remains_readable_but_not_resumable() -> Result<()> {
-        let temp = TempDir::new()?;
-        let vm_state_path = temp.path().join("vm-state.bin");
-        let mem_image_path = temp.path().join("mem-image.json");
-        let rootfs_image_path = temp.path().join("rootfs-image.json");
-        fs::write(&vm_state_path, b"state")?;
-        fs::write(&mem_image_path, b"{}")?;
-        fs::write(&rootfs_image_path, b"{}")?;
-
-        let mut common = fresh_config().common;
-        common.rootfs_virtual_size = Some(4096);
-        common
-            .rootfs_image_config
-            .as_mut()
-            .expect("fresh config has a rootfs")
-            .image_config_path = rootfs_image_path;
-        let mut value = serde_json::to_value(FirecrackerSnapshotConfig {
-            common,
-            vm_state_path,
-            mem_overlaybd_config: OverlaybdConfig {
-                image_config_path: mem_image_path,
-                read_only: true,
-                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
-            },
-            mem_virtual_size: 4096,
-            managed_snapshot_root: None,
-        })?;
-        let common = value["common"]
-            .as_object_mut()
-            .expect("common config must be an object");
-        common.remove("tools_drive_version");
-        common.insert(
-            "tools_drive_path".to_string(),
-            serde_json::Value::String("/legacy/node/tools.ext4".to_string()),
-        );
-
-        let state = FirecrackerPausedState::decode(PathBuf::new(), value)?;
-
-        assert!(state
-            .snapshot_config()
-            .common
-            .tools_drive_version
-            .is_empty());
-        let err = state
-            .snapshot_config()
-            .validate()
-            .expect_err("legacy paused state must not resume without a tools drive version");
-        assert!(err
-            .to_string()
-            .contains("sandbox state does not record a tools drive version"));
         Ok(())
     }
 
@@ -2380,6 +2242,7 @@ mod tests {
             custom_extension_params: None,
             envd_access_token: None,
             control_plane_config: None,
+            preferred_node_id: None,
         };
 
         let snapshot_config =

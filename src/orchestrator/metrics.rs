@@ -18,10 +18,6 @@ pub struct OrchestratorMetrics {
     pub starting_sandbox_count: u32,
     pub allocated_cpu: u32,
     pub allocated_memory_bytes: u64,
-    /// Number of sandboxes currently in the `Paused` state.
-    pub paused_sandbox_count: u32,
-    pub paused_allocated_cpu: u32,
-    pub paused_allocated_memory_bytes: u64,
 }
 
 /// Monotonic creation counters maintained by the orchestrator.
@@ -75,27 +71,19 @@ impl OrchestratorCounters {
 ///   being moved out of the running set. This matches the historical
 ///   incremental-counter behavior, where `running_sandbox_count` was not
 ///   decremented on entry to those transitional states.
-/// - `starting_sandbox_count` counts only `Creating` and `Resuming`.
-/// - Allocated CPU / memory are counted in every state except `Paused`, since
-///   a paused sandbox has released its VM-side resources.
-/// - `paused_sandbox_count` and the `paused_allocated_*` fields are populated
-///   only for the `Paused` state, and are tracked separately from the active
-///   running set so that schedulers can apply an "including paused" ceiling
-///   without conflating the two.
+/// - `starting_sandbox_count` counts only `Creating`.
+/// - Allocated CPU / memory are counted in every state: every record names a
+///   VM that holds its resources.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SandboxContribution {
     running_sandbox_count: u32,
     starting_sandbox_count: u32,
     allocated_cpu: u32,
     allocated_memory_bytes: u64,
-    paused_sandbox_count: u32,
-    paused_allocated_cpu: u32,
-    paused_allocated_memory_bytes: u64,
 }
 
 impl SandboxContribution {
     pub fn new(state: SandboxState, resources: SandboxResources) -> Self {
-        let is_paused = matches!(state, SandboxState::Paused);
         let counts_as_running = matches!(
             state,
             SandboxState::Running
@@ -104,16 +92,13 @@ impl SandboxContribution {
                 | SandboxState::Forking
                 | SandboxState::Killing
         );
-        let counts_as_starting = matches!(state, SandboxState::Creating | SandboxState::Resuming);
+        let counts_as_starting = matches!(state, SandboxState::Creating);
         let memory_bytes = u64::from(resources.memory_mib) * 1024 * 1024;
         Self {
             running_sandbox_count: u32::from(counts_as_running),
             starting_sandbox_count: u32::from(counts_as_starting),
-            allocated_cpu: if !is_paused { resources.cpu_count } else { 0 },
-            allocated_memory_bytes: if !is_paused { memory_bytes } else { 0 },
-            paused_sandbox_count: u32::from(is_paused),
-            paused_allocated_cpu: if is_paused { resources.cpu_count } else { 0 },
-            paused_allocated_memory_bytes: if is_paused { memory_bytes } else { 0 },
+            allocated_cpu: resources.cpu_count,
+            allocated_memory_bytes: memory_bytes,
         }
     }
 }
@@ -139,15 +124,6 @@ pub fn aggregate_resource_metrics(
     metrics.allocated_memory_bytes = metrics
         .allocated_memory_bytes
         .saturating_add(contribution.allocated_memory_bytes);
-    metrics.paused_sandbox_count = metrics
-        .paused_sandbox_count
-        .saturating_add(contribution.paused_sandbox_count);
-    metrics.paused_allocated_cpu = metrics
-        .paused_allocated_cpu
-        .saturating_add(contribution.paused_allocated_cpu);
-    metrics.paused_allocated_memory_bytes = metrics
-        .paused_allocated_memory_bytes
-        .saturating_add(contribution.paused_allocated_memory_bytes);
 }
 
 #[cfg(test)]
@@ -211,7 +187,7 @@ mod tests {
             meta(SandboxState::Running, 2, 256),
             meta(SandboxState::Running, 1, 128),
             meta(SandboxState::Creating, 4, 512),
-            meta(SandboxState::Resuming, 1, 64),
+            meta(SandboxState::Creating, 1, 64),
         ];
         let metrics = aggregate(metas.iter());
         assert_eq!(metrics.running_sandbox_count, 2);
@@ -224,69 +200,20 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_excludes_only_paused_from_resources() {
-        // Paused is the only state that has released its VM-side resources.
-        // Killing still holds CPU/memory because the VM has not yet stopped,
-        // and it counts toward `running_sandbox_count` as a transitional
-        // exit from the running set. Paused sandboxes are tracked separately
-        // in the paused_* fields.
-        let metas = [
-            meta(SandboxState::Paused, 8, 1024),
-            meta(SandboxState::Killing, 2, 256),
-            meta(SandboxState::Running, 1, 128),
-        ];
-        let metrics = aggregate(metas.iter());
-        assert_eq!(metrics.running_sandbox_count, 2);
-        assert_eq!(metrics.starting_sandbox_count, 0);
-        assert_eq!(metrics.allocated_cpu, 2 + 1);
-        assert_eq!(
-            metrics.allocated_memory_bytes,
-            u64::from(256u32 + 128) * 1024 * 1024
-        );
-        assert_eq!(metrics.paused_sandbox_count, 1);
-        assert_eq!(metrics.paused_allocated_cpu, 8);
-        assert_eq!(metrics.paused_allocated_memory_bytes, 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn aggregate_treats_pausing_and_snapshotting_as_running_with_resources() {
-        // Pausing / Snapshotting keep the VM alive while the orchestrator
-        // transitions the sandbox out of the live serving set, so they
-        // contribute to both `running_sandbox_count` and the allocated
-        // CPU / memory totals.
+    fn aggregate_counts_every_transitional_state_out_of_running_as_running_with_resources() {
         let metas = [
             meta(SandboxState::Pausing, 2, 256),
             meta(SandboxState::Snapshotting, 1, 128),
+            meta(SandboxState::Forking, 4, 512),
+            meta(SandboxState::Killing, 8, 1024),
         ];
         let metrics = aggregate(metas.iter());
-        assert_eq!(metrics.running_sandbox_count, 2);
+        assert_eq!(metrics.running_sandbox_count, 4);
         assert_eq!(metrics.starting_sandbox_count, 0);
-        assert_eq!(metrics.allocated_cpu, 3);
-        assert_eq!(metrics.allocated_memory_bytes, (256u64 + 128) * 1024 * 1024);
-        assert_eq!(metrics.paused_sandbox_count, 0);
-        assert_eq!(metrics.paused_allocated_cpu, 0);
-        assert_eq!(metrics.paused_allocated_memory_bytes, 0);
-    }
-
-    #[test]
-    fn aggregate_paused_sums_independently_of_active_resources() {
-        // Multiple paused sandboxes accumulate into the paused_* totals only,
-        // never into allocated_cpu / allocated_memory_bytes. Active sandboxes
-        // contribute only to the active fields.
-        let metas = [
-            meta(SandboxState::Paused, 4, 512),
-            meta(SandboxState::Paused, 2, 128),
-            meta(SandboxState::Running, 1, 64),
-        ];
-        let metrics = aggregate(metas.iter());
-        assert_eq!(metrics.running_sandbox_count, 1);
-        assert_eq!(metrics.allocated_cpu, 1);
-        assert_eq!(metrics.allocated_memory_bytes, 64 * 1024 * 1024);
-        assert_eq!(metrics.paused_sandbox_count, 2);
-        assert_eq!(metrics.paused_allocated_cpu, 4 + 2);
+        assert_eq!(metrics.allocated_cpu, 2 + 1 + 4 + 8);
         assert_eq!(
-            metrics.paused_allocated_memory_bytes,
-            (512u64 + 128) * 1024 * 1024
+            metrics.allocated_memory_bytes,
+            (256u64 + 128 + 512 + 1024) * 1024 * 1024
         );
     }
 
@@ -297,8 +224,5 @@ mod tests {
         assert_eq!(metrics.starting_sandbox_count, 0);
         assert_eq!(metrics.allocated_cpu, 0);
         assert_eq!(metrics.allocated_memory_bytes, 0);
-        assert_eq!(metrics.paused_sandbox_count, 0);
-        assert_eq!(metrics.paused_allocated_cpu, 0);
-        assert_eq!(metrics.paused_allocated_memory_bytes, 0);
     }
 }

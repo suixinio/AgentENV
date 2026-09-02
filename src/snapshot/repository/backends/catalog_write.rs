@@ -101,6 +101,7 @@ pub fn commit_opening_record(commit: &SnapshotCommit) -> SnapshotRecord {
         created_at_unix_ms: commit.created_at_unix_ms.unwrap_or(now),
         updated_at_unix_ms: now,
         committed: None,
+        origin_node_id: commit.origin_node_id.clone(),
     }
 }
 
@@ -140,6 +141,7 @@ mod tests {
             },
             resources: crate::types::SandboxResources::default(),
             created_at_unix_ms: None,
+            origin_node_id: None,
             committed: crate::snapshot::types::CommittedSnapshot::mock(),
         };
 

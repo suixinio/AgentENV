@@ -22,10 +22,6 @@ pub struct NodeMetricsSnapshot {
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
     pub disks: Vec<DiskMetric>,
-    /// CPU reservation of all paused sandboxes on the node, summed.
-    pub paused_allocated_cpu: u32,
-    /// Memory reservation of all paused sandboxes on the node, summed.
-    pub paused_allocated_memory_bytes: u64,
 }
 
 /// Request-time node snapshot returned by the admin/node APIs.
@@ -52,6 +48,4 @@ pub struct NodeSnapshot {
     pub create_successes: u64,
     pub create_fails: u64,
     pub sandbox_starting_count: u32,
-    /// Number of sandboxes currently in the Paused state on this node.
-    pub paused_sandbox_count: u32,
 }

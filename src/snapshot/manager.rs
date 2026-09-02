@@ -223,6 +223,18 @@ impl SnapshotManager {
         })
     }
 
+    /// Records where a resume of a paused sandbox landed on its row.
+    pub async fn set_origin_node_id(
+        &self,
+        id: &crate::snapshot::SnapshotId,
+        origin_node_id: &str,
+    ) -> crate::snapshot::RepositoryResult<()> {
+        self.repository
+            .catalog()
+            .set_origin_node_id(id, origin_node_id)
+            .await
+    }
+
     /// Commits a pure staged value without consulting node-local residue.
     #[tracing::instrument(skip(self, staged), fields(snapshot_id = %staged.commit.id))]
     pub async fn commit_staged(

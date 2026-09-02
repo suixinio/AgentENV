@@ -379,10 +379,10 @@ max_sandbox_lifetime_secs = 86400
 # Slack added to the routing projection's TTL so the record outlives the
 # sandbox rather than dying just before it.
 projection_ttl_grace_secs = 60
-# Durable paused-sandbox metadata restored after a server restart.
+# Node-local scratch root for capture artifacts; nothing in it survives a
+# pause, and startup reclaim sweeps it.
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
 
-# Cluster-wide registry of paused sandboxes.
 # Where this process's orchestrator keeps its active-state records.
 #
 #   backend = "in_memory"  this process's own ledger, lost when it exits. What
@@ -433,45 +433,6 @@ redis_response_timeout_ms = 1500
 redis_connect_timeout_ms = 2500
 
 #
-# 🔴 This section must stay in this file even when every value is a default.
-# `deploy/k8s/run.sh` copies this file verbatim over the cluster's
-# `agentenv-k8s-config` ConfigMap on every apply, so a section that lives only
-# in the cluster disappears on the next `make k8s-apply` — and disappears
-# quietly: the backend falls back to `local`, pauses stop reaching the shared
-# repository, and nothing reports an error until a node is lost and its
-# sandboxes turn out to have gone with it.
-[orchestrator.paused_registry]
-# - "local": a paused sandbox is resumable only on the node that paused it.
-# - "postgres": aenv-api connects directly to the registry database over the
-#   shared [pg] pool, folding the scheduler's registry service into that
-#   process. It requires a heartbeat roster source (aenv-api's own node
-#   registry, which it always builds) to select this backend, and requires it
-#   unconditionally — aenv-api is the only process that builds this registry
-#   at all. aenv-node ignores whatever is set here: it warns and wires a
-#   registry that records nothing, because cluster-wide records belong to the
-#   API half.
-#
-# 🔴 A deployment selects this through AENV_PAUSED_REGISTRY_BACKEND, not by
-# editing the copy of this file that lands in the cluster ConfigMap — see
-# above. The environment wins over this value.
-backend = "local"
-
-# How often a node renews its registry leases and re-checks its local paused
-# records against the registry. Ignored by the "local" backend.
-reconcile_interval_secs = 30
-
-# How long a node's hold on a *parked* sandbox stays valid without renewal.
-# Held to at least three reconcile intervals whatever is configured here, since
-# a lease shorter than the cadence that renews it expires on a healthy node.
-# A live sandbox is never handed to another node on this alone.
-lease_ttl_secs = 90
-
-# How often the "postgres" backend's cluster-wide reclaim pass runs. Ignored
-# by every other backend. A separate knob from reconcile_interval_secs on
-# purpose -- reconcile keeps healthy leases alive, reclaim is a backstop for
-# rows nothing has renewed in a lease's worth of time already.
-reclaim_interval_secs = 30
-
 [snapshot]
 # Node-local cache for snapshot artifacts.
 # local_cache_path = "$AENV_HOME/snapshot-local-cache"
@@ -664,10 +625,10 @@ interval_secs = 5
 node_id = "node-a"
 # Logical cluster UUID.
 #
-# 🔴 Also the scope of every paused-sandbox registry row this node writes, and
-# it has to be the same id the scheduler scopes its registry to — set them
-# apart and nothing fails, the rows are simply written into a cluster the
-# scheduler never looks at. A deployment sets both from one place: the
+# Also the cluster the api half files this node's heartbeats under, so it has
+# to be the same id the api half scopes its node registry to; set them apart
+# and nothing fails, the node is simply reported into a cluster the api half
+# never lists. A deployment sets both from one place: the
 # `cluster-identity-config` ConfigMap in deploy/k8s/base/kustomization.yaml,
 # reaching this value through AENV_CLUSTER_ID. This line is what a node falls
 # back to when that ConfigMap is absent, so the two must carry the same value;

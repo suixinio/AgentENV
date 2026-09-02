@@ -97,6 +97,7 @@ async fn publish_captured_snapshot_for_test(
                     .virtualization_mode,
                 image_configs: aenv_node::types::ImageConfigs::new(),
                 custom_extension_params: None,
+                paused_sandbox: None,
             },
             captured_snapshot,
         )
@@ -379,6 +380,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
             custom_extension_params: None,
             envd_access_token: None,
             control_plane_config: None,
+            preferred_node_id: None,
         };
         let mut child =
             FirecrackerSandbox::from_snapshot(runnable, &launch_config, ExecutionId::new())?;
@@ -582,6 +584,7 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                         custom_extension_params: None,
                         envd_access_token: None,
                         control_plane_config: None,
+                        preferred_node_id: None,
                     };
                     let mut sandbox = FirecrackerSandbox::from_snapshot(
                         &runnable,

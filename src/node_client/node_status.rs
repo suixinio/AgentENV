@@ -110,12 +110,6 @@ mod tests {
         ) -> Result<tonic::Response<pb::SandboxCheckpointResponse>, tonic::Status> {
             Err(tonic::Status::unimplemented("override only"))
         }
-        async fn resume(
-            &self,
-            _request: tonic::Request<pb::SandboxResumeRequest>,
-        ) -> Result<tonic::Response<pb::SandboxResumeResponse>, tonic::Status> {
-            Err(tonic::Status::unimplemented("override only"))
-        }
         async fn fork(
             &self,
             _request: tonic::Request<pb::SandboxForkRequest>,

@@ -138,9 +138,6 @@ pub struct StoredNodeSnapshot {
     pub create_successes: u64,
     pub create_fails: u64,
     pub reported_at_unix_ms: i64,
-    pub paused_sandbox_count: u32,
-    pub paused_allocated_cpu: u32,
-    pub paused_allocated_memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,9 +151,6 @@ pub struct StoredRosterEntry {
     pub sandbox_id: String,
     pub execution_id: String,
     pub projection_ttl_secs: u64,
-    /// Defaults false so records predating this field remain decodable.
-    #[serde(default)]
-    pub paused: bool,
 }
 
 /// Shared-store mutation queued by the synchronous registry.

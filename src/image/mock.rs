@@ -46,10 +46,6 @@ impl RuntimeImageRefs for RecordingRuntimeImageRefs {
             .push(owner);
     }
 
-    async fn reconcile_paused(&self, _live_paused: &[SandboxId]) -> Result<()> {
-        Ok(())
-    }
-
     async fn maintain_running(&self, _running: Vec<(SandboxId, RuntimeArtifactSet)>) -> Result<()> {
         Ok(())
     }

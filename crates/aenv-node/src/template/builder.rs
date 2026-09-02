@@ -142,6 +142,7 @@ impl TemplateBuilder {
                     // snapshot's extension custom config: it is a per-sandbox
                     // user setting, not part of the built image content.
                     custom_extension_params: None,
+                    paused_sandbox: None,
                 },
                 build_execution.manifest,
             )

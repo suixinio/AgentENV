@@ -158,6 +158,7 @@ pub fn decode_row(row: CatalogRow, expected_cluster: Uuid) -> RepositoryResult<S
         created_at_unix_ms: row.created_at_ms,
         updated_at_unix_ms: row.updated_at_ms,
         committed,
+        origin_node_id: row.origin_node_id.clone(),
     })
 }
 

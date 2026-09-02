@@ -178,6 +178,10 @@ pub struct SnapshotCommit {
     #[serde(default)]
     pub created_at_unix_ms: Option<i64>,
     pub committed: CommittedSnapshot,
+    /// The node whose disk staged the bytes; the row records it as the
+    /// preferred place to resume a paused sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
 }
 
 impl SnapshotCommit {
@@ -186,6 +190,7 @@ impl SnapshotCommit {
         metadata: &SnapshotPublishMetadata,
         imported: ImportedSnapshotArtifacts,
         created_at_unix_ms: i64,
+        origin_node_id: Option<String>,
     ) -> Self {
         Self {
             id: metadata.id.clone(),
@@ -193,6 +198,7 @@ impl SnapshotCommit {
             source: metadata.source.clone(),
             resources: metadata.resources,
             created_at_unix_ms: Some(created_at_unix_ms),
+            origin_node_id,
             committed: CommittedSnapshot {
                 context: metadata.context.clone(),
                 startup: metadata.startup.clone(),
@@ -200,6 +206,7 @@ impl SnapshotCommit {
                 virtualization_mode: metadata.virtualization_mode,
                 image_configs: metadata.image_configs.clone(),
                 custom_extension_params: metadata.custom_extension_params.clone(),
+                paused_sandbox: metadata.paused_sandbox.clone(),
                 rootfs_layers: imported.rootfs_layers,
                 attached_drives: imported.attached_drives,
                 memory_layers: imported.memory_layers,
@@ -395,6 +402,17 @@ pub trait SnapshotCatalog: Send + Sync {
     /// Resolvable rows only. See [`Self::resolve_alias_scoped`].
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
 
+    /// Records the node a resume of this snapshot's sandbox landed on, so the
+    /// next resume prefers it. A preference only; backends without the column
+    /// keep the default and lose nothing but warmth.
+    async fn set_origin_node_id(
+        &self,
+        _id: &SnapshotId,
+        _origin_node_id: &str,
+    ) -> RepositoryResult<()> {
+        Ok(())
+    }
+
     /// [`Self::resolve_alias`] at an explicitly chosen scope.
     ///
     /// See [`Self::get_scoped`] on why the default ignores the scope.
@@ -563,6 +581,7 @@ mod pagination_tests {
             created_at_unix_ms,
             updated_at_unix_ms: created_at_unix_ms,
             committed: None,
+            origin_node_id: None,
         }
     }
 

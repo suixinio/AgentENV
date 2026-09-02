@@ -2,7 +2,6 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use axum_extra::extract::CookieJar;
-use chrono::{DateTime, Utc};
 use headers::Host;
 use http::Method;
 
@@ -10,7 +9,6 @@ use tracing::info;
 
 use crate::node_registry::fleet::{FleetNode, FleetNodes};
 use crate::observability::{DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
-use crate::orchestrator::{PausedRegistryListEntry, PausedRegistryState};
 use crate::proto::scheduler as scheduler_proto;
 use crate::snapshot::CatalogReadScope;
 use crate::types::SandboxId;
@@ -56,8 +54,8 @@ impl From<NodeMetricsSnapshot> for models::NodeMetrics {
                 .into_iter()
                 .map(models::DiskMetrics::from)
                 .collect(),
-            metrics.paused_allocated_cpu,
-            metrics.paused_allocated_memory_bytes,
+            0,
+            0,
         )
     }
 }
@@ -87,7 +85,7 @@ impl From<NodeSnapshot> for models::Node {
             node.create_successes,
             node.create_fails,
             node.sandbox_starting_count,
-            node.paused_sandbox_count,
+            0,
         )
     }
 }
@@ -165,8 +163,8 @@ fn observed_metrics(snapshot: &scheduler_proto::NodeSnapshot) -> models::NodeMet
                 )
             })
             .collect(),
-        snapshot.paused_allocated_cpu,
-        snapshot.paused_allocated_memory_bytes,
+        0,
+        0,
     )
 }
 
@@ -186,7 +184,7 @@ fn observed_node_model(observed: scheduler_proto::ObservedNode) -> models::Node 
         snapshot.create_successes,
         snapshot.create_fails,
         snapshot.sandbox_starting_count,
-        snapshot.paused_sandbox_count,
+        0,
     )
 }
 
@@ -208,44 +206,28 @@ fn observed_node_detail(observed: scheduler_proto::ObservedNode) -> models::Node
         vec![],
         snapshot.create_successes,
         snapshot.create_fails,
-        snapshot.paused_sandbox_count,
+        0,
     )
 }
 
 /// Renders an absent deadline as JSON null.
 ///
-/// An absent lease means "already expired" and an absent sandbox deadline means
-/// "never expires"; zero would be the same number for both.
-fn nullable_unix_ms(at: Option<DateTime<Utc>>) -> Nullable<i64> {
-    match at {
-        Some(at) => Nullable::Present(at.timestamp_millis()),
-        None => Nullable::Null,
-    }
-}
-
-impl From<&PausedRegistryListEntry> for models::RegistrySandbox {
-    fn from(entry: &PausedRegistryListEntry) -> Self {
+impl From<&super::paused::PausedSandboxRow> for models::RegistrySandbox {
+    fn from(row: &super::paused::PausedSandboxRow) -> Self {
         models::RegistrySandbox::new(
-            entry.sandbox_id.to_string(),
-            entry.cluster_id.to_string(),
-            entry.state.as_str().to_string(),
-            entry.generation,
-            entry.origin_node_id.clone(),
-            entry.claimed_by_node_id.clone().unwrap_or_default(),
-            entry
-                .snapshot_id
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
-            entry.holder().to_string(),
-            entry.paused_at.timestamp_millis(),
-            entry.updated_at.timestamp_millis(),
-            nullable_unix_ms(entry.lease_expires_at),
-            nullable_unix_ms(entry.sandbox_expires_at),
-            entry
-                .execution_id
-                .map(|id| id.to_string())
-                .unwrap_or_default(),
+            row.sandbox_id.to_string(),
+            String::new(),
+            "paused".to_string(),
+            0,
+            row.origin_node_id.clone().unwrap_or_default(),
+            String::new(),
+            row.snapshot_id.to_string(),
+            row.origin_node_id.clone().unwrap_or_default(),
+            row.paused_at_unix_ms,
+            row.paused_at_unix_ms,
+            Nullable::Null,
+            Nullable::Null,
+            String::new(),
         )
     }
 }
@@ -264,27 +246,14 @@ fn parse_page_token(raw: &str) -> Result<Option<SandboxId>, String> {
         .map_err(|_| "invalid nextToken".to_string())
 }
 
-/// Resolves the `state` filter against the registry's own vocabulary.
-fn registry_state_filter(raw: Option<&str>) -> Result<Option<PausedRegistryState>, String> {
+/// The only state a paused sandbox can be in. Anything else names a state the
+/// catalog does not record.
+fn registry_state_filter(raw: Option<&str>) -> Result<(), String> {
     let trimmed = raw.unwrap_or_default().trim();
-    if trimmed.is_empty() {
-        return Ok(None);
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("paused") {
+        return Ok(());
     }
-    if let Some(state) = PausedRegistryState::ALL
-        .into_iter()
-        .find(|state| state.as_str().eq_ignore_ascii_case(trimmed))
-    {
-        return Ok(Some(state));
-    }
-    let known: Vec<&str> = PausedRegistryState::ALL
-        .iter()
-        .copied()
-        .map(PausedRegistryState::as_str)
-        .collect();
-    Err(format!(
-        "unknown state '{trimmed}', must be one of {}",
-        known.join(", ")
-    ))
+    Err(format!("unknown state '{trimmed}', must be paused"))
 }
 
 #[async_trait]
@@ -412,7 +381,7 @@ impl Admin<()> for ApiImpl {
             vec![],
             node.create_successes,
             node.create_fails,
-            node.paused_sandbox_count,
+            0,
         );
         Ok(NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(detail))
     }
@@ -498,10 +467,8 @@ impl Admin<()> for ApiImpl {
         Ok(NodesNodeIdPostResponse::Status204_TheNodeStatusWasChangedSuccessfully)
     }
 
-    /// Lists the cluster paused-sandbox registry, newest database clock included.
-    ///
-    /// A deployment without a cluster-backed registry answers 501: that is a
-    /// property of the configuration, not something a retry changes.
+    /// Lists the paused sandboxes the catalog records: one row per sandbox,
+    /// its newest ready snapshot.
     async fn registry_sandboxes_get(
         &self,
         _method: &Method,
@@ -510,38 +477,22 @@ impl Admin<()> for ApiImpl {
         _claims: &Self::Claims,
         query_params: &models::RegistrySandboxesGetQueryParams,
     ) -> Result<RegistrySandboxesGetResponse, ()> {
-        let registry = self.paused.registry();
-        if !registry.is_cluster_backed() {
-            return Ok(
-                RegistrySandboxesGetResponse::Status501_ThisDeploymentIsNotConfiguredWithAClusterRegistry(
-                    Self::error(501, "paused registry is not configured"),
-                ),
-            );
+        if let Err(message) = registry_state_filter(query_params.state.as_deref()) {
+            return Ok(RegistrySandboxesGetResponse::Status400_BadRequest(
+                Self::error(400, message),
+            ));
         }
-
-        let state_filter = match registry_state_filter(query_params.state.as_deref()) {
-            Ok(state_filter) => state_filter,
-            Err(message) => {
-                return Ok(RegistrySandboxesGetResponse::Status400_BadRequest(
-                    Self::error(400, message),
-                ));
-            }
-        };
-
-        let listing = match registry.list_all().await {
-            Ok(listing) => listing,
+        let rows = match self.list_paused_sandboxes().await {
+            Ok(rows) => rows,
             Err(err) => {
                 return Ok(
                     RegistrySandboxesGetResponse::Status503_TheRegistryCouldNotBeRead(Self::error(
                         503,
-                        format!("paused registry unavailable: {err}"),
+                        format!("snapshot catalog unavailable: {err:#}"),
                     )),
                 );
             }
         };
-
-        // The node filter compares against the holder as the registry stores it;
-        // node aliases are resolved by the node registry, which is not on this path.
         let node_filter = query_params.node_id.as_deref().unwrap_or_default().trim();
         let page_token =
             match parse_page_token(query_params.next_token.as_deref().unwrap_or_default()) {
@@ -552,20 +503,20 @@ impl Admin<()> for ApiImpl {
                     ));
                 }
             };
-
-        let mut matched: Vec<PausedRegistryListEntry> = listing
-            .sandboxes
+        let mut matched: Vec<super::paused::PausedSandboxRow> = rows
             .into_iter()
-            .filter(|entry| state_filter.is_none_or(|state| entry.state == state))
-            .filter(|entry| node_filter.is_empty() || entry.holder() == node_filter)
-            .filter(|entry| page_token.is_none_or(|after| entry.sandbox_id > after))
+            .filter(|row| {
+                node_filter.is_empty() || row.origin_node_id.as_deref() == Some(node_filter)
+            })
+            .filter(|row| page_token.is_none_or(|after| row.sandbox_id > after))
             .collect();
-
         // Keyset paging needs a total order the backend does not promise.
-        matched.sort_by_key(|entry| entry.sandbox_id);
-
-        let mut page =
-            models::RegistrySandboxListing::new(Vec::new(), listing.now.timestamp_millis());
+        matched.sort_by_key(|row| row.sandbox_id);
+        let now_unix_ms = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis() as i64)
+            .unwrap_or(0);
+        let mut page = models::RegistrySandboxListing::new(Vec::new(), now_unix_ms);
         let page_size = query_params.limit.unwrap_or(0) as usize;
         if page_size > 0 && page_size < matched.len() {
             matched.truncate(page_size);
@@ -578,7 +529,6 @@ impl Admin<()> for ApiImpl {
             );
         }
         page.sandboxes = matched.iter().map(models::RegistrySandbox::from).collect();
-
         Ok(RegistrySandboxesGetResponse::Status200_SuccessfullyReturnedTheRegistryPage(page))
     }
 
@@ -647,10 +597,7 @@ mod operator_snapshot_delete_tests {
 
     use super::ApiImpl;
     use crate::identity::NodeIdentity;
-    use crate::orchestrator::{
-        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
-        Orchestrator,
-    };
+    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
         ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
@@ -799,6 +746,7 @@ mod operator_snapshot_delete_tests {
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             committed: None,
+            origin_node_id: None,
         };
         if committed {
             record.committed = Some(crate::snapshot::CommittedSnapshot::mock());
@@ -811,17 +759,7 @@ mod operator_snapshot_delete_tests {
             deleted: Arc::clone(&deleted),
         });
 
-        let root = tempfile::tempdir().expect("a temp dir");
-        let orchestrator = Orchestrator::new(
-            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-            InMemoryMetadataStore::new(),
-            MockBackendFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
-            crate::image::DisabledRuntimeImageRefs::shared(),
-        )
-        .await
-        .expect("an orchestrator");
-        std::mem::forget(root);
+        let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
 
         let snapshot_manager = Arc::new(SnapshotManager::from_parts(
             Arc::new(SnapshotRepository::new(
@@ -836,13 +774,8 @@ mod operator_snapshot_delete_tests {
 
         let api = Arc::new(ApiImpl::new(
             orchestrator,
-            Arc::clone(&snapshot_manager),
+            snapshot_manager,
             None,
-            crate::api::PausedSandboxWiring::new(
-                Arc::new(DisabledPausedSandboxRegistry),
-                Arc::clone(&snapshot_manager),
-                &NodeIdentity::from_config(&Default::default()),
-            ),
             Vec::new(),
             crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
         ));
@@ -950,11 +883,8 @@ mod operator_snapshot_delete_tests {
 #[cfg(test)]
 mod registry_listing_tests {
     use std::sync::Arc;
-    use std::time::SystemTime;
 
-    use async_trait::async_trait;
     use axum_extra::extract::CookieJar;
-    use chrono::{DateTime, TimeZone, Utc};
     use headers::Host;
     use http::Method;
     use serde_json::{json, Value};
@@ -964,205 +894,48 @@ mod registry_listing_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::identity::NodeIdentity;
-    use crate::orchestrator::{
-        BeganPause, DeadlineRenewalOutcome, HeldSandbox, InMemoryMetadataStore, MarkRunningOutcome,
-        Orchestrator, PausedRegistryError, PausedRegistryListEntry, PausedRegistryListing,
-        PausedRegistryRows, PausedRegistryState, PausedSandboxEntry, PausedSandboxRegistry,
-        ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
-    };
-    use crate::orchestrator::{DisabledPausedSandboxRegistry, FileBackedSandboxPersister};
+    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
-    use crate::snapshot::mock::mock_snapshot_manager;
-    use crate::snapshot::SnapshotId;
-    use crate::types::{ExecutionId, SandboxId};
-
-    /// Registry that only answers the two calls this endpoint is allowed to make.
-    struct ListingRegistry {
-        listing: PausedRegistryListing,
-        unreadable: bool,
-    }
-
-    impl ListingRegistry {
-        fn holding(sandboxes: Vec<PausedRegistryListEntry>) -> Arc<Self> {
-            Arc::new(Self {
-                listing: PausedRegistryListing {
-                    sandboxes,
-                    now: at(1_700_000_009_000),
-                },
-                unreadable: false,
-            })
-        }
-
-        fn unreadable() -> Arc<Self> {
-            Arc::new(Self {
-                listing: PausedRegistryListing {
-                    sandboxes: Vec::new(),
-                    now: at(0),
-                },
-                unreadable: true,
-            })
-        }
-    }
-
-    #[async_trait]
-    impl PausedSandboxRegistry for ListingRegistry {
-        async fn list_all(&self) -> RegistryResult<PausedRegistryListing> {
-            if self.unreadable {
-                return Err(PausedRegistryError::Backend {
-                    operation: "list_all",
-                    source: anyhow::anyhow!("the database is down"),
-                });
-            }
-            Ok(self.listing.clone())
-        }
-
-        fn is_cluster_backed(&self) -> bool {
-            true
-        }
-
-        async fn begin_pause(&self, _entry: &PausedSandboxEntry) -> RegistryResult<BeganPause> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn complete_pause(
-            &self,
-            _sandbox_id: &SandboxId,
-            _generation: i64,
-            _snapshot_id: &SnapshotId,
-        ) -> RegistryResult<()> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn mark_local_only(
-            &self,
-            _sandbox_id: &SandboxId,
-            _generation: i64,
-        ) -> RegistryResult<()> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn get(&self, _sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn get_many(&self, _sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn claim_for_resume(
-            &self,
-            _sandbox_id: &SandboxId,
-            _node_id: &str,
-            _execution_id: ExecutionId,
-        ) -> RegistryResult<ResumeClaim> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn release_claim(
-            &self,
-            _sandbox_id: &SandboxId,
-            _generation: i64,
-        ) -> RegistryResult<bool> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn mark_running(
-            &self,
-            _sandbox_id: &SandboxId,
-            _node_id: &str,
-            _holder_node_id: &str,
-            _execution_id: ExecutionId,
-            _expires_at: Option<SystemTime>,
-        ) -> RegistryResult<MarkRunningOutcome> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn renew_sandbox_deadline(
-            &self,
-            _sandbox_id: &SandboxId,
-            _execution_id: ExecutionId,
-            _expires_at: Option<SystemTime>,
-        ) -> RegistryResult<DeadlineRenewalOutcome> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
-            unimplemented!("the listing endpoint only reads")
-        }
-        async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
-            unimplemented!("the listing endpoint only reads")
-        }
-    }
-
-    fn at(unix_ms: i64) -> DateTime<Utc> {
-        Utc.timestamp_millis_opt(unix_ms).single().expect("a time")
-    }
+    use crate::snapshot::mock::{
+        in_memory_snapshot_manager, mock_paused_sandbox_config, mock_snapshot_manager,
+        paused_sandbox_record,
+    };
+    use crate::snapshot::{SnapshotManager, SnapshotRecord};
+    use crate::types::SandboxId;
 
     fn sandbox_id(nth: u8) -> SandboxId {
         SandboxId::from_uuid(
-            Uuid::parse_str(&format!("0192a0{nth:02}-0000-7000-8000-000000000000"))
+            Uuid::parse_str(&format!("0192b000-0000-7000-8000-0000000000{nth:02x}"))
                 .expect("a uuid"),
         )
     }
 
-    /// A row with every optional column populated.
-    fn full_row() -> PausedRegistryListEntry {
-        PausedRegistryListEntry {
-            sandbox_id: sandbox_id(1),
-            cluster_id: Uuid::parse_str("11111111-2222-3333-4444-555555555555").expect("a uuid"),
-            state: PausedRegistryState::Running,
-            generation: 7,
-            origin_node_id: "node-a".to_string(),
-            claimed_by_node_id: Some("node-b".to_string()),
-            snapshot_id: Some(SnapshotId::generate()),
-            paused_at: at(1_700_000_001_000),
-            updated_at: at(1_700_000_002_000),
-            lease_expires_at: Some(at(1_700_000_003_000)),
-            sandbox_expires_at: Some(at(1_700_000_004_000)),
-            execution_id: Some(ExecutionId::from_uuid(
-                Uuid::parse_str("0192b000-0000-7000-8000-000000000000").expect("a uuid"),
-            )),
-        }
-    }
-
-    /// The same row with every nullable column absent.
-    fn empty_row(nth: u8) -> PausedRegistryListEntry {
-        PausedRegistryListEntry {
-            sandbox_id: sandbox_id(nth),
-            claimed_by_node_id: None,
-            snapshot_id: None,
-            lease_expires_at: None,
-            sandbox_expires_at: None,
-            execution_id: None,
-            state: PausedRegistryState::Paused,
-            ..full_row()
-        }
-    }
-
-    async fn api_over(registry: Arc<dyn PausedSandboxRegistry>) -> Arc<ApiImpl> {
-        let root = tempfile::tempdir().expect("a temp dir");
-        let orchestrator = Orchestrator::new(
-            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-            InMemoryMetadataStore::new(),
-            MockBackendFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
-            crate::image::DisabledRuntimeImageRefs::shared(),
+    fn row(nth: u8, node: &str) -> SnapshotRecord {
+        paused_sandbox_record(
+            sandbox_id(nth),
+            Some(node),
+            mock_paused_sandbox_config(),
+            1_700_000_001_000 + i64::from(nth),
         )
-        .await
-        .expect("an orchestrator");
-        std::mem::forget(root);
-        let snapshot_manager = Arc::new(mock_snapshot_manager());
+    }
 
+    async fn api_over(snapshot_manager: SnapshotManager) -> Arc<ApiImpl> {
+        let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
         Arc::new(ApiImpl::new(
             orchestrator,
-            Arc::clone(&snapshot_manager),
+            Arc::new(snapshot_manager),
             None,
-            crate::api::PausedSandboxWiring::new(
-                registry,
-                snapshot_manager,
-                &NodeIdentity::from_config(&Default::default()),
-            ),
             Vec::new(),
-            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+            crate::api::ResumeWiring::api_half_for_test(),
         ))
+    }
+
+    async fn api_holding(rows: Vec<SnapshotRecord>) -> Arc<ApiImpl> {
+        let (snapshot_manager, catalog) = in_memory_snapshot_manager();
+        for record in rows {
+            catalog.seed(record);
+        }
+        api_over(snapshot_manager).await
     }
 
     fn params() -> models::RegistrySandboxesGetQueryParams {
@@ -1200,81 +973,83 @@ mod registry_listing_tests {
 
     #[tokio::test]
     async fn the_page_carries_every_field_the_gateway_renders() {
-        let row = full_row();
-        let api = api_over(ListingRegistry::holding(vec![row.clone()])).await;
+        let record = row(1, "node-a");
+        let api = api_holding(vec![record.clone()]).await;
 
         let page = body(list(&api, params()).await);
 
+        let sandboxes = page["sandboxes"].as_array().expect("rows");
+        assert_eq!(sandboxes.len(), 1);
         assert_eq!(
-            page,
+            sandboxes[0],
             json!({
-                "sandboxes": [{
-                    "sandboxID": row.sandbox_id.to_string(),
-                    "clusterID": row.cluster_id.to_string(),
-                    "state": "running",
-                    "generation": 7,
-                    "originNodeID": "node-a",
-                    "claimedByNodeID": "node-b",
-                    "snapshotID": row.snapshot_id.expect("a snapshot").to_string(),
-                    "holderNodeID": "node-a",
-                    "pausedAtUnixMs": 1_700_000_001_000i64,
-                    "updatedAtUnixMs": 1_700_000_002_000i64,
-                    "leaseExpiresAtUnixMs": 1_700_000_003_000i64,
-                    "sandboxExpiresAtUnixMs": 1_700_000_004_000i64,
-                    "executionID": "0192b000-0000-7000-8000-000000000000",
-                }],
-                "databaseTimeUnixMs": 1_700_000_009_000i64,
+                "sandboxID": sandbox_id(1).to_string(),
+                "clusterID": "",
+                "state": "paused",
+                "generation": 0,
+                "originNodeID": "node-a",
+                "claimedByNodeID": "",
+                "snapshotID": record.id.to_string(),
+                "holderNodeID": "node-a",
+                "pausedAtUnixMs": record.created_at_unix_ms,
+                "updatedAtUnixMs": record.created_at_unix_ms,
+                "leaseExpiresAtUnixMs": Value::Null,
+                "sandboxExpiresAtUnixMs": Value::Null,
+                "executionID": "",
             }),
-            "the REST page is the gateway's registrySandboxItem field for field"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_absent_lease_is_json_null_and_never_zero() {
-        let api = api_over(ListingRegistry::holding(vec![empty_row(1)])).await;
-
-        let page = body(list(&api, params()).await);
-
-        let row = &page["sandboxes"][0];
-        assert_eq!(
-            row["leaseExpiresAtUnixMs"],
-            Value::Null,
-            "🔴 a null lease means already expired; zero would read as a deadline"
-        );
-        assert_eq!(
-            row["sandboxExpiresAtUnixMs"],
-            Value::Null,
-            "🔴 a null sandbox deadline means never expires, the opposite meaning"
+            "the REST page is the gateway's registrySandboxItem field for field; a \
+             paused sandbox holds no lease, no deadline and no incarnation"
         );
         assert!(
-            row.as_object()
-                .expect("an object")
-                .contains_key("leaseExpiresAtUnixMs"),
-            "and the key stays present, so absent cannot be confused with unset"
+            page["databaseTimeUnixMs"].as_i64().expect("a clock") > 0,
+            "got {page}"
         );
-        assert_eq!(row["claimedByNodeID"], json!(""));
-        assert_eq!(row["snapshotID"], json!(""));
-        assert_eq!(row["executionID"], json!(""));
     }
 
     #[tokio::test]
-    async fn a_lease_at_the_unix_epoch_stays_a_number() {
-        let mut row = empty_row(1);
-        row.lease_expires_at = Some(at(0));
-        let api = api_over(ListingRegistry::holding(vec![row])).await;
+    async fn only_the_newest_pause_of_a_sandbox_is_listed() {
+        let older = paused_sandbox_record(
+            sandbox_id(1),
+            Some("node-a"),
+            mock_paused_sandbox_config(),
+            1_700_000_001_000,
+        );
+        let newer = paused_sandbox_record(
+            sandbox_id(1),
+            Some("node-b"),
+            mock_paused_sandbox_config(),
+            1_700_000_002_000,
+        );
+        let api = api_holding(vec![older, newer.clone()]).await;
 
         let page = body(list(&api, params()).await);
 
-        assert_eq!(
-            page["sandboxes"][0]["leaseExpiresAtUnixMs"],
-            json!(0),
-            "the option is carried, not encoded into a sentinel value"
-        );
+        let sandboxes = page["sandboxes"].as_array().expect("rows");
+        assert_eq!(sandboxes.len(), 1, "one sandbox, one row: got {page}");
+        assert_eq!(sandboxes[0]["snapshotID"], json!(newer.id.to_string()));
+        assert_eq!(sandboxes[0]["holderNodeID"], json!("node-b"));
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_taken_while_running_is_not_a_paused_sandbox() {
+        let mut checkpoint = row(1, "node-a");
+        checkpoint
+            .committed
+            .as_mut()
+            .expect("a committed row")
+            .paused_sandbox = None;
+        let api = api_holding(vec![checkpoint, row(2, "node-a")]).await;
+
+        let page = body(list(&api, params()).await);
+
+        let sandboxes = page["sandboxes"].as_array().expect("rows");
+        assert_eq!(sandboxes.len(), 1, "got {page}");
+        assert_eq!(sandboxes[0]["sandboxID"], json!(sandbox_id(2).to_string()));
     }
 
     #[tokio::test]
     async fn the_last_page_omits_the_next_token() {
-        let api = api_over(ListingRegistry::holding(vec![empty_row(1)])).await;
+        let api = api_holding(vec![row(1, "node-a")]).await;
 
         let page = body(list(&api, params()).await);
 
@@ -1289,12 +1064,7 @@ mod registry_listing_tests {
 
     #[tokio::test]
     async fn a_limit_pages_by_sandbox_id() {
-        let api = api_over(ListingRegistry::holding(vec![
-            empty_row(3),
-            empty_row(1),
-            empty_row(2),
-        ]))
-        .await;
+        let api = api_holding(vec![row(3, "node-a"), row(1, "node-a"), row(2, "node-a")]).await;
 
         let first = body(
             list(
@@ -1335,23 +1105,8 @@ mod registry_listing_tests {
     }
 
     #[tokio::test]
-    async fn the_filters_select_by_state_and_holder() {
-        let mut other_node = empty_row(2);
-        other_node.origin_node_id = "node-z".to_string();
-        let api = api_over(ListingRegistry::holding(vec![full_row(), other_node])).await;
-
-        let by_state = body(
-            list(
-                &api,
-                models::RegistrySandboxesGetQueryParams {
-                    state: Some("running".to_string()),
-                    ..params()
-                },
-            )
-            .await,
-        );
-        assert_eq!(by_state["sandboxes"].as_array().expect("rows").len(), 1);
-        assert_eq!(by_state["sandboxes"][0]["state"], json!("running"));
+    async fn the_node_filter_selects_by_the_node_that_holds_the_bytes() {
+        let api = api_holding(vec![row(1, "node-a"), row(2, "node-z")]).await;
 
         let by_node = body(
             list(
@@ -1365,16 +1120,32 @@ mod registry_listing_tests {
         );
         assert_eq!(by_node["sandboxes"].as_array().expect("rows").len(), 1);
         assert_eq!(by_node["sandboxes"][0]["holderNodeID"], json!("node-z"));
+
+        let by_state = body(
+            list(
+                &api,
+                models::RegistrySandboxesGetQueryParams {
+                    state: Some("paused".to_string()),
+                    ..params()
+                },
+            )
+            .await,
+        );
+        assert_eq!(
+            by_state["sandboxes"].as_array().expect("rows").len(),
+            2,
+            "paused is the only state a row can be in, so the filter selects everything"
+        );
     }
 
     #[tokio::test]
     async fn an_unknown_state_is_refused_rather_than_ignored() {
-        let api = api_over(ListingRegistry::holding(vec![empty_row(1)])).await;
+        let api = api_holding(vec![row(1, "node-a")]).await;
 
         let response = list(
             &api,
             models::RegistrySandboxesGetQueryParams {
-                state: Some("asleep".to_string()),
+                state: Some("running".to_string()),
                 ..params()
             },
         )
@@ -1385,30 +1156,14 @@ mod registry_listing_tests {
                 response,
                 RegistrySandboxesGetResponse::Status400_BadRequest(_)
             ),
-            "🔴 a filter that silently does not apply returns every row with a 200, got \
+            "a filter that silently does not apply returns every row with a 200, got \
              {response:?}"
         );
     }
 
     #[tokio::test]
-    async fn a_deployment_without_a_cluster_registry_answers_501() {
-        let api = api_over(Arc::new(DisabledPausedSandboxRegistry)).await;
-
-        let response = list(&api, params()).await;
-
-        assert!(
-            matches!(
-                response,
-                RegistrySandboxesGetResponse::Status501_ThisDeploymentIsNotConfiguredWithAClusterRegistry(_)
-            ),
-            "a permanent property of the configuration is not a 503 a retry can fix, got \
-             {response:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unreadable_registry_answers_503() {
-        let api = api_over(ListingRegistry::unreadable()).await;
+    async fn an_unreadable_catalog_answers_503() {
+        let api = api_over(mock_snapshot_manager()).await;
 
         let response = list(&api, params()).await;
 
@@ -1423,8 +1178,8 @@ mod registry_listing_tests {
 
     #[test]
     fn the_query_parameters_stay_a_closed_set() {
-        // 🔴 Exhaustive destructuring: a fifth parameter — an executionID filter
-        // above all — stops compiling here before it can reach the spec.
+        // Exhaustive destructuring: a fifth parameter stops compiling here
+        // before it can reach the spec.
         let models::RegistrySandboxesGetQueryParams {
             state,
             node_id,
@@ -1455,10 +1210,7 @@ mod fleet_node_tests {
     use crate::identity::NodeIdentity;
     use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
     use crate::node_registry::types::Node as DiscoveredNode;
-    use crate::orchestrator::{
-        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
-        Orchestrator,
-    };
+    use crate::orchestrator::Orchestrator;
     use crate::proto::scheduler as scheduler_proto;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::mock_snapshot_manager;
@@ -1499,9 +1251,6 @@ mod fleet_node_tests {
                 create_successes: 21,
                 create_fails: 22,
                 reported_at_unix_ms: 1_700_000_000_000,
-                paused_sandbox_count: 23,
-                paused_allocated_cpu: 24,
-                paused_allocated_memory_bytes: 25,
             }),
             last_seen_unix_ms: 1_700_000_000_001,
         }
@@ -1545,13 +1294,13 @@ mod fleet_node_tests {
                         "usedBytes": 17,
                         "totalBytes": 18,
                     }],
-                    "pausedAllocatedCPU": 24,
-                    "pausedAllocatedMemoryBytes": 25,
+                    "pausedAllocatedCPU": 0,
+                    "pausedAllocatedMemoryBytes": 0,
                 },
                 "createSuccesses": 21,
                 "createFails": 22,
                 "sandboxStartingCount": 20,
-                "sandboxPausedCount": 23,
+                "sandboxPausedCount": 0,
             })
         );
     }
@@ -1652,29 +1401,13 @@ mod fleet_node_tests {
         fleet: Option<Arc<AtomicNodeRegistry>>,
         node_service_port: u16,
     ) -> ApiImpl {
-        let root = tempfile::tempdir().expect("a temp dir");
-        let orchestrator = Orchestrator::new(
-            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-            InMemoryMetadataStore::new(),
-            MockBackendFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
-            crate::image::DisabledRuntimeImageRefs::shared(),
-        )
-        .await
-        .expect("an orchestrator");
-        std::mem::forget(root);
-        let snapshot_manager = Arc::new(mock_snapshot_manager());
+        let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
         let identity = NodeIdentity::from_config(&Default::default());
 
         let api = ApiImpl::new(
             orchestrator,
-            Arc::clone(&snapshot_manager),
+            Arc::new(mock_snapshot_manager()),
             None,
-            crate::api::PausedSandboxWiring::new(
-                Arc::new(DisabledPausedSandboxRegistry),
-                snapshot_manager,
-                &identity,
-            ),
             Vec::new(),
             crate::api::ResumeWiring::node_local(identity.id.clone()),
         );
@@ -1885,13 +1618,6 @@ mod fleet_node_tests {
             &self,
             _request: tonic::Request<crate::proto::node::SandboxCheckpointRequest>,
         ) -> Result<tonic::Response<crate::proto::node::SandboxCheckpointResponse>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented("override only"))
-        }
-        async fn resume(
-            &self,
-            _request: tonic::Request<crate::proto::node::SandboxResumeRequest>,
-        ) -> Result<tonic::Response<crate::proto::node::SandboxResumeResponse>, tonic::Status>
         {
             Err(tonic::Status::unimplemented("override only"))
         }

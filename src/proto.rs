@@ -68,48 +68,20 @@ mod node_wire_tests {
 
     #[test]
     fn the_staging_fields_keep_their_wire_numbers() {
-        // Tag 3, wire type 2 (length-delimited): 3 << 3 | 2 == 0x1a.
-        let paused = pb::SandboxPauseResponse {
-            paused_state: None,
-            staged: None,
-            staging_error: "no room on the device".to_string(),
-        };
-        let bytes = paused.encode_to_vec();
-        assert_eq!(
-            bytes.first().copied(),
-            Some(0x1a),
-            "SandboxPauseResponse.staging_error moved off field 3: {bytes:02x?}"
-        );
-
         // Tag 2, wire type 2: 2 << 3 | 2 == 0x12.
         let staged = pb::SandboxPauseResponse {
-            paused_state: None,
             staged: Some(pb::StagedSnapshot {
                 value: Some(pb::SerializedValue {
                     schema_version: pb::SERIALIZED_VALUE_VERSION,
                     json: b"{}".to_vec(),
                 }),
             }),
-            staging_error: String::new(),
         };
         let bytes = staged.encode_to_vec();
         assert_eq!(
             bytes.first().copied(),
             Some(0x12),
             "SandboxPauseResponse.staged moved off field 2: {bytes:02x?}"
-        );
-
-        // Tag 1, wire type 0 (varint): 1 << 3 | 0 == 0x08.
-        let asked = pb::SandboxPauseRequest {
-            sandbox_id: String::new(),
-            execution_id: String::new(),
-            publish: true,
-        };
-        let bytes = asked.encode_to_vec();
-        assert_eq!(
-            bytes,
-            vec![0x18, 0x01],
-            "SandboxPauseRequest.publish moved off field 3, or stopped being a bool: {bytes:02x?}"
         );
 
         // Zero-valued messages encode to nothing, proving the prefixes are field-driven.
@@ -192,42 +164,6 @@ mod node_wire_tests {
         assert!(pb::SandboxCreateResponse::default()
             .encode_to_vec()
             .is_empty());
-    }
-
-    #[test]
-    fn an_older_reader_still_parses_a_reply_carrying_a_staging_error() {
-        let bytes = pb::SandboxPauseResponse {
-            paused_state: Some(pb::PausedState {
-                artifact_root: "/var/lib/agentenv/paused/7".to_string(),
-                state: None,
-            }),
-            staged: None,
-            staging_error: "no room on the device".to_string(),
-        }
-        .encode_to_vec();
-
-        // Legacy shape excludes `staging_error`.
-        #[derive(prost::Message)]
-        struct OlderPauseResponse {
-            #[prost(message, optional, tag = "1")]
-            paused_state: Option<pb::PausedState>,
-            #[prost(message, optional, tag = "2")]
-            staged: Option<pb::StagedSnapshot>,
-        }
-
-        let older = OlderPauseResponse::decode(bytes.as_slice())
-            .expect("an older reader must not choke on a field it has never heard of");
-        assert_eq!(
-            older
-                .paused_state
-                .expect("the pause it can read is still there")
-                .artifact_root,
-            "/var/lib/agentenv/paused/7"
-        );
-        assert!(
-            older.staged.is_none(),
-            "an older reader read a staging failure as a row"
-        );
     }
 }
 
@@ -448,6 +384,7 @@ mod scheduler_wire_tests {
                         metadata: Default::default(),
                         cpu_count,
                         memory_mib,
+                        preferred_node_id: String::new(),
                     },
                 )),
             }),

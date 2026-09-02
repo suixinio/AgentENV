@@ -453,6 +453,7 @@ mod tests {
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            paused_sandbox: None,
         };
         let snapshot = Arc::new(ready_record(metadata, committed));
 
@@ -510,6 +511,7 @@ mod tests {
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
+            paused_sandbox: None,
         };
         let snapshot = Arc::new(ready_record(metadata, committed));
 

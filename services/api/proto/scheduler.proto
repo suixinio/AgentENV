@@ -10,8 +10,8 @@ option go_package = "agentenv/services/api/proto;schedulerv1";
 //
 // 🔴 No method on this service may answer with codes.PermissionDenied. That
 // code means "a superseded incarnation tried to write" — that fencing is
-// enforced by aenv-api's own in-process paused registry, never by this
-// service, so this service itself has no such refusal to make.
+// enforced by the binding store's incarnation arbitration inside aenv-api,
+// never by this service, so this service itself has no such refusal to make.
 service Scheduler {
   rpc Schedule(ScheduleRequest) returns (ScheduleResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
@@ -74,6 +74,10 @@ message NewSandboxHint {
   // comes from. Named for its unit precisely because the cold-start hint
   // above spells the same quantity `memory_mb`.
   optional uint64 memory_mib = 3;
+  // The node the caller would rather see chosen: where a paused sandbox's
+  // bytes were last warm. Honoured only while that node is schedulable;
+  // empty means no preference.
+  string preferred_node_id = 4;
 }
 
 message ScheduleRequest {
@@ -140,15 +144,9 @@ message NodeSnapshot {
   uint64 create_successes = 11;
   uint64 create_fails = 12;
   int64 reported_at_unix_ms = 13;
-  // Paused-sandbox resource accounting. These are *not* included in
-  // sandbox_count, allocated_cpu, or allocated_memory_bytes — those report the
-  // active running set only. Paused sandboxes have released their VM-side
-  // CPU / memory but still own persisted state on the node, so the scheduler
-  // can use these fields (together with the active fields) to apply
-  // "including paused" capacity limits.
-  uint32 paused_sandbox_count = 14;
-  uint32 paused_allocated_cpu = 15;
-  uint64 paused_allocated_memory_bytes = 16;
+  // A node holds no paused sandboxes: a paused sandbox is a snapshot row.
+  reserved 14, 15, 16;
+  reserved "paused_sandbox_count", "paused_allocated_cpu", "paused_allocated_memory_bytes";
 }
 
 message P2pEndpoint {
@@ -208,36 +206,18 @@ message SandboxRosterEntry {
   // Absent (an older node) lands on the same fallback, which is exactly the
   // behaviour that shipped before this field existed.
   uint32 projection_ttl_secs = 3;
-  // Whether this sandbox is parked: on this node's disk, with no VM behind it.
-  //
-  // The entry is still reported — the roster is the only thing that renews a
-  // paused sandbox's registry lease, and a node that stopped naming its paused
-  // sandboxes would let another node claim rows whose snapshot only exists
-  // here. What the flag changes is routing: a parked sandbox must NOT hold a
-  // routing projection, because the gateway reads a projection hit as "there
-  // is a VM at the other end" and answers the data plane straight from it
-  // instead of waking the sandbox. So the receiver keeps this entry in the
-  // registry and withholds it from binding reconciliation.
-  //
-  // 🔴 Absent (an older node) is false, which is byte-for-byte the behaviour
-  // that shipped before this field existed: every entry reconciled, paused
-  // ones included.
-  bool paused = 4;
+  // Every roster entry names a VM: a node holds no paused sandboxes.
+  reserved 4;
+  reserved "paused";
 }
 
 message HeartbeatResponse {
   string cpu_config_json = 1;
 
-  // Sandboxes this heartbeat reported paused that the control plane's registry
-  // says this node does not hold: nothing names them, or a row names another
-  // node. The node drops its record and artifacts for each.
-  //
-  // Silence means keep, and it is the only safe default. An api half with no
-  // cluster-backed registry, or one whose registry could not answer, names
-  // nothing here. A node must never turn an absence it observed itself into a
-  // deletion: only this side can tell a sandbox that was never recorded from
-  // one whose record moved to another machine.
-  repeated string disowned_sandbox_ids = 2;
+  // A node holds nothing the control plane could disown: a paused sandbox is
+  // a snapshot row, not a record on a node.
+  reserved 2;
+  reserved "disowned_sandbox_ids";
 }
 
 enum SandboxEventType {

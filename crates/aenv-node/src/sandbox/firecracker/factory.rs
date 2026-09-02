@@ -2,23 +2,19 @@
 //!
 //! This module implements the [`FirecrackerSandboxFactory`] which creates instances of [`FirecrackerSandbox`] by
 //! reading configuration from the global [`ConfigManager`]. It also handles
-//! launches from committed snapshots and resumes from snapshot configs.
+//! launches from committed snapshots.
 
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
 
 use super::config::FirecrackerSandboxConfig;
-use super::sandbox::{FirecrackerPausedState, FirecrackerSandbox};
+use super::sandbox::FirecrackerSandbox;
 use crate::cfg::ConfigManager;
 use crate::runtime_snapshot::RunnableSnapshot;
-use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackendFactory};
-use crate::sandbox::{
-    EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig,
-};
-use crate::types::{ExecutionId, SandboxId};
+use crate::sandbox::backend::{SandboxBackend, SandboxBackendFactory};
+use crate::sandbox::{FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig};
+use crate::types::ExecutionId;
 
 pub struct FirecrackerSandboxFactory {
     cpu_config_arc: Option<Arc<RwLock<Option<String>>>>,
@@ -166,57 +162,11 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         let sandbox = FirecrackerSandbox::from_snapshot(snapshot, &launch_config, execution_id)?;
         Ok(Box::new(sandbox))
     }
-
-    fn decode_paused_state(
-        &self,
-        artifact_root: PathBuf,
-        state: Value,
-    ) -> Result<Arc<dyn PausedSandboxState>> {
-        Ok(Arc::new(FirecrackerPausedState::decode(
-            artifact_root,
-            state,
-        )?))
-    }
-
-    fn build_from_paused_state(
-        &self,
-        sandbox_id: SandboxId,
-        execution_id: ExecutionId,
-        state: &dyn PausedSandboxState,
-        envd_access_token: Option<EnvdAccessToken>,
-    ) -> Result<Box<dyn SandboxBackend>> {
-        let paused_state = state
-            .downcast_ref::<FirecrackerPausedState>()
-            .context("The provided PausedSandboxState is not a Firecracker paused state")?;
-        let sandbox = FirecrackerSandbox::from_snapshot_config_with_override(
-            paused_state.snapshot_config().clone(),
-            sandbox_id,
-            execution_id,
-            envd_access_token,
-        )?;
-        Ok(Box::new(sandbox))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-
-    use crate::sandbox::{PausedSandboxState, RuntimeArtifactSet};
-
-    #[derive(Debug)]
-    struct WrongPausedState;
-
-    impl PausedSandboxState for WrongPausedState {
-        fn encode(&self) -> Result<Value> {
-            Ok(Value::Null)
-        }
-
-        fn runtime_artifacts(&self) -> RuntimeArtifactSet {
-            RuntimeArtifactSet::empty()
-        }
-    }
 
     #[test]
     fn filter_extra_boot_args_keeps_only_allowed_prefixes() {
@@ -261,21 +211,5 @@ mod tests {
                     .to_string()
             )
         );
-    }
-
-    #[test]
-    fn build_from_paused_state_rejects_wrong_snapshot_type() {
-        let factory = FirecrackerSandboxFactory::new();
-        let state: Arc<dyn PausedSandboxState> = Arc::new(WrongPausedState);
-
-        match factory.build_from_paused_state(
-            SandboxId::new(),
-            ExecutionId::new(),
-            state.as_ref(),
-            None,
-        ) {
-            Ok(_) => panic!("wrong snapshot type should fail"),
-            Err(err) => assert!(err.to_string().contains("not a Firecracker paused state")),
-        }
     }
 }

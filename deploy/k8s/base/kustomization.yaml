@@ -47,8 +47,8 @@ configMapGenerator:
   # writes it there from config/default.toml (run.sh:30) before invoking
   # kustomize, so the node's TOML and the repo's own default can never be two
   # different files. That is also why editing this ConfigMap in a live cluster
-  # is undone by the next apply — see the note on [orchestrator.paused_registry]
-  # in config/default.toml.
+  # is undone by the next apply — see the note on [orchestrator.store] in
+  # config/default.toml.
   #
   # Consequence: `kubectl kustomize deploy/k8s/base` fails on a clean checkout,
   # and always has — this tree is not a kustomize entry point. Render or apply
@@ -80,25 +80,11 @@ configMapGenerator:
       - config/pg-overlay.toml
   - name: gateway-k8s-config
     files:
-      # 🔴 阶段四 E4: `gateway.scheduler_addr` inside this file is
-      # `agentenv-api:8002`, not `agentenv-scheduler:9090` — the gateway's
-      # `schedulerv1.SchedulerClient` (`services/gateway/cmd/main.go`) is a
-      # plain generated gRPC client over `services/api/proto/scheduler.proto`,
-      # the same schema `src/node_registry/grpc_service.rs`'s
-      # `NodeRegistryGrpcService` implements, so pointing it at the api
-      # Deployment's own gRPC listener answers the RPCs the gateway actually
-      # sends — `LookupNode`/`RecordAssignment`/`ListObservedNodes`/`GetNode`/
-      # `ListRegistrySandboxes` — for real with no scheduler process running.
-      # `ListRegistrySandboxes`
-      # (`services/gateway/internal/registry_list.go`) was the last gap --
-      # `src/node_registry/grpc_service.rs`'s `list_registry_sandboxes` now
-      # answers it against `PausedSandboxRegistry::list_all`, so every
-      # gateway-to-scheduler RPC this endpoint sends is covered.
-      # `gateway.query_only_scheduler_addr`, which used to name a second,
-      # separately dialled address for the cold-path LookupNode call below, is
-      # deleted from `services/shared/config` outright along with the client
-      # selection it configured — there is no longer a second address to
-      # leave unset here.
+      # `gateway.scheduler_addr` inside this file is `agentenv-api:8002`: the
+      # api Deployment's own gRPC listener, where `apiproxy.ResumeSandbox`
+      # (`services/api/proto/apiproxy/apiproxy.proto`) is served. That is the
+      # only RPC the gateway sends; `/registry/sandboxes` is answered on
+      # `aenv-api`'s REST surface from the snapshot catalog's paused rows.
       - config/gateway.json
   - name: sandbox-proxy-config
     literals:
@@ -274,117 +260,8 @@ configMapGenerator:
   # form of why. Giving the api half a machine to drive is a `aenv-node`
   # DaemonSet, not a ConfigMap key.
 
-  # 🔴 `paused-registry-config` is GONE. It carried one key,
-  # AENV_PAUSED_REGISTRY_BACKEND=central, read only by the node DaemonSet —
-  # and reading it there never did anything. `assemble_node`
-  # (`crates/aenv-node/src/bin/aenv-node.rs`) treats any backend other than
-  # `local` the same way: it logs a `warn!` naming the configured value
-  # ("aenv-node ignores the configured paused-sandbox registry: cluster-wide
-  # records belong to the API half") and wires in
-  # `DisabledPausedSandboxRegistry` regardless, because cluster-wide
-  # paused-sandbox state belongs to the api half alone now (see
-  # AENV_PAUSED_REGISTRY_BACKEND=postgres, a literal on
-  # `agentenv-api-deployment.yaml` rather than a reference to this
-  # ConfigMap — that asymmetry is what `snapshot_catalog_manifest_test.go`
-  # leans on as a control).
-  #
-  # Deleting the ConfigMap and the DaemonSet's reference to it is not a
-  # behaviour change: the node already ignored `central` and fell through to
-  # the same `DisabledPausedSandboxRegistry` wiring it uses with nothing set
-  # at all — the code default in config/default.toml (`local`) produces the
-  # identical outcome. What changes is that the node no longer logs a startup
-  # warning about a value it was always going to ignore.
-  # 🔴 `snapshot-catalog-config` is GONE, and so are the two keys it carried.
-  #
-  # The snapshot catalog moved out of object storage and into PostgreSQL in
-  # three steps, steered by AENV_SNAPSHOT_CATALOG_WRITE and
-  # AENV_SNAPSHOT_CATALOG_READ:
-  #
-  #     object_store/object_store → both/object_store → both/postgres
-  #                               → postgres/postgres
-  #
-  # This cluster reached the last of those and stayed there. The switches, the
-  # double write behind them, the mirror backlog, the read-side confirmation
-  # table and the object-storage catalog itself have all been deleted from the
-  # code: PostgreSQL is the catalog, `[pg]` is where it is configured, and
-  # object storage holds byte artifacts and no rows.
-  #
-  # 🔴 Setting either variable now does NOTHING. There was a startup refusal
-  # here for one release — both binaries exited naming the variable — and it
-  # has been removed with the rest of this transition's scaffolding. No field
-  # declares these names, so confique ignores them silently, which is exactly
-  # why this ConfigMap is deleted rather than left behind: a manifest that
-  # kept them would start a process that looks entirely healthy while its
-  # operator believed the catalog was double-written, and nothing would say
-  # otherwise. `services/shared/config/snapshot_catalog_manifest_test.go`
-  # walks every AgentENV workload in this directory and fails if one declares
-  # them; that walk is now the only thing standing between an un-migrated
-  # manifest and a silent misbelief.
-  #
-  # 🔴 One-time cost on a cluster that still has this ConfigMap and these
-  # references: apply the new manifests and roll BOTH workloads. Deleting the
-  # ConfigMap alone is not enough while the Deployment/DaemonSet still
-  # reference it, but it is also not harmful: `optional: true` meant an absent
-  # ConfigMap already left the variables unset, which is exactly what the new
-  # build wants.
-  #
-  # 🔴 There is no way back to an object-storage catalog. Rows written since the
-  # cutover live in PostgreSQL alone; no code has ever replayed them the other
-  # way, and the code that could have has been deleted. Rolling back is an image
-  # tag on both workloads plus restoring this ConfigMap — and it lands on a
-  # cluster whose object-storage catalog is still frozen at the cutover.
-  # Which durable snapshot repository this cluster keeps, and where the half of
-  # its configuration that cannot be in this repository is read from.
-  #
-  # 🔴 `[backend.oss]` is the one section no environment variable can reach.
-  # confique descends into a struct only through `#[config(nested)]`, `nested`
-  # may not be `Option<_>`, and `backend.oss` is `Option<OssBackendConfig>` — so
-  # the endpoint, the bucket and the credentials are read from a *file* and from
-  # nothing else. Until AENV_CONFIG_OVERLAY_PATH existed, the only file was the
-  # one run.sh overwrites, which is why this cluster's OSS settings — plaintext
-  # credentials and all — were sitting in the `agentenv-k8s-config` ConfigMap
-  # with no tracked copy anywhere.
-  #
-  # AENV_CONFIG_OVERLAY_PATH names extra TOML files layered over
-  # `config/agentenv.toml`, applied left to right, merged deeply table by table.
-  # Two of them here, and the split is the whole point:
-  #   · config/oss-overlay.toml — tracked in this repository, no credentials;
-  #   · backend-oss.toml — projected from the `rustfs-credentials` Secret,
-  #     credentials only, listed last so it wins where they overlap.
-  #
-  # 🔴 A file that is named and not on disk is a *startup error*, deliberately:
-  # the alternative is a node that quietly starts on `posix_fs` with an empty
-  # snapshot store. So this key and the Secret below must move together.
-  #
-  # 🔴 The Secret needs one key that is not there on a fresh cluster, and it is
-  # not created from this repository because it holds credentials. The cluster
-  # already keeps the same pair under RUSTFS_ACCESS_KEY / RUSTFS_SECRET_KEY;
-  # add the TOML form beside them once, before rolling either workload:
-  #
-  #   NS=agentenv-system
-  #   AK=$(kubectl -n $NS get secret rustfs-credentials \
-  #        -o jsonpath='{.data.RUSTFS_ACCESS_KEY}' | base64 -d)
-  #   SK=$(kubectl -n $NS get secret rustfs-credentials \
-  #        -o jsonpath='{.data.RUSTFS_SECRET_KEY}' | base64 -d)
-  #   T=$(mktemp) && printf '[backend.oss]\naccess_key_id = "%s"\naccess_key_secret = "%s"\n' \
-  #        "$AK" "$SK" > "$T"
-  #   kubectl -n $NS patch secret rustfs-credentials --type merge \
-  #     -p "{\"data\":{\"backend-oss-credentials.toml\":\"$(base64 -w0 "$T")\"}}"
-  #   shred -u "$T"
-  #
-  # 🔴 And the pods have to be rolled for any of it to take effect: both files
-  # are `subPath` mounts, which kubelet never refreshes. Order matters — add the
-  # Secret key first, then apply, then roll. Rolling before the key exists is a
-  # node that will not start.
-  #
-  # Turning it off is one command and does not touch a manifest:
-  #   kubectl -n agentenv-system set env daemonset/agentenv-node \
-  #     deploy/agentenv-api AENV_CONFIG_OVERLAY_PATH=
-  # An environment variable set to the empty string is read as unset, so that
-  # clears it. It also lands the cluster on `posix_fs` unless
-  # AENV_SNAPSHOT_REPOSITORY_BACKEND is cleared too — which is why that one is
-  # separate, and why clearing only this key fails loudly instead of quietly
-  # serving an empty snapshot store.
+  # A paused sandbox is a snapshot catalog row, so no ConfigMap and no
+  # environment variable selects a paused-sandbox registry for either half.
   - name: snapshot-storage-config
     literals:
       - AENV_SNAPSHOT_REPOSITORY_BACKEND=oss
@@ -471,8 +348,7 @@ configMapGenerator:
   # both; 208 GiB is safe on neither.
   #
   # 🔴 Environment, not `config/agentenv.toml`, for the reason
-  # AENV_PAUSED_REGISTRY_BACKEND and the catalog pair are — that file does not
-  # survive an apply. `src/cfg/image.rs` carries the same note on both
+  # AENV_ORCHESTRATOR_STORE_BACKEND is — that file does not survive an apply. `src/cfg/image.rs` carries the same note on both
   # `#[config(env = …)]` attributes, which is what makes this reachable at all.
   #
   # 🔴 A separate ConfigMap from snapshot-storage-config on purpose. That one is

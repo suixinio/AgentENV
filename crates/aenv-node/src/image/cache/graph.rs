@@ -33,10 +33,6 @@ impl ImageCacheHoldOwner {
     pub fn namespace(&self) -> &str {
         &self.namespace
     }
-
-    pub fn key(&self) -> &str {
-        &self.key
-    }
 }
 
 impl fmt::Display for ImageCacheHoldOwner {
@@ -183,8 +179,8 @@ struct ParsedConfig {
     modified_secs: u64,
 }
 
-/// Proof that paused holds have been re-derived, which a deleting pass needs
-/// because holds do not survive the process that took them.
+/// Proof that the startup reconcile ran, which a deleting pass needs because
+/// holds do not survive the process that took them.
 ///
 /// [`ImageCacheMetadataStore::grant_reclaim_authority`] is the only source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,7 +191,7 @@ impl ImageCacheMetadataStore {
         Self::default()
     }
 
-    /// Records that paused holds have been re-derived, unblocking deleting passes.
+    /// Records that the startup reconcile ran, unblocking deleting passes.
     pub async fn grant_reclaim_authority(&self) -> ReclaimAuthority {
         ReclaimAuthority(())
     }
@@ -284,6 +280,7 @@ impl ImageCacheMetadataStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn list_hold_owners_in_namespaces(
         &self,
         namespaces: &[&str],

@@ -1,7 +1,6 @@
 //! Object-safe orchestration facade over role-specific generic orchestrators.
 //! A single macro defines both the trait and forwarding implementation.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,10 +12,8 @@ use crate::sandbox::{
 };
 use crate::types::{ExecutionId, SandboxId};
 
-use super::launch_plan::ClaimedExecution;
 use super::metrics::OrchestratorMetrics;
-use super::paused_registry::PausedSandboxPublisher;
-use super::persistence::{ClusterRegistration, SandboxPersister};
+use super::pause_publisher::PausePublisher;
 use super::proxy::ProxyLookupResult;
 #[cfg(test)]
 use super::proxy::ProxyTarget;
@@ -79,11 +76,10 @@ macro_rules! orchestration_surface {
         }
 
         #[async_trait]
-        impl<S, F, P> SandboxOrchestration for Orchestrator<S, F, P>
+        impl<S, F> SandboxOrchestration for Orchestrator<S, F>
         where
             S: MetadataStore + 'static,
             F: SandboxBackendFactory,
-            P: SandboxPersister + 'static,
         {
             $(
                 $(#[$owned_meta])*
@@ -91,7 +87,7 @@ macro_rules! orchestration_surface {
                     $( -> $owned_ret )?
                 {
                     // Fully qualify the inherent method to avoid trait recursion.
-                    Orchestrator::<S, F, P>::$owned_name(&self $(, $owned_arg )* ).await
+                    Orchestrator::<S, F>::$owned_name(&self $(, $owned_arg )* ).await
                 }
             )*
             $(
@@ -99,13 +95,13 @@ macro_rules! orchestration_surface {
                 async fn $borrowed_name(&self $(, $borrowed_arg: $borrowed_ty )* )
                     $( -> $borrowed_ret )?
                 {
-                    Orchestrator::<S, F, P>::$borrowed_name(self $(, $borrowed_arg )* ).await
+                    Orchestrator::<S, F>::$borrowed_name(self $(, $borrowed_arg )* ).await
                 }
             )*
             $(
                 $(#[$sync_meta])*
                 fn $sync_name(&self $(, $sync_arg: $sync_ty )* ) $( -> $sync_ret )? {
-                    Orchestrator::<S, F, P>::$sync_name(self $(, $sync_arg )* )
+                    Orchestrator::<S, F>::$sync_name(self $(, $sync_arg )* )
                 }
             )*
         }
@@ -128,28 +124,12 @@ orchestration_surface! {
             children: ForkChildren,
             new_timeout: NewTimeout,
         ) -> Result<Vec<SandboxForkOutcome>>;
-        /// Tears a sandbox down and forgets it, cluster record included.
+        /// Tears a sandbox down and forgets it.
         fn delete_sandbox(sandbox_id: SandboxId) -> Result<()>;
-        /// Tears down a local copy of a sandbox that is alive somewhere else,
-        /// leaving the cluster's record of it alone.
-        fn discard_superseded_sandbox(sandbox_id: SandboxId) -> Result<()>;
-        /// Drops this node's paused record for a sandbox the cluster has moved
-        /// past. Returns whether there was one.
-        fn discard_local_paused_record(sandbox_id: SandboxId) -> Result<bool>;
-        /// Pauses every running sandbox and stops accepting work.
+        /// Stops every sandbox and stops accepting work.
         fn shutdown() -> Result<()>;
-        /// Pauses one sandbox, publishing it to the cluster if publishing is
-        /// wired up.
-        fn pause_sandbox(sandbox_id: SandboxId) -> Result<SandboxMetadata>;
-        /// Pauses one sandbox and hands the capture back for the caller to
-        /// publish, instead of offering it to this process's own publisher.
-        fn pause_sandbox_for_publication(sandbox_id: SandboxId) -> Result<PauseOutcome>;
-        /// Brings a paused sandbox back, under a fresh execution.
-        fn resume_sandbox(
-            sandbox_id: SandboxId,
-            timeout: NewTimeout,
-            claimed: ClaimedExecution,
-        ) -> Result<SandboxMetadata>;
+        /// Pauses one sandbox: publishes its capture and forgets the record.
+        fn pause_sandbox(sandbox_id: SandboxId) -> Result<PauseOutcome>;
         /// Captures a snapshot of a running sandbox and leaves it running.
         fn capture_snapshot(sandbox_id: SandboxId) -> Result<SnapshotCaptureResult>;
         /// Replaces a running sandbox's egress policy.
@@ -193,17 +173,6 @@ orchestration_surface! {
             timeout: Option<Duration>,
             allow_shorter: bool,
         ) -> Result<Option<SandboxMetadata>>;
-        /// Where on this machine's disk a paused sandbox's capture was
-        /// written, or `None` when this node holds no paused record for it.
-        fn paused_artifact_root(sandbox_id: &SandboxId) -> Result<Option<PathBuf>>;
-        /// Whether a paused record was ever announced to a cluster registry,
-        /// and under which node identity.
-        fn paused_record_cluster_registration(
-            sandbox_id: SandboxId,
-        ) -> Result<ClusterRegistration>;
-        /// The real machine a paused sandbox will reopen on, when that is
-        /// already knowable — before anything has tried to resume it.
-        fn paused_origin_node_id(sandbox_id: &SandboxId) -> Option<String>;
         /// The real machine currently running a sandbox, straight from its
         /// live backend.
         fn sandbox_holding_node_id(sandbox_id: &SandboxId) -> Option<String>;
@@ -242,8 +211,8 @@ orchestration_surface! {
         fn get_envd_access_token(metadata: &SandboxMetadata) -> Option<EnvdAccessToken>;
         /// Whether `candidate` is the envd access token for this sandbox.
         fn validate_envd_access_token(sandbox_id: SandboxId, candidate: &str) -> bool;
-        /// Wires in cluster-wide pause bookkeeping. The first wiring wins.
-        fn set_paused_publisher(publisher: Arc<dyn PausedSandboxPublisher>);
+        /// Wires where pause captures become durable. The first wiring wins.
+        fn set_pause_publisher(publisher: Arc<dyn PausePublisher>);
         /// Subscribes to sandbox lifecycle events. Best-effort and lossy.
         fn subscribe_sandbox_events() -> broadcast::Receiver<SandboxLifecycleEvent>;
         /// Whether this node is refusing new work.
@@ -359,33 +328,6 @@ mod tests {
             Arc::clone(&orchestration)
                 .fork_sandbox(unknown, ForkChildren::Fresh(1), NewTimeout::UseExisting)
                 .await,
-        );
-        refuses(
-            "resume_sandbox",
-            unknown,
-            Arc::clone(&orchestration)
-                .resume_sandbox(
-                    unknown,
-                    NewTimeout::UseExisting,
-                    ClaimedExecution::from_claim(ExecutionId::new()),
-                )
-                .await,
-        );
-
-        refuses(
-            "discard_superseded_sandbox",
-            unknown,
-            Arc::clone(&orchestration)
-                .discard_superseded_sandbox(unknown)
-                .await,
-        );
-
-        assert!(
-            !Arc::clone(&orchestration)
-                .discard_local_paused_record(unknown)
-                .await
-                .expect("asking about a record this node never had is not an error"),
-            "there was no local paused record to discard"
         );
     }
 }

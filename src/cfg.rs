@@ -465,107 +465,6 @@ pub enum SnapshotRepositoryBackendKind {
     Oss,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PausedRegistryBackendKind {
-    /// Node-local only. A paused sandbox is resumable on the node that paused
-    /// it and invisible to the rest of the cluster.
-    Local,
-    /// Direct PostgreSQL paused registry owned by `aenv-api`.
-    ///
-    /// Requires `[pg].dsn` and a heartbeat roster for safe reclaim.
-    Postgres,
-}
-
-impl PausedRegistryBackendKind {
-    /// Deployment spelling for this backend.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Postgres => "postgres",
-        }
-    }
-}
-
-#[derive(Debug, Config, Clone)]
-pub struct PausedRegistryConfig {
-    /// Backend selection that survives replacement of the base ConfigMap.
-    #[config(default = "local", env = "AENV_PAUSED_REGISTRY_BACKEND")]
-    pub backend: PausedRegistryBackendKind,
-    /// Lease-renewal and local reconciliation cadence.
-    ///
-    /// Ignored by the local backend.
-    #[config(default = 30u64)]
-    pub reconcile_interval_secs: u64,
-    /// Lease lifetime for parked sandboxes, floored by renewal cadence.
-    ///
-    /// Lease expiry alone never authorizes moving a live sandbox.
-    #[config(default = 90u64)]
-    pub lease_ttl_secs: u64,
-    /// PostgreSQL cluster-wide reclaim cadence; ignored by other backends.
-    #[config(default = 30u64)]
-    pub reclaim_interval_secs: u64,
-}
-
-impl PausedRegistryConfig {
-    /// Reconciliation cadence, floored at one second to avoid a zero-period panic.
-    pub fn reconcile_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.reconcile_interval_secs.max(1))
-    }
-
-    /// Reclamation cadence, floored at one second.
-    pub fn reclaim_interval(&self) -> std::time::Duration {
-        std::time::Duration::from_secs(self.reclaim_interval_secs.max(1))
-    }
-
-    /// Lease length, held to at least three renewal intervals.
-    pub fn lease_ttl_secs(&self) -> u64 {
-        self.lease_ttl_secs
-            .max(self.reconcile_interval_secs.max(1).saturating_mul(3))
-    }
-}
-
-#[cfg(test)]
-mod paused_registry_config_tests {
-    use super::*;
-
-    fn config(reconcile_interval_secs: u64, lease_ttl_secs: u64) -> PausedRegistryConfig {
-        PausedRegistryConfig {
-            backend: PausedRegistryBackendKind::Postgres,
-            reconcile_interval_secs,
-            lease_ttl_secs,
-            reclaim_interval_secs: 30,
-        }
-    }
-
-    #[test]
-    fn a_zero_interval_never_reaches_the_timer() {
-        assert_eq!(
-            config(0, 90).reconcile_interval(),
-            std::time::Duration::from_secs(1)
-        );
-    }
-
-    #[test]
-    fn a_lease_can_never_be_shorter_than_the_renewal_cadence() {
-        assert_eq!(config(60, 10).lease_ttl_secs(), 180);
-        assert_eq!(config(0, 0).lease_ttl_secs(), 3);
-    }
-
-    #[test]
-    fn a_generous_lease_is_left_alone() {
-        assert_eq!(config(30, 600).lease_ttl_secs(), 600);
-    }
-
-    #[test]
-    fn the_defaults_leave_room_for_two_missed_renewals() {
-        let defaults = config(30, 90);
-
-        assert_eq!(defaults.lease_ttl_secs(), 90);
-        assert!(defaults.lease_ttl_secs() >= defaults.reconcile_interval().as_secs() * 3);
-    }
-}
-
 #[derive(Debug, Config, Clone)]
 pub struct UblkTomlConfig {
     /// Path to the `uvm-ublk-daemon` binary.
@@ -883,6 +782,8 @@ pub struct OrchestratorConfig {
     /// sandbox it points at rather than expiring just before it.
     #[config(default = 60u64, env = "AENV_PROJECTION_TTL_GRACE_SECS")]
     pub projection_ttl_grace_secs: u64,
+    /// Scratch root for capture artifacts and startup reclaim; nothing under
+    /// it outlives a pause.
     #[config(
         default = "$AENV_HOME/persisted-sandboxes",
         env = "AENV_PERSISTED_SANDBOX_STORE_PATH",
@@ -892,11 +793,9 @@ pub struct OrchestratorConfig {
     /// Optional startup reclaim override; unset means enabled.
     #[config(env = "AENV_STARTUP_RECLAIM_ENABLED")]
     pub startup_reclaim_enabled: Option<bool>,
-    /// Delay after node isolation before shutdown begins pausing sandboxes.
+    /// Delay after node isolation before shutdown begins stopping sandboxes.
     #[config(default = 10u64, env = "AENV_SHUTDOWN_DRAIN_PROPAGATION_SECS")]
     pub shutdown_drain_propagation_secs: u64,
-    #[config(nested)]
-    pub paused_registry: PausedRegistryConfig,
     #[config(nested)]
     pub store: OrchestratorStoreConfig,
 }
@@ -1940,43 +1839,6 @@ mod tests {
     }
 
     #[test]
-    fn the_bundled_default_config_documents_the_paused_registry() {
-        let text = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml"),
-        )
-        .expect("read the bundled config");
-        let parsed: toml::Value = toml::from_str(&text)
-            .map_err(|err| err.message().to_string())
-            .expect("parse the bundled config");
-
-        let section = parsed
-            .get("orchestrator")
-            .and_then(|orchestrator| orchestrator.get("paused_registry"))
-            .and_then(toml::Value::as_table)
-            .expect("config/default.toml must carry an [orchestrator.paused_registry] section");
-
-        for key in [
-            "backend",
-            "reconcile_interval_secs",
-            "lease_ttl_secs",
-            "reclaim_interval_secs",
-        ] {
-            assert!(
-                section.contains_key(key),
-                "[orchestrator.paused_registry] is missing {key}"
-            );
-        }
-
-        for key in ["dsn", "max_connections"] {
-            assert!(
-                !section.contains_key(key),
-                "[orchestrator.paused_registry] still carries {key}: the node holds no database \
-                 connection of its own"
-            );
-        }
-    }
-
-    #[test]
     fn the_bundled_default_config_never_carries_a_pg_dsn() {
         let text = std::fs::read_to_string(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("config/default.toml"),
@@ -1999,60 +1861,6 @@ mod tests {
             "config/default.toml commits a non-blank [pg].dsn -- a database credential must \
              come from a file named by AENV_CONFIG_OVERLAY_PATH, projected from a mounted \
              Secret, never from a tracked file"
-        );
-    }
-
-    #[test]
-    fn the_paused_registry_backend_is_settable_from_the_environment() {
-        let _env = env_guard();
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-
-        for (value, expected) in [
-            ("postgres", PausedRegistryBackendKind::Postgres),
-            ("local", PausedRegistryBackendKind::Local),
-        ] {
-            std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", value);
-            let overridden = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
-            std::env::remove_var("AENV_PAUSED_REGISTRY_BACKEND");
-
-            assert_eq!(
-                overridden
-                    .unwrap_or_else(|err| panic!("load with backend={value}: {err}"))
-                    .config()
-                    .orchestrator
-                    .paused_registry
-                    .backend,
-                expected
-            );
-
-            assert_eq!(
-                expected.as_str(),
-                value,
-                "the logged name and the accepted value must be the same word"
-            );
-        }
-
-        for typo in ["postgress", "Postgres", "postgres ", "node-local"] {
-            std::env::set_var("AENV_PAUSED_REGISTRY_BACKEND", typo);
-            let loaded = ConfigManager::new_from_path(&workspace.join("config/default.toml"));
-            std::env::remove_var("AENV_PAUSED_REGISTRY_BACKEND");
-
-            assert!(
-                loaded.is_err(),
-                "backend={typo:?} was accepted; a misspelled backend must not \
-                 silently leave the node on `local`"
-            );
-        }
-
-        assert_eq!(
-            ConfigManager::new_from_path(&workspace.join("config/default.toml"))
-                .expect("load without the override")
-                .config()
-                .orchestrator
-                .paused_registry
-                .backend,
-            PausedRegistryBackendKind::Local,
-            "the file's value must stand when the environment says nothing"
         );
     }
 

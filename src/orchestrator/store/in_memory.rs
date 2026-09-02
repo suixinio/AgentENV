@@ -556,7 +556,7 @@ mod tests {
         store
             .add(SandboxMetadata {
                 id: SandboxId::new(),
-                state: SandboxState::Paused,
+                state: SandboxState::Pausing,
                 user_metadata: Some(user_metadata_match.clone()),
                 ..Default::default()
             })
@@ -583,7 +583,7 @@ mod tests {
     async fn list_filtered_supports_multiple_states() {
         let store = InMemoryMetadataStore::new();
         let running_id = SandboxId::new();
-        let paused_id = SandboxId::new();
+        let pausing_id = SandboxId::new();
 
         store
             .add(SandboxMetadata {
@@ -596,8 +596,8 @@ mod tests {
 
         store
             .add(SandboxMetadata {
-                id: paused_id,
-                state: SandboxState::Paused,
+                id: pausing_id,
+                state: SandboxState::Pausing,
                 ..Default::default()
             })
             .await
@@ -614,7 +614,7 @@ mod tests {
 
         let filtered = store
             .list_filtered(SandboxListFilter {
-                states: Some(vec![SandboxState::Running, SandboxState::Paused]),
+                states: Some(vec![SandboxState::Running, SandboxState::Pausing]),
                 excluded_states: None,
                 user_metadata: None,
             })
@@ -623,7 +623,7 @@ mod tests {
 
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().any(|m| m.id == running_id));
-        assert!(filtered.iter().any(|m| m.id == paused_id));
+        assert!(filtered.iter().any(|m| m.id == pausing_id));
     }
 
     #[tokio::test]
@@ -644,7 +644,7 @@ mod tests {
         store
             .add(SandboxMetadata {
                 id: SandboxId::new(),
-                state: SandboxState::Paused,
+                state: SandboxState::Pausing,
                 ..Default::default()
             })
             .await
@@ -662,7 +662,7 @@ mod tests {
         let filtered = store
             .list_filtered(SandboxListFilter {
                 states: None,
-                excluded_states: Some(vec![SandboxState::Paused]),
+                excluded_states: Some(vec![SandboxState::Pausing]),
                 user_metadata: None,
             })
             .await
@@ -688,7 +688,7 @@ mod tests {
             .unwrap();
 
         store
-            .update_state_if_state(&sandbox_id, SandboxState::Paused, &[SandboxState::Running])
+            .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
             .await
             .unwrap();
 
@@ -702,16 +702,16 @@ mod tests {
             .unwrap();
         assert!(running.is_empty());
 
-        let paused = store
+        let pausing = store
             .list_filtered(SandboxListFilter {
-                states: Some(vec![SandboxState::Paused]),
+                states: Some(vec![SandboxState::Pausing]),
                 excluded_states: None,
                 user_metadata: None,
             })
             .await
             .unwrap();
-        assert_eq!(paused.len(), 1);
-        assert_eq!(paused[0].id, sandbox_id);
+        assert_eq!(pausing.len(), 1);
+        assert_eq!(pausing[0].id, sandbox_id);
     }
 
     #[tokio::test]
@@ -740,7 +740,7 @@ mod tests {
 
         let conflict = store
             .update_if_state(&id, &[SandboxState::Running], |metadata| {
-                metadata.state = SandboxState::Paused;
+                metadata.state = SandboxState::Pausing;
             })
             .await
             .unwrap_err();
@@ -883,30 +883,32 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(20)).await;
         store
-            .update_state_if_state(&id, SandboxState::Paused, &[SandboxState::Running])
+            .update_state_if_state(&id, SandboxState::Pausing, &[SandboxState::Running])
             .await
             .unwrap();
-        let paused = store.get(&id).await.unwrap().unwrap();
-        assert_eq!(paused.running_since, None);
-        let charged = paused.running_elapsed;
-        assert!(charged >= Duration::from_millis(15), "{charged:?}");
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        store.update(paused).await.unwrap();
+        let pausing = store.get(&id).await.unwrap().unwrap();
         assert_eq!(
-            store.get(&id).await.unwrap().unwrap().running_elapsed,
-            charged
+            pausing.running_since, opened,
+            "a state change does not close the run"
         );
+        assert_eq!(pausing.running_elapsed, Duration::ZERO);
+
+        store.update(pausing).await.unwrap();
+        assert_eq!(store.get(&id).await.unwrap().unwrap().running_since, opened);
 
         store
-            .update_if_state(&id, &[SandboxState::Paused], |metadata| {
+            .update_if_state(&id, &[SandboxState::Pausing], |metadata| {
                 metadata.state = SandboxState::Running;
+                metadata.running_since = None;
             })
             .await
             .unwrap();
-        let resumed = store.get(&id).await.unwrap().unwrap();
-        assert!(resumed.running_since.is_some());
-        assert_eq!(resumed.running_elapsed, charged);
+        let reopened = store.get(&id).await.unwrap().unwrap();
+        assert!(
+            reopened.running_since.is_some(),
+            "a write that lost the clock has it reopened"
+        );
+        assert_eq!(reopened.running_elapsed, Duration::ZERO);
     }
 
     #[tokio::test]

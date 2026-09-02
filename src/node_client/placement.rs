@@ -40,10 +40,15 @@ pub enum NodeMembership {
 #[async_trait]
 pub trait NodePlacement: Send + Sync + 'static {
     /// Selects a node for a new sandbox.
+    ///
+    /// `preferred_node_id` is honoured when that node is schedulable and
+    /// silently ignored otherwise: it is where a paused sandbox's bytes were
+    /// last warm, never where the sandbox must run.
     async fn place_new(
         &self,
         sandbox_id: SandboxId,
         resources: SandboxResources,
+        preferred_node_id: Option<&str>,
     ) -> anyhow::Result<NodeEndpoint>;
 
     /// Locates the node holding an existing sandbox.
@@ -118,6 +123,7 @@ impl NodePlacement for FixedNodePlacement {
         &self,
         _sandbox_id: SandboxId,
         _resources: SandboxResources,
+        _preferred_node_id: Option<&str>,
     ) -> anyhow::Result<NodeEndpoint> {
         Ok(self.node.clone())
     }

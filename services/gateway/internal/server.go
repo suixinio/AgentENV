@@ -232,7 +232,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !resolved {
 		// 🔴 Everything the projection could not answer lands here, and that
 		// includes a read error. A miss is not an absence: the api half walks
-		// the binding, then the heartbeat roster, then the paused registry,
+		// the binding, then the heartbeat roster, then the snapshot catalog,
 		// answers a running sandbox as it stands and wakes a paused one. Only
 		// the half that owns sandboxes can tell those apart, and it is the
 		// only thing asked: a verdict that is not "woken" ends the request
@@ -342,9 +342,9 @@ var hostPort = regexp.MustCompile(`(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-
 
 // schedulerReason is what of the scheduler's answer a caller may see.
 //
-// 🔴 The scheduler's message is deliberately forwarded — `local_only on node
-// "node-a"` and `paused registry is not ready` are reasons a client acts on,
-// and the tests above pin them. What must not be forwarded is the text a
+// 🔴 The scheduler's message is deliberately forwarded — `sandbox is being
+// resumed by node "node-a"` is a reason a client acts on, and the tests above
+// pin the forwarding. What must not be forwarded is the text a
 // failed *dial* produces, because it is not the scheduler speaking and it names
 // the cluster's internal addressing to whoever asked.
 //

@@ -11,9 +11,9 @@ use tracing::{debug, info, warn};
 
 use crate::image::ImageResolver;
 use crate::orchestrator::{
-    ClaimedExecution, CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox,
-    NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxMetadata, SandboxOperation,
-    SandboxOrchestration, SandboxPersistenceError,
+    CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, NewTimeout,
+    OrchestratorError, PublishedPause, SandboxLaunchSource, SandboxMetadata, SandboxOperation,
+    SandboxOrchestration,
 };
 use crate::proto::node as pb;
 use crate::sandbox::{
@@ -109,7 +109,7 @@ impl NodeSandboxService {
         let staged = self
             .snapshots
             .stage_captured(
-                crate::orchestrator::capture_publish_metadata(metadata, None),
+                crate::orchestrator::capture_publish_metadata(metadata, None, None),
                 captured,
             )
             .await
@@ -431,8 +431,8 @@ fn capture_op_failure_status(
         | OrchestratorError::ShuttingDown
         | OrchestratorError::NotAcceptingNewWork
         | OrchestratorError::VirtualizationModeMismatch { .. } => false,
-        // Artifact allocation failure occurs before backend capture.
-        OrchestratorError::SandboxPersistenceFailed(_) => false,
+        // The capture could not be published; the sandbox is running again.
+        OrchestratorError::PausePublicationFailed { .. } => false,
         // NotFound here means no sandbox remained to pause.
         _ => true,
     };
@@ -456,12 +456,6 @@ fn orchestrator_status(err: &OrchestratorError) -> Status {
         OrchestratorError::SandboxNotFound(sandbox_id) => {
             Status::not_found(format!("sandbox {sandbox_id} is not on this node"))
         }
-        // Absence, not node failure: a claim holder can rebuild a published row.
-        OrchestratorError::SandboxPersistenceFailed(SandboxPersistenceError::RecordAbsent {
-            sandbox_id,
-        }) => Status::not_found(format!(
-            "sandbox {sandbox_id} is not holding a paused capture on this node"
-        )),
         OrchestratorError::InvalidRequest(message) => Status::invalid_argument(message.clone()),
         OrchestratorError::InvalidSandboxState { .. }
         | OrchestratorError::SandboxOperationConflict { .. }
@@ -551,6 +545,7 @@ pub fn template_build_publish_metadata(
         virtualization_mode,
         image_configs: build_execution.image_configs,
         custom_extension_params: None,
+        paused_sandbox: None,
     };
     (metadata, build_execution.manifest)
 }
@@ -660,6 +655,8 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             control_plane_config: convert::control_plane_config(&request.control_plane_config),
             // Empty lets the orchestrator mint; nonempty adopts the caller's claim.
             execution_id: convert::optional_execution_id(&request.execution_id)?,
+            // Placement happened on the api half; the node runs what it was handed.
+            preferred_node_id: None,
         };
 
         // Under the id the caller chose, because the caller's record of this
@@ -698,9 +695,9 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         Ok(Response::new(pb::SandboxDeleteResponse {}))
     }
 
-    /// Pauses locally and returns the node-owned capture location.
-    ///
-    /// Optional publication stages a row for the caller without changing pause success.
+    /// Pauses locally: the orchestrator stages the capture on this node's
+    /// repository and forgets the sandbox; the staged value goes to the caller
+    /// to commit.
     async fn pause(
         &self,
         request: Request<pb::SandboxPauseRequest>,
@@ -713,107 +710,44 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .await
             .map_err(untouched)?;
 
-        // Published and local pauses intentionally use distinct orchestration entry points.
-        let (metadata, staged, staging_error) = if request.publish {
-            let outcome = Arc::clone(&self.orchestration)
-                .pause_sandbox_for_publication(sandbox_id)
-                .await
-                .map_err(|err| {
-                    capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err)
-                })?;
-            let (staged, staging_error) = match outcome.publishable {
-                // Staging failure is reported inside a successful, locally resumable pause.
-                Some(publishable) => match self
-                    .stage_for_caller(sandbox_id, &outcome.metadata, publishable)
-                    .await
-                {
-                    Ok(staged) => (Some(staged), String::new()),
-                    Err(err) => {
-                        warn!(
-                            %sandbox_id,
-                            error = %err,
-                            "paused a sandbox and could not stage its capture; it is resumable on \
-                             this node only"
-                        );
-                        (None, err)
-                    }
-                },
-                None => {
-                    debug!(
-                        %sandbox_id,
-                        "pause produced no publishable capture; the sandbox was already paused here"
-                    );
-                    (None, String::new())
-                }
-            };
-            (outcome.metadata, staged, staging_error)
-        } else {
-            let metadata = Arc::clone(&self.orchestration)
-                .pause_sandbox(sandbox_id)
-                .await
-                .map_err(|err| {
-                    capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err)
-                })?;
-            (metadata, None, String::new())
-        };
-
-        // A successful pause must return the handle needed to reopen it.
-        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
-            // Missing reply state is nonterminal because the node record remains resumable.
-            crate::proto::node::capture_failure_status(
-                tonic::Code::Internal,
-                format!(
-                    "sandbox {sandbox_id} was paused on this node, but its record carries no \
-                     capture to describe"
-                ),
-                false,
-                "the sandbox is paused on this node and can still be reopened here",
-            )
-        })?;
-        let state = paused_state
-            .encode()
-            .map_err(|err| {
-                crate::proto::node::capture_failure_status(
-                    tonic::Code::Internal,
-                    format!("encode sandbox {sandbox_id}'s paused state: {err:#}"),
-                    false,
-                    "the sandbox is paused on this node and can still be reopened here",
-                )
-            })
-            .and_then(|state| {
-                crate::proto::node::encode_value(&state).map_err(|err| {
-                    crate::proto::node::capture_failure_status(
-                        tonic::Code::Internal,
-                        format!("encode sandbox {sandbox_id}'s paused state: {err}"),
-                        false,
-                        "the sandbox is paused on this node and can still be reopened here",
-                    )
-                })
-            })?;
-
-        // Never persist a fabricated empty artifact location after a failed read.
-        let artifact_root = self
-            .orchestration
-            .paused_artifact_root(&sandbox_id)
+        let outcome = Arc::clone(&self.orchestration)
+            .pause_sandbox(sandbox_id)
             .await
             .map_err(|err| capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err))?;
-        if artifact_root.is_none() {
-            // Some persisters manage temporary capture storage without a named root.
-            warn!(
-                %sandbox_id,
-                "paused a sandbox this node kept no artifact directory for"
-            );
-        }
+
+        let staged = match outcome.published {
+            Some(PublishedPause::Staged(staged)) => *staged,
+            // A pause this call merely joined belongs to the caller that made it;
+            // the node has nothing to hand this one.
+            None => {
+                return Err(Status::failed_precondition(format!(
+                    "sandbox {sandbox_id} was already being paused by another call, and only \
+                     that call receives the staged snapshot"
+                )));
+            }
+            Some(PublishedPause::Committed(snapshot_id)) => {
+                return Err(Status::internal(format!(
+                    "sandbox {sandbox_id}'s pause was committed as snapshot {snapshot_id} on this \
+                     node, which holds no catalog to commit into"
+                )));
+            }
+        };
+
+        // Encoding failure loses the announcement, never the sandbox.
+        let value = crate::proto::node::encode_value(&staged).map_err(|err| {
+            Status::internal(format!(
+                "encode the staged snapshot for sandbox {sandbox_id}: {err} (its bytes are staged \
+                 on this node and nothing will announce them)"
+            ))
+        })?;
+        info!(
+            %sandbox_id,
+            snapshot_id = %staged.commit.id,
+            "paused a sandbox and staged its snapshot for the caller to commit"
+        );
 
         Ok(Response::new(pb::SandboxPauseResponse {
-            paused_state: Some(pb::PausedState {
-                artifact_root: artifact_root
-                    .map(|root| root.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                state: Some(state),
-            }),
-            staged,
-            staging_error,
+            staged: Some(pb::StagedSnapshot { value: Some(value) }),
         }))
     }
 
@@ -854,49 +788,6 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
 
         Ok(Response::new(pb::SandboxCheckpointResponse {
             staged: Some(staged),
-        }))
-    }
-
-    /// Resumes from this node's persisted record.
-    ///
-    /// NotFound remains distinct from record-read or availability failures.
-    async fn resume(
-        &self,
-        request: Request<pb::SandboxResumeRequest>,
-    ) -> Result<Response<pb::SandboxResumeResponse>, Status> {
-        let request = request.into_inner();
-        let sandbox_id = convert::sandbox_id(&request.sandbox_id)?;
-        let paused_execution_id = convert::execution_id(&request.execution_id)?;
-        // A resume must carry the execution ID granted by arbitration.
-        let resumed_execution_id = convert::execution_id(&request.resumed_execution_id)?;
-        if resumed_execution_id == paused_execution_id {
-            // Resume always creates a new incarnation.
-            return Err(Status::invalid_argument(format!(
-                "sandbox {sandbox_id} cannot be resumed as the same run it was paused under \
-                 ({paused_execution_id}): a resume starts a new one"
-            )));
-        }
-
-        self.fenced(sandbox_id, paused_execution_id).await?;
-
-        let timeout = match convert::optional_timeout(request.timeout_ms) {
-            Some(timeout) => NewTimeout::Set(timeout),
-            // Preserve the deadline stored with the paused sandbox.
-            None => NewTimeout::UseExisting,
-        };
-
-        let metadata = Arc::clone(&self.orchestration)
-            .resume_sandbox(
-                sandbox_id,
-                timeout,
-                // Adopt the execution claim already recorded by the caller.
-                ClaimedExecution::adopted_from_remote_claim(resumed_execution_id),
-            )
-            .await
-            .map_err(|err| orchestrator_status(&err))?;
-
-        Ok(Response::new(pb::SandboxResumeResponse {
-            started: Some(self.running_sandbox(&metadata).await),
         }))
     }
 

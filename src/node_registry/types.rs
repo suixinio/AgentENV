@@ -45,11 +45,6 @@ pub struct RosterEntry {
     pub execution_id: String,
     /// Projection TTL; zero delegates to the binding store's default.
     pub projection_ttl: Duration,
-    /// Whether the sandbox is parked without a VM.
-    ///
-    /// Paused entries still renew paused-registry leases but binding reconciliation must
-    /// exclude them because a routing projection promises a running VM.
-    pub paused: bool,
 }
 
 /// Node heartbeat roster; absent `last_seen` means discovery knows it but no heartbeat arrived.

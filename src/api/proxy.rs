@@ -826,12 +826,6 @@ async fn resolve_proxy_request(
                 sandbox_id,
             )))
         }
-        // Proxying never wakes paused sandboxes; the gateway cold path does.
-        Ok(ProxyLookupResult::Paused { .. }) => {
-            return Err(proxy_error_response(
-                &ProxyRequestError::SandboxUnavailable(sandbox_id, SandboxState::Paused),
-            ))
-        }
         Ok(ProxyLookupResult::Unavailable(state)) => {
             return Err(proxy_error_response(
                 &ProxyRequestError::SandboxUnavailable(sandbox_id, state),
@@ -1326,11 +1320,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
-    use crate::{
-        api::server,
-        orchestrator::{FileBackedSandboxPersister, Orchestrator},
-        snapshot::mock::mock_snapshot_manager,
-    };
+    use crate::{api::server, orchestrator::Orchestrator, snapshot::mock::mock_snapshot_manager};
 
     #[test]
     fn strip_host_port_handles_dns_and_ipv6_hosts() {
@@ -1731,26 +1721,13 @@ mod tests {
         domains: Vec<String>,
         resume_wiring: crate::api::ResumeWiring,
     ) -> Arc<ApiImpl> {
-        let root = tempfile::tempdir().unwrap();
-        let orchestrator = Orchestrator::new(
-            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-            crate::orchestrator::InMemoryMetadataStore::new(),
-            crate::sandbox::mock::MockBackendFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
-            crate::image::DisabledRuntimeImageRefs::shared(),
-        )
-        .await
-        .unwrap();
-        let snapshot_manager = Arc::new(mock_snapshot_manager());
+        let orchestrator =
+            Orchestrator::with_in_memory_store(crate::sandbox::mock::MockBackendFactory::new())
+                .await;
         Arc::new(ApiImpl::new(
             orchestrator,
-            Arc::clone(&snapshot_manager),
+            Arc::new(mock_snapshot_manager()),
             None,
-            crate::api::PausedSandboxWiring::new(
-                Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry),
-                snapshot_manager,
-                &crate::identity::NodeIdentity::from_config(&Default::default()),
-            ),
             domains,
             resume_wiring,
         ))
@@ -2069,12 +2046,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proxy_returns_gone_for_non_running_sandbox() {
+    async fn proxy_returns_gone_for_a_sandbox_mid_transition() {
         let upstream_addr = start_upstream_server().await;
         let sandbox_id = SandboxId::new();
         let app = proxy_app_for_sandbox_with_state_and_auto_resume(
             &sandbox_id,
-            crate::orchestrator::SandboxState::Paused,
+            crate::orchestrator::SandboxState::Pausing,
             false,
         )
         .await;
@@ -3169,7 +3146,7 @@ mod execution_fencing_tests {
     }
 
     #[tokio::test]
-    async fn a_paused_sandbox_is_not_a_superseded_execution() {
+    async fn a_sandbox_mid_pause_is_not_a_superseded_execution() {
         let sandbox_id = SandboxId::new();
         let app = {
             let api = build_api().await;
@@ -3177,13 +3154,9 @@ mod execution_fencing_tests {
                 .set_proxy_target_for_test(
                     sandbox_id,
                     ProxyTarget::new(Ipv4Addr::LOCALHOST),
-                    SandboxState::Paused,
+                    SandboxState::Pausing,
                 )
                 .await;
-            api.orchestrator()
-                .set_auto_resume_for_test(&sandbox_id, true)
-                .await
-                .unwrap();
             server::new(api)
         };
 

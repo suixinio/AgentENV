@@ -169,11 +169,8 @@ impl RuntimeImageRefs for ImageCacheStore {
             .await;
     }
 
-    async fn reconcile_paused(&self, live_paused: &[SandboxId]) -> Result<()> {
-        let ids: Vec<String> = live_paused.iter().map(|id| id.to_string()).collect();
-        self.cache
-            .reconcile_namespace(HoldNamespace::Paused, &ids)
-            .await
+    async fn prepare_maintenance(&self) -> Result<()> {
+        self.cache.startup_reconcile().await
     }
 
     async fn maintain_running(&self, running: Vec<(SandboxId, RuntimeArtifactSet)>) -> Result<()> {
@@ -204,7 +201,6 @@ impl RuntimeImageRefs for ImageCacheStore {
 fn owner_namespace(owner: RuntimeImageOwner) -> (HoldNamespace, SandboxId) {
     match owner {
         RuntimeImageOwner::StartingSandbox(id) => (HoldNamespace::Runtime, id),
-        RuntimeImageOwner::PausedSandbox(id) => (HoldNamespace::Paused, id),
     }
 }
 

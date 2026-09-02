@@ -60,19 +60,6 @@ spec:
                   name: agentenv-runtime-secrets
                   key: sandbox-access-token-hash-seed
                   optional: true
-            # 🔴 No AENV_PAUSED_REGISTRY_BACKEND here any more, and no
-            # `paused-registry-config` ConfigMap for it to read from. This
-            # process ignored that key regardless of what it named:
-            # `assemble_node` (`crates/aenv-node/src/bin/aenv-node.rs`) treats
-            # any backend other than `local` the same way — it logs a `warn!`
-            # naming the configured value and wires in
-            # `DisabledPausedSandboxRegistry` regardless, because cluster-wide
-            # paused-sandbox state belongs to the api half alone (see
-            # AENV_PAUSED_REGISTRY_BACKEND=postgres on
-            # `agentenv-api-deployment.yaml`). Leaving the key here only
-            # bought this Pod a startup warning about a value it was always
-            # going to ignore; the code default (`local`, from
-            # config/default.toml) produces the identical outcome without one.
             # 🔴 No AENV_SNAPSHOT_CATALOG_WRITE / _READ here any more, and
             # setting them would now do nothing at all — no field declares
             # those names, so confique ignores them and no error is raised.
@@ -152,21 +139,22 @@ spec:
             - name: AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR
               value: "0.0.0.0:9103"
             # The cluster's name for the machine, not the pod's. This ID is
-            # what a paused sandbox's registry row records as its holder and
-            # what the node must still match to renew that row's lease; a pod
-            # name changes on every pod recreation, so a restarted node would
-            # stop matching its own rows and the leases on every sandbox parked
-            # on it would lapse for good. Must stay in step with the scheduler's
+            # what the api half's node registry keys this node on and what a
+            # paused sandbox's catalog row records as `origin_node_id`, the
+            # node a resume prefers while it is schedulable; a pod name changes
+            # on every pod recreation, so a restarted node would come back as a
+            # stranger to every row it staged and the warm-cache preference
+            # would never fire. Must stay in step with the scheduler's
             # discovery, which names nodes the same way.
             - name: AENV_NODE_ID
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
-            # The cluster this node's registry rows belong to, read from the
-            # same ConfigMap key the scheduler scopes its registry to. A node
-            # stamping one cluster id while the scheduler serves and reclaims
-            # another is not an error anywhere: the rows are written, and then
-            # nobody the node talks to can see them.
+            # The cluster this node's heartbeats belong to, read from the
+            # same ConfigMap key the api half scopes its node registry to. A
+            # node stamping one cluster id while the api half serves another
+            # is not an error anywhere: the heartbeats land, and then nobody
+            # the node talks to lists this node or places anything on it.
             #
             # Optional because a node falls back to `[node_identity].cluster_id`
             # in config/default.toml, which carries the same value — the
@@ -353,7 +341,7 @@ spec:
                     # to answer "is anything still transitioning here" —
                     # sandboxCount covers the states where the VM is up
                     # (Running, Pausing, Snapshotting, Forking, Killing) and
-                    # sandboxStartingCount covers Creating and Resuming — and
+                    # sandboxStartingCount covers Creating — and
                     # the NodeDetail schema that /nodes/{id} returns **has no
                     # sandboxStartingCount field at all**. A node polled
                     # through /nodes/{id} therefore cannot see a sandbox that
@@ -361,39 +349,8 @@ spec:
                     # while one was starting. /nodes returns this node as a
                     # one-element array of Node, which carries both.
                     #
-                    # 🔴 sandboxPausedCount is deliberately left out of the sum.
-                    # A Paused sandbox has no running VM and nothing in flight —
-                    # it is a metadata row plus an artifact directory under
-                    # orchestrator.persisted_sandbox_store_path, already
-                    # fsync'd to this Pod's `workspace` hostPath mount
-                    # (src/orchestrator/persistence/file_backed.rs, opened with
-                    # LocalStoreDurability::Sync) — and Orchestrator::new
-                    # restores every persisted Paused sandbox the moment the
-                    # next process starts on this same node
-                    # (src/orchestrator/service.rs). The shutdown this hook is
-                    # waiting to unblock does not touch Paused sandboxes either
-                    # (run_shutdown_cleanup filters them out with
-                    # `excluded_states: Some(vec![SandboxState::Paused])`)
-                    # because there is nothing left for it to preserve. Paused
-                    # sandboxes exist to sit there until a later resume, so
-                    # sandboxPausedCount does not go to zero on its own; summing
-                    # it in made every rolling update of this DaemonSet wait out
-                    # the full drain timeout, on every node, serially, for as
-                    # long as the cluster held any paused sandbox at all — which
-                    # is the normal, intended state of a cluster that uses pause
-                    # for anything.
-                    #
-                    # 🔴 X-Admin-Token, not X-API-Key: both node endpoints are
-                    # declared with AdminApiKeyAuth and the wrong header is a
-                    # 401, which `-f` turns into the same silent failure.
-                    #
-                    # 🔴 And a non-number is never a zero. `jq -e` exits
-                    # non-zero on a missing field, a non-numeric one, or an
-                    # empty array — which is what this endpoint returns when
-                    # observability is switched off — so "the server did not
-                    # answer" and "the server said none" stay different answers.
-                    # The first retries and then gives up loudly; only the
-                    # second ends the wait.
+                    # 🔴 sandboxPausedCount is always zero: a paused sandbox
+                    # is a snapshot catalog row, not anything this node holds.
                     DRAIN_DEADLINE=$(( $(date +%s) + ${AENV_PRESTOP_DRAIN_TIMEOUT_SECONDS:-900} ))
                     DRAIN_READ_FAILURES=0
                     while true; do
@@ -405,7 +362,7 @@ spec:
                       if [ -z "$count" ]; then
                         DRAIN_READ_FAILURES=$(( DRAIN_READ_FAILURES + 1 ))
                         if [ "$DRAIN_READ_FAILURES" -ge 10 ]; then
-                          echo "preStop: cannot read this node's sandbox count after $DRAIN_READ_FAILURES tries; handing over to the server's own shutdown, which pauses what is still here"
+                          echo "preStop: cannot read this node's sandbox count after $DRAIN_READ_FAILURES tries; handing over to the server's own shutdown, which stops what is still here"
                           break
                         fi
                         echo "preStop: failed to read sandbox count ($DRAIN_READ_FAILURES), retrying..."
@@ -413,13 +370,13 @@ spec:
                         continue
                       fi
                       DRAIN_READ_FAILURES=0
-                      echo "preStop: $count sandbox(es) remaining (running + starting; paused sandboxes are excluded and stay put)"
+                      echo "preStop: $count sandbox(es) remaining (running + starting)"
                       if [ "$count" = "0" ]; then
                         echo "preStop: all sandboxes drained, exiting"
                         break
                       fi
                       if [ "$(date +%s)" -ge "$DRAIN_DEADLINE" ]; then
-                        echo "preStop: drain deadline reached with $count sandbox(es) still here; handing over to the server's own shutdown, which pauses them"
+                        echo "preStop: drain deadline reached with $count sandbox(es) still here; handing over to the server's own shutdown, which stops them"
                         break
                       fi
                       sleep 3

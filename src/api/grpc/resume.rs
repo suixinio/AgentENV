@@ -6,7 +6,7 @@
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
-use crate::api::impls::{DataPlaneResume, DataPlaneResumeRequest, PinRefusalReason};
+use crate::api::impls::{DataPlaneResume, DataPlaneResumeRequest};
 use crate::api::ApiImpl;
 use crate::proto::apiproxy::{
     self as pb, sandbox_resume_service_server::SandboxResumeService as SandboxResumeServiceTrait,
@@ -131,23 +131,6 @@ where
                     &holder,
                 ))
             }
-            DataPlaneResume::PinRefused {
-                reason,
-                origin_node_id,
-                detail,
-            } => {
-                // Pin refusals need an operator-visible log as well as a counter.
-                warn!(
-                    target: "agentenv",
-                    %sandbox_id,
-                    %origin_node_id,
-                    reason = reason.as_str(),
-                    "refusing to wake a sandbox pinned to a node that cannot serve it; \
-                     no other node has its bytes, so this is not retried elsewhere"
-                );
-                record(pin_result_label(reason));
-                Err(refusal(detail, reason.as_str(), &origin_node_id))
-            }
             DataPlaneResume::Exhausted(reason) => {
                 record("resource_exhausted");
                 Err(Status::resource_exhausted(reason))
@@ -188,11 +171,6 @@ fn refusal(message: impl Into<String>, reason: &str, origin_node_id: &str) -> St
     Status::with_metadata(tonic::Code::FailedPrecondition, message, metadata)
 }
 
-/// Returns the wire reason as the metric label for pin refusals.
-fn pin_result_label(reason: PinRefusalReason) -> &'static str {
-    reason.as_str()
-}
-
 fn record(result: &'static str) {
     metrics::counter!("agentenv_api_resume_grpc_total", "result" => result).increment(1);
 }
@@ -210,10 +188,6 @@ pub fn describe_metrics() {
         "unavailable",
         "internal",
         "timed_out",
-        PinRefusalReason::OriginNotReporting.as_str(),
-        PinRefusalReason::OriginNotAcceptingWork.as_str(),
-        PinRefusalReason::OriginNotReachableFromHere.as_str(),
-        PinRefusalReason::OriginUnclassified.as_str(),
     ] {
         metrics::counter!("agentenv_api_resume_grpc_total", "result" => result).increment(0);
     }

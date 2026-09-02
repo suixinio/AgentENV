@@ -140,6 +140,17 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
         )
     }
 
+    async fn set_origin_node_id(
+        &self,
+        id: &SnapshotId,
+        origin_node_id: &str,
+    ) -> RepositoryResult<()> {
+        metrics::record_catalog_outcome(
+            "set_origin_node_id",
+            writes::set_origin_node_id(&self.pool, self.cluster_id, id, origin_node_id).await,
+        )
+    }
+
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
         PostgresSnapshotCatalog::resolve_alias_scoped(self, alias, CatalogReadScope::Resolvable)
             .await
@@ -269,6 +280,7 @@ mod pg {
             resources: resources(),
             created_at_unix_ms: None,
             committed: CommittedSnapshot::mock(),
+            origin_node_id: None,
         }
     }
 
@@ -367,6 +379,7 @@ mod pg {
             resources: resources(),
             created_at_unix_ms: None,
             committed: CommittedSnapshot::mock(),
+            origin_node_id: None,
         };
 
         let published = catalog
@@ -607,6 +620,7 @@ mod pg {
             resources: resources(),
             created_at_unix_ms: None,
             committed: CommittedSnapshot::mock(),
+            origin_node_id: None,
         };
         catalog
             .publish_commit(sandbox_commit)

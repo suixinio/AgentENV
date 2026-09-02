@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, OnceLock},
+    sync::OnceLock,
     time::{Duration, SystemTime},
 };
 
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::orchestrator::SandboxState;
 use crate::sandbox::CustomExtensionParams;
-use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
+use crate::sandbox::SandboxNetworkPolicy;
 use crate::snapshot::{CommandContext, SnapshotRuntimeVersions, StartupCommand};
 use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
@@ -136,7 +136,7 @@ fn decode_control_plane_config<'de, D: serde::Deserializer<'de>>(
 }
 
 // Absent and empty markers map to `None`; malformed base64 remains an error.
-fn deserialize_optional_control_plane_config<'de, D>(
+pub(crate) fn deserialize_optional_control_plane_config<'de, D>(
     deserializer: D,
 ) -> Result<Option<ControlPlaneConfig>, D::Error>
 where
@@ -230,13 +230,9 @@ pub struct SandboxMetadata {
     /// Running time spent by completed runs; defaults to zero for older records.
     #[serde(default)]
     pub running_elapsed: Duration,
-    /// Start of the current running interval; synchronized from `state` and not persisted.
+    /// Start of the current running interval; not persisted.
     #[serde(skip)]
     pub running_since: Option<SystemTime>,
-    /// Paused state produced by the sandbox backend during `pause`.
-    /// Passed back to the backend factory when `resume_sandbox` is called.
-    #[serde(skip)]
-    pub paused_state: Option<Arc<dyn PausedSandboxState>>,
 }
 
 impl Default for SandboxMetadata {
@@ -273,7 +269,6 @@ impl Default for SandboxMetadata {
             max_lifetime: None,
             running_elapsed: Duration::ZERO,
             running_since: None,
-            paused_state: None,
         }
     }
 }
@@ -286,33 +281,32 @@ impl SandboxMetadata {
     /// Returns the deadline for remaining running-time budget.
     pub fn lifetime_deadline(&self, now: SystemTime) -> Option<SystemTime> {
         let remaining = self.max_lifetime?.saturating_sub(self.running_elapsed);
-        let anchor = match self.running_since {
-            // Ignore a stale start timestamp when the state is not running.
-            Some(since) if self.state.spends_lifetime() => since,
-            _ => now,
-        };
+        let anchor = self.running_since.unwrap_or(now);
 
         anchor.checked_add(remaining)
     }
 
-    /// Synchronizes the running clock with state, charging completed intervals once.
+    /// Starts the running clock if no interval is open. Every recorded state
+    /// spends lifetime: a paused sandbox has no record.
     pub fn sync_running_clock(&mut self, now: SystemTime) {
-        match (self.state.spends_lifetime(), self.running_since) {
-            (true, None) => self.running_since = Some(now),
-            (false, Some(since)) => {
-                self.running_elapsed = self
-                    .running_elapsed
-                    .saturating_add(now.duration_since(since).unwrap_or(Duration::ZERO));
-                self.running_since = None;
-            }
-            _ => {}
+        if self.running_since.is_none() {
+            self.running_since = Some(now);
         }
+    }
+
+    /// Running time spent by this and earlier runs, as of `now`.
+    pub fn running_elapsed_at(&self, now: SystemTime) -> Duration {
+        let open = self
+            .running_since
+            .and_then(|since| now.duration_since(since).ok())
+            .unwrap_or(Duration::ZERO);
+        self.running_elapsed.saturating_add(open)
     }
 
     /// Restarts the lifetime budget for a newly forked child.
     pub fn restart_lifetime_clock(&mut self, now: SystemTime) {
         self.running_elapsed = Duration::ZERO;
-        self.running_since = self.state.spends_lifetime().then_some(now);
+        self.running_since = Some(now);
     }
 
     /// Returns remaining lifetime plus routing grace, or `0` for receiver default.
@@ -558,11 +552,11 @@ mod tests {
     }
 
     #[test]
-    fn a_paused_sandbox_carries_its_budget_forward_instead_of_burning_it() {
+    fn a_record_with_no_open_run_carries_its_budget_forward_instead_of_burning_it() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
-        let paused = SandboxMetadata {
+        let parked = SandboxMetadata {
             created_at: base,
-            state: SandboxState::Paused,
+            state: SandboxState::Running,
             max_lifetime: Some(Duration::from_secs(86_400)),
             running_elapsed: Duration::from_secs(60),
             running_since: None,
@@ -571,7 +565,7 @@ mod tests {
 
         let much_later = base + Duration::from_secs(90_000);
         assert_eq!(
-            paused.lifetime_deadline(much_later),
+            parked.lifetime_deadline(much_later),
             Some(much_later + Duration::from_secs(86_340)),
             "the budget left is the ceiling minus the minute actually spent running"
         );
@@ -593,20 +587,22 @@ mod tests {
         assert_eq!(metadata.running_since, Some(base));
         assert_eq!(metadata.running_elapsed, Duration::ZERO);
 
-        metadata.state = SandboxState::Paused;
+        metadata.state = SandboxState::Pausing;
         metadata.sync_running_clock(base + Duration::from_secs(60));
-        assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
-        assert_eq!(metadata.running_since, None);
-        metadata.sync_running_clock(base + Duration::from_secs(90_000));
-        assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
+        assert_eq!(
+            metadata.running_since,
+            Some(base),
+            "a state change does not close the run"
+        );
+        assert_eq!(metadata.running_elapsed, Duration::ZERO);
 
-        metadata.state = SandboxState::Running;
+        metadata.running_since = None;
         metadata.sync_running_clock(base + Duration::from_secs(90_000));
         assert_eq!(
             metadata.running_since,
             Some(base + Duration::from_secs(90_000))
         );
-        assert_eq!(metadata.running_elapsed, Duration::from_secs(60));
+        assert_eq!(metadata.running_elapsed, Duration::ZERO);
     }
 
     #[test]
@@ -808,7 +804,7 @@ mod tests {
     fn a_record_written_before_the_running_clock_existed_still_decodes() {
         let mut document = serde_json::to_value(SandboxMetadata {
             created_at: UNIX_EPOCH + Duration::from_secs(100),
-            state: SandboxState::Paused,
+            state: SandboxState::Running,
             max_lifetime: Some(Duration::from_secs(86_400)),
             running_elapsed: Duration::from_secs(600),
             ..Default::default()
@@ -881,7 +877,6 @@ mod tests {
         assert_eq!(decoded.user_metadata, record.user_metadata);
         assert_eq!(decoded.state, record.state);
 
-        assert!(decoded.paused_state.is_none());
         assert!(decoded.running_since.is_none());
     }
 
@@ -1003,7 +998,7 @@ mod golden {
             execution_id: ExecutionId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c08").unwrap(),
             snapshot_id: "0199c8ff-1122-7000-8000-aabbccddeeff".to_string(),
             snapshot_alias: Some("tpl-node22".to_string()),
-            state: SandboxState::Paused,
+            state: SandboxState::Pausing,
             created_at: UNIX_EPOCH + Duration::new(1_755_561_600, 123_456_789),
             timeout: Some(Duration::new(900, 0)),
             timeout_action: SandboxTimeoutAction::Delete,
@@ -1066,7 +1061,6 @@ mod golden {
             running_elapsed: Duration::new(5_400, 0),
             // Skipped from serialization.
             running_since: None,
-            paused_state: None,
         }
     }
 

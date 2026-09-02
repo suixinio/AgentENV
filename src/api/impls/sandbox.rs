@@ -14,6 +14,7 @@ use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
     CreateSandboxRequest, ForkChildren, NewTimeout, OrchestratorError, SandboxExpiry,
     SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    StoreError,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -25,7 +26,6 @@ use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::unresolved_attached_drives;
 use super::pagination::PaginationCursor;
-use super::paused_recovery::{CrossNodeResume, MissingLocalResume, ResumeArbitration};
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
@@ -98,10 +98,9 @@ impl From<OrchestratorError> for models::Error {
 impl From<SandboxState> for models::SandboxState {
     fn from(state: SandboxState) -> Self {
         match state {
-            SandboxState::Pausing
-            | SandboxState::Paused
-            | SandboxState::Snapshotting
-            | SandboxState::Forking => Self::Paused,
+            SandboxState::Pausing | SandboxState::Snapshotting | SandboxState::Forking => {
+                Self::Paused
+            }
             _ => Self::Running,
         }
     }
@@ -194,7 +193,9 @@ fn base_policy_from_allow_internet_access(value: Option<bool>) -> BaseSandboxNet
     }
 }
 
-fn allow_internet_access_from_base_policy(policy: BaseSandboxNetworkPolicy) -> Nullable<bool> {
+pub(super) fn allow_internet_access_from_base_policy(
+    policy: BaseSandboxNetworkPolicy,
+) -> Nullable<bool> {
     match policy {
         BaseSandboxNetworkPolicy::Default => Nullable::Null,
         BaseSandboxNetworkPolicy::Allow => Nullable::Present(true),
@@ -267,32 +268,13 @@ impl ApiImpl {
         sandbox
     }
 
-    /// Maps a snapshot-backed rebuild onto the resume endpoint's responses.
-    fn rebuilt_resume_response(
-        &self,
-        rebuilt: CrossNodeResume,
-        sandbox_id: SandboxId,
-    ) -> SandboxesSandboxIdResumePostResponse {
-        match rebuilt {
-            CrossNodeResume::Restored(metadata) => {
-                let routing = RoutingHeaders::of(&metadata);
-
-                SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
-                    body: self.sandbox_model(*metadata),
-                    x_agentenv_sandbox_id: Some(routing.sandbox_id),
-                    x_agentenv_execution_id: Some(routing.execution_id),
-                    x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
-                }
-            }
-            CrossNodeResume::NotFound => SandboxesSandboxIdResumePostResponse::Status404_NotFound(
-                sandbox_not_found(sandbox_id.to_string()),
-            ),
-            CrossNodeResume::Failed(reason) => {
-                SandboxesSandboxIdResumePostResponse::Status500_ServerError(Self::error(
-                    500,
-                    format!("failed to restore paused sandbox: {reason}"),
-                ))
-            }
+    fn resumed_response(&self, metadata: SandboxMetadata) -> SandboxesSandboxIdResumePostResponse {
+        let routing = RoutingHeaders::of(&metadata);
+        SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
+            body: self.sandbox_model(metadata),
+            x_agentenv_sandbox_id: Some(routing.sandbox_id),
+            x_agentenv_execution_id: Some(routing.execution_id),
+            x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
         }
     }
 }
@@ -514,6 +496,7 @@ impl Sandboxes<()> for ApiImpl {
             control_plane_config: None,
             // User REST creates mint their incarnation in the orchestrator.
             execution_id: None,
+            preferred_node_id: None,
         };
 
         match timer
@@ -658,6 +641,7 @@ impl Sandboxes<()> for ApiImpl {
             control_plane_config: None,
             // User REST creates mint their incarnation in the orchestrator.
             execution_id: None,
+            preferred_node_id: None,
         };
 
         match timer
@@ -699,8 +683,78 @@ impl Sandboxes<()> for ApiImpl {
                 sandbox_not_found(path_id),
             ));
         };
-        let metadata = match self.orchestrator.get_sandbox(&sandbox_id).await {
-            Ok(Some(metadata)) => metadata,
+        let timeout = Duration::from_secs(body.timeout as u64);
+        match self.orchestrator.get_sandbox(&sandbox_id).await {
+            Ok(Some(metadata)) => match metadata.state {
+                SandboxState::Creating
+                | SandboxState::Running
+                | SandboxState::Snapshotting
+                | SandboxState::Forking => {
+                    match self
+                        .orchestrator
+                        .keep_alive_for(sandbox_id, Some(timeout), false)
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(OrchestratorError::SandboxNotFound(id)) => {
+                            return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
+                                sandbox_not_found(id),
+                            ));
+                        }
+                        Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
+                            return Ok(
+                                SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                                    Self::error(400, format!("invalid timeout: {timeout:?}")),
+                                ),
+                            );
+                        }
+                        Err(err) => {
+                            return Ok(
+                                SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
+                                    err.into(),
+                                ),
+                            );
+                        }
+                    }
+                    // Include the incarnation required for the gateway's projection write.
+                    let routing = RoutingHeaders::of(&metadata);
+
+                    return Ok(
+                        SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning {
+                            body: self.sandbox_model(metadata),
+                            x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                            x_agentenv_execution_id: Some(routing.execution_id),
+                            x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                        },
+                    );
+                }
+                SandboxState::Killing => {
+                    return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
+                        sandbox_not_found(sandbox_id),
+                    ));
+                }
+                SandboxState::Pausing => {
+                    return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                        Self::error(400, "sandbox is pausing; connect again once it has paused"),
+                    ));
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
+                return Ok(
+                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
+                );
+            }
+        }
+        if !self.owns_sandboxes() {
+            return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
+                sandbox_not_found(sandbox_id),
+            ));
+        }
+
+        // No record: resume from the sandbox's newest pause, if it has one.
+        let record = match self.latest_paused_snapshot(sandbox_id).await {
+            Ok(Some(record)) => record,
             Ok(None) => {
                 return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
                     sandbox_not_found(sandbox_id),
@@ -708,195 +762,54 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(err) => {
                 return Ok(
-                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
+                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
+                        Self::snapshot_manager_error(&err),
+                    ),
                 );
             }
         };
-
-        match metadata.state {
-            SandboxState::Creating
-            | SandboxState::Resuming
-            | SandboxState::Running
-            | SandboxState::Snapshotting
-            | SandboxState::Forking => {
-                match self
-                    .orchestrator
-                    .keep_alive_for(sandbox_id, duration_from_secs(Some(body.timeout)), false)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(OrchestratorError::SandboxNotFound(id)) => {
-                        return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
-                            sandbox_not_found(id),
-                        ));
-                    }
-                    Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
-                        return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                            Self::error(400, format!("invalid timeout: {timeout:?}")),
-                        ));
-                    }
-                    Err(err) => {
-                        return Ok(
-                            SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
-                                err.into(),
-                            ),
-                        );
-                    }
-                }
-                // Include the incarnation required for the gateway's projection write.
-                let routing = RoutingHeaders::of(&metadata);
-
-                return Ok(
-                    SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(routing.sandbox_id),
-                        x_agentenv_execution_id: Some(routing.execution_id),
-                        x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
-                    },
-                );
-            }
-            SandboxState::Killing => {
-                return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
-                    sandbox_not_found(sandbox_id),
-                ));
-            }
-            SandboxState::Pausing | SandboxState::Paused => {}
-        }
-
-        // Arbitrate every resume path before touching the local sandbox.
-        let (entry, claimed, connect_held) = match self.arbitrate_resume(sandbox_id).await {
-            ResumeArbitration::Proceed(claimed) => (None, claimed, None),
-            ResumeArbitration::Held(entry, claimed) => {
-                let generation = entry.generation;
-                (Some(entry), claimed, Some(generation))
-            }
-            ResumeArbitration::Blocked { origin_node_id } => {
-                return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                    Self::error(400, format!("sandbox is held by node '{origin_node_id}'")),
-                ));
-            }
-            ResumeArbitration::NotReady { origin_node_id } => {
-                return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                    Self::error(
-                        400,
-                        format!(
-                            "sandbox snapshot is still being published by node '{origin_node_id}'"
-                        ),
-                    ),
-                ));
-            }
-            // Unavailability is not absence; 404 would permit a destructive rebuild.
-            ResumeArbitration::Unavailable { reason } => {
+        let request = match Self::restore_request(record.clone(), NewTimeout::Set(timeout)) {
+            Ok(request) => request,
+            Err(err) => {
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(Self::error(
                         500,
-                        format!("cannot determine whether the sandbox is live elsewhere: {reason}"),
+                        err.to_string(),
                     )),
                 );
             }
         };
-
-        // try to resume the sandbox
         match self
             .orchestrator()
-            .resume_sandbox(
-                sandbox_id,
-                NewTimeout::Set(Duration::from_secs(body.timeout as u64)),
-                claimed,
-            )
+            .restore_sandbox(sandbox_id, request)
             .await
         {
             Ok(resumed_metadata) => {
-                // Confirm a held claim after the resume chooses its actual node.
-                if connect_held.is_some() {
-                    // Record the node where the resume actually landed.
-                    let holding_node_id = self
-                        .orchestrator()
-                        .sandbox_holding_node_id(&sandbox_id)
-                        .await;
-                    self.paused
-                        .mark_sandbox_running(
-                            sandbox_id,
-                            resumed_metadata.execution_id,
-                            resumed_metadata.expires_at,
-                            holding_node_id,
-                        )
-                        .await;
-                }
-
+                self.note_resume_landing(&record, &resumed_metadata).await;
                 let routing = RoutingHeaders::of(&resumed_metadata);
 
-                return Ok(
-                SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully {
-                    body: self.sandbox_model(resumed_metadata),
-                    x_agentenv_sandbox_id: Some(routing.sandbox_id),
-                    x_agentenv_execution_id: Some(routing.execution_id),
-                    x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
-                },
-            );
+                Ok(
+                    SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully {
+                        body: self.sandbox_model(resumed_metadata),
+                        x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                        x_agentenv_execution_id: Some(routing.execution_id),
+                        x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                    },
+                )
             }
-            Err(OrchestratorError::SandboxNotFound(id)) => {
-                if let Some(generation) = connect_held {
-                    self.abandon_claim(sandbox_id, generation).await;
-                }
-                return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
-                ));
-            }
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
-                if let Some(generation) = connect_held {
-                    self.abandon_claim(sandbox_id, generation).await;
-                }
-                return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                    Self::error(
-                        400,
-                        format!("sandbox cannot be resumed from {} state", state),
-                    ),
-                ));
-            }
+            Err(OrchestratorError::StoreOperationFailed(StoreError::SandboxAlreadyExists {
+                ..
+            })) => Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                Self::error(400, "sandbox is already being resumed"),
+            )),
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
+                SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    format!("sandbox cannot be resumed from {} state", state),
+                )),
+            ),
             Err(err) => {
-                // The origin cannot serve this reopen, and the row names a snapshot.
-                if let Some(entry) = entry.filter(|_| err.paused_resume_warrants_rebuild()) {
-                    let rebuilt = self
-                        .rebuild_instead_of_reopening(
-                            entry,
-                            NewTimeout::Set(Duration::from_secs(body.timeout as u64)),
-                        )
-                        .await;
-
-                    return Ok(match rebuilt {
-                        CrossNodeResume::Restored(metadata) => {
-                            let routing = RoutingHeaders::of(&metadata);
-
-                            SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully {
-                                body: self.sandbox_model(*metadata),
-                                x_agentenv_sandbox_id: Some(routing.sandbox_id),
-                                x_agentenv_execution_id: Some(routing.execution_id),
-                                x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
-                            }
-                        }
-                        CrossNodeResume::NotFound => {
-                            SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
-                                sandbox_not_found(sandbox_id.to_string()),
-                            )
-                        }
-                        CrossNodeResume::Failed(reason) => {
-                            SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
-                                Self::error(
-                                    500,
-                                    format!("failed to restore paused sandbox: {reason}"),
-                                ),
-                            )
-                        }
-                    });
-                }
-
-                if let Some(generation) = connect_held {
-                    self.abandon_claim(sandbox_id, generation).await;
-                }
-                return Ok(
-                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
-                );
+                Ok(SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()))
             }
         }
     }
@@ -915,25 +828,35 @@ impl Sandboxes<()> for ApiImpl {
                 sandbox_not_found(path_id),
             ));
         };
-        // Discard a stale local record before deleting cluster-owned state.
-        self.discard_if_superseded(sandbox_id).await;
-
-        match self.orchestrator().delete_sandbox(sandbox_id).await {
-            // The orchestrator removes its cluster row and snapshot.
-            Ok(_) => {
-                Ok(SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully)
-            }
-            Err(OrchestratorError::SandboxNotFound(id)) => {
-                // A published paused record may exist even without a local sandbox.
-                self.forget_paused_sandbox(sandbox_id).await;
-
-                Ok(SandboxesSandboxIdDeleteResponse::Status404_NotFound(
-                    sandbox_not_found(id),
+        // Kill the running sandbox if there is one, then forget every pause of
+        // it; only a sandbox that is neither running nor paused is not found.
+        let killed = match self.orchestrator().delete_sandbox(sandbox_id).await {
+            Ok(_) => true,
+            Err(OrchestratorError::SandboxNotFound(_)) => false,
+            Err(err) => {
+                return Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
+                    err.into(),
                 ))
             }
-            Err(err) => Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
-                err.into(),
-            )),
+        };
+        let forgotten = if self.owns_sandboxes() {
+            match self.forget_paused_snapshots(sandbox_id).await {
+                Ok(deleted) => deleted > 0,
+                Err(err) => {
+                    return Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
+                        Self::snapshot_manager_error(&err),
+                    ))
+                }
+            }
+        } else {
+            false
+        };
+        if killed || forgotten {
+            Ok(SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully)
+        } else {
+            Ok(SandboxesSandboxIdDeleteResponse::Status404_NotFound(
+                sandbox_not_found(sandbox_id),
+            ))
         }
     }
 
@@ -1028,9 +951,30 @@ impl Sandboxes<()> for ApiImpl {
         let metadata = match self.orchestrator.get_sandbox(&sandbox_id).await {
             Ok(Some(metadata)) => metadata,
             Ok(None) => {
-                return Ok(SandboxesSandboxIdGetResponse::Status404_NotFound(
-                    sandbox_not_found(sandbox_id),
-                ));
+                // No record: the sandbox is paused, or it does not exist.
+                if !self.owns_sandboxes() {
+                    return Ok(SandboxesSandboxIdGetResponse::Status404_NotFound(
+                        sandbox_not_found(sandbox_id),
+                    ));
+                }
+                return Ok(match self.latest_paused_snapshot(sandbox_id).await {
+                    Ok(Some(record)) => match super::paused::paused_sandbox_detail(&record) {
+                        Some(detail) => {
+                            SandboxesSandboxIdGetResponse::Status200_SuccessfullyReturnedTheSandbox(
+                                detail,
+                            )
+                        }
+                        None => SandboxesSandboxIdGetResponse::Status404_NotFound(
+                            sandbox_not_found(sandbox_id),
+                        ),
+                    },
+                    Ok(None) => SandboxesSandboxIdGetResponse::Status404_NotFound(
+                        sandbox_not_found(sandbox_id),
+                    ),
+                    Err(err) => SandboxesSandboxIdGetResponse::Status500_ServerError(
+                        Self::snapshot_manager_error(&err),
+                    ),
+                });
             }
             Err(err) => {
                 return Ok(SandboxesSandboxIdGetResponse::Status500_ServerError(
@@ -1205,13 +1149,23 @@ impl Sandboxes<()> for ApiImpl {
             .time("pause", self.orchestrator().pause_sandbox(sandbox_id))
             .await
         {
-            // The orchestrator publishes every pause path.
+            // The pause published its snapshot; the sandbox is gone from the node.
             Ok(_) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
             ),
-            Err(OrchestratorError::SandboxNotFound(id)) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
-            ),
+            Err(OrchestratorError::SandboxNotFound(id)) => {
+                // Already paused reads as a conflict, never as absence.
+                if self.owns_sandboxes()
+                    && matches!(self.latest_paused_snapshot(id).await, Ok(Some(_)))
+                {
+                    return Ok(SandboxesSandboxIdPausePostResponse::Status409_Conflict(
+                        Self::error(409, format!("sandbox {id} is already paused")),
+                    ));
+                }
+                Ok(SandboxesSandboxIdPausePostResponse::Status404_NotFound(
+                    sandbox_not_found(id),
+                ))
+            }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status409_Conflict(Self::error(
                     409,
@@ -1288,7 +1242,11 @@ impl Sandboxes<()> for ApiImpl {
                 "publish",
                 // Use the staged result's id; a remote node may have chosen it.
                 self.snapshot_manager.publish_captured(
-                    crate::orchestrator::capture_publish_metadata(&capture.metadata, alias.clone()),
+                    crate::orchestrator::capture_publish_metadata(
+                        &capture.metadata,
+                        alias.clone(),
+                        None,
+                    ),
                     capture.captured_snapshot,
                 ),
             )
@@ -1375,177 +1333,106 @@ impl Sandboxes<()> for ApiImpl {
         };
         let timeout = duration_from_secs(body.timeout).unwrap_or(default_sandbox_timeout());
 
-        // Drop a superseded local record before attempting resume.
-        self.discard_if_superseded(sandbox_id).await;
-
-        // Arbitrate again to close the race with a concurrent resume.
-        let arbitration = self.arbitrate_resume(sandbox_id).await;
-        let held = match &arbitration {
-            ResumeArbitration::Blocked { origin_node_id } => {
-                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                    Self::error(409, format!("sandbox is held by node '{origin_node_id}'")),
-                ));
-            }
-            ResumeArbitration::NotReady { origin_node_id } => {
-                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                    Self::error(
-                        409,
-                        format!(
-                            "sandbox snapshot is still being published by node '{origin_node_id}'"
+        // A running sandbox is answered as it stands; one mid-transition is
+        // refused; only the absence of a record reads the snapshot row.
+        match self.orchestrator.get_sandbox(&sandbox_id).await {
+            Ok(Some(metadata)) => match metadata.state {
+                SandboxState::Running => {
+                    let metadata = match self
+                        .orchestrator
+                        .keep_alive_for(sandbox_id, Some(timeout), true)
+                        .await
+                    {
+                        Ok(Some(metadata)) => metadata,
+                        Ok(None) => metadata,
+                        Err(OrchestratorError::SandboxNotFound(id)) => {
+                            return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                                sandbox_not_found(id),
+                            ))
+                        }
+                        Err(err) => {
+                            return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                                err.into(),
+                            ))
+                        }
+                    };
+                    return Ok(self.resumed_response(metadata));
+                }
+                SandboxState::Killing => {
+                    return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                        sandbox_not_found(sandbox_id),
+                    ));
+                }
+                state => {
+                    return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                        Self::error(
+                            409,
+                            format!("sandbox cannot be resumed from {} state", state),
                         ),
-                    ),
-                ));
-            }
-            // Unavailability is not absence; 404 would permit a destructive rebuild.
-            // OpenAPI has no 503 response, so this remains the consumer-equivalent 500.
-            ResumeArbitration::Unavailable { reason } => {
+                    ));
+                }
+            },
+            Ok(None) => {}
+            Err(err) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                    Self::error(
-                        500,
-                        format!("cannot determine whether the sandbox is live elsewhere: {reason}"),
-                    ),
+                    err.into(),
                 ));
             }
-            ResumeArbitration::Held(entry, _) => Some(entry.generation),
-            ResumeArbitration::Proceed(_) => None,
-        };
+        }
+        if !self.owns_sandboxes() {
+            return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                sandbox_not_found(sandbox_id),
+            ));
+        }
 
-        // Separate the optional rebuild row from the claim consumed by resume.
-        let (entry, claimed) = match arbitration {
-            ResumeArbitration::Held(entry, claimed) => (Some(entry), claimed),
-            ResumeArbitration::Proceed(claimed) => (None, claimed),
-            _ => unreachable!("refusals return before this point"),
+        let record = match self.latest_paused_snapshot(sandbox_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                    sandbox_not_found(sandbox_id),
+                ));
+            }
+            Err(err) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ));
+            }
+        };
+        let request = match Self::restore_request(record.clone(), NewTimeout::Set(timeout)) {
+            Ok(request) => request,
+            Err(err) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                    Self::error(500, err.to_string()),
+                ));
+            }
         };
 
         let timer = SandboxStageTimer::new("resume");
         match timer
             .time(
                 "resume",
-                self.orchestrator()
-                    .resume_sandbox(sandbox_id, NewTimeout::Set(timeout), claimed),
+                self.orchestrator().restore_sandbox(sandbox_id, request),
             )
             .await
         {
             Ok(metadata) => {
-                // Confirm a held claim after the resume chooses its actual node.
-                if held.is_some() {
-                    // Record the node where the resume actually landed.
-                    let holding_node_id = self
-                        .orchestrator()
-                        .sandbox_holding_node_id(&sandbox_id)
-                        .await;
-                    self.paused
-                        .mark_sandbox_running(
-                            sandbox_id,
-                            metadata.execution_id,
-                            metadata.expires_at,
-                            holding_node_id,
-                        )
-                        .await;
-                }
-
-                let routing = RoutingHeaders::of(&metadata);
-
-                return Ok(
-                    SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(routing.sandbox_id),
-                        x_agentenv_execution_id: Some(routing.execution_id),
-                        x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
-                    },
-                );
+                self.note_resume_landing(&record, &metadata).await;
+                Ok(self.resumed_response(metadata))
             }
-            Err(OrchestratorError::SandboxNotFound(id)) => {
-                // A claimed catalog row can rebuild a missing local sandbox.
-                let Some(entry) = entry else {
-                    // A concurrent resume loser can arrive here while the winner starts the sandbox.
-                    // Confirm cluster absence before returning 404, which permits rebuild.
-                    return Ok(
-                        match self
-                            .resolve_missing_local_resume(sandbox_id, NewTimeout::Set(timeout))
-                            .await
-                        {
-                            MissingLocalResume::Unknown => {
-                                SandboxesSandboxIdResumePostResponse::Status404_NotFound(
-                                    sandbox_not_found(id),
-                                )
-                            }
-                            MissingLocalResume::Resumed(metadata) => {
-                                let routing = RoutingHeaders::of(&metadata);
-
-                                SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
-                                body: self.sandbox_model(*metadata),
-                                x_agentenv_sandbox_id: Some(routing.sandbox_id),
-                                x_agentenv_execution_id: Some(routing.execution_id),
-                                x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
-                            }
-                            }
-                            MissingLocalResume::Busy { holder } => {
-                                SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                                    Self::error(
-                                        409,
-                                        format!("sandbox is being resumed by node '{holder}'"),
-                                    ),
-                                )
-                            }
-                            MissingLocalResume::Undecided(reason) => {
-                                SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                                    Self::error(
-                                        500,
-                                        format!(
-                                    "cannot determine whether the sandbox still exists: {reason}"
-                                ),
-                                    ),
-                                )
-                            }
-                            MissingLocalResume::Failed(reason) => {
-                                SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                                    Self::error(
-                                        500,
-                                        format!("failed to restore paused sandbox: {reason}"),
-                                    ),
-                                )
-                            }
-                        },
-                    );
-                };
-
-                let rebuilt = self
-                    .restore_claimed_sandbox(*entry, NewTimeout::Set(timeout))
-                    .await;
-
-                return Ok(self.rebuilt_resume_response(rebuilt, sandbox_id));
-            }
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
-                if let Some(generation) = held {
-                    self.abandon_claim(sandbox_id, generation).await;
-                }
-
-                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                    Self::error(
-                        409,
-                        format!("sandbox cannot be resumed from {} state", state),
-                    ),
-                ));
-            }
-            Err(err) => {
-                // The origin cannot serve this reopen, and the row names a snapshot.
-                if let Some(entry) = entry.filter(|_| err.paused_resume_warrants_rebuild()) {
-                    let rebuilt = self
-                        .rebuild_instead_of_reopening(entry, NewTimeout::Set(timeout))
-                        .await;
-
-                    return Ok(self.rebuilt_resume_response(rebuilt, sandbox_id));
-                }
-
-                if let Some(generation) = held {
-                    self.abandon_claim(sandbox_id, generation).await;
-                }
-
-                return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                    err.into(),
-                ));
-            }
+            Err(OrchestratorError::StoreOperationFailed(StoreError::SandboxAlreadyExists {
+                ..
+            })) => Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                Self::error(409, "sandbox is already being resumed"),
+            )),
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
+                SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
+                    409,
+                    format!("sandbox cannot be resumed from {} state", state),
+                )),
+            ),
+            Err(err) => Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
+                err.into(),
+            )),
         }
     }
 
@@ -1596,21 +1483,21 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         query_params: &models::V2SandboxesGetQueryParams,
     ) -> Result<V2SandboxesGetResponse, ()> {
-        let states = if query_params.state.len() == 1 {
-            Some(vec![match query_params.state[0] {
-                models::SandboxState::Running => SandboxState::Running,
-                models::SandboxState::Paused => SandboxState::Paused,
-            }])
+        // Only two states are supported. With both, or neither, named, the
+        // listing spans running records and paused rows alike.
+        let (want_running, want_paused) = if query_params.state.len() == 1 {
+            match query_params.state[0] {
+                models::SandboxState::Running => (true, false),
+                models::SandboxState::Paused => (false, true),
+            }
         } else {
-            // Only two states are supported. If multiple states are provided,
-            // treat it as no state filter (i.e. return all sandboxes regardless of state)
-            None
+            (true, true)
         };
-
+        let user_metadata = parse_metadata_filter(&query_params.metadata);
         let filter = SandboxListFilter {
-            states,
+            states: Some(vec![SandboxState::Running]),
             excluded_states: None,
-            user_metadata: parse_metadata_filter(&query_params.metadata),
+            user_metadata: user_metadata.clone(),
         };
 
         let cursor = match query_params.next_token.as_deref() {
@@ -1626,32 +1513,76 @@ impl Sandboxes<()> for ApiImpl {
             None => PaginationCursor::new(SystemTime::now(), SandboxId::max()),
         };
 
-        let list = match self.orchestrator.list_sandboxes_filtered(filter).await {
+        // Running records are read either way: a resumed sandbox keeps the row
+        // it was resumed from, and only its record says it is not paused.
+        let running = match self.orchestrator.list_sandboxes_filtered(filter).await {
             Ok(list) => list,
             Err(err) => {
                 return Ok(V2SandboxesGetResponse::Status500_ServerError(err.into()));
             }
         };
+        let mut listed: Vec<(SystemTime, SandboxId, models::ListedSandbox)> = if want_running {
+            running
+                .iter()
+                .map(|sandbox| {
+                    (
+                        sandbox.created_at,
+                        sandbox.id,
+                        models::ListedSandbox::from(sandbox.clone()),
+                    )
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if want_paused && self.owns_sandboxes() {
+            let running_ids: std::collections::HashSet<SandboxId> =
+                running.iter().map(|sandbox| sandbox.id).collect();
+            let paused = match self.list_paused_snapshots().await {
+                Ok(paused) => paused,
+                Err(err) => {
+                    return Ok(V2SandboxesGetResponse::Status500_ServerError(
+                        Self::snapshot_manager_error(&err),
+                    ));
+                }
+            };
+            for record in &paused {
+                let Some(sandbox_id) = super::paused::paused_sandbox_id(record) else {
+                    continue;
+                };
+                // A sandbox resumed since its last pause is listed once, as running.
+                if running_ids.contains(&sandbox_id) {
+                    continue;
+                }
+                let Some(model) = super::paused::listed_paused_sandbox(record) else {
+                    continue;
+                };
+                if let Some(wanted) = user_metadata.as_ref() {
+                    let has = model.metadata.as_ref();
+                    if !wanted.iter().all(|(key, value)| {
+                        has.is_some_and(|metadata| metadata.get(key) == Some(value))
+                    }) {
+                        continue;
+                    }
+                }
+                listed.push((super::paused::paused_started_at(record), sandbox_id, model));
+            }
+        }
 
         let page = cursor.paginate(
-            list,
+            listed,
             query_params.limit,
-            |a, b| PaginationCursor::compare_desc(a.created_at, &a.id, b.created_at, &b.id),
-            |sandbox, cursor| {
-                PaginationCursor::compare_desc(
-                    sandbox.created_at,
-                    &sandbox.id,
-                    cursor.time(),
-                    cursor.value(),
-                )
+            |a, b| PaginationCursor::compare_desc(a.0, &a.1, b.0, &b.1),
+            |entry, cursor| {
+                PaginationCursor::compare_desc(entry.0, &entry.1, cursor.time(), cursor.value())
             },
-            |sandbox| PaginationCursor::new(sandbox.created_at, sandbox.id),
+            |entry| PaginationCursor::new(entry.0, entry.1),
         );
 
         let out = page
             .items
             .into_iter()
-            .map(models::ListedSandbox::from)
+            .map(|(_, _, model)| model)
             .collect::<Vec<_>>();
 
         Ok(
@@ -2011,46 +1942,20 @@ mod warm_start_source_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::identity::NodeIdentity;
-    use crate::orchestrator::{
-        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
-        Orchestrator,
-    };
+    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
 
     async fn surface(row: SnapshotRecord) -> Arc<ApiImpl> {
-        let root = tempfile::tempdir().expect("a temp dir");
-
-        let orchestrator = Orchestrator::new(
-            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-            InMemoryMetadataStore::new(),
-            MockBackendFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().join("paused")),
-            crate::image::DisabledRuntimeImageRefs::shared(),
-        )
-        .await
-        .expect("an orchestrator");
-
-        let snapshot_manager = Arc::new(unresolvable_snapshot_manager(row));
-
-        let api = Arc::new(ApiImpl::new(
+        let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
+        Arc::new(ApiImpl::new(
             orchestrator,
-            Arc::clone(&snapshot_manager),
+            Arc::new(unresolvable_snapshot_manager(row)),
             None,
-            crate::api::PausedSandboxWiring::new(
-                Arc::new(DisabledPausedSandboxRegistry),
-                Arc::clone(&snapshot_manager),
-                &NodeIdentity::from_config(&Default::default()),
-            ),
             Vec::new(),
             crate::api::ResumeWiring::api_half_for_test(),
-        ));
-
-        std::mem::forget(root);
-
-        api
+        ))
     }
 
     fn ready_row() -> SnapshotRecord {
@@ -2081,6 +1986,538 @@ mod warm_start_source_tests {
             "🔴 the assertion. This manager's runtime resolver fails every call, so a create \
              that touched it could not have got here — answering 201 over it is the proof that \
              this route never turned the catalog row into local bytes, got {response:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod paused_sandbox_rest_tests {
+    use std::sync::Arc;
+
+    use axum_extra::extract::CookieJar;
+    use headers::Host;
+    use http::Method;
+
+    use agentenv_http_server::apis::sandboxes::*;
+    use agentenv_http_server::models;
+
+    use super::ApiImpl;
+    use crate::api::ResumeWiring;
+    use crate::orchestrator::{Orchestrator, SandboxState};
+    use crate::sandbox::mock::MockBackendFactory;
+    use crate::snapshot::mock::{
+        in_memory_snapshot_manager, mock_paused_sandbox_config, paused_sandbox_record,
+        InMemorySnapshotCatalog,
+    };
+    use crate::snapshot::repository::interfaces::SnapshotCatalog;
+    use crate::snapshot::PausedSandboxConfig;
+    use crate::types::SandboxId;
+
+    const ORIGIN: &str = "node-origin";
+
+    struct Surface {
+        api: Arc<ApiImpl>,
+        catalog: Arc<InMemorySnapshotCatalog>,
+    }
+
+    impl Surface {
+        async fn as_half(wiring: ResumeWiring) -> Self {
+            let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
+            let (snapshot_manager, catalog) = in_memory_snapshot_manager();
+            let api = Arc::new(ApiImpl::new(
+                orchestrator,
+                Arc::new(snapshot_manager),
+                None,
+                Vec::new(),
+                wiring,
+            ));
+            Self { api, catalog }
+        }
+
+        async fn api_half() -> Self {
+            Self::as_half(ResumeWiring::api_half_for_test()).await
+        }
+
+        async fn node_half() -> Self {
+            Self::as_half(ResumeWiring::node_local(ORIGIN)).await
+        }
+
+        fn paused_at(&self, sandbox_id: SandboxId, paused: PausedSandboxConfig, at_unix_ms: i64) {
+            self.catalog.seed(paused_sandbox_record(
+                sandbox_id,
+                Some(ORIGIN),
+                paused,
+                at_unix_ms,
+            ));
+        }
+
+        fn paused(&self, paused: PausedSandboxConfig) -> SandboxId {
+            let sandbox_id = SandboxId::new();
+            self.paused_at(sandbox_id, paused, 1_700_000_000_000);
+            sandbox_id
+        }
+
+        async fn state_of(&self, sandbox_id: SandboxId) -> Option<SandboxState> {
+            self.api
+                .orchestrator()
+                .get_sandbox(&sandbox_id)
+                .await
+                .expect("the store answers")
+                .map(|metadata| metadata.state)
+        }
+
+        async fn get(&self, sandbox_id: SandboxId) -> SandboxesSandboxIdGetResponse {
+            self.api
+                .sandboxes_sandbox_id_get(
+                    &Method::GET,
+                    &host(),
+                    &CookieJar::new(),
+                    &super::super::Claims,
+                    &models::SandboxesSandboxIdGetPathParams {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                )
+                .await
+                .expect("the handler answers")
+        }
+
+        async fn pause(&self, sandbox_id: SandboxId) -> SandboxesSandboxIdPausePostResponse {
+            self.api
+                .sandboxes_sandbox_id_pause_post(
+                    &Method::POST,
+                    &host(),
+                    &CookieJar::new(),
+                    &super::super::Claims,
+                    &models::SandboxesSandboxIdPausePostPathParams {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                )
+                .await
+                .expect("the handler answers")
+        }
+
+        async fn resume(&self, sandbox_id: SandboxId) -> SandboxesSandboxIdResumePostResponse {
+            self.api
+                .sandboxes_sandbox_id_resume_post(
+                    &Method::POST,
+                    &host(),
+                    &CookieJar::new(),
+                    &super::super::Claims,
+                    &models::SandboxesSandboxIdResumePostPathParams {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                    &models::ResumedSandbox { timeout: Some(60) },
+                )
+                .await
+                .expect("the handler answers")
+        }
+
+        async fn connect(&self, sandbox_id: SandboxId) -> SandboxesSandboxIdConnectPostResponse {
+            self.api
+                .sandboxes_sandbox_id_connect_post(
+                    &Method::POST,
+                    &host(),
+                    &CookieJar::new(),
+                    &super::super::Claims,
+                    &models::SandboxesSandboxIdConnectPostPathParams {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                    &models::ConnectSandbox::new(60),
+                )
+                .await
+                .expect("the handler answers")
+        }
+
+        async fn delete(&self, sandbox_id: SandboxId) -> SandboxesSandboxIdDeleteResponse {
+            self.api
+                .sandboxes_sandbox_id_delete(
+                    &Method::DELETE,
+                    &host(),
+                    &CookieJar::new(),
+                    &super::super::Claims,
+                    &models::SandboxesSandboxIdDeletePathParams {
+                        sandbox_id: sandbox_id.to_string(),
+                    },
+                )
+                .await
+                .expect("the handler answers")
+        }
+
+        async fn list_v2(&self, state: Vec<models::SandboxState>) -> Vec<models::ListedSandbox> {
+            let response = self
+                .api
+                .v2_sandboxes_get(
+                    &Method::GET,
+                    &host(),
+                    &CookieJar::new(),
+                    &super::super::Claims,
+                    &models::V2SandboxesGetQueryParams {
+                        metadata: None,
+                        state,
+                        next_token: None,
+                        limit: None,
+                    },
+                )
+                .await
+                .expect("the handler answers");
+            match response {
+                V2SandboxesGetResponse::Status200_SuccessfullyReturnedAllRunningSandboxes {
+                    body,
+                    ..
+                } => body,
+                other => panic!("expected a listing, got {other:?}"),
+            }
+        }
+    }
+
+    fn host() -> Host {
+        Host::from(http::uri::Authority::from_static("localhost"))
+    }
+
+    fn detail(response: SandboxesSandboxIdGetResponse) -> models::SandboxDetail {
+        match response {
+            SandboxesSandboxIdGetResponse::Status200_SuccessfullyReturnedTheSandbox(detail) => {
+                detail
+            }
+            other => panic!("expected the sandbox, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_paused_sandbox_is_read_from_its_row_with_state_paused() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = surface.paused(PausedSandboxConfig {
+            template_id: "tpl-from-the-row".to_string(),
+            auto_resume: false,
+            user_metadata: Some([("owner".to_string(), "row".to_string())].into()),
+            ..mock_paused_sandbox_config()
+        });
+
+        let detail = detail(surface.get(sandbox_id).await);
+
+        assert_eq!(detail.state, models::SandboxState::Paused);
+        assert_eq!(detail.sandbox_id, sandbox_id.to_string());
+        assert_eq!(detail.template_id, "tpl-from-the-row");
+        assert_eq!(
+            detail.metadata,
+            Some([("owner".to_string(), "row".to_string())].into())
+        );
+        assert_eq!(
+            detail
+                .lifecycle
+                .as_ref()
+                .map(|lifecycle| lifecycle.auto_resume),
+            Some(false),
+            "the row's lifecycle flags are what the client reads"
+        );
+        assert!(
+            matches!(
+                surface.get(SandboxId::new()).await,
+                SandboxesSandboxIdGetResponse::Status404_NotFound(_)
+            ),
+            "a sandbox with neither a record nor a row is not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_node_half_does_not_read_paused_rows() {
+        let node = Surface::node_half().await;
+        let sandbox_id = node.paused(mock_paused_sandbox_config());
+
+        assert!(
+            matches!(
+                node.get(sandbox_id).await,
+                SandboxesSandboxIdGetResponse::Status404_NotFound(_)
+            ),
+            "the row sits in this process's catalog and the node half still answers 404"
+        );
+        assert!(matches!(
+            node.resume(sandbox_id).await,
+            SandboxesSandboxIdResumePostResponse::Status404_NotFound(_)
+        ));
+        assert!(matches!(
+            node.pause(sandbox_id).await,
+            SandboxesSandboxIdPausePostResponse::Status404_NotFound(_)
+        ));
+        assert!(
+            matches!(
+                node.delete(sandbox_id).await,
+                SandboxesSandboxIdDeleteResponse::Status404_NotFound(_)
+            ),
+            "and it deletes no rows it does not own"
+        );
+        assert!(node.list_v2(Vec::new()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_newest_pause_of_a_sandbox_is_the_one_read() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = SandboxId::new();
+        surface.paused_at(
+            sandbox_id,
+            PausedSandboxConfig {
+                template_id: "older".to_string(),
+                ..mock_paused_sandbox_config()
+            },
+            1_700_000_001_000,
+        );
+        surface.paused_at(
+            sandbox_id,
+            PausedSandboxConfig {
+                template_id: "newer".to_string(),
+                ..mock_paused_sandbox_config()
+            },
+            1_700_000_002_000,
+        );
+
+        assert_eq!(detail(surface.get(sandbox_id).await).template_id, "newer");
+    }
+
+    #[tokio::test]
+    async fn pausing_an_already_paused_sandbox_is_a_conflict_and_pausing_nothing_is_not_found() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = surface.paused(mock_paused_sandbox_config());
+
+        assert!(
+            matches!(
+                surface.pause(sandbox_id).await,
+                SandboxesSandboxIdPausePostResponse::Status409_Conflict(_)
+            ),
+            "a paused sandbox exists, so pausing it again is a conflict, never absence"
+        );
+        assert!(matches!(
+            surface.pause(SandboxId::new()).await,
+            SandboxesSandboxIdPausePostResponse::Status404_NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_resume_rebuilds_the_sandbox_from_its_row_and_answers_created() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = surface.paused(PausedSandboxConfig {
+            user_metadata: Some([("owner".to_string(), "row".to_string())].into()),
+            ..mock_paused_sandbox_config()
+        });
+        assert_eq!(surface.state_of(sandbox_id).await, None);
+
+        let response = surface.resume(sandbox_id).await;
+
+        let SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully {
+            body,
+            x_agentenv_execution_id,
+            ..
+        } = response
+        else {
+            panic!("expected the sandbox to be rebuilt, got {response:?}");
+        };
+        assert_eq!(body.sandbox_id, sandbox_id.to_string());
+        let rebuilt = surface
+            .api
+            .orchestrator()
+            .get_sandbox(&sandbox_id)
+            .await
+            .expect("the store answers")
+            .expect("the resume created a record under the sandbox's own id");
+        assert_eq!(rebuilt.state, SandboxState::Running);
+        assert_eq!(
+            x_agentenv_execution_id,
+            Some(rebuilt.execution_id.to_string()),
+            "the routing headers name the incarnation the resume minted"
+        );
+        assert_eq!(
+            rebuilt.user_metadata,
+            Some([("owner".to_string(), "row".to_string())].into()),
+            "the rebuilt sandbox carries the configuration its row paused with"
+        );
+
+        let detail = detail(surface.get(sandbox_id).await);
+        assert_eq!(
+            detail.state,
+            models::SandboxState::Running,
+            "once running, the record answers, not the row"
+        );
+
+        assert!(
+            matches!(
+                surface.resume(sandbox_id).await,
+                SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully { .. }
+            ),
+            "a resume of a running sandbox is answered as it stands"
+        );
+        assert!(matches!(
+            surface.resume(SandboxId::new()).await,
+            SandboxesSandboxIdResumePostResponse::Status404_NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_connect_rebuilds_a_paused_sandbox_and_answers_a_running_one_as_it_stands() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = surface.paused(mock_paused_sandbox_config());
+
+        assert!(matches!(
+            surface.connect(sandbox_id).await,
+            SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully { .. }
+        ));
+        assert_eq!(
+            surface.state_of(sandbox_id).await,
+            Some(SandboxState::Running)
+        );
+        assert!(matches!(
+            surface.connect(sandbox_id).await,
+            SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning { .. }
+        ));
+        assert!(matches!(
+            surface.connect(SandboxId::new()).await,
+            SandboxesSandboxIdConnectPostResponse::Status404_NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_lands_on_no_known_node_leaves_the_rows_origin_alone() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = SandboxId::new();
+        let record = paused_sandbox_record(
+            sandbox_id,
+            Some(ORIGIN),
+            mock_paused_sandbox_config(),
+            1_700_000_000_000,
+        );
+        surface.catalog.seed(record.clone());
+
+        let _ = surface.resume(sandbox_id).await;
+
+        assert_eq!(
+            surface
+                .api
+                .orchestrator()
+                .sandbox_holding_node_id(&sandbox_id)
+                .await,
+            None,
+            "the premise: this backend names no node for the sandbox it runs"
+        );
+        let landed = surface
+            .catalog
+            .get(&record.id.to_string())
+            .await
+            .expect("the catalog answers")
+            .expect("the row outlives the resume");
+        assert_eq!(
+            landed.origin_node_id.as_deref(),
+            Some(ORIGIN),
+            "a landing nobody can name must not erase the node whose cache is warm"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_paused_sandbox_forgets_every_pause_of_it() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = SandboxId::new();
+        surface.paused_at(sandbox_id, mock_paused_sandbox_config(), 1_700_000_001_000);
+        surface.paused_at(sandbox_id, mock_paused_sandbox_config(), 1_700_000_002_000);
+        let other = surface.paused(mock_paused_sandbox_config());
+
+        assert!(matches!(
+            surface.delete(sandbox_id).await,
+            SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully
+        ));
+
+        assert!(
+            matches!(
+                surface.get(sandbox_id).await,
+                SandboxesSandboxIdGetResponse::Status404_NotFound(_)
+            ),
+            "every pause of the sandbox is gone, not just the newest"
+        );
+        assert!(
+            matches!(
+                surface.delete(sandbox_id).await,
+                SandboxesSandboxIdDeleteResponse::Status404_NotFound(_)
+            ),
+            "deleting what is neither running nor paused is not found"
+        );
+        assert!(
+            matches!(
+                surface.get(other).await,
+                SandboxesSandboxIdGetResponse::Status200_SuccessfullyReturnedTheSandbox(_)
+            ),
+            "and another sandbox's pause is untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_running_sandbox_forgets_its_pauses_too() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = surface.paused(mock_paused_sandbox_config());
+        let _ = surface.resume(sandbox_id).await;
+        // The resume left the row behind; a delete must not leave a paused ghost.
+        assert!(matches!(
+            surface.get(sandbox_id).await,
+            SandboxesSandboxIdGetResponse::Status200_SuccessfullyReturnedTheSandbox(_)
+        ));
+
+        assert!(matches!(
+            surface.delete(sandbox_id).await,
+            SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully
+        ));
+
+        assert_eq!(surface.state_of(sandbox_id).await, None);
+        assert!(matches!(
+            surface.get(sandbox_id).await,
+            SandboxesSandboxIdGetResponse::Status404_NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_v2_listing_shows_each_sandbox_once_and_a_running_one_as_running() {
+        let surface = Surface::api_half().await;
+        let resumed = surface.paused(mock_paused_sandbox_config());
+        let still_paused = surface.paused(mock_paused_sandbox_config());
+        let _ = surface.resume(resumed).await;
+
+        let all = surface.list_v2(Vec::new()).await;
+        let mut states: Vec<(String, models::SandboxState)> = all
+            .iter()
+            .map(|sandbox| (sandbox.sandbox_id.clone(), sandbox.state))
+            .collect();
+        states.sort();
+        let mut expected = vec![
+            (resumed.to_string(), models::SandboxState::Running),
+            (still_paused.to_string(), models::SandboxState::Paused),
+        ];
+        expected.sort();
+        assert_eq!(
+            states, expected,
+            "a resumed sandbox still has its row and must be listed once, as running"
+        );
+
+        let running_only = surface.list_v2(vec![models::SandboxState::Running]).await;
+        assert_eq!(
+            running_only
+                .iter()
+                .map(|sandbox| sandbox.sandbox_id.clone())
+                .collect::<Vec<_>>(),
+            vec![resumed.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_paused_only_listing_does_not_show_a_sandbox_that_is_running() {
+        let surface = Surface::api_half().await;
+        let resumed = surface.paused(mock_paused_sandbox_config());
+        let still_paused = surface.paused(mock_paused_sandbox_config());
+        let _ = surface.resume(resumed).await;
+
+        let paused_only = surface.list_v2(vec![models::SandboxState::Paused]).await;
+
+        assert_eq!(
+            paused_only
+                .iter()
+                .map(|sandbox| sandbox.sandbox_id.clone())
+                .collect::<Vec<_>>(),
+            vec![still_paused.to_string()],
+            "a running sandbox keeps the row it was resumed from; the row is not a \
+             second, paused sandbox"
         );
     }
 }

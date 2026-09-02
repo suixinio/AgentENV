@@ -1,11 +1,13 @@
 mod artifacts;
 mod drive;
+mod paused;
 mod snapshot;
 mod value;
 mod version;
 
 pub use artifacts::SNAPSHOT_ARTIFACT_LAYOUT;
 pub use drive::CommittedAttachedDrive;
+pub use paused::PausedSandboxConfig;
 pub use snapshot::rootfs_snapshot_image_tag;
 pub use snapshot::{
     CommandContext, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,

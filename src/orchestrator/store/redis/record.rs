@@ -1,27 +1,14 @@
 //! Versioned Redis record preserving metadata fields skipped by plain serde.
-//! Paused state travels as the same serializable reference used by the file persister.
 
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::super::{Result, SandboxMetadata, StoreError};
 use crate::types::{ExecutionId, SandboxId};
 
 /// Current stored-record schema version.
 pub const RECORD_VERSION: u32 = 1;
-
-/// Serializable paused-state reference.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct PausedStateRef {
-    /// Node-local artifact path; `origin_node_id` identifies its machine.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_root: Option<PathBuf>,
-    /// The backend's own encoding of its paused state.
-    pub state: Value,
-}
 
 /// Versioned JSON stored under a sandbox record key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,14 +27,11 @@ pub struct StoredSandboxRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<i64>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub paused_state_ref: Option<PausedStateRef>,
-
     /// Current running-interval start retained separately from skipped metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running_since_ms: Option<i64>,
 
-    /// Node running the sandbox or holding its paused bytes.
+    /// Node running the sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_node_id: Option<String>,
 
@@ -57,25 +41,13 @@ pub struct StoredSandboxRecord {
 }
 
 impl StoredSandboxRecord {
-    /// Builds a stored record and serializes any paused-state handle.
     pub fn new(metadata: &SandboxMetadata, rev: u64) -> Result<Self> {
-        let paused_state_ref = match metadata.paused_state.as_ref() {
-            Some(state) => Some(PausedStateRef {
-                artifact_root: None,
-                state: state.encode().map_err(|source| StoreError::Backend {
-                    source: source.context("failed to encode paused sandbox state"),
-                })?,
-            }),
-            None => None,
-        };
-
         Ok(Self {
             version: RECORD_VERSION,
             rev,
             expires_at_ms: metadata.expires_at.map(to_unix_millis),
             running_since_ms: metadata.running_since.map(to_unix_millis),
             metadata: metadata.clone(),
-            paused_state_ref,
             origin_node_id: None,
             published: false,
         })
@@ -85,9 +57,6 @@ impl StoredSandboxRecord {
     pub fn inherit_placement_from(&mut self, previous: &Self) {
         if self.origin_node_id.is_none() {
             self.origin_node_id = previous.origin_node_id.clone();
-        }
-        if self.paused_state_ref.is_none() {
-            self.paused_state_ref = previous.paused_state_ref.clone();
         }
         self.published = self.published || previous.published;
     }
@@ -130,7 +99,6 @@ impl StoredSandboxRecord {
         Ok(record)
     }
 
-    /// Returns metadata while leaving remote paused state as a separate reference.
     pub fn into_metadata(self) -> SandboxMetadata {
         self.metadata
     }
@@ -193,61 +161,13 @@ pub fn to_unix_millis(time: SystemTime) -> i64 {
 mod tests {
     use super::*;
     use crate::orchestrator::SandboxState;
-    use std::sync::Arc;
-
-    use crate::sandbox::{PausedSandboxState, RuntimeArtifactSet};
-
-    #[derive(Debug)]
-    struct FakePausedState(Value);
-
-    impl PausedSandboxState for FakePausedState {
-        fn encode(&self) -> anyhow::Result<Value> {
-            Ok(self.0.clone())
-        }
-
-        fn runtime_artifacts(&self) -> RuntimeArtifactSet {
-            RuntimeArtifactSet::default()
-        }
-    }
+    use serde_json::Value;
 
     fn metadata() -> SandboxMetadata {
         SandboxMetadata {
             state: SandboxState::Running,
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn paused_state_survives_a_round_trip_as_a_reference() {
-        let mut paused = metadata();
-        paused.state = SandboxState::Paused;
-        paused.paused_state = Some(Arc::new(FakePausedState(
-            serde_json::json!({"snapshot": "abc", "mem": 42}),
-        )));
-
-        let encoded = StoredSandboxRecord::new(&paused, 1)
-            .unwrap()
-            .encode()
-            .unwrap();
-        let decoded = StoredSandboxRecord::decode(&encoded).unwrap();
-
-        let reference = decoded
-            .paused_state_ref
-            .as_ref()
-            .expect("paused state reference lost in the round trip");
-        assert_eq!(
-            reference.state,
-            serde_json::json!({"snapshot": "abc", "mem": 42})
-        );
-    }
-
-    #[test]
-    fn a_plain_metadata_round_trip_still_loses_the_handle() {
-        let mut paused = metadata();
-        paused.paused_state = Some(Arc::new(FakePausedState(serde_json::json!({"a": 1}))));
-        let bytes = serde_json::to_vec(&paused).unwrap();
-        let back: SandboxMetadata = serde_json::from_slice(&bytes).unwrap();
-        assert!(back.paused_state.is_none());
     }
 
     #[test]
@@ -465,10 +385,6 @@ mod tests {
         let previous = StoredSandboxRecord {
             origin_node_id: Some("node-a".to_string()),
             published: true,
-            paused_state_ref: Some(PausedStateRef {
-                artifact_root: Some(PathBuf::from("/var/lib/agentenv/x")),
-                state: serde_json::json!({"k": 1}),
-            }),
             ..StoredSandboxRecord::new(&metadata(), 1).unwrap()
         };
         let mut next = StoredSandboxRecord::new(&metadata(), 2).unwrap();
@@ -476,6 +392,5 @@ mod tests {
 
         assert_eq!(next.origin_node_id.as_deref(), Some("node-a"));
         assert!(next.published);
-        assert_eq!(next.paused_state_ref, previous.paused_state_ref);
     }
 }

@@ -170,7 +170,7 @@ func TestOnlyTheApiHalfIsToldWhereTheClusterStoreIs(t *testing.T) {
 // about the manifests rather than about the walk.
 func TestNoManifestSwitchesOnTheStartupHostSweep(t *testing.T) {
 	const forbidden = "AENV_STARTUP_RECLAIM_ENABLED"
-	const control = "AENV_PAUSED_REGISTRY_BACKEND"
+	const control = "AENV_ORCHESTRATOR_STORE_REDIS_URL"
 
 	entries, err := os.ReadDir(manifestDir)
 	if err != nil {

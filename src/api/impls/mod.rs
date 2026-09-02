@@ -3,8 +3,7 @@ pub mod attached_drives;
 pub mod auth;
 mod pagination;
 pub use pagination::{snapshot_cursor_from_token, snapshot_next_token, PaginationError};
-mod paused_coordinator;
-mod paused_recovery;
+mod paused;
 mod resume_surface;
 pub mod sandbox;
 mod snapshots;
@@ -17,22 +16,16 @@ use anyhow::Error as AnyhowError;
 use async_trait::async_trait;
 
 use super::proxy::{build_proxy_client, ProxyClient};
-use crate::identity::NodeIdentity;
 use crate::node_client::NodePlacement;
 use crate::node_registry::fleet::NodeFleetView;
 use crate::node_registry::registry::NodeRegistry;
 use crate::observability::ObservabilityService;
-use crate::orchestrator::{PausedSandboxPublisher, PausedSandboxRegistry, SandboxOrchestration};
+use crate::orchestrator::SandboxOrchestration;
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use agentenv_http_server::{apis, models};
-pub use paused_coordinator::{PausedSandboxCoordinator, StaleReleaseOutcome};
-// REST and data-plane resume share one arbitration path.
-pub(in crate::api) use paused_recovery::ResumeArbitration;
 pub use resume_surface::ResumeWiring;
-pub(in crate::api) use resume_surface::{
-    DataPlaneResume, DataPlaneResumeRequest, PinRefusalReason,
-};
+pub(in crate::api) use resume_surface::{DataPlaneResume, DataPlaneResumeRequest};
 #[cfg(test)]
 pub(in crate::api) use resume_surface::{
     PlacedNode, PlacementRefusal, ResumePlacement, ResumePlacementSource, WakeSite,
@@ -41,39 +34,11 @@ pub(in crate::api) use resume_surface::{
 #[derive(Clone, Debug)]
 pub struct Claims;
 
-/// Shared pause registry and publication wiring.
-pub struct PausedSandboxWiring {
-    pub coordinator: Arc<PausedSandboxCoordinator>,
-}
-
-impl PausedSandboxWiring {
-    pub fn new(
-        registry: Arc<dyn PausedSandboxRegistry>,
-        snapshot_manager: Arc<SnapshotManager>,
-        identity: &NodeIdentity,
-    ) -> Self {
-        Self {
-            coordinator: Arc::new(PausedSandboxCoordinator::new(
-                registry,
-                snapshot_manager,
-                identity.id.clone(),
-            )),
-        }
-    }
-
-    /// The orchestrator's side of the wiring.
-    pub fn publisher(&self) -> Arc<dyn PausedSandboxPublisher> {
-        Arc::clone(&self.coordinator) as Arc<dyn PausedSandboxPublisher>
-    }
-}
-
 #[derive(Clone)]
 pub struct ApiImpl {
     /// Process-independent orchestration surface selected at startup.
     orchestrator: Arc<dyn SandboxOrchestration>,
     snapshot_manager: Arc<SnapshotManager>,
-    /// Cluster pause bookkeeping; the local backend is a no-op.
-    paused: Arc<PausedSandboxCoordinator>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
@@ -90,14 +55,12 @@ impl ApiImpl {
         orchestrator: Arc<dyn SandboxOrchestration>,
         snapshot_manager: Arc<SnapshotManager>,
         observability: Option<Arc<ObservabilityService>>,
-        paused: PausedSandboxWiring,
         sandbox_proxy_domains: Vec<String>,
         resume_wiring: ResumeWiring,
     ) -> Self {
         Self {
             orchestrator,
             snapshot_manager,
-            paused: paused.coordinator,
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,

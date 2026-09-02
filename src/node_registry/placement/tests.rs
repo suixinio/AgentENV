@@ -483,6 +483,7 @@ fn hint_shapes_map_onto_a_closed_request_table() {
             metadata: Default::default(),
             cpu_count,
             memory_mib,
+            preferred_node_id: String::new(),
         })),
     };
 

@@ -116,7 +116,7 @@ func TestProjectionHitDoesNotAskTheApiHalf(t *testing.T) {
 // registry paths alive.
 //
 // 🔴 A miss must reach the api half, which walks the binding, then the
-// heartbeat roster, then the paused registry, and answers a running sandbox
+// heartbeat roster, then the snapshot catalog, and answers a running sandbox
 // as it stands. Those last two cover the window a heartbeat is late for and
 // the window another node's reconciliation dropped a binding this node still
 // lists. A gateway that answered its own 404 on a miss would remove both, and

@@ -96,7 +96,12 @@ impl SnapshotRepository {
             Ok(imported) => {
                 let staged_at_unix_ms = now_unix_ms();
                 Ok(StagedSnapshot {
-                    commit: SnapshotCommit::new(&metadata, imported, staged_at_unix_ms),
+                    commit: SnapshotCommit::new(
+                        &metadata,
+                        imported,
+                        staged_at_unix_ms,
+                        Some(self.origin_node_id.clone()),
+                    ),
                     staged_at_unix_ms,
                     origin_node_id: self.origin_node_id.clone(),
                 })

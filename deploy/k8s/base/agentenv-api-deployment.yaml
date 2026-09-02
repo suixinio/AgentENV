@@ -11,10 +11,11 @@
 # 🔴 `aenv-api` assembles now (`src/bin/aenv-api.rs::assemble_api`): the cluster
 # metadata store, the remote backend factory and both gRPC listeners are wired.
 # What it still refuses, and refuses loudly rather than half-doing, is a cold
-# create (`POST /sandboxes-cold`) and resuming a paused sandbox whose capture
-# lives on a machine this replica cannot ask to reopen it. Everything the
-# gateway is pointed at in 3a works; those two are why 3a is a shadow rollout
-# rather than the end of the split.
+# create (`POST /sandboxes-cold`). Resuming a paused sandbox needs nothing
+# this replica lacks: it is a create from the sandbox's snapshot-catalog row,
+# placed like any other create. Everything the gateway is pointed at in 3a
+# works; the cold create is why 3a is a shadow rollout rather than the end of
+# the split.
 #
 # 🔴 Building a template (`POST /v2/templates/{id}/builds/{id}`) is no longer
 # on that list in code — `run_the_build_on_a_node` dispatches it to a node
@@ -134,10 +135,10 @@ spec:
                   optional: false
             # Where this replica's own ledger of active sandboxes lives.
             #
-            # 🔴 Written out here rather than read from a ConfigMap the way the
-            # node reads its paused-registry backend, because the two choices
-            # are not alike. A node may legitimately be `local`/`in_memory` —
-            # its records describe the machine it is on. An api replica may not:
+            # Written out here rather than left to config/default.toml, because
+            # a node and an api replica are not alike. A node may legitimately
+            # be `in_memory`: its records describe the VMs on the machine it is
+            # on, and nothing it holds outlives them. An api replica may not:
             # `in_memory` would give each replica a private opinion about
             # sandboxes the others also answer for. `aenv-api` refuses to
             # start on `in_memory` rather than starting like that, and these two
@@ -159,38 +160,6 @@ spec:
             # overlaps `agentenv:scheduler:bindings:*`.
             - name: AENV_ORCHESTRATOR_STORE_REDIS_URL
               value: redis://agentenv-redis:6379
-            # The cluster-wide registry of paused sandboxes, which this half
-            # arbitrates: it claims rows, renews their leases, reconciles them
-            # and discards them.
-            #
-            # 🔴 阶段四 E3 (task's own label): `postgres`, not `central`. Stage
-            # C (`src/orchestrator/paused_registry/postgres/`) folds the
-            # scheduler's own registry service into this process — this
-            # replica now connects directly to the shared `[pg]` pool (the
-            # same one the snapshot catalog uses, wired below
-            # via `AENV_CONFIG_OVERLAY_PATH`/`pg-overlay.toml`/`pg-dsn.toml`)
-            # rather than dialling the scheduler's `PausedRegistry` gRPC
-            # surface, so no database credential lands on `aenv-node`
-            # either way.
-            #
-            # 🔴 This precondition is load-bearing and enforced at startup,
-            # not just documented here: `build_paused_registry`
-            # (`src/orchestrator/paused_registry/mod.rs`) requires a
-            # heartbeat-roster `NodeRegistry` handle for this backend —
-            # unconditionally, not behind any role test: `aenv-api` is the only
-            # caller that function has ever had, and no process links both
-            # halves. That handle always exists — `aenv-api` builds its own
-            # node registry unconditionally now — without it, `running` rows
-            # would have no lease-renewal path and would be wrongly reclaimed
-            # even while healthy (the exact failure Fix A, commit `151d00b`,
-            # closed for the `central` backend).
-            #
-            # Not a configMapKeyRef, for the same reason as the store above: the
-            # node's copy of this key may fall back to `local` and still be
-            # correct, and this one may not. An api replica running a node-local
-            # paused registry would arbitrate a registry only it can see.
-            - name: AENV_PAUSED_REGISTRY_BACKEND
-              value: "postgres"
             # 🔴 No AENV_SNAPSHOT_CATALOG_WRITE / _READ here any more, and
             # setting them would now do nothing at all — no field declares
             # those names, so confique ignores them and no error is raised.
@@ -320,13 +289,14 @@ spec:
             # 🔴 The replica's identity, and it must be the Pod's name rather
             # than the machine's.
             #
-            # This half releases, renews and reconciles paused-registry rows by
-            # node identity, and the rows are keyed by the machine that holds
-            # the sandbox. An api replica reporting `spec.nodeName` would share
-            # an identity with the node DaemonSet Pod on that same machine, and
-            # its startup pass would release that machine's live holdings out
-            # from under it — the same family of fault as two servers sweeping
-            # one host, reached by a different mistake.
+            # This half stamps its own identity on what it writes, and every
+            # node identity the control plane keys on (the heartbeat roster,
+            # the sandbox-to-node bindings, a paused row's `origin_node_id`)
+            # is the machine name the DaemonSet reports. An api replica
+            # reporting `spec.nodeName` would share an identity with the node
+            # DaemonSet Pod on that same machine — one name for two processes,
+            # the same family of fault as two servers sweeping one host,
+            # reached by a different mistake.
             - name: AENV_NODE_ID
               valueFrom:
                 fieldRef:
@@ -367,8 +337,7 @@ spec:
             #      `NodeRegistryGrpcService` value it had already built.
             #      `ResumeWiring::cluster_in_process` now calls
             #      `lookup_node` on that value directly: same RPC, same
-            #      `tonic::Status` values, same pin/prefer discrimination, no
-            #      socket. `resume_placement_is_wired_after_every_builder`
+            #      `tonic::Status` values, no socket. `resume_placement_is_wired_after_every_builder`
             #      (`src/bin/aenv-api.rs`) guards the one thing that call
             #      site can get wrong — handing over a service that has not
             #      been through every builder.
@@ -383,30 +352,6 @@ spec:
             # the DaemonSet reads), and the gateway still dials this
             # Deployment's gRPC listener under its own `scheduler_addr`. What
             # is gone is only this replica's own *client* of it.
-            # 🔴 `AENV_PAUSED_REGISTRY_BACKEND` requires a heartbeat-roster
-            # `NodeRegistry` (see that key's own comment above) — `aenv-api`
-            # always builds one, unconditionally, so there is no companion
-            # switch left to keep in step with this one; there used to be an
-            # `AENV_NODE_PLACEMENT_SOURCE` env var doing exactly that, but the
-            # `"scheduler"` alternative it selected between (dialling a Go
-            # scheduler process for placement instead of answering from this
-            # process's own registry) is gone along with that process, and
-            # the switch was deleted with it. Setting that env var again does
-            # nothing at all: no field declares it, so confique ignores it and
-            # nothing errors.
-            #
-            # 🔴 `AENV_PAUSED_REGISTRY_BACKEND` does not roll back on its own
-            # any more. `"central"` — the backend that used to pair with the
-            # now-deleted `"scheduler"` placement source — is gone, not
-            # merely unused: `PausedRegistryBackendKind::Central` and
-            # `CentralPausedSandboxRegistry` were deleted along with the Go
-            # scheduler they dialled, so setting `AENV_PAUSED_REGISTRY_BACKEND
-            # =central` now refuses to start rather than rolling back. A
-            # genuine rollback of the paused-registry backend is restoring
-            # the scheduler Deployment/Service/PDB manifests and a compatible
-            # scheduler image from git history (`e2734fd` deleted them, along
-            # with `services/scheduler` itself), not a value this Deployment
-            # can still express.
             # 🔴 `[binding_store]` backs `Schedule`/`LookupNode`/
             # `RecordAssignment`, which native placement always answers
             # locally (`NativeNodePlacement`,
@@ -439,11 +384,12 @@ spec:
             # sandbox's routing binding the moment its PAUSE/DELETE event
             # arrives. Off, every such event is dropped as
             # `ignored_switch_off` and the only teardown left is heartbeat
-            # reconciliation — so for up to one heartbeat interval a paused
-            # sandbox still holds a projection, the gateway reads that as "a
-            # VM is at the other end", forwards the data plane to the node
-            # instead of waking it, and the node answers 410 for a sandbox
-            # that never wakes. Measured on the dev cluster before this
+            # reconciliation — so for up to one heartbeat interval a sandbox
+            # that was just paused still holds a projection, the gateway reads
+            # that as "a VM is at the other end", forwards the data plane to
+            # the node instead of letting this half restore the sandbox, and
+            # the node answers for a VM it no longer holds. Measured on the
+            # dev cluster before this
             # landed: 12 of 18 immediate post-pause requests, and
             # `agentenv_api_sandbox_event_total{event_type="pause",
             # outcome="ignored_switch_off"}` climbing on every one.

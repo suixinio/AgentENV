@@ -2,8 +2,7 @@ mod facade;
 mod launch_plan;
 
 mod metrics;
-pub mod paused_registry;
-mod persistence;
+mod pause_publisher;
 mod proxy;
 mod service;
 pub mod store;
@@ -15,35 +14,23 @@ use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
 pub use facade::SandboxOrchestration;
-pub use launch_plan::ClaimedExecution;
 pub use metrics::OrchestratorMetrics;
-pub use paused_registry::{
-    build_paused_registry, BeganPause, ConflictReason, DeadlineRenewalOutcome,
-    DisabledPausedSandboxRegistry, HeldSandbox, MarkRunningOutcome, PausedRegistryError,
-    PausedRegistryListEntry, PausedRegistryListing, PausedRegistryRows, PausedRegistryState,
-    PausedSandboxEntry, PausedSandboxPublisher, PausedSandboxRegistry,
-    PostgresPausedRegistryFactory, ReclaimedHoldings, RegistryResult, ReleasedHoldings,
-    ResumeClaim,
-};
-pub use persistence::{
-    ClusterRegistration, DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
-    SandboxPersistenceError, SandboxPersister,
-};
 #[cfg(any(test, feature = "test-support"))]
-pub use persistence::{RecordingCall, RecordingPersister};
+pub use pause_publisher::DiscardingPausePublisher;
+pub use pause_publisher::{CommittingPausePublisher, PausePublisher, StagingPausePublisher};
 pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use service::Orchestrator;
 pub use store::{
     configured_max_sandbox_lifetime, is_allowed_transition, ActiveStateRecord, ControlPlaneConfig,
     FencedRemoval, InMemoryMetadataStore, MetadataRows, MetadataStore, MetadataUpdateResult,
-    NewTimeout, PausedHandle, PausedStateRef, RedisMetadataStore, RedisStoreConfig,
-    RedisStoreConfigError, SandboxListFilter, SandboxMetadata, SandboxTimeoutAction, StoreError,
-    StoredSandboxRecord, TransitionEffect, TransitionGuard, TransitionOutcome, TransitionRequest,
-    TransitionSettlement, DEFAULT_STORE_KEY_PREFIX, STORE_RECORD_VERSION,
+    NewTimeout, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError, SandboxListFilter,
+    SandboxMetadata, SandboxTimeoutAction, StoreError, StoredSandboxRecord, TransitionEffect,
+    TransitionGuard, TransitionOutcome, TransitionRequest, TransitionSettlement,
+    DEFAULT_STORE_KEY_PREFIX, STORE_RECORD_VERSION,
 };
 pub use types::{
     capture_publish_metadata, CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox,
-    PauseOutcome, PausePublication, SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent,
+    PauseOutcome, PublishedPause, SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent,
     SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
 
@@ -110,8 +97,14 @@ pub enum OrchestratorError {
     #[error("store operation failed: {0}")]
     StoreOperationFailed(#[source] store::StoreError),
 
-    #[error("sandbox persistence failed: {0}")]
-    SandboxPersistenceFailed(#[from] SandboxPersistenceError),
+    /// The pause captured the sandbox but nothing durable came of it; the
+    /// sandbox was put back to running.
+    #[error("sandbox {sandbox_id} could not be published after pausing: {source}")]
+    PausePublicationFailed {
+        sandbox_id: SandboxId,
+        #[source]
+        source: anyhow::Error,
+    },
 
     #[error("invalid timeout for {sandbox_id}: {timeout}")]
     InvalidTimeout {
@@ -132,25 +125,6 @@ pub enum OrchestratorError {
 
     #[error("internal error: {0}")]
     InternalError(String),
-}
-
-impl OrchestratorError {
-    /// Whether the origin cannot serve this resume, leaving a rebuild the only
-    /// route: the capture is absent here, or the machine naming it is gone.
-    ///
-    /// Callers holding a claim on a published row may rebuild from the
-    /// repository instead of surfacing this.
-    pub fn paused_resume_warrants_rebuild(&self) -> bool {
-        let source = match self {
-            Self::SandboxPersistenceFailed(SandboxPersistenceError::RecordAbsent { .. }) => {
-                return true
-            }
-            Self::SandboxOperationFailed { source, .. } | Self::ConfigLoadFailed(source) => source,
-            _ => return false,
-        };
-
-        crate::node_client::wire::warrants_rebuild(source)
-    }
 }
 
 impl From<store::StoreError> for OrchestratorError {

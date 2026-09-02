@@ -2,8 +2,8 @@ use crate::common;
 
 use aenv_node::cfg::ConfigManager;
 use aenv_node::orchestrator::{
-    ClaimedExecution, CreateSandboxRequest, FileBackedSandboxPersister, ForkChildren,
-    InMemoryMetadataStore, NewTimeout, Orchestrator, ProxyLookupResult, SandboxExpiry,
+    CommittingPausePublisher, CreateSandboxRequest, ForkChildren, InMemoryMetadataStore,
+    NewTimeout, Orchestrator, ProxyLookupResult, PublishedPause, SandboxExpiry,
     SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
 use aenv_node::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
@@ -14,7 +14,7 @@ use aenv_node::snapshot::{
 
 use anyhow::Result;
 use envd::process::{ListRequest, ProcessClient};
-use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
 use tonic::Request;
@@ -46,10 +46,6 @@ async fn assert_envd_process_list_succeeds(
     Ok(())
 }
 
-fn host_file_persister(root: PathBuf) -> FileBackedSandboxPersister {
-    FileBackedSandboxPersister::new(root, ConfigManager::global_config().virtualization_mode)
-}
-
 #[tokio::test]
 async fn orchestrator_lifecycle() -> Result<()> {
     common::setup().await;
@@ -67,19 +63,20 @@ async fn orchestrator_lifecycle() -> Result<()> {
             )
             .await?;
         let runnable = snapshot_manager.resolve_runnable(stored).await?;
+        let snapshot_manager = Arc::new(snapshot_manager);
 
         let store = InMemoryMetadataStore::new();
         let factory = FirecrackerSandboxFactory::new();
-        let paused_store = root.path().join("paused-sandboxes");
-        let persister = host_file_persister(paused_store.clone());
         let orchestrator = Orchestrator::new(
             aenv_node::sandbox::AccessTokenSeedPolicy::MayGenerate,
             store,
             factory,
-            persister,
             aenv_node::image::DisabledRuntimeImageRefs::shared(),
         )
         .await?;
+        orchestrator.set_pause_publisher(Arc::new(CommittingPausePublisher::new(Arc::clone(
+            &snapshot_manager,
+        ))));
         let case_id = Uuid::now_v7().to_string();
 
         let request = CreateSandboxRequest {
@@ -102,6 +99,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             control_plane_config: None,
             execution_id: None,
             secure: true,
+            preferred_node_id: None,
         };
 
         let created = orchestrator.create_sandbox(request).await?;
@@ -157,47 +155,56 @@ async fn orchestrator_lifecycle() -> Result<()> {
         assert_eq!(fetched.id, sandbox_id);
         assert_eq!(fetched.state, SandboxState::Running);
 
-        orchestrator.pause_sandbox(sandbox_id).await?;
-        let paused = orchestrator
-            .get_sandbox(&sandbox_id)
-            .await?
-            .expect("sandbox metadata should exist after pause");
-        assert_eq!(paused.state, SandboxState::Paused);
+        let paused = orchestrator.pause_sandbox(sandbox_id).await?;
+        let Some(PublishedPause::Committed(paused_snapshot_id)) = paused.published else {
+            panic!("a pause this process commits answers with the row it wrote: {paused:?}");
+        };
+        assert!(
+            orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
+            "a paused sandbox exists only as its snapshot"
+        );
         assert_eq!(
             orchestrator.proxy_lookup_for(&sandbox_id).await?,
-            ProxyLookupResult::Paused { auto_resume: false }
+            ProxyLookupResult::NotFound
         );
 
-        orchestrator.shutdown().await?;
-        drop(orchestrator);
-
-        let restarted = Orchestrator::new(
-            aenv_node::sandbox::AccessTokenSeedPolicy::MayGenerate,
-            InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
-            host_file_persister(paused_store),
-            aenv_node::image::DisabledRuntimeImageRefs::shared(),
-        )
-        .await?;
-        let restored = restarted
-            .get_sandbox(&sandbox_id)
+        let paused_record = snapshot_manager
+            .get(paused_snapshot_id.to_string())
             .await?
-            .expect("persisted paused metadata should be loaded after orchestrator restart");
-        assert_eq!(restored.state, SandboxState::Paused);
-        assert_eq!(
-            restarted.proxy_lookup_for(&sandbox_id).await?,
-            ProxyLookupResult::Paused { auto_resume: false }
-        );
+            .expect("the pause committed a catalog row");
+        let paused_config = paused_record
+            .committed
+            .as_ref()
+            .and_then(|committed| committed.paused_sandbox.as_ref())
+            .expect("a pause row says how to bring the sandbox back");
+        assert!(paused_config.secure);
+        assert_eq!(paused_config.template_id, created.snapshot_id);
 
-        let resumed = restarted
-            .resume_sandbox(
+        let paused_runnable = snapshot_manager.resolve_runnable(paused_record).await?;
+        let resumed = orchestrator
+            .restore_sandbox(
                 sandbox_id,
-                NewTimeout::Set(Duration::from_secs(120)),
-                ClaimedExecution::minted_for_test(),
+                CreateSandboxRequest {
+                    source: SandboxLaunchSource::Snapshot(Box::new(paused_runnable)),
+                    expiry: SandboxExpiry::After(Duration::from_secs(120)),
+                    timeout_action: SandboxTimeoutAction::Pause,
+                    user_metadata: None,
+                    env_vars: None,
+                    network_policy: SandboxNetworkPolicy::default(),
+                    auto_resume: false,
+                    custom_extension_params: None,
+                    control_plane_config: None,
+                    execution_id: None,
+                    secure: true,
+                    preferred_node_id: None,
+                },
             )
             .await?;
+        assert_eq!(resumed.id, sandbox_id);
+        assert_ne!(resumed.execution_id, created.execution_id);
         assert_eq!(resumed.state, SandboxState::Running);
         assert_eq!(resumed.timeout, Some(Duration::from_secs(120)));
+        let restarted = orchestrator;
         let lookup = restarted.proxy_lookup_for(&sandbox_id).await?;
         assert!(
             matches!(lookup, ProxyLookupResult::Ready(_)),
@@ -269,6 +276,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 control_plane_config: None,
                 execution_id: None,
                 secure: false,
+                preferred_node_id: None,
             })
             .await?;
         let sandbox_id = created.id;
@@ -313,6 +321,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                     virtualization_mode: capture.metadata.virtualization_mode,
                     image_configs: capture.metadata.image_configs.clone(),
                     custom_extension_params: None,
+                    paused_sandbox: None,
                 },
                 capture.captured_snapshot,
             )
@@ -365,6 +374,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 control_plane_config: None,
                 execution_id: None,
                 secure: false,
+                preferred_node_id: None,
             })
             .await?;
         assert_eq!(relaunched.state, SandboxState::Running);

@@ -10,14 +10,13 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,backgr
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use aenv_node::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring};
-use aenv_node::cfg::{AppConfig, PausedRegistryBackendKind};
+use aenv_node::api::{server, ApiImpl, ResumeWiring};
+use aenv_node::cfg::AppConfig;
 use aenv_node::identity::NodeIdentity;
 use aenv_node::image::ImageResolver;
 use aenv_node::observability::{ObservabilityReporter, ObservabilityService};
 use aenv_node::orchestrator::{
-    DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator,
-    SandboxOrchestration,
+    InMemoryMetadataStore, Orchestrator, SandboxOrchestration, StagingPausePublisher,
 };
 use aenv_node::overlaybd::OverlaybdP2pRuntime;
 use aenv_node::p2p::P2pTransport;
@@ -29,8 +28,7 @@ use anyhow::Context as _;
 use clap::Parser;
 use tracing::{info, warn};
 
-type LocalOrchestrator =
-    Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, FileBackedSandboxPersister>;
+type LocalOrchestrator = Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory>;
 
 #[derive(Debug, Parser)]
 #[command(name = "aenv-node")]
@@ -260,11 +258,8 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
     let factory = FirecrackerSandboxFactory::with_cpu_config(applied_cpu_arc);
-    // Restore persisted sandboxes before the first roster heartbeat; an empty
-    // restart heartbeat would delete this node's scheduler bindings.
     let image_refs = aenv_node::image::local_runtime_image_refs();
-    let orchestrator =
-        Orchestrator::with_file_backed_store_and_factory(factory, image_refs).await?;
+    let orchestrator = Orchestrator::with_in_memory_store_and_factory(factory, image_refs).await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(
@@ -315,36 +310,12 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
 async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     let core = assemble_node_core(config).await?;
 
-    let configured_backend = config.orchestrator.paused_registry.backend;
-    let cluster_registry_configured =
-        !matches!(configured_backend, PausedRegistryBackendKind::Local);
-    // Expose ignored cluster holdings continuously rather than only at startup.
-    metrics::gauge!("agentenv_node_unreleased_cluster_holdings").set(
-        if cluster_registry_configured {
-            1.0
-        } else {
-            0.0
-        },
-    );
-    if cluster_registry_configured {
-        warn!(
-            target: "agentenv",
-            configured = ?configured_backend,
-            "aenv-node ignores the configured paused-sandbox registry: cluster-wide records \
-             belong to the API half. Paused sandboxes stay resumable on this node, and this \
-             process claims nothing new — but anything this machine was holding from a previous \
-             single-process AgentENV is not released by this one and stays held until its lease \
-             lapses."
-        );
-    }
-    // Cluster-facing paused-registry calls are disabled on the node half.
-    let paused_wiring = PausedSandboxWiring::new(
-        Arc::new(DisabledPausedSandboxRegistry),
-        Arc::clone(&core.snapshot_manager),
-        &core.identity,
-    );
+    // A pause stages its capture on this node's repository; the api half
+    // commits the staged value.
     core.orchestrator
-        .set_paused_publisher(paused_wiring.publisher());
+        .set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(
+            &core.snapshot_manager,
+        ))));
     let orchestration: Arc<dyn SandboxOrchestration> =
         Arc::clone(&core.orchestrator) as Arc<dyn SandboxOrchestration>;
 
@@ -377,7 +348,6 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         Arc::clone(&orchestration),
         core.snapshot_manager,
         core.observability,
-        paused_wiring,
         config.sandbox_proxy.domains.clone(),
         ResumeWiring::node_local(&core.identity.id),
     ));

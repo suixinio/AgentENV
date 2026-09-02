@@ -6,7 +6,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::sandbox::CustomExtensionParams;
-use crate::snapshot::CommandContext;
+use crate::snapshot::repository::interfaces::StagedSnapshot;
+use crate::snapshot::{CommandContext, PausedSandboxConfig, SnapshotId};
 use crate::types::{ExecutionId, ImageConfigs, SandboxId, SandboxResources};
 
 #[derive(Clone)]
@@ -61,6 +62,10 @@ pub struct CreateSandboxRequest {
     pub control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
     /// Pre-minted incarnation for delegated creates; user creates leave it absent.
     pub execution_id: Option<ExecutionId>,
+    /// Node the placement should favour, typically the one that paused the
+    /// sandbox this request restores. A preference only: an unschedulable
+    /// node yields to ordinary placement.
+    pub preferred_node_id: Option<String>,
 }
 
 /// One sandbox present in the node's live handle table.
@@ -119,8 +124,6 @@ pub struct SandboxRosterEntry {
     pub execution_id: ExecutionId,
     /// `0` selects the receiver's default TTL.
     pub projection_ttl_secs: u32,
-    /// Whether the sandbox is paused locally without a running VM.
-    pub paused: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,35 +144,27 @@ pub struct SandboxLifecycleEvent {
     pub resources: SandboxResources,
 }
 
+/// States of a sandbox record. A record exists only while a VM is running or
+/// being brought up or down; a paused sandbox is a snapshot catalog row and
+/// has no record here.
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SandboxState {
     Creating,
-    Resuming,
     Running,
     Snapshotting,
     Forking,
     Pausing,
-    Paused,
     Killing,
-}
-
-impl SandboxState {
-    /// Whether this state consumes running-time lifetime budget.
-    pub fn spends_lifetime(self) -> bool {
-        !matches!(self, SandboxState::Paused)
-    }
 }
 
 impl Display for SandboxState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             SandboxState::Creating => "creating",
-            SandboxState::Resuming => "resuming",
             SandboxState::Running => "running",
             SandboxState::Snapshotting => "snapshotting",
             SandboxState::Forking => "forking",
             SandboxState::Pausing => "pausing",
-            SandboxState::Paused => "paused",
             SandboxState::Killing => "killing",
         };
         write!(f, "{s}")
@@ -183,9 +178,13 @@ pub struct SnapshotCaptureResult {
 }
 
 /// Builds snapshot publication metadata from authoritative runtime metadata.
+///
+/// A pause capture carries the sandbox's own configuration so a later resume
+/// can rebuild the sandbox from the row alone; a checkpoint carries none.
 pub fn capture_publish_metadata(
     metadata: &super::store::SandboxMetadata,
     alias: Option<crate::snapshot::SnapshotAlias>,
+    paused_sandbox: Option<PausedSandboxConfig>,
 ) -> crate::snapshot::SnapshotPublishMetadata {
     crate::snapshot::SnapshotPublishMetadata {
         id: crate::snapshot::SnapshotId::generate(),
@@ -200,31 +199,35 @@ pub fn capture_publish_metadata(
         virtualization_mode: metadata.virtualization_mode,
         image_configs: metadata.image_configs.clone(),
         custom_extension_params: metadata.custom_extension_params.clone(),
+        paused_sandbox,
     }
 }
 
-/// Completed pause plus an optional capture ready for repository publication.
+/// What a pause left behind once the sandbox's record was gone.
+#[derive(Debug)]
+pub enum PublishedPause {
+    /// Bytes durable on this node, row not yet announced. The caller commits it.
+    Staged(Box<StagedSnapshot>),
+    /// Catalog row committed; the sandbox is resumable anywhere.
+    Committed(SnapshotId),
+}
+
+/// A completed pause.
 #[derive(Debug)]
 pub struct PauseOutcome {
+    /// The record as it stood when the VM stopped.
     pub metadata: super::store::SandboxMetadata,
-    pub publishable: Option<crate::sandbox::CapturedSandboxSnapshot>,
+    /// `None` when this call joined a pause another caller was already
+    /// performing: the publication belongs to that caller.
+    pub published: Option<PublishedPause>,
 }
 
 impl PauseOutcome {
-    /// Constructs a pause outcome with no capture available to publish.
-    pub fn nothing_to_publish(metadata: super::store::SandboxMetadata) -> Self {
+    /// A pause completed by somebody else.
+    pub fn joined(metadata: super::store::SandboxMetadata) -> Self {
         Self {
             metadata,
-            publishable: None,
+            published: None,
         }
     }
-}
-
-/// Selects whether this process or its caller publishes a pause capture.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PausePublication {
-    /// Offer the capture to this process's publisher.
-    Here,
-    /// Return the capture to the caller without local publication.
-    ByCaller,
 }

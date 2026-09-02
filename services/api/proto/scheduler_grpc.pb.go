@@ -40,8 +40,8 @@ const (
 //
 // 🔴 No method on this service may answer with codes.PermissionDenied. That
 // code means "a superseded incarnation tried to write" — that fencing is
-// enforced by aenv-api's own in-process paused registry, never by this
-// service, so this service itself has no such refusal to make.
+// enforced by the binding store's incarnation arbitration inside aenv-api,
+// never by this service, so this service itself has no such refusal to make.
 type SchedulerClient interface {
 	Schedule(ctx context.Context, in *ScheduleRequest, opts ...grpc.CallOption) (*ScheduleResponse, error)
 	Heartbeat(ctx context.Context, in *HeartbeatRequest, opts ...grpc.CallOption) (*HeartbeatResponse, error)
@@ -162,8 +162,8 @@ func (c *schedulerClient) UnregisterNode(ctx context.Context, in *UnregisterNode
 //
 // 🔴 No method on this service may answer with codes.PermissionDenied. That
 // code means "a superseded incarnation tried to write" — that fencing is
-// enforced by aenv-api's own in-process paused registry, never by this
-// service, so this service itself has no such refusal to make.
+// enforced by the binding store's incarnation arbitration inside aenv-api,
+// never by this service, so this service itself has no such refusal to make.
 type SchedulerServer interface {
 	Schedule(context.Context, *ScheduleRequest) (*ScheduleResponse, error)
 	Heartbeat(context.Context, *HeartbeatRequest) (*HeartbeatResponse, error)

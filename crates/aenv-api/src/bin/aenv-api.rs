@@ -10,7 +10,7 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,backgr
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use aenv_api::api::{server, ApiImpl, PausedSandboxWiring, ResumeWiring, StaleReleaseOutcome};
+use aenv_api::api::{server, ApiImpl, ResumeWiring};
 use aenv_api::binding_store::{
     BindingStore, BindingStoreSettings, RedisBindingStore, RedisBindingStoreConfig,
 };
@@ -31,9 +31,7 @@ use aenv_api::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use aenv_api::node_registry::warmup::WarmupGate;
 use aenv_api::observability::ObservabilityService;
 use aenv_api::orchestrator::{
-    build_paused_registry, spawn_paused_registry_background_tasks, DisabledSandboxPersister,
-    Orchestrator, PgPausedRegistryFactory, PostgresPausedRegistryFactory, RedisMetadataStore,
-    SandboxOrchestration,
+    CommittingPausePublisher, Orchestrator, RedisMetadataStore, SandboxOrchestration,
 };
 use aenv_api::pg::{self, PgPoolSettings};
 use aenv_api::server_main::{self, spawn_grpc_surface, Assembly};
@@ -120,7 +118,6 @@ fn spawn_pg_singleton_tasks(
 
 async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let identity = NodeIdentity::from_config(&config.node_identity);
-    let identity_for_registry = identity.clone();
     let store_config = cluster_store_config(&config.orchestrator.store)?;
 
     let NativeNodeRegistryBits {
@@ -153,19 +150,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         node_registry_upkeep.push(task);
     }
     let pg_pool = build_pg_pool(config).await?;
-    let mut pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
-    let node_registry_for_paused: Option<Arc<dyn NodeRegistry>> =
-        Some(Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>);
-    let paused_registry_factory = PgPausedRegistryFactory::new(pg_pool.clone());
-    let paused_registry = build_paused_registry(
-        &config.orchestrator.paused_registry,
-        &identity_for_registry,
-        Some(&paused_registry_factory as &dyn PostgresPausedRegistryFactory),
-        node_registry_for_paused.clone(),
-    )
-    .await?;
-    let node_registry_grpc_service =
-        node_registry_grpc_service.with_paused_registry(Arc::clone(&paused_registry));
+    let pg_singleton_tasks = spawn_pg_singleton_tasks(config, pg_pool.clone());
     let placement = cluster_placement(
         &native_registry_handle,
         config.cluster.node_service_port,
@@ -179,7 +164,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         aenv_api::sandbox::AccessTokenSeedPolicy::MustBeConfigured,
         store,
         RemoteSandboxBackendFactory::new(Arc::clone(&placement)),
-        DisabledSandboxPersister,
         aenv_api::image::DisabledRuntimeImageRefs::shared(),
     )
     .await?;
@@ -209,29 +193,19 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         None
     };
 
-    let paused_registry_tasks = spawn_paused_registry_background_tasks(
-        &config.orchestrator.paused_registry,
-        &identity_for_registry,
-        Some(pg_pool),
-        node_registry_for_paused,
-    );
-    pg_singleton_tasks.extend(paused_registry_tasks.singleton);
-    let mut paused_registry_upkeep = paused_registry_tasks.plain;
-    let paused_wiring = PausedSandboxWiring::new(
-        paused_registry,
-        Arc::clone(&snapshot_manager),
-        &identity_for_registry,
-    );
-    orchestrator.set_paused_publisher(paused_wiring.publisher());
+    // A pause's staged snapshot is committed here, making the sandbox
+    // resumable anywhere.
+    orchestrator.set_pause_publisher(Arc::new(CommittingPausePublisher::new(Arc::clone(
+        &snapshot_manager,
+    ))));
 
     let api_impl = Arc::new(
         ApiImpl::new(
             Arc::clone(&orchestration),
             snapshot_manager,
             observability,
-            paused_wiring,
             config.sandbox_proxy.domains.clone(),
-            // Clone only after the binding, artifact, and paused-registry builders.
+            // Clone only after the binding and artifact builders.
             ResumeWiring::cluster_in_process(node_registry_grpc_service.clone()),
         )
         .with_node_placement(placement)
@@ -243,21 +217,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         ),
     );
 
-    // Replica identities must be unique because stale-release is identity-scoped.
-    let stale_release = api_impl.release_stale_node_holdings().await;
-    api_impl.renew_paused_leases().await;
-    api_impl.reconcile_local_records().await;
-    let mut paused_upkeep = spawn_paused_record_upkeep(
-        Arc::clone(&api_impl),
-        config.orchestrator.paused_registry.reconcile_interval(),
-    );
-    if stale_release == StaleReleaseOutcome::Failed {
-        let retrier = Arc::clone(&api_impl);
-        paused_upkeep.push(tokio::spawn(async move {
-            retrier.retry_stale_node_holdings_release().await;
-        }));
-    }
-    paused_upkeep.append(&mut node_registry_upkeep);
+    let mut upkeep = node_registry_upkeep;
     if config.binding_store.sweep_enabled {
         let cluster_id = config.node_identity.cluster_id.clone().unwrap_or_default();
         let sweeper = Arc::new(aenv_api::binding_store::sweep::BindingSweeper::new(
@@ -268,11 +228,10 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>;
         let store = Arc::clone(&binding_store_handle);
         let interval = Duration::from_secs(config.binding_store.sweep_interval_secs);
-        paused_upkeep.push(tokio::spawn(async move {
+        upkeep.push(tokio::spawn(async move {
             sweeper.run(registry, store, interval).await;
         }));
     }
-    paused_upkeep.append(&mut paused_registry_upkeep);
 
     let grpc = {
         let served = Arc::clone(&api_impl);
@@ -300,7 +259,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     Ok(Assembly {
         app: server::new_control_plane_only(api_impl),
         orchestration,
-        upkeep: paused_upkeep,
+        upkeep,
         pg_singleton_tasks,
         reporter: None,
         runtime: None,
@@ -543,35 +502,6 @@ async fn run_kubernetes_discovery_with_retry(
         tokio::time::sleep(backoff).await;
         backoff = std::cmp::min(backoff.saturating_mul(2), KUBE_DISCOVERY_MAX_BACKOFF);
     }
-}
-
-// Renewal and reconciliation stay separate so a teardown cannot starve lease renewal.
-fn spawn_paused_record_upkeep(
-    api_impl: Arc<ApiImpl>,
-    interval: Duration,
-) -> Vec<tokio::task::JoinHandle<()>> {
-    let renewer = Arc::clone(&api_impl);
-    let renew = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        // The startup pass already ran; skip the immediate first tick.
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            renewer.renew_paused_leases().await;
-        }
-    });
-
-    let reconcile = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(interval);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            api_impl.reconcile_local_records().await;
-            api_impl.reclaim_expired_sandboxes().await;
-        }
-    });
-
-    vec![renew, reconcile]
 }
 
 #[cfg(test)]
@@ -889,7 +819,7 @@ mod tests {
         // Control for the strip filter: a phrase that occurs only in one of
         // assemble_api's own comment lines, so it is present before the strip
         // and absent after it.
-        const COMMENT_ANCHOR: &str = "stale-release is identity-scoped";
+        const COMMENT_ANCHOR: &str = "Clone only after the binding and artifact builders";
         assert!(
             raw_body.contains(COMMENT_ANCHOR),
             "the comment this check anchors on is gone; re-anchor on another \
@@ -900,11 +830,7 @@ mod tests {
             "no comment line survived the strip, so this is scanning the raw body again"
         );
         let resume = at("ResumeWiring::cluster_in_process(node_registry_grpc_service.clone())");
-        for builder in [
-            ".with_binding_store(",
-            ".with_artifact_store(",
-            ".with_paused_registry(",
-        ] {
+        for builder in [".with_binding_store(", ".with_artifact_store("] {
             assert!(
                 at(builder) < resume,
                 "🔴 {builder} runs after the clone handed to resume placement, so the \

@@ -2,16 +2,12 @@
 //!
 //! [`SandboxBackend`] represents the lifecycle of a single sandbox instance.
 //! [`SandboxBackendFactory`] is responsible for constructing new sandbox
-//! instances (from scratch, from a committed snapshot, or from paused state).
+//! instances, from scratch or from a committed snapshot.
 
-use std::any::Any;
-use std::fmt;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
-use serde_json::Value;
 
 use super::{
     EnvdAccessToken, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
@@ -21,37 +17,6 @@ use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::CustomExtensionParams;
 pub use crate::snapshot::CapturedSandboxSnapshot;
 use crate::types::{ExecutionId, SandboxId};
-
-/// A concrete sandbox backend's paused state.
-///
-/// The Orchestrator treats this value as completely opaque: it stores it in
-/// [`SandboxMetadata`][crate::orchestrator::SandboxMetadata] after a
-/// `pause` call and passes it back to
-/// [`SandboxBackendFactory::build_from_paused_state`] when a resume is requested.
-/// Concrete implementations own their serialized form.
-pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
-    fn encode(&self) -> Result<Value>;
-
-    /// Local artifacts this paused sandbox will reopen on resume.
-    /// The orchestrator only carries this value to the image-liveness layer; it
-    /// does not interpret the backend-specific artifact identities inside it.
-    fn runtime_artifacts(&self) -> RuntimeArtifactSet;
-
-    /// Returns the remote machine holding this capture, or `None` when it is
-    /// held on this machine.
-    fn holding_node_id(&self) -> Option<&str> {
-        None
-    }
-}
-
-impl dyn PausedSandboxState {
-    pub fn downcast_ref<T>(&self) -> Option<&T>
-    where
-        T: PausedSandboxState,
-    {
-        (self as &dyn Any).downcast_ref::<T>()
-    }
-}
 
 #[derive(thiserror::Error, Debug)]
 pub enum SandboxCaptureError {
@@ -157,31 +122,6 @@ pub struct ResolvedImageFacts {
 
 /// Everything a single pause produced.
 ///
-/// A pause captures the sandbox once and can express that capture two ways: the
-/// backend-specific state the *same* node reopens on resume, and — when the
-/// capture landed in a caller-managed artifact directory that outlives the
-/// runtime — the publishable form a snapshot repository can commit so *any*
-/// node can rebuild the sandbox. Both come out of the same capture, so offering
-/// the publishable form costs no second snapshot.
-pub struct PausedSandboxCapture {
-    /// Reopened by the origin node on a local resume.
-    pub state: Arc<dyn PausedSandboxState>,
-    /// `None` when the backend cannot hand out a publishable capture — for
-    /// example a pause into backend-managed temporary artifacts, which are
-    /// reclaimed as soon as the paused state is dropped.
-    pub publishable: Option<CapturedSandboxSnapshot>,
-}
-
-impl PausedSandboxCapture {
-    /// A capture that only the pausing node can reopen.
-    pub fn local_only(state: Arc<dyn PausedSandboxState>) -> Self {
-        Self {
-            state,
-            publishable: None,
-        }
-    }
-}
-
 /// Lifecycle interface for a single sandbox instance.
 ///
 /// Implementors must be `Send + 'static` so that they can be stored inside
@@ -207,29 +147,22 @@ pub trait SandboxBackend: Send + 'static {
     /// workload is submitted.
     async fn wait_for_ready(&self) -> Result<()>;
 
-    /// Pause the sandbox and capture its state for later resume.
+    /// Pauses the VM in place and captures it for publication.
     ///
-    /// After this call the caller is expected to invoke [`stop`][Self::stop]
-    /// to release system resources; the paused state encapsulates everything
-    /// needed to resume the sandbox later via
-    /// [`SandboxBackendFactory::build_from_paused_state`].
+    /// The VM stays paused: the caller either publishes the capture and then
+    /// [`stop`][Self::stop]s the sandbox, or [`resume`][Self::resume]s it when
+    /// publication fails. A backend that drives a sandbox on another machine
+    /// returns the capture that machine already staged.
     ///
     /// [`SandboxCaptureError::Terminal`] indicates snapshot capture mutated the live
     /// runtime before failing, so callers must not keep treating the sandbox
     /// as safely runnable.
     ///
-    /// For simplicity, [`SandboxCaptureError::Recoverable`] must guarantee the sandbox
-    /// has already been restored to a running state before the error is returned.
-    ///
-    /// `committer_waiting` is false when durable bytes produced solely for
-    /// publication would be orphaned; borrowed existing artifacts may still be offered.
-    async fn pause(
-        &mut self,
-        artifact_root: Option<&Path>,
-        committer_waiting: bool,
-    ) -> SandboxCaptureResult<PausedSandboxCapture>;
+    /// [`SandboxCaptureError::Recoverable`] must guarantee the sandbox has
+    /// already been restored to a running state before the error is returned.
+    async fn pause(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
 
-    /// Resume a paused but not-yet-stopped sandbox from its snapshot.
+    /// Resumes a VM paused in place by [`pause`][Self::pause].
     ///
     /// Idempotent: calling `resume` more than once must not return an error.
     async fn resume(&mut self) -> Result<()>;
@@ -310,7 +243,7 @@ pub trait SandboxBackend: Send + 'static {
 ///
 /// A single factory instance is stored inside the
 /// [`Orchestrator`][crate::orchestrator::Orchestrator] and is used for every
-/// `create_sandbox` and `resume_sandbox` request.
+/// launch.
 pub trait SandboxBackendFactory: Send + Sync + 'static {
     /// Build a brand-new sandbox backend from a high-level launch request.
     ///
@@ -374,13 +307,6 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         false
     }
 
-    /// Decode backend-specific paused state loaded from persistence.
-    fn decode_paused_state(
-        &self,
-        artifact_root: PathBuf,
-        state: Value,
-    ) -> Result<Arc<dyn PausedSandboxState>>;
-
     /// Whether sandboxes built by this factory survive this process.
     fn sandboxes_outlive_this_process(&self) -> bool {
         false
@@ -398,19 +324,6 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
     ) -> Result<Option<Box<dyn SandboxBackend>>> {
         Ok(None)
     }
-
-    /// Build a sandbox backend from backend-specific paused state captured by `pause`.
-    ///
-    /// `decode_paused_state` above deliberately takes no incarnation: it
-    /// reads the state a previous run left on disk, which says nothing about
-    /// which run is about to happen. This one does, because it builds the run.
-    fn build_from_paused_state(
-        &self,
-        sandbox_id: crate::types::SandboxId,
-        execution_id: ExecutionId,
-        state: &dyn PausedSandboxState,
-        envd_access_token: Option<EnvdAccessToken>,
-    ) -> Result<Box<dyn SandboxBackend>>;
 }
 
 /// Process execution capability of a running sandbox.

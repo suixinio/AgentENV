@@ -1,20 +1,18 @@
 //! Redis metadata-store integration tests.
 
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use redis::AsyncCommands;
 use uuid::Uuid;
 
 use super::super::{
-    MetadataStore, PausedHandle, SandboxMetadata, StoreError, TransitionEffect, TransitionOutcome,
+    MetadataStore, SandboxMetadata, StoreError, TransitionEffect, TransitionOutcome,
     TransitionRequest, TransitionSettlement,
 };
 use super::harness::{raw, sibling, store_or_skip};
 use super::keys::{ExpiryMember, TransitionMember};
 use super::RedisMetadataStore;
 use crate::orchestrator::SandboxState;
-use crate::sandbox::{PausedSandboxState, RuntimeArtifactSet};
 use crate::types::{ExecutionId, SandboxId};
 
 fn running(id: SandboxId) -> SandboxMetadata {
@@ -75,19 +73,6 @@ async fn stored_rev(store: &RedisMetadataStore, id: &SandboxId) -> u64 {
         .rev
 }
 
-#[derive(Debug)]
-struct FakePausedState(serde_json::Value);
-
-impl PausedSandboxState for FakePausedState {
-    fn encode(&self) -> anyhow::Result<serde_json::Value> {
-        Ok(self.0.clone())
-    }
-
-    fn runtime_artifacts(&self) -> RuntimeArtifactSet {
-        RuntimeArtifactSet::default()
-    }
-}
-
 mod contract {
     use super::super::harness;
     use super::super::RedisMetadataStore;
@@ -97,74 +82,6 @@ mod contract {
     }
 
     crate::orchestrator::store::contract::metadata_store_contract!();
-}
-
-#[tokio::test]
-async fn a_paused_handle_survives_the_store_as_a_reference() {
-    let store = store_or_skip!("a_paused_handle_survives_the_store_as_a_reference");
-    let id = SandboxId::new();
-    let mut metadata = running(id);
-    metadata.state = SandboxState::Paused;
-    metadata.paused_state = Some(Arc::new(FakePausedState(
-        serde_json::json!({"vm": "state", "n": 7}),
-    )));
-    store.add(metadata).await.unwrap();
-
-    let record = store.inner().read_record(&id).await.unwrap().unwrap();
-    let reference = record
-        .paused_state_ref
-        .expect("the paused handle must have been encoded into a reference");
-    assert_eq!(reference.state, serde_json::json!({"vm": "state", "n": 7}));
-
-    let read_back = store.get(&id).await.unwrap().unwrap();
-    assert!(read_back.paused_state.is_none());
-}
-
-#[tokio::test]
-async fn a_shared_store_answers_remote_for_a_paused_sandbox_never_not_paused() {
-    let store =
-        store_or_skip!("a_shared_store_answers_remote_for_a_paused_sandbox_never_not_paused");
-    let id = SandboxId::new();
-    let mut metadata = running(id);
-    metadata.state = SandboxState::Paused;
-    metadata.paused_state = Some(Arc::new(FakePausedState(serde_json::json!({"vm": 1}))));
-    store.add(metadata).await.unwrap();
-
-    match store.paused_handle(&id).await.unwrap() {
-        PausedHandle::Remote { reference, .. } => {
-            assert_eq!(reference.state, serde_json::json!({"vm": 1}));
-        }
-        other => panic!("a shared store cannot hand back a handle; expected Remote, got {other:?}"),
-    }
-
-    assert!(store
-        .get(&id)
-        .await
-        .unwrap()
-        .unwrap()
-        .paused_state
-        .is_none());
-}
-
-#[tokio::test]
-async fn a_state_change_does_not_erase_the_paused_reference() {
-    let store = store_or_skip!("a_state_change_does_not_erase_the_paused_reference");
-    let id = SandboxId::new();
-    let mut metadata = running(id);
-    metadata.state = SandboxState::Paused;
-    metadata.paused_state = Some(Arc::new(FakePausedState(serde_json::json!({"a": 1}))));
-    store.add(metadata).await.unwrap();
-
-    store
-        .update_state_if_state(&id, SandboxState::Resuming, &[SandboxState::Paused])
-        .await
-        .unwrap();
-
-    let record = store.inner().read_record(&id).await.unwrap().unwrap();
-    assert!(
-        record.paused_state_ref.is_some(),
-        "the reference to the paused bytes was dropped by an unrelated write"
-    );
 }
 
 #[tokio::test]
@@ -224,59 +141,6 @@ async fn an_uncapped_sandbox_has_no_record_ttl() {
         .await
         .unwrap();
     assert_eq!(record_pttl(&store, &id).await, -1);
-}
-
-#[tokio::test]
-async fn a_paused_records_ttl_stops_shrinking_while_a_running_ones_does_not() {
-    let store =
-        store_or_skip!("a_paused_records_ttl_stops_shrinking_while_a_running_ones_does_not");
-
-    let paused_id = SandboxId::new();
-    store
-        .add(capped(paused_id, Duration::from_secs(600)))
-        .await
-        .unwrap();
-    store
-        .update_state_if_state(&paused_id, SandboxState::Paused, &[SandboxState::Running])
-        .await
-        .unwrap();
-    let paused_before = record_pttl(&store, &paused_id).await;
-
-    let running_id = SandboxId::new();
-    store
-        .add(capped(running_id, Duration::from_secs(600)))
-        .await
-        .unwrap();
-    let running_before = record_pttl(&store, &running_id).await;
-
-    // Sleep past whole-second TTL rounding granularity.
-    tokio::time::sleep(Duration::from_millis(2_100)).await;
-
-    store
-        .update_if_state(&paused_id, &[SandboxState::Paused], |metadata| {
-            metadata.snapshot_id = "touched".to_string();
-        })
-        .await
-        .unwrap();
-    store
-        .update_if_state(&running_id, &[SandboxState::Running], |metadata| {
-            metadata.snapshot_id = "touched".to_string();
-        })
-        .await
-        .unwrap();
-
-    let paused_after = record_pttl(&store, &paused_id).await;
-    let running_after = record_pttl(&store, &running_id).await;
-
-    assert!(
-        paused_after >= paused_before - 1_000,
-        "a paused record's TTL kept draining: {paused_before} -> {paused_after}"
-    );
-    assert!(
-        running_after <= running_before - 1_000,
-        "a running record's deadline is pinned, so its TTL must drain: \
-         {running_before} -> {running_after}"
-    );
 }
 
 #[tokio::test]
@@ -789,7 +653,7 @@ async fn start_pause(store: &RedisMetadataStore, id: &SandboxId) -> TransitionOu
         .start_transition(
             id,
             TransitionRequest::new(SandboxState::Pausing, vec![SandboxState::Running])
-                .with_effect(TransitionEffect::Terminal(SandboxState::Paused)),
+                .with_effect(TransitionEffect::Removal),
         )
         .await
         .unwrap()
@@ -834,9 +698,9 @@ async fn a_transition_publishes_a_key_an_index_entry_and_a_result() {
 
     guard.complete(Ok(())).await.unwrap();
 
-    assert_eq!(
-        store.get(&id).await.unwrap().unwrap().state,
-        SandboxState::Paused
+    assert!(
+        store.get(&id).await.unwrap().is_none(),
+        "a completed pause removes the record"
     );
     let held: Option<String> = connection
         .get(store.inner().keys().transition(&id))
@@ -925,7 +789,7 @@ async fn a_second_transition_towards_the_same_state_joins_rather_than_conflicts(
         .start_transition(
             &id,
             TransitionRequest::new(SandboxState::Pausing, vec![SandboxState::Running])
-                .with_effect(TransitionEffect::Terminal(SandboxState::Paused)),
+                .with_effect(TransitionEffect::Removal),
         )
         .await
         .unwrap()
@@ -977,7 +841,7 @@ async fn an_eviction_refuses_a_sandbox_that_was_kept_alive_in_the_meantime() {
         .start_transition(
             &id,
             TransitionRequest::new(SandboxState::Pausing, vec![SandboxState::Running])
-                .with_effect(TransitionEffect::Terminal(SandboxState::Paused))
+                .with_effect(TransitionEffect::Removal)
                 .as_eviction(),
         )
         .await
@@ -1004,7 +868,7 @@ async fn an_eviction_of_a_sandbox_that_is_still_due_starts() {
         .start_transition(
             &due_id,
             TransitionRequest::new(SandboxState::Pausing, vec![SandboxState::Running])
-                .with_effect(TransitionEffect::Terminal(SandboxState::Paused))
+                .with_effect(TransitionEffect::Removal)
                 .as_eviction(),
         )
         .await
@@ -1022,7 +886,7 @@ async fn an_eviction_of_a_sandbox_that_is_still_due_starts() {
         .start_transition(
             &live_id,
             TransitionRequest::new(SandboxState::Pausing, vec![SandboxState::Running])
-                .with_effect(TransitionEffect::Terminal(SandboxState::Paused)),
+                .with_effect(TransitionEffect::Removal),
         )
         .await
         .unwrap();
@@ -1293,7 +1157,7 @@ async fn two_replicas_racing_opposite_transitions_produce_one_winner() {
     let pause = store.start_transition(
         &id,
         TransitionRequest::new(SandboxState::Pausing, vec![SandboxState::Running])
-            .with_effect(TransitionEffect::Terminal(SandboxState::Paused)),
+            .with_effect(TransitionEffect::Removal),
     );
     let kill = other.start_transition(
         &id,

@@ -16,40 +16,34 @@ pub enum TransitionEffect {
 const fn index(state: SandboxState) -> usize {
     match state {
         SandboxState::Creating => 0,
-        SandboxState::Resuming => 1,
-        SandboxState::Running => 2,
-        SandboxState::Snapshotting => 3,
-        SandboxState::Forking => 4,
-        SandboxState::Pausing => 5,
-        SandboxState::Paused => 6,
-        SandboxState::Killing => 7,
+        SandboxState::Running => 1,
+        SandboxState::Snapshotting => 2,
+        SandboxState::Forking => 3,
+        SandboxState::Pausing => 4,
+        SandboxState::Killing => 5,
     }
 }
 
 // ALLOWED[from][to], ordered as in `index`.
 #[rustfmt::skip]
-const ALLOWED: [[bool; 8]; 8] = [
-    //          Crea   Resu   Runn   Snap   Fork   Paus   Pausd  Kill
-    /* Crea  */ [false, false, true,  false, false, false, false, false],
-    /* Resu  */ [false, false, true,  false, false, false, true,  false],
-    /* Runn  */ [false, true,  false, true,  true,  true,  false, true ],
-    /* Snap  */ [false, false, true,  false, false, false, false, false],
-    /* Fork  */ [false, false, true,  false, false, false, false, false],
-    /* Paus  */ [false, false, true,  false, false, false, true,  false],
-    /* Pausd */ [false, true,  false, false, false, false, false, true ],
-    /* Kill  */ [false, false, true,  false, false, false, true,  false],
+const ALLOWED: [[bool; 6]; 6] = [
+    //          Crea   Runn   Snap   Fork   Paus   Kill
+    /* Crea  */ [false, true,  false, false, false, false],
+    /* Runn  */ [false, false, true,  true,  true,  true ],
+    /* Snap  */ [false, true,  false, false, false, false],
+    /* Fork  */ [false, true,  false, false, false, false],
+    /* Paus  */ [false, true,  false, false, false, false],
+    /* Kill  */ [false, true,  false, false, false, false],
 ];
 
 /// Stored serde token used by Lua predicates.
 pub fn state_token(state: SandboxState) -> &'static str {
     match state {
         SandboxState::Creating => "Creating",
-        SandboxState::Resuming => "Resuming",
         SandboxState::Running => "Running",
         SandboxState::Snapshotting => "Snapshotting",
         SandboxState::Forking => "Forking",
         SandboxState::Pausing => "Pausing",
-        SandboxState::Paused => "Paused",
         SandboxState::Killing => "Killing",
     }
 }
@@ -58,12 +52,10 @@ pub fn state_token(state: SandboxState) -> &'static str {
 pub fn state_from_token(token: &str) -> Option<SandboxState> {
     Some(match token {
         "Creating" => SandboxState::Creating,
-        "Resuming" => SandboxState::Resuming,
         "Running" => SandboxState::Running,
         "Snapshotting" => SandboxState::Snapshotting,
         "Forking" => SandboxState::Forking,
         "Pausing" => SandboxState::Pausing,
-        "Paused" => SandboxState::Paused,
         "Killing" => SandboxState::Killing,
         _ => return None,
     })
@@ -78,14 +70,12 @@ pub fn is_allowed_transition(from: SandboxState, to: SandboxState) -> bool {
 mod tests {
     use super::*;
 
-    const STATES: [SandboxState; 8] = [
+    const STATES: [SandboxState; 6] = [
         SandboxState::Creating,
-        SandboxState::Resuming,
         SandboxState::Running,
         SandboxState::Snapshotting,
         SandboxState::Forking,
         SandboxState::Pausing,
-        SandboxState::Paused,
         SandboxState::Killing,
     ];
 
@@ -94,21 +84,18 @@ mod tests {
         use SandboxState::*;
         let edges: &[(SandboxState, SandboxState, &str)] = &[
             (Creating, Running, "create finishes"),
-            (Resuming, Running, "resume finishes"),
-            (Resuming, Paused, "resume rolls back"),
-            (Running, Resuming, "resume of an already-running sandbox"),
             (Running, Snapshotting, "snapshot starts"),
             (Running, Forking, "fork starts"),
             (Running, Pausing, "pause starts"),
             (Running, Killing, "delete starts"),
             (Snapshotting, Running, "snapshot finishes or rolls back"),
             (Forking, Running, "fork finishes or rolls back"),
-            (Pausing, Running, "pause rolls back"),
-            (Pausing, Paused, "pause finishes"),
-            (Paused, Resuming, "resume starts"),
-            (Paused, Killing, "delete starts"),
+            (
+                Pausing,
+                Running,
+                "pause rolls back; a finished pause removes the record",
+            ),
             (Killing, Running, "delete rolls back to a running sandbox"),
-            (Killing, Paused, "delete rolls back to a paused sandbox"),
         ];
 
         for from in STATES {
@@ -148,6 +135,7 @@ mod tests {
             assert_eq!(state_from_token(state_token(state)), Some(state));
         }
         assert_eq!(state_from_token("running"), None);
+        assert_eq!(state_from_token("Paused"), None);
         assert_eq!(state_from_token(""), None);
     }
 

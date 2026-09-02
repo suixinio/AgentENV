@@ -16,12 +16,13 @@ use crate::orchestrator::SandboxState;
 use crate::types::{ExecutionId, SandboxId};
 
 pub use in_memory::InMemoryMetadataStore;
+pub(crate) use metadata::deserialize_optional_control_plane_config;
 pub use metadata::{
     configured_max_sandbox_lifetime, ControlPlaneConfig, NewTimeout, SandboxMetadata,
     SandboxTimeoutAction,
 };
 pub use redis::{
-    ActiveStateRecord, PausedStateRef, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError,
+    ActiveStateRecord, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError,
     StoredSandboxRecord, DEFAULT_KEY_PREFIX as DEFAULT_STORE_KEY_PREFIX,
     RECORD_VERSION as STORE_RECORD_VERSION,
 };
@@ -262,33 +263,6 @@ impl Drop for TransitionGuard {
     }
 }
 
-/// Source of paused runtime state: local handle, remote reference, or confirmed absence.
-pub enum PausedHandle {
-    /// Process-local paused-state handle.
-    Local(Arc<dyn crate::sandbox::PausedSandboxState>),
-    /// Remote paused-state reference and the node whose path it names.
-    Remote {
-        reference: PausedStateRef,
-        /// Node whose local path `reference` names.
-        origin_node_id: Option<String>,
-    },
-    /// Confirmed absence of paused state.
-    NotPaused,
-}
-
-impl std::fmt::Debug for PausedHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PausedHandle::Local(_) => f.write_str("PausedHandle::Local(..)"),
-            PausedHandle::Remote { origin_node_id, .. } => f
-                .debug_struct("PausedHandle::Remote")
-                .field("origin_node_id", origin_node_id)
-                .finish_non_exhaustive(),
-            PausedHandle::NotPaused => f.write_str("PausedHandle::NotPaused"),
-        }
-    }
-}
-
 /// Settlement observed by a transition joiner.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TransitionSettlement {
@@ -400,20 +374,6 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<TransitionOutcome> {
         Err(StoreError::UnsupportedByBackend {
             method: "start_transition",
-        })
-    }
-
-    /// Returns local, remote, or absent paused runtime state.
-    async fn paused_handle(&self, sandbox_id: &SandboxId) -> Result<PausedHandle> {
-        let metadata = self
-            .get(sandbox_id)
-            .await?
-            .ok_or(StoreError::SandboxNotFound {
-                sandbox_id: *sandbox_id,
-            })?;
-        Ok(match metadata.paused_state {
-            Some(handle) => PausedHandle::Local(handle),
-            None => PausedHandle::NotPaused,
         })
     }
 

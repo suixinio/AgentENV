@@ -1,21 +1,18 @@
 //! Building sandboxes that run somewhere else.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
-use serde_json::Value;
+use anyhow::{bail, Result};
 
 use crate::proto::node as pb;
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::{
-    EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxBackend,
-    SandboxBackendFactory, SandboxLaunchConfig, UnresolvedImageBuildSpec,
+    FreshSandboxBuildSpec, SandboxBackend, SandboxBackendFactory, SandboxLaunchConfig,
+    UnresolvedImageBuildSpec,
 };
 use crate::snapshot::SnapshotRecord;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-use super::paused_state::RemotePausedState;
 use super::placement::NodePlacement;
 use super::stub::{PendingLaunch, RemoteSandboxStub};
 use super::wire;
@@ -113,6 +110,7 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             Arc::clone(&self.placement),
             PendingLaunch::Launch {
                 request: Box::new(request),
+                preferred_node_id: launch_config.preferred_node_id,
             },
         )))
     }
@@ -185,6 +183,7 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             Arc::clone(&self.placement),
             PendingLaunch::Launch {
                 request: Box::new(request),
+                preferred_node_id: launch_config.preferred_node_id,
             },
         )))
     }
@@ -209,99 +208,5 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             resources,
             Arc::clone(&self.placement),
         ))))
-    }
-
-    /// Decodes the node-selected artifact path and capture identity.
-    fn decode_paused_state(
-        &self,
-        _artifact_root: PathBuf,
-        state: Value,
-    ) -> Result<Arc<dyn PausedSandboxState>> {
-        let origin_node_id = state
-            .get("origin_node_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                // A capture without an origin node cannot be resumed safely.
-                anyhow!("paused state does not say which node holds its artifacts")
-            })?
-            .to_string();
-        let artifact_root = state
-            .get("artifact_root")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("paused state has no artifact root"))?
-            .to_string();
-        // The paused execution ID fences the exact capture to reopen.
-        let paused_execution_id = state
-            .get("execution_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("paused state does not say which run it captured"))
-            .and_then(|raw| {
-                ExecutionId::parse_str(raw).map_err(|err| {
-                    anyhow!("paused state names {raw:?} as the run it captured: {err}")
-                })
-            })?;
-        let inner = state
-            .get("state")
-            .cloned()
-            .ok_or_else(|| anyhow!("paused state has no backend state"))?;
-
-        Ok(Arc::new(RemotePausedState::new(
-            origin_node_id,
-            artifact_root,
-            paused_execution_id,
-            inner,
-        )))
-    }
-
-    /// Builds a stub that reopens a pinned capture on its origin node.
-    ///
-    /// Published captures are rebuilt through the snapshot-create path instead.
-    fn build_from_paused_state(
-        &self,
-        sandbox_id: SandboxId,
-        execution_id: ExecutionId,
-        state: &dyn PausedSandboxState,
-        // The node derives the envd token from the shared cluster seed.
-        _envd_access_token: Option<EnvdAccessToken>,
-    ) -> Result<Box<dyn SandboxBackend>> {
-        let state = state.downcast_ref::<RemotePausedState>().ok_or_else(|| {
-            // Foreign paused state carries no trustworthy remote artifact location.
-            anyhow!(
-                "sandbox {sandbox_id} cannot be resumed from here: its paused state was not \
-                 produced by this factory, so nothing in it says which machine holds the capture"
-            )
-        })?;
-
-        let paused_execution_id = state.paused_execution_id();
-        if paused_execution_id == execution_id {
-            bail!(
-                "sandbox {sandbox_id} would be resumed as the same run it was paused under \
-                 ({paused_execution_id}): a resume starts a new one, and reusing the paused \
-                 run's identity leaves commands written before the pause indistinguishable from \
-                 commands written after it"
-            );
-        }
-
-        let request = pb::SandboxResumeRequest {
-            sandbox_id: sandbox_id.to_string(),
-            // The node verifies this capture incarnation before reopening.
-            execution_id: paused_execution_id.to_string(),
-            // The node must adopt the resume claim's new incarnation.
-            resumed_execution_id: execution_id.to_string(),
-            // Zero preserves the deadline from the paused record.
-            timeout_ms: 0,
-        };
-
-        Ok(Box::new(RemoteSandboxStub::pending(
-            sandbox_id,
-            execution_id,
-            // Resources are populated from the resume reply before use.
-            SandboxResources::default(),
-            Arc::clone(&self.placement),
-            PendingLaunch::Resume {
-                request: Box::new(request),
-                origin_node_id: state.origin_node_id().to_string(),
-            },
-        )))
     }
 }

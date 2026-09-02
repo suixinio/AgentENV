@@ -242,27 +242,30 @@ async fn memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
 }
 
 #[tokio::test]
-async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<()> {
+async fn backend_pause_captures_artifacts_a_repository_can_publish() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
-    let temp = tempfile::tempdir()?;
-    let artifact_root = temp.path().join("paused-artifacts");
-    let paused_state = SandboxBackend::pause(&mut sandbox, Some(&artifact_root), false).await?;
+    let captured = SandboxBackend::pause(&mut sandbox).await?;
+    let aenv_node::snapshot::CapturedSandboxSnapshot::Local(artifacts) = captured else {
+        panic!("a pause captured in this process holds local artifacts, not a staged row");
+    };
+    let manifest = artifacts
+        .publishable_manifest()
+        .context("a pause capture must be publishable")?;
+    assert!(
+        manifest.vm_state.path.is_file(),
+        "the capture names a VM state file that does not exist: {}",
+        manifest.vm_state.path.display()
+    );
     sandbox.stop().await?;
-
-    let encoded = paused_state.state.encode()?;
-    drop(paused_state);
-
-    let decoded =
-        aenv_node::sandbox::FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
-    let mut resumed =
-        FirecrackerSandbox::resume_from_snapshot_config(decoded.snapshot_config()).await?;
-    verify_disk_marker(&mut resumed).await?;
-    resumed.stop().await?;
+    assert!(
+        manifest.vm_state.path.is_file(),
+        "stopping the VM discarded the capture it was paused for"
+    );
     Ok(())
 }
 

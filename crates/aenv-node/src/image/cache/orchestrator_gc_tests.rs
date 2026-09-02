@@ -1,4 +1,4 @@
-//! Verifies paused sandboxes keep runtime image commits pinned in the real
+//! Verifies running sandboxes keep runtime image commits pinned in the real
 //! node-local layer cache.
 
 use std::path::{Path, PathBuf};
@@ -9,13 +9,12 @@ use anyhow::Result;
 use serde_json::json;
 use tempfile::TempDir;
 
-use super::service::HoldNamespace;
 use super::test_support::{test_local_image_services_from_service, ImageCacheService};
 use crate::cfg::ResolvedImageCacheConfig;
 use crate::image::RecordingRuntimeImageRefs;
 use crate::orchestrator::{
-    CreateSandboxRequest, DisabledSandboxPersister, InMemoryMetadataStore, Orchestrator,
-    SandboxExpiry, SandboxLaunchSource, SandboxTimeoutAction,
+    CreateSandboxRequest, InMemoryMetadataStore, Orchestrator, SandboxExpiry, SandboxLaunchSource,
+    SandboxTimeoutAction,
 };
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::mock::{MockBackendFactory, MockBehavior};
@@ -44,6 +43,7 @@ fn create_request(
         execution_id: None,
         auto_resume: false,
         secure: false,
+        preferred_node_id: None,
     }
 }
 
@@ -68,7 +68,8 @@ fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size:
 }
 
 #[tokio::test]
-async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()> {
+async fn a_running_sandbox_keeps_its_commit_pinned_after_its_source_config_was_evicted(
+) -> Result<()> {
     setup();
     let temp = TempDir::new().expect("tempdir");
     let root_dir = temp.path().join("image-cache");
@@ -83,16 +84,16 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
     ));
 
     let source = temp.path().join("source.commit");
-    std::fs::write(&source, b"paused").expect("write source commit");
+    std::fs::write(&source, b"pinned").expect("write source commit");
     let commit_file = image_cache
-        .import_hard_commit_trusted_descriptor(&source, "sha256:paused", 6)
+        .import_hard_commit_trusted_descriptor(&source, "sha256:pinned", 6)
         .await
-        .expect("import paused commit");
+        .expect("import the commit");
 
     let source_config = root_dir.join("configs/source-image.json");
     let runtime_config = temp.path().join("runtime/image.json");
-    write_local_commit_image_config(&source_config, &commit_file, "sha256:paused", 6);
-    write_local_commit_image_config(&runtime_config, &commit_file, "sha256:paused", 6);
+    write_local_commit_image_config(&source_config, &commit_file, "sha256:pinned", 6);
+    write_local_commit_image_config(&runtime_config, &commit_file, "sha256:pinned", 6);
 
     let behavior = Arc::new(MockBehavior::new());
     behavior.set_source_config_paths(vec![source_config.clone()]);
@@ -103,7 +104,6 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
     let mut orchestrator = Arc::new(Orchestrator::from_test_parts(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(behavior),
-        DisabledSandboxPersister,
         Duration::from_secs(600),
         Arc::new(RecordingRuntimeImageRefs::default()),
         "orchestrator-image-cache-test-seed",
@@ -122,11 +122,8 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
         .await?;
     std::fs::remove_file(&source_config).expect("evict source config");
 
-    orchestrator.pause_sandbox(created.id).await?;
-    // What `Orchestrator::new` does before it starts maintenance.
-    image_cache
-        .reconcile_namespace(HoldNamespace::Paused, &[created.id.to_string()])
-        .await?;
+    // Maintenance refuses to reclaim anything until the startup reconcile ran.
+    image_cache.startup_reconcile().await?;
     let running: Vec<(String, Vec<PathBuf>)> = orchestrator
         .collect_running_artifacts()
         .await
@@ -138,6 +135,10 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
             )
         })
         .collect();
+    assert!(
+        running.iter().any(|(id, _)| id == &created.id.to_string()),
+        "the running set does not name the sandbox, so this test proves nothing"
+    );
     let summary = image_cache
         .run_maintenance(running, None, Duration::from_secs(0))
         .await
@@ -147,7 +148,7 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
     assert!(commit_file.exists());
     assert!(
         summary.retained >= 1,
-        "paused commit must be retained by its durable pin"
+        "the running sandbox's commit must be retained through its runtime config"
     );
     Ok(())
 }

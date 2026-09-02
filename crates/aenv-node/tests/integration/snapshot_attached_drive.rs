@@ -186,6 +186,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
         virtualization_mode: aenv_node::cfg::ConfigManager::global_config().virtualization_mode,
         image_configs: aenv_node::types::ImageConfigs::new(),
         custom_extension_params: None,
+        paused_sandbox: None,
     };
 
     Ok(snapshot_manager

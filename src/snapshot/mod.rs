@@ -17,8 +17,8 @@ pub use repository::{
 pub use types::rootfs_snapshot_image_tag;
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,
-    OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotAlias, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions,
-    SnapshotSource, SnapshotSourceKind, StartupCommand, TemplateBuildErrorReason,
-    TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
+    OverlaybdLayerRef, PausedSandboxConfig, PersistedDiskImagePublication, SnapshotAlias,
+    SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
+    SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, StartupCommand,
+    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };

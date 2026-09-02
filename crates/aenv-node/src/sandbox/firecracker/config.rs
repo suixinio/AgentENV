@@ -264,7 +264,7 @@ impl FirecrackerCommonConfig {
     pub fn resolved_tools_drive_path(&self, config: &AppConfig) -> Result<PathBuf> {
         if self.tools_drive_version.trim().is_empty() {
             anyhow::bail!(
-                "sandbox state does not record a tools drive version; migrate its persisted metadata before resuming it"
+                "snapshot does not record a tools drive version; rebuild it before launching from it"
             );
         }
         config

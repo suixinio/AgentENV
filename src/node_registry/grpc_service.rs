@@ -1,9 +1,8 @@
 //! Implements the node-registry RPC subset of `scheduler.v1.Scheduler` for `aenv-api`.
 //!
-//! Heartbeats store the full roster in the node registry, including paused entries
-//! that renew paused-registry leases, but reconcile only routable entries into the
+//! Heartbeats store the full roster in the node registry and reconcile it into the
 //! binding store. Unregister removes identity first, so route cleanup is best-effort.
-//! Optional binding, artifact, and paused-registry dependencies gate their RPC groups.
+//! Optional binding and artifact dependencies gate their RPC groups.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -18,7 +17,6 @@ use crate::binding_store::lookup::{
 use crate::binding_store::{
     Binding, BindingDecision, BindingDeleteOutcome, BindingState, BindingStore,
 };
-use crate::orchestrator::PausedSandboxRegistry;
 use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{
     self, ForgetP2pArtifactRequest, ForgetP2pArtifactResponse, GetNodeRequest, GetNodeResponse,
@@ -53,8 +51,6 @@ pub struct NodeRegistryGrpcService {
     projection_authoritative: bool,
     max_projection_ttl: Duration,
     artifact_store: Option<Arc<dyn ArtifactStore>>,
-    paused_registry: Option<Arc<dyn PausedSandboxRegistry>>,
-    /// Shared by `schedule` and paused lookup so both advance one round-robin cursor.
     strategy: Arc<RoundRobinStrategy>,
     /// Resolves metric handles at construction, outside the placement hot path.
     shadow: Arc<ShadowPlacement>,
@@ -69,7 +65,6 @@ impl NodeRegistryGrpcService {
             projection_authoritative: false,
             max_projection_ttl: Duration::ZERO,
             artifact_store: None,
-            paused_registry: None,
             strategy: Arc::new(RoundRobinStrategy::new()),
             shadow: Arc::new(ShadowPlacement::default()),
         }
@@ -87,13 +82,6 @@ impl NodeRegistryGrpcService {
     #[must_use]
     pub fn with_placement_shadow(mut self, shadow: ShadowPlacement) -> Self {
         self.shadow = Arc::new(shadow);
-        self
-    }
-
-    /// Wires the optional cluster-backed paused-sandbox registry.
-    #[must_use]
-    pub fn with_paused_registry(mut self, paused_registry: Arc<dyn PausedSandboxRegistry>) -> Self {
-        self.paused_registry = Some(paused_registry);
         self
     }
 
@@ -118,9 +106,8 @@ impl NodeRegistryGrpcService {
         self
     }
 
-    /// Resolves a sandbox through the binding store, the heartbeat roster and
-    /// the paused registry, in that order; the answer's label names which of
-    /// the three answered.
+    /// Resolves a running sandbox through the binding store, then the
+    /// heartbeat roster; the answer's label names which of the two answered.
     pub async fn lookup_sandbox(&self, sandbox_id: &str) -> Result<LookupAnswer, Status> {
         let Some(binding_store) = self.binding_store.clone() else {
             return Err(Status::unimplemented(format!(
@@ -141,7 +128,6 @@ impl NodeRegistryGrpcService {
                 shadow: self.shadow.as_ref(),
             },
             binding_store: binding_store.as_ref(),
-            paused_registry: self.paused_registry.as_deref(),
             warmup: self.warmup.as_ref(),
         };
         let outcome = lookup_logic::lookup_node(&deps, sandbox_id, SystemTime::now()).await;
@@ -153,10 +139,14 @@ impl NodeRegistryGrpcService {
             }
             LookupOutcome::NotFound => Err(Status::not_found("sandbox assignment not found")),
             LookupOutcome::Unavailable(_label, message) => Err(Status::unavailable(message)),
-            LookupOutcome::FailedPrecondition(_label, message) => {
-                Err(Status::failed_precondition(message))
-            }
         }
+    }
+
+    /// The data-plane endpoint discovery has for a node, if it is known.
+    pub fn node_endpoint(&self, node_id: &str) -> Option<String> {
+        self.registry
+            .resolve(node_id.trim())
+            .map(|node| node.endpoint)
     }
 
     /// Writes the routing projection for a sandbox running under `execution_id`
@@ -283,54 +273,6 @@ impl NodeRegistryGrpcService {
                 Ok(())
             }
         }
-    }
-
-    // The judgement belongs here and is named explicitly rather than left for the
-    // node to derive: only this side can tell a sandbox that was never recorded
-    // from one whose row moved to another machine. Everything this side cannot
-    // settle — no registry, one that is not cluster-backed, a read that failed, an
-    // id the batch did not answer for — is left out, so a node that hears nothing
-    // keeps everything.
-    async fn disowned_paused_sandboxes(
-        &self,
-        node_id: &str,
-        roster: &[crate::node_registry::types::RosterEntry],
-    ) -> Vec<String> {
-        let Some(registry) = self.paused_registry.as_ref() else {
-            return Vec::new();
-        };
-        if !registry.is_cluster_backed() {
-            return Vec::new();
-        }
-        let paused: Vec<crate::types::SandboxId> = roster
-            .iter()
-            .filter(|entry| entry.paused)
-            .filter_map(|entry| crate::types::SandboxId::parse_str(entry.sandbox_id.trim()).ok())
-            .collect();
-        if paused.is_empty() {
-            return Vec::new();
-        }
-        let rows = match registry.get_many(&paused).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(
-                    node_id = %node_id,
-                    error = %err,
-                    "could not read the paused registry for this node's roster; naming nothing"
-                );
-                return Vec::new();
-            }
-        };
-        let answered = rows.answered();
-        paused
-            .iter()
-            .filter(|sandbox_id| match answered.get(sandbox_id) {
-                None => false,
-                Some(None) => true,
-                Some(Some(entry)) => entry.origin_node_id != node_id,
-            })
-            .map(|sandbox_id| sandbox_id.to_string())
-            .collect()
     }
 
     /// Reserves a sandbox's routing record before the node that will run it is asked to.
@@ -557,7 +499,6 @@ impl NodeRegistryGrpcService {
     fn record_lookup_execution_authority(authority: ExecutionAuthority) {
         let label = match authority {
             ExecutionAuthority::Registry => "registry",
-            ExecutionAuthority::Pending => "pending",
             ExecutionAuthority::Unknown => "unknown",
         };
         metrics::counter!(LOOKUP_EXECUTION_AUTHORITY_METRIC, "authority" => label).increment(1);
@@ -657,18 +598,7 @@ impl Scheduler for NodeRegistryGrpcService {
 
         // Warm-up means bindings were seeded when a binding store is configured.
         if let Some(binding_store) = &self.binding_store {
-            // Paused entries must renew their registry leases but must not become routing
-            // projections. Reconciliation also removes projections for newly paused entries.
-            let routable: Vec<_> = roster.iter().filter(|e| !e.paused).cloned().collect();
-            let withheld = roster.len() - routable.len();
-            if withheld > 0 {
-                tracing::debug!(
-                    node_id = %node_id,
-                    withheld,
-                    "withholding paused sandboxes from binding reconciliation"
-                );
-            }
-            match binding_store.reconcile_node(node, routable, now).await {
+            match binding_store.reconcile_node(node, roster, now).await {
                 Err(err) => {
                     tracing::warn!(
                         node_id = %node_id,
@@ -689,10 +619,7 @@ impl Scheduler for NodeRegistryGrpcService {
             self.warmup.reported_in(now);
         }
 
-        Ok(Response::new(HeartbeatResponse {
-            cpu_config_json,
-            disowned_sandbox_ids: self.disowned_paused_sandboxes(node_id, &roster).await,
-        }))
+        Ok(Response::new(HeartbeatResponse { cpu_config_json }))
     }
 
     async fn get_node(
@@ -780,10 +707,20 @@ impl Scheduler for NodeRegistryGrpcService {
             strategy: self.strategy.as_ref(),
             shadow: self.shadow.as_ref(),
         };
+        let preferred_node_id = req
+            .hint
+            .as_ref()
+            .and_then(|hint| match hint.kind.as_ref() {
+                Some(scheduler::schedule_request_hint::Kind::NewSandbox(hint)) => {
+                    Some(hint.preferred_node_id.as_str())
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
         let result = lookup_logic::select_node(
             &deps,
             req.hint.as_ref(),
-            "",
+            preferred_node_id,
             ShadowSource::Schedule,
             SystemTime::now(),
         );
@@ -936,7 +873,6 @@ mod tests {
     use tokio::sync::oneshot;
     use tonic::transport::Channel;
 
-    use crate::binding_store::lookup::SandboxLocation;
     use crate::node_registry::types::Node;
     use crate::proto::scheduler::scheduler_client::SchedulerClient;
     use crate::proto::scheduler::scheduler_server::SchedulerServer;
@@ -1763,22 +1699,20 @@ mod tests {
         (registry, service)
     }
 
-    fn heartbeat_with_a_paused_sandbox() -> HeartbeatRequest {
+    fn heartbeat_with_two_sandboxes() -> HeartbeatRequest {
         HeartbeatRequest {
             node_id: "node-a".to_string(),
             cluster_id: "cluster-a".to_string(),
             service_instance_id: "node-a-instance".to_string(),
             roster: vec![
                 scheduler::SandboxRosterEntry {
-                    sandbox_id: "sbx-running".to_string(),
+                    sandbox_id: "sbx-1".to_string(),
                     execution_id: "0199a000-0000-7000-8000-000000000001".to_string(),
-                    paused: false,
                     ..Default::default()
                 },
                 scheduler::SandboxRosterEntry {
-                    sandbox_id: "sbx-parked".to_string(),
+                    sandbox_id: "sbx-2".to_string(),
                     execution_id: "0199a000-0000-7000-8000-000000000002".to_string(),
-                    paused: true,
                     ..Default::default()
                 },
             ],
@@ -1786,137 +1720,8 @@ mod tests {
         }
     }
 
-    fn heartbeat_holding(paused: SandboxId, running: SandboxId) -> HeartbeatRequest {
-        HeartbeatRequest {
-            node_id: "node-a".to_string(),
-            cluster_id: "cluster-a".to_string(),
-            service_instance_id: "node-a-instance".to_string(),
-            roster: vec![
-                scheduler::SandboxRosterEntry {
-                    sandbox_id: running.to_string(),
-                    execution_id: "0199a000-0000-7000-8000-000000000001".to_string(),
-                    paused: false,
-                    ..Default::default()
-                },
-                scheduler::SandboxRosterEntry {
-                    sandbox_id: paused.to_string(),
-                    execution_id: "0199a000-0000-7000-8000-000000000002".to_string(),
-                    paused: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        }
-    }
-
-    async fn disowned_by(
-        registry: FakePausedRegistry,
-        paused: SandboxId,
-        running: SandboxId,
-    ) -> Vec<String> {
-        let (_registry, service) = service_with_registry(
-            vec![node("node-a", "http://node-a")],
-            in_memory_binding_store(),
-        );
-        service
-            .with_paused_registry(Arc::new(registry))
-            .heartbeat(Request::new(heartbeat_holding(paused, running)))
-            .await
-            .expect("node-a heartbeats")
-            .into_inner()
-            .disowned_sandbox_ids
-    }
-
     #[tokio::test]
-    async fn a_heartbeat_names_a_paused_sandbox_no_row_records() {
-        let paused = SandboxId::new();
-        let running = SandboxId::new();
-        assert_eq!(
-            disowned_by(FakePausedRegistry::empty(true), paused, running).await,
-            vec![paused.to_string()],
-            "a paused sandbox the registry has no row for is this node's alone and unreachable"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_names_a_paused_sandbox_whose_row_names_another_node() {
-        let paused = SandboxId::new();
-        let running = SandboxId::new();
-        let registry = FakePausedRegistry::with_entry(
-            paused_entry(paused, PausedRegistryState::Running, "node-b", None),
-            true,
-        );
-        assert_eq!(
-            disowned_by(registry, paused, running).await,
-            vec![paused.to_string()],
-            "the row names node-b, so node-a is holding a ghost of it"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_names_nothing_while_the_row_still_names_this_node() {
-        let paused = SandboxId::new();
-        let running = SandboxId::new();
-        let registry = FakePausedRegistry::with_entry(
-            paused_entry(paused, PausedRegistryState::Paused, "node-a", None),
-            true,
-        );
-        assert!(disowned_by(registry, paused, running).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_names_nothing_when_the_registry_could_not_answer() {
-        let paused = SandboxId::new();
-        let running = SandboxId::new();
-        assert!(
-            disowned_by(FakePausedRegistry::erroring(), paused, running)
-                .await
-                .is_empty(),
-            "a registry that could not be read named a sandbox for deletion"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_names_nothing_when_the_batch_did_not_answer_for_the_sandbox() {
-        let paused = SandboxId::new();
-        let running = SandboxId::new();
-        assert!(
-            disowned_by(
-                FakePausedRegistry::not_answering_for(paused),
-                paused,
-                running
-            )
-            .await
-            .is_empty(),
-            "an id the batch left out of its coverage was read as a confirmed absence"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_names_nothing_without_a_cluster_backed_registry() {
-        let paused = SandboxId::new();
-        let running = SandboxId::new();
-        assert!(
-            disowned_by(FakePausedRegistry::empty(false), paused, running)
-                .await
-                .is_empty(),
-            "a deployment whose rows are node-local would have every paused sandbox deleted"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_heartbeat_never_names_a_running_sandbox() {
-        let paused = SandboxId::new();
-        let running = SandboxId::new();
-        let named = disowned_by(FakePausedRegistry::empty(true), paused, running).await;
-        assert!(
-            !named.contains(&running.to_string()),
-            "a running sandbox has no registry row by design; naming it would tear down live VMs"
-        );
-    }
-
-    #[tokio::test]
-    async fn heartbeat_withholds_paused_sandboxes_from_binding_reconciliation() {
+    async fn heartbeat_hands_binding_reconciliation_the_whole_roster() {
         let store = Arc::new(RecordingBindingStore::default());
         let (_registry, service) = service_with_registry(
             vec![node("node-a", "http://node-a")],
@@ -1924,7 +1729,7 @@ mod tests {
         );
 
         service
-            .heartbeat(Request::new(heartbeat_with_a_paused_sandbox()))
+            .heartbeat(Request::new(heartbeat_with_two_sandboxes()))
             .await
             .expect("node-a heartbeats");
 
@@ -1933,19 +1738,15 @@ mod tests {
             .into_iter()
             .map(|entry| entry.sandbox_id)
             .collect();
-
-        // Exact equality also catches accidental removal of every roster entry.
         assert_eq!(
             reconciled,
-            vec!["sbx-running".to_string()],
-            "binding reconciliation must receive the running sandbox and only the running \
-             sandbox: a projection for a parked sandbox is what makes the gateway answer the \
-             data plane with 410 instead of waking it"
+            vec!["sbx-1".to_string(), "sbx-2".to_string()],
+            "every sandbox the node reports is a running sandbox, and each gets a projection"
         );
     }
 
     #[tokio::test]
-    async fn heartbeat_still_registers_paused_sandboxes_so_their_leases_keep_renewing() {
+    async fn heartbeat_registers_every_roster_entry_and_its_holder() {
         let store = Arc::new(RecordingBindingStore::default());
         let (registry, service) = service_with_registry(
             vec![node("node-a", "http://node-a")],
@@ -1953,7 +1754,7 @@ mod tests {
         );
 
         service
-            .heartbeat(Request::new(heartbeat_with_a_paused_sandbox()))
+            .heartbeat(Request::new(heartbeat_with_two_sandboxes()))
             .await
             .expect("node-a heartbeats");
 
@@ -1964,37 +1765,18 @@ mod tests {
             .iter()
             .map(|entry| entry.sandbox_id.as_str())
             .collect();
-        assert_eq!(
-            held,
-            vec!["sbx-running", "sbx-parked"],
-            "🔴 the registry roster must keep the paused sandbox. It is the only thing that \
-             renews that sandbox's lease in the cluster paused registry \
-             (`candidates_from_rosters` reads exactly these entries); dropping it here lets the \
-             lease lapse and another node claim a row whose snapshot lives on this node's disk \
-             alone"
-        );
-        assert!(
-            roster
-                .iter()
-                .any(|entry| entry.sandbox_id == "sbx-parked" && entry.paused),
-            "and it must keep it flagged as paused, not launder it into a running entry"
-        );
-
-        assert_eq!(
-            registry.nodes_holding("sbx-parked"),
-            vec!["node-a".to_string()],
-            "🔴 the reverse index must still name the node holding the paused sandbox: this is \
-             what answers 'who has this snapshot' after the projection is gone"
-        );
-        assert_eq!(
-            registry.nodes_holding("sbx-running"),
-            vec!["node-a".to_string()],
-            "and the running sandbox is unaffected"
-        );
+        assert_eq!(held, vec!["sbx-1", "sbx-2"]);
+        for sandbox_id in ["sbx-1", "sbx-2"] {
+            assert_eq!(
+                registry.nodes_holding(sandbox_id),
+                vec!["node-a".to_string()],
+                "the reverse index names the node holding {sandbox_id}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn heartbeat_removes_the_projection_of_a_sandbox_that_has_since_paused() {
+    async fn heartbeat_removes_the_projection_of_a_sandbox_the_roster_stopped_naming() {
         let store: Arc<dyn BindingStore> =
             Arc::new(crate::binding_store::InMemoryBindingStore::new(
                 crate::binding_store::BindingStoreSettings::default(),
@@ -2002,42 +1784,43 @@ mod tests {
         let (_registry, service) =
             service_with_registry(vec![node("node-a", "http://node-a")], Arc::clone(&store));
 
-        let mut running = heartbeat_with_a_paused_sandbox();
-        running.roster[1].paused = false;
         service
-            .heartbeat(Request::new(running))
+            .heartbeat(Request::new(heartbeat_with_two_sandboxes()))
             .await
             .expect("node-a heartbeats while both sandboxes run");
-        assert!(
-            store
-                .get("sbx-parked", SystemTime::now())
-                .await
-                .unwrap()
-                .is_some(),
-            "precondition: while it is running the sandbox does hold a projection"
-        );
+        for sandbox_id in ["sbx-1", "sbx-2"] {
+            assert!(
+                store
+                    .get(sandbox_id, SystemTime::now())
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "precondition: while it is running {sandbox_id} holds a projection"
+            );
+        }
 
+        let mut only_first = heartbeat_with_two_sandboxes();
+        only_first.roster.truncate(1);
         service
-            .heartbeat(Request::new(heartbeat_with_a_paused_sandbox()))
+            .heartbeat(Request::new(only_first))
             .await
-            .expect("node-a heartbeats again, now with the sandbox paused");
+            .expect("node-a heartbeats again without sbx-2");
 
         assert!(
             store
-                .get("sbx-parked", SystemTime::now())
+                .get("sbx-2", SystemTime::now())
                 .await
                 .unwrap()
                 .is_none(),
-            "the projection must be gone once the node reports the sandbox as paused, so the \
-             gateway takes its wake path instead of routing to a VM that is not running"
+            "a sandbox the node no longer reports has no projection to route by"
         );
         assert!(
             store
-                .get("sbx-running", SystemTime::now())
+                .get("sbx-1", SystemTime::now())
                 .await
                 .unwrap()
                 .is_some(),
-            "and the running sandbox must keep its projection through the same reconcile"
+            "and the sandbox still reported keeps its projection through the same reconcile"
         );
     }
 
@@ -2425,184 +2208,7 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
 
     use crate::binding_store::{BindingStoreSettings, InMemoryBindingStore};
-    use crate::orchestrator::{
-        BeganPause, DeadlineRenewalOutcome, HeldSandbox, MarkRunningOutcome, PausedRegistryError,
-        PausedRegistryListing, PausedRegistryRows, PausedRegistryState, PausedSandboxEntry,
-        ReclaimedHoldings, RegistryResult, ReleasedHoldings, ResumeClaim,
-    };
     use crate::types::{ExecutionId, SandboxId};
-
-    struct FakePausedRegistry {
-        entries: StdHashMap<SandboxId, PausedSandboxEntry>,
-        cluster_backed: bool,
-        erroring: bool,
-        // Ids a batch read leaves out of its coverage, as an undecodable row does.
-        uncovered: std::collections::HashSet<SandboxId>,
-    }
-
-    impl FakePausedRegistry {
-        fn with_entry(entry: PausedSandboxEntry, cluster_backed: bool) -> Self {
-            let mut entries = StdHashMap::new();
-            entries.insert(entry.sandbox_id, entry);
-            Self {
-                entries,
-                cluster_backed,
-                erroring: false,
-                uncovered: Default::default(),
-            }
-        }
-
-        fn empty(cluster_backed: bool) -> Self {
-            Self {
-                entries: StdHashMap::new(),
-                cluster_backed,
-                erroring: false,
-                uncovered: Default::default(),
-            }
-        }
-
-        fn not_answering_for(sandbox_id: SandboxId) -> Self {
-            let mut registry = Self::empty(true);
-            registry.uncovered.insert(sandbox_id);
-            registry
-        }
-
-        fn erroring() -> Self {
-            Self {
-                entries: StdHashMap::new(),
-                cluster_backed: true,
-                erroring: true,
-                uncovered: Default::default(),
-            }
-        }
-    }
-
-    #[tonic::async_trait]
-    impl PausedSandboxRegistry for FakePausedRegistry {
-        async fn get(&self, sandbox_id: &SandboxId) -> RegistryResult<Option<PausedSandboxEntry>> {
-            if self.erroring {
-                return Err(PausedRegistryError::Backend {
-                    operation: "test",
-                    source: anyhow::anyhow!("boom"),
-                });
-            }
-            Ok(self.entries.get(sandbox_id).cloned())
-        }
-
-        fn is_cluster_backed(&self) -> bool {
-            self.cluster_backed
-        }
-
-        async fn begin_pause(&self, _entry: &PausedSandboxEntry) -> RegistryResult<BeganPause> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn complete_pause(
-            &self,
-            _sandbox_id: &SandboxId,
-            _generation: i64,
-            _snapshot_id: &crate::snapshot::SnapshotId,
-        ) -> RegistryResult<()> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn mark_local_only(
-            &self,
-            _sandbox_id: &SandboxId,
-            _generation: i64,
-        ) -> RegistryResult<()> {
-            unimplemented!("lookup_node never calls this")
-        }
-        // `uncovered` ids are left out of both the entries and the coverage list,
-        // so a caller acting on their absence is acting on an answer this fixture
-        // never gave.
-        async fn get_many(&self, sandbox_ids: &[SandboxId]) -> RegistryResult<PausedRegistryRows> {
-            if self.erroring {
-                return Err(PausedRegistryError::Backend {
-                    operation: "test",
-                    source: anyhow::anyhow!("boom"),
-                });
-            }
-            let covered: Vec<SandboxId> = sandbox_ids
-                .iter()
-                .copied()
-                .filter(|id| !self.uncovered.contains(id))
-                .collect();
-            let entries = covered
-                .iter()
-                .filter_map(|id| self.entries.get(id).map(|entry| (*id, entry.clone())))
-                .collect();
-            Ok(PausedRegistryRows { entries, covered })
-        }
-        async fn claim_for_resume(
-            &self,
-            _sandbox_id: &SandboxId,
-            _node_id: &str,
-            _execution_id: ExecutionId,
-        ) -> RegistryResult<ResumeClaim> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn release_claim(
-            &self,
-            _sandbox_id: &SandboxId,
-            _generation: i64,
-        ) -> RegistryResult<bool> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn renew_lease(&self, _node_id: &str, _held: &[HeldSandbox]) -> RegistryResult<u64> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn reclaim_expired_holdings(&self) -> RegistryResult<ReclaimedHoldings> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn mark_running(
-            &self,
-            _sandbox_id: &SandboxId,
-            _node_id: &str,
-            _holder_node_id: &str,
-            _execution_id: ExecutionId,
-            _expires_at: Option<SystemTime>,
-        ) -> RegistryResult<MarkRunningOutcome> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn renew_sandbox_deadline(
-            &self,
-            _sandbox_id: &SandboxId,
-            _execution_id: ExecutionId,
-            _expires_at: Option<SystemTime>,
-        ) -> RegistryResult<DeadlineRenewalOutcome> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn release_node_holdings(&self, _node_id: &str) -> RegistryResult<ReleasedHoldings> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn remove(&self, _sandbox_id: &SandboxId, _generation: i64) -> RegistryResult<bool> {
-            unimplemented!("lookup_node never calls this")
-        }
-        async fn list_all(&self) -> RegistryResult<PausedRegistryListing> {
-            unimplemented!("lookup_node never calls this")
-        }
-    }
-
-    fn paused_entry(
-        sandbox_id: SandboxId,
-        state: PausedRegistryState,
-        origin_node_id: &str,
-        execution_id: Option<ExecutionId>,
-    ) -> PausedSandboxEntry {
-        let now = chrono::Utc::now();
-        PausedSandboxEntry {
-            sandbox_id,
-            cluster_id: uuid::Uuid::nil(),
-            state,
-            generation: 1,
-            origin_node_id: origin_node_id.to_string(),
-            claimed_by_node_id: None,
-            snapshot_id: None,
-            metadata: None,
-            execution_id,
-            paused_at: now,
-            updated_at: now,
-        }
-    }
 
     /// Returns a gate made warm by one report against an elapsed deadline.
     fn warm_gate(registry: &Arc<AtomicNodeRegistry>) -> Arc<WarmupGate> {
@@ -2644,7 +2250,6 @@ mod tests {
                     sandbox_id: sandbox_id.to_string(),
                     execution_id: execution_id.to_string(),
                     projection_ttl_secs: 0,
-                    paused: false,
                 })
                 .collect(),
             ..Default::default()
@@ -2679,9 +2284,21 @@ mod tests {
         );
     }
 
+    fn schedule_preferring(node_id: &str) -> ScheduleRequest {
+        ScheduleRequest {
+            hint: Some(scheduler::ScheduleRequestHint {
+                kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
+                    scheduler::NewSandboxHint {
+                        preferred_node_id: node_id.to_string(),
+                        ..Default::default()
+                    },
+                )),
+            }),
+        }
+    }
+
     #[tokio::test]
-    async fn schedule_and_lookup_node_advance_one_shared_round_robin_cursor() {
-        let sandbox_id = SandboxId::new();
+    async fn schedule_honours_a_schedulable_preferred_node_and_ignores_an_unknown_one() {
         let registry = Arc::new(AtomicNodeRegistry::new(
             vec![
                 node("node-a", "http://10.0.0.1:8000"),
@@ -2690,41 +2307,34 @@ mod tests {
             ],
             Duration::from_secs(30),
         ));
-        // No origin preference, so paused lookup reaches the shared strategy.
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            paused_entry(sandbox_id, PausedRegistryState::Paused, "", None),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
 
-        let mut seen = Vec::new();
-        for _ in 0..2 {
-            let scheduled = service
-                .schedule(Request::new(ScheduleRequest { hint: None }))
+        for _ in 0..3 {
+            let resp = service
+                .schedule(Request::new(schedule_preferring("node-b")))
                 .await
-                .expect("three discovered nodes")
+                .expect("node-b is discovered")
                 .into_inner();
-            seen.push(scheduled.node.expect("a node was chosen").node_id);
-
-            let looked_up = service
-                .lookup_sandbox(&sandbox_id.to_string())
-                .await
-                .expect("a paused row with no origin preference");
-            assert_eq!(looked_up.location, SandboxLocation::Placed);
-            seen.push(looked_up.node.id);
+            assert_eq!(resp.node.expect("a node was chosen").node_id, "node-b");
         }
 
+        let mut fallback = Vec::new();
+        for _ in 0..3 {
+            let resp = service
+                .schedule(Request::new(schedule_preferring("node-z")))
+                .await
+                .expect("an unknown preference falls back to the strategy")
+                .into_inner();
+            fallback.push(resp.node.expect("a node was chosen").node_id);
+        }
         assert_eq!(
-            seen,
+            fallback,
             vec![
                 "node-a".to_string(),
                 "node-b".to_string(),
-                "node-c".to_string(),
-                "node-a".to_string(),
+                "node-c".to_string()
             ],
-            "Schedule and the sandbox lookup must advance ONE cursor; a, a, b, b means              they were each handed their own RoundRobinStrategy"
+            "the preferred calls must not have moved the round-robin cursor"
         );
     }
 
@@ -2849,7 +2459,7 @@ mod tests {
             .await
             .expect("a binding exists");
         assert_eq!(resp.node.id, "node-a");
-        assert_eq!(resp.location, SandboxLocation::Bound);
+        assert_eq!(resp.label, LookupResultLabel::BoundBinding);
         assert_eq!(resp.execution_id, execution_id);
         assert_eq!(resp.execution_authority, ExecutionAuthority::Registry);
     }
@@ -3008,7 +2618,7 @@ mod tests {
             .await
             .expect("no binding, but node-a's roster lists it");
         assert_eq!(resp.node.id, "node-a");
-        assert_eq!(resp.location, SandboxLocation::Bound);
+        assert_eq!(resp.label, LookupResultLabel::BoundRoster);
     }
 
     #[tokio::test]
@@ -3085,376 +2695,8 @@ mod tests {
         let status = service
             .lookup_sandbox(&SandboxId::new().to_string())
             .await
-            .expect_err("no binding, no roster, no registry row");
+            .expect_err("no binding, no roster");
         assert_eq!(status.code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_skips_a_registry_row_when_the_registry_is_not_cluster_backed() {
-        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
-        let sandbox_id = SandboxId::new();
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            paused_entry(sandbox_id, PausedRegistryState::Paused, "node-a", None),
-            /* cluster_backed */ false,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let status = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect_err("the registry has a row, but it may not be trusted");
-        assert_eq!(status.code(), tonic::Code::NotFound);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_reports_unavailable_when_the_paused_registry_errors() {
-        let registry = Arc::new(AtomicNodeRegistry::new(vec![], Duration::from_secs(30)));
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::erroring());
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let status = service
-            .lookup_sandbox(&SandboxId::new().to_string())
-            .await
-            .expect_err("the registry could not be read");
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_places_a_paused_sandbox_preferring_its_origin_node() {
-        let sandbox_id = SandboxId::new();
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![
-                node("node-a", "http://10.0.0.1:8000"),
-                node("node-b", "http://10.0.0.2:8000"),
-            ],
-            Duration::from_secs(30),
-        ));
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            paused_entry(sandbox_id, PausedRegistryState::Paused, "node-b", None),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let resp = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect("a paused row, no heartbeat needed");
-        assert_eq!(resp.node.id, "node-b", "origin is preferred");
-        assert_eq!(resp.location, SandboxLocation::Placed);
-        assert_eq!(resp.origin_node_id, "node-b");
-        assert_eq!(resp.execution_id, "", "PLACED never carries an incarnation");
-        assert_eq!(resp.execution_authority, ExecutionAuthority::Pending);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_pins_a_publishing_sandbox_to_a_live_schedulable_origin() {
-        let sandbox_id = SandboxId::new();
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![node("node-a", "http://10.0.0.1:8000")],
-            Duration::from_secs(30),
-        ));
-        registry
-            .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
-            .expect("node-a is in discovery");
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            paused_entry(sandbox_id, PausedRegistryState::Publishing, "node-a", None),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let resp = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect("origin is live and schedulable");
-        assert_eq!(resp.node.id, "node-a");
-        assert_eq!(resp.location, SandboxLocation::Pinned);
-        assert_eq!(resp.execution_authority, ExecutionAuthority::Pending);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_refuses_a_local_only_sandbox_when_origin_is_not_reporting() {
-        let sandbox_id = SandboxId::new();
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![node("node-a", "http://10.0.0.1:8000")],
-            Duration::from_secs(30),
-        ));
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            paused_entry(sandbox_id, PausedRegistryState::LocalOnly, "node-a", None),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let status = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect_err("origin has never reported");
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert!(
-            status.message().contains("not reporting"),
-            "{}",
-            status.message()
-        );
-    }
-
-    #[tokio::test]
-    async fn lookup_node_answers_bound_from_a_running_registry_row() {
-        let sandbox_id = SandboxId::new();
-        let execution_id = ExecutionId::new();
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![node("node-a", "http://10.0.0.1:8000")],
-            Duration::from_secs(30),
-        ));
-        registry
-            .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
-            .expect("node-a is in discovery");
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            paused_entry(
-                sandbox_id,
-                PausedRegistryState::Running,
-                "node-a",
-                Some(execution_id),
-            ),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let resp = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect("the holder is live");
-        assert_eq!(resp.node.id, "node-a");
-        assert_eq!(resp.location, SandboxLocation::Bound);
-        assert_eq!(resp.execution_id, execution_id.to_string());
-        assert_eq!(resp.execution_authority, ExecutionAuthority::Registry);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_refuses_a_running_row_when_the_holder_is_unreachable_and_warm() {
-        let sandbox_id = SandboxId::new();
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![node("node-a", "http://10.0.0.1:8000")],
-            Duration::from_secs(30),
-        ));
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            paused_entry(sandbox_id, PausedRegistryState::Running, "node-a", None),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let status = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect_err("the holder has never reported, and the gate is warm");
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    }
-
-    /// A row mid-resume, shaped the way the claim leaves it before placement runs.
-    fn claimed_resuming_row(
-        sandbox_id: SandboxId,
-        origin_node_id: &str,
-        published: bool,
-    ) -> PausedSandboxEntry {
-        let mut entry = paused_entry(
-            sandbox_id,
-            PausedRegistryState::Resuming,
-            origin_node_id,
-            Some(ExecutionId::new()),
-        );
-        entry.claimed_by_node_id = Some("agentenv-api-replica-0".to_string());
-        entry.snapshot_id = published.then(crate::snapshot::SnapshotId::generate);
-        entry
-    }
-
-    // The resume path's half of the invariant: the claim CAS writes the row before
-    // anything is restored, so a row in any state must keep the lookup off the
-    // absence the delete path reads as a verdict.
-    #[tokio::test]
-    async fn a_registry_row_in_any_state_is_never_a_warm_absence() {
-        for state in [
-            PausedRegistryState::Paused,
-            PausedRegistryState::Publishing,
-            PausedRegistryState::LocalOnly,
-            PausedRegistryState::Running,
-            PausedRegistryState::Resuming,
-        ] {
-            for origin_is_live in [true, false] {
-                let sandbox_id = SandboxId::new();
-                let registry = Arc::new(AtomicNodeRegistry::new(
-                    vec![node("node-a", "http://10.0.0.1:8000")],
-                    Duration::from_secs(30),
-                ));
-                if origin_is_live {
-                    registry
-                        .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
-                        .expect("node-a is in discovery");
-                }
-                let origin = if origin_is_live {
-                    "node-a"
-                } else {
-                    "node-gone"
-                };
-                let paused: Arc<dyn PausedSandboxRegistry> =
-                    Arc::new(FakePausedRegistry::with_entry(
-                        paused_entry(sandbox_id, state, origin, Some(ExecutionId::new())),
-                        true,
-                    ));
-                let service =
-                    NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-                        .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-                        .with_paused_registry(paused);
-
-                let outcome = service.lookup_sandbox(&sandbox_id.to_string()).await;
-                let code = outcome.err().map(|status| status.code());
-                assert_ne!(
-                    code,
-                    Some(tonic::Code::NotFound),
-                    "a {state:?} row with origin_is_live={origin_is_live} answered NotFound, so \
-                     the row that fences this sandbox does not stop a delete from reaping it"
-                );
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn lookup_node_places_a_resuming_row_elsewhere_when_its_origin_is_gone() {
-        let sandbox_id = SandboxId::new();
-        // node-b is the origin and has left the cluster: discovery has dropped it,
-        // exactly as deleting its pod does, while the row still names it.
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![node("node-a", "http://10.0.0.1:8000")],
-            Duration::from_secs(30),
-        ));
-        registry
-            .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
-            .expect("node-a is in discovery");
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            claimed_resuming_row(sandbox_id, "node-b", true),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let resp = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect(
-                "🔴 the assertion. Taking the claim is what flips a row to resuming, and it \
-                 happens before placement is ever asked, so refusing here refuses every resume \
-                 whose origin is gone -- the whole of criterion (b)",
-            );
-
-        assert_eq!(resp.node.id, "node-a", "the only node still reporting");
-        assert_eq!(resp.location, SandboxLocation::Placed);
-        assert_eq!(
-            resp.origin_node_id, "node-b",
-            "the hint is reported as it still stands; the rewrite happens where the rebuild lands"
-        );
-        assert_eq!(resp.execution_id, "", "PLACED never carries an incarnation");
-    }
-
-    #[tokio::test]
-    async fn lookup_node_keeps_a_resuming_row_on_a_live_origin() {
-        let sandbox_id = SandboxId::new();
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![
-                node("node-a", "http://10.0.0.1:8000"),
-                node("node-b", "http://10.0.0.2:8000"),
-            ],
-            Duration::from_secs(30),
-        ));
-        registry
-            .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
-            .expect("node-a is in discovery");
-        registry
-            .heartbeat(&heartbeat_req("node-b", vec![]), SystemTime::now())
-            .expect("node-b is in discovery");
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            claimed_resuming_row(sandbox_id, "node-b", true),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let resp = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect("the origin is live");
-
-        assert_eq!(
-            resp.node.id, "node-b",
-            "the control: a live origin still holds the warm capture, and a resume in flight \
-             there must not be routed away from it"
-        );
-        assert_eq!(resp.location, SandboxLocation::Bound);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_refuses_an_unpublished_resuming_row_whose_origin_is_gone() {
-        let sandbox_id = SandboxId::new();
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![
-                node("node-a", "http://10.0.0.1:8000"),
-                node("node-b", "http://10.0.0.2:8000"),
-            ],
-            Duration::from_secs(30),
-        ));
-        registry
-            .heartbeat(&heartbeat_req("node-a", vec![]), SystemTime::now())
-            .expect("node-a is in discovery");
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            claimed_resuming_row(sandbox_id, "node-b", false),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let status = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect_err(
-                "the control: with nothing published there is nothing another node could \
-                 rebuild from, so naming one would send the resume somewhere it must fail",
-            );
-        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_withholds_a_running_rows_holder_unreachable_verdict_while_cold() {
-        let sandbox_id = SandboxId::new();
-        let registry = Arc::new(AtomicNodeRegistry::new(
-            vec![node("node-a", "http://10.0.0.1:8000")],
-            Duration::from_secs(30),
-        ));
-        let paused: Arc<dyn PausedSandboxRegistry> = Arc::new(FakePausedRegistry::with_entry(
-            paused_entry(sandbox_id, PausedRegistryState::Running, "node-a", None),
-            true,
-        ));
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), cold_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(paused);
-
-        let status = service
-            .lookup_sandbox(&sandbox_id.to_string())
-            .await
-            .expect_err("cold, so this must not be asserted as a fact yet");
-        assert_eq!(status.code(), tonic::Code::Unavailable);
     }
 
     #[tokio::test]
@@ -3622,6 +2864,7 @@ mod tests {
                             metadata: Default::default(),
                             cpu_count: Some(1),
                             memory_mib: Some(1),
+                            preferred_node_id: String::new(),
                         },
                     )),
                 }),
@@ -3715,6 +2958,7 @@ mod tests {
                     memory_mib: 512,
                     disk_size_mib: 1024,
                 },
+                None,
             )
             .await
             .expect("two discovered nodes");
@@ -3769,6 +3013,7 @@ mod tests {
                         metadata: Default::default(),
                         cpu_count,
                         memory_mib,
+                        preferred_node_id: String::new(),
                     },
                 )),
             }),
@@ -3836,7 +3081,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_call_path_reports_under_its_own_source_and_a_preference_reports_nothing() {
+    async fn schedule_reports_under_its_own_source_and_a_preference_reports_nothing() {
         let registry = Arc::new(AtomicNodeRegistry::new(
             vec![
                 node("node-a", "http://10.0.0.1:8000"),
@@ -3857,21 +3102,11 @@ mod tests {
         let snapshotter = recorder.snapshotter();
         let guard = metrics::set_default_local_recorder(&recorder);
 
-        let unpreferred = SandboxId::new();
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(Arc::new(FakePausedRegistry::with_entry(
-                paused_entry(unpreferred, PausedRegistryState::Paused, "", None),
-                true,
-            )));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
         service
             .schedule(Request::new(ScheduleRequest { hint: None }))
             .await
             .expect("two discovered nodes");
-        service
-            .lookup_sandbox(&unpreferred.to_string())
-            .await
-            .expect("a paused row with no origin preference");
 
         drop(guard);
         let agreement =
@@ -3884,26 +3119,21 @@ mod tests {
                 .sum()
         };
         assert_eq!(total_under("schedule"), 1, "{agreement:?}");
-        assert_eq!(total_under("paused_lookup"), 1, "{agreement:?}");
+        assert_eq!(total_under("paused_lookup"), 0, "{agreement:?}");
 
         let recorder = metrics_util::debugging::DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         let guard = metrics::set_default_local_recorder(&recorder);
 
-        let preferred = SandboxId::new();
-        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-            .with_binding_store(in_memory_binding_store(), false, Duration::ZERO)
-            .with_paused_registry(Arc::new(FakePausedRegistry::with_entry(
-                paused_entry(preferred, PausedRegistryState::Paused, "node-b", None),
-                true,
-            )));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
         let answer = service
-            .lookup_sandbox(&preferred.to_string())
+            .schedule(Request::new(schedule_preferring("node-b")))
             .await
-            .expect("a paused row preferring node-b");
+            .expect("node-b is discovered")
+            .into_inner();
 
         drop(guard);
-        assert_eq!(answer.node.id, "node-b");
+        assert_eq!(answer.node.expect("a node was chosen").node_id, "node-b");
         let counters = drain_counters(&snapshotter);
         assert!(
             counters

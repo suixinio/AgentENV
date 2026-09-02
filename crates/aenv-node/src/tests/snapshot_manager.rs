@@ -276,6 +276,7 @@ pub fn staged_elsewhere(id: SnapshotId, source_sandbox_id: &str) -> StagedSnapsh
             },
             resources: Default::default(),
             created_at_unix_ms: Some(1_700_000_000_000),
+            origin_node_id: Some("the-node-holding-the-bytes".to_string()),
             committed: crate::snapshot::CommittedSnapshot::mock(),
         },
         staged_at_unix_ms: 1_700_000_000_000,

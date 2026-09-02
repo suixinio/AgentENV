@@ -61,21 +61,17 @@ const (
 // on the only consumer that needs it. `node.proto` uses details because both of
 // its ends are Rust.
 //
-// 🔴 **Three `FAILED_PRECONDITION` reasons, and they are not interchangeable.**
+// 🔴 **Two `FAILED_PRECONDITION` reasons, and they are not interchangeable.**
 // A caller that cannot tell them apart backs off wrongly in one direction or the
 // other:
 //
 // | reason | means | how long |
 // |---|---|---|
-// | `transition_in_progress` | somebody else is mid-resume on this sandbox | a moment; retry |
-// | `origin_not_reporting` | the only copy is on a node that has gone silent | until that node is heard from, possibly never |
-// | `origin_not_accepting_work` | the only copy is on a node that is draining | until that node is back in rotation |
-// | `origin_unclassified` | a pin refusal this build did not recognise | unknown — and the reason it exists is that the classification is a string match on the placement source's message, so a reworded message must degrade to "do not retry elsewhere" rather than to "retry anywhere" |
+// | `transition_in_progress` | somebody else is mid-operation on this sandbox | a moment; retry |
+// | `auto_resume_disabled` | the sandbox's row forbids traffic-triggered wake-ups | until a user resumes it explicitly |
 //
-// 🔴 All four mean **do not try another node**, and the last three mean it
-// absolutely: for an unpublished pause there is no second copy of the bytes to
-// try. Retrying elsewhere does not fail — it *succeeds*, by rewinding the
-// sandbox to whatever older snapshot did reach shared storage.
+// 🔴 Neither means "try another node": a paused sandbox is a snapshot row any
+// node can rebuild, and it is the api half that places the rebuild.
 type SandboxResumeServiceClient interface {
 	// Wakes a paused sandbox and says where it woke up.
 	//
@@ -143,21 +139,17 @@ func (c *sandboxResumeServiceClient) ResumeSandbox(ctx context.Context, in *Sand
 // on the only consumer that needs it. `node.proto` uses details because both of
 // its ends are Rust.
 //
-// 🔴 **Three `FAILED_PRECONDITION` reasons, and they are not interchangeable.**
+// 🔴 **Two `FAILED_PRECONDITION` reasons, and they are not interchangeable.**
 // A caller that cannot tell them apart backs off wrongly in one direction or the
 // other:
 //
 // | reason | means | how long |
 // |---|---|---|
-// | `transition_in_progress` | somebody else is mid-resume on this sandbox | a moment; retry |
-// | `origin_not_reporting` | the only copy is on a node that has gone silent | until that node is heard from, possibly never |
-// | `origin_not_accepting_work` | the only copy is on a node that is draining | until that node is back in rotation |
-// | `origin_unclassified` | a pin refusal this build did not recognise | unknown — and the reason it exists is that the classification is a string match on the placement source's message, so a reworded message must degrade to "do not retry elsewhere" rather than to "retry anywhere" |
+// | `transition_in_progress` | somebody else is mid-operation on this sandbox | a moment; retry |
+// | `auto_resume_disabled` | the sandbox's row forbids traffic-triggered wake-ups | until a user resumes it explicitly |
 //
-// 🔴 All four mean **do not try another node**, and the last three mean it
-// absolutely: for an unpublished pause there is no second copy of the bytes to
-// try. Retrying elsewhere does not fail — it *succeeds*, by rewinding the
-// sandbox to whatever older snapshot did reach shared storage.
+// 🔴 Neither means "try another node": a paused sandbox is a snapshot row any
+// node can rebuild, and it is the api half that places the rebuild.
 type SandboxResumeServiceServer interface {
 	// Wakes a paused sandbox and says where it woke up.
 	//

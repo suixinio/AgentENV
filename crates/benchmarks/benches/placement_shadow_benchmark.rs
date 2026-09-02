@@ -66,6 +66,7 @@ fn hint() -> ScheduleRequestHint {
             metadata: Default::default(),
             cpu_count: Some(2),
             memory_mib: Some(2048),
+            preferred_node_id: String::new(),
         })),
     }
 }

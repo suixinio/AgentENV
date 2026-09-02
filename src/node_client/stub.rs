@@ -1,8 +1,9 @@
 //! Drives one sandbox on another node.
 //!
-//! Transport failure never means the sandbox is absent. Remote pause captures carry
-//! their origin node and incarnation; resume must reopen that pinned capture there.
-//! Runtime artifacts are local-only and therefore empty on the deciding half.
+//! Transport failure never means the sandbox is absent. A remote pause hands back
+//! the snapshot the node staged; the api half commits it and the sandbox is gone
+//! from the node. Runtime artifacts are local-only and therefore empty on the
+//! deciding half.
 
 use std::future::Future;
 use std::net::Ipv4Addr;
@@ -12,21 +13,20 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tonic::transport::{Channel, Endpoint};
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient;
 use crate::sandbox::{
-    CapturedSandboxSnapshot, CustomExtensionParams, PausedSandboxCapture, ResolvedImageFacts,
-    RuntimeArtifactSet, RuntimeConfirmedGone, SandboxBackend, SandboxCaptureError,
-    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxNetworkPolicy,
-    SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, CustomExtensionParams, ResolvedImageFacts, RuntimeArtifactSet,
+    RuntimeConfirmedGone, SandboxBackend, SandboxCaptureError, SandboxCaptureResult,
+    SandboxForkResult, SandboxForkSpec, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
+use crate::snapshot::repository::interfaces::StagedSnapshot;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-use super::paused_state::RemotePausedState;
 use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
-use super::wire::{self, RemoteResumeFailure};
+use super::wire;
 
 use std::sync::Arc;
 
@@ -35,11 +35,8 @@ pub enum PendingLaunch {
     /// A create request ready to send.
     Launch {
         request: Box<pb::SandboxCreateRequest>,
-    },
-    /// Reopens a paused sandbox on the node holding its capture.
-    Resume {
-        request: Box<pb::SandboxResumeRequest>,
-        origin_node_id: String,
+        /// Where the sandbox's bytes were last warm, if anywhere.
+        preferred_node_id: Option<String>,
     },
     /// A fork child the node already started.
     AlreadyStarted,
@@ -244,138 +241,6 @@ impl RemoteSandboxStub {
             rootfs_virtual_size: (response.rootfs_virtual_size > 0)
                 .then_some(response.rootfs_virtual_size),
         })
-    }
-
-    /// Reopens a local capture only on its recorded origin node.
-    ///
-    /// Missing placement falls back to resolving that origin node; any different holder
-    /// is rejected. Cluster resume claims, store CAS, and execution IDs provide fencing.
-    async fn reopen(
-        &mut self,
-        request: pb::SandboxResumeRequest,
-        origin_node_id: String,
-    ) -> Result<()> {
-        let sandbox_id = self.sandbox_id;
-        let placed = match self.placement.place_existing(sandbox_id).await {
-            Ok(placed) => placed,
-            // A scheduler that answered about this sandbox and refused has told us
-            // the holder cannot serve it; one that could not answer has not.
-            Err(err) if crate::node_client::wire::placement_gave_a_verdict(&err) => {
-                return Err(anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
-                    &origin_node_id,
-                    sandbox_id,
-                    format!("{err:#}"),
-                )))
-            }
-            Err(err) => {
-                return Err(err.context(format!("locate the machine holding sandbox {sandbox_id}")))
-            }
-        };
-        let node = match placed {
-            Some(node) => {
-                if node.node_id != origin_node_id {
-                    return Err(anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
-                        &origin_node_id,
-                        sandbox_id,
-                        format!(
-                            "placement chose node {}: reopening a capture happens on the machine \
-                             holding it, and rebuilding this sandbox somewhere else is a create \
-                             from a published snapshot rather than this call",
-                            node.node_id
-                        ),
-                    )));
-                }
-                node
-            }
-            None => {
-                debug!(
-                    %sandbox_id,
-                    %origin_node_id,
-                    "the placement source has no record of this sandbox; reopening its capture on \
-                     the machine the capture names"
-                );
-                let node = self
-                    .placement
-                    .resolve_node(&origin_node_id)
-                    .await
-                    .map_err(|err| {
-                        anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
-                            &origin_node_id,
-                            sandbox_id,
-                            format!("its address could not be found: {err:#}"),
-                        ))
-                    })?;
-                // Recheck the fallback result before dialing the pinned origin.
-                if node.node_id != origin_node_id {
-                    return Err(anyhow::Error::new(RemoteResumeFailure::origin_unavailable(
-                        &origin_node_id,
-                        sandbox_id,
-                        format!("the placement source answered with node {}", node.node_id),
-                    )));
-                }
-                node
-            }
-        };
-
-        let mut client = Self::connect(&node.endpoint).await.map_err(|err| {
-            anyhow::Error::new(RemoteResumeFailure::unreachable(
-                &node.node_id,
-                sandbox_id,
-                format!("{err:#}"),
-            ))
-        })?;
-
-        let response = client
-            .resume(request)
-            .await
-            .map_err(|status| {
-                anyhow::Error::new(RemoteResumeFailure::from_status(
-                    &node.node_id,
-                    sandbox_id,
-                    status,
-                ))
-            })?
-            .into_inner();
-
-        // A successful resume must identify the run now executing.
-        let started = response.started.ok_or_else(|| {
-            anyhow!(
-                "node {} reopened sandbox {sandbox_id} and said nothing about the run it started",
-                node.node_id
-            )
-        })?;
-
-        // Never delete the only capture after a resume incarnation mismatch.
-        if started.execution_id != self.execution_id.to_string() {
-            bail!(
-                "node {} reopened sandbox {sandbox_id} as execution {}, and this resume claimed \
-                 execution {}",
-                node.node_id,
-                started.execution_id,
-                self.execution_id
-            );
-        }
-
-        // Resume resources come from the node's record.
-        if let Some(resources) = started.resources.as_ref() {
-            self.resources = SandboxResources {
-                cpu_count: resources.cpu_count,
-                memory_mib: resources.memory_mib,
-                disk_size_mib: resources.disk_size_mib,
-            };
-        }
-        // Announce resume because this process did not retain the old live binding.
-        self.announce_placement(&node).await;
-
-        self.placed = Some(Placed {
-            node,
-            client,
-            host_interaction_ip: wire::host_ip(&started.host_interaction_ip),
-            rootfs_virtual_size: (started.rootfs_virtual_size > 0)
-                .then_some(started.rootfs_virtual_size),
-            resolved_image_facts: None,
-        });
-        Ok(())
     }
 
     fn placed(&self) -> Result<&Placed> {
@@ -637,24 +502,22 @@ impl SandboxBackend for RemoteSandboxStub {
         if self.placed.is_some() {
             return Ok(());
         }
-        let request = match &self.pending {
+        let (request, preferred_node_id) = match &self.pending {
             PendingLaunch::AlreadyStarted => return Ok(()),
             // Attach resolves an existing sandbox rather than starting one.
             PendingLaunch::Attach => return self.attach().await,
-            PendingLaunch::Launch { request } => (**request).clone(),
-            PendingLaunch::Resume {
+            PendingLaunch::Launch {
                 request,
-                origin_node_id,
-            } => {
-                let request = (**request).clone();
-                let origin_node_id = origin_node_id.clone();
-                return self.reopen(request, origin_node_id).await;
-            }
+                preferred_node_id,
+            } => ((**request).clone(), preferred_node_id.clone()),
         };
-
         let node = self
             .placement
-            .place_new(self.sandbox_id, self.resources)
+            .place_new(
+                self.sandbox_id,
+                self.resources,
+                preferred_node_id.as_deref(),
+            )
             .await
             .with_context(|| format!("choose a node for sandbox {}", self.sandbox_id))?;
 
@@ -748,12 +611,12 @@ impl SandboxBackend for RemoteSandboxStub {
         self.placed().map(|_| ())
     }
 
-    async fn pause(
-        &mut self,
-        _artifact_root: Option<&std::path::Path>,
-        committer_waiting: bool,
-    ) -> SandboxCaptureResult<PausedSandboxCapture> {
-        // The node chooses the capture path on the disk that stores the bytes.
+    /// Pauses on the node, which stages the capture and forgets the sandbox.
+    ///
+    /// The node's answer is the staged snapshot; the api half commits it. A
+    /// pause that stopped the VM without staging anything left nothing to
+    /// resume, so it is reported as terminal.
+    async fn pause(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
         let node_id = self
@@ -769,82 +632,32 @@ impl SandboxBackend for RemoteSandboxStub {
                 Box::pin(client.pause(pb::SandboxPauseRequest {
                     sandbox_id: sandbox_id.to_string(),
                     execution_id: execution_id.to_string(),
-                    // Stage durable bytes only when a publisher will commit them.
-                    publish: committer_waiting,
                 }))
             })
             .await
             .map_err(wire::into_capture_error)?
             .into_inner();
 
-        let paused = response.paused_state.ok_or_else(|| {
-            // Missing state after a successful pause makes the sandbox unrecoverable.
-            SandboxCaptureError::terminal(anyhow!(
-                "node {node_id} paused sandbox {sandbox_id} and returned no paused state"
-            ))
-        })?;
-        let state = wire::serialized_value(paused.state.as_ref(), "paused state")
-            .map_err(SandboxCaptureError::terminal)?
-            .unwrap_or(serde_json::Value::Null);
-
-        // Mark the local stub paused even if publication metadata cannot be decoded.
-        if !response.staging_error.is_empty() {
-            // The local capture remains usable when shared staging fails.
-            warn!(
-                %sandbox_id,
-                node_id,
-                error = %response.staging_error,
-                "a paused sandbox could not be staged for publication; it is resumable only on \
-                 the node that holds it"
-            );
-        }
         let staged_value = response.staged.and_then(|staged| staged.value);
-        if !committer_waiting && staged_value.is_some() {
-            // Unexpected unannounced bytes have no reader; surface the leak.
-            warn!(
-                %sandbox_id,
-                node_id,
-                "node staged a snapshot for a pause that did not ask to publish; its bytes are \
-                 durable there and nothing will announce them"
-            );
-        }
-        let publishable = match staged_value.filter(|_| committer_waiting) {
-            Some(value) => {
-                let staged: crate::snapshot::repository::StagedSnapshot =
-                    wire::serialized(Some(&value), "staged snapshot")
-                        .map_err(SandboxCaptureError::recoverable)?
-                        .ok_or_else(|| {
-                            SandboxCaptureError::recoverable(anyhow!(
-                                "node {node_id} returned an empty staged snapshot for {sandbox_id}"
-                            ))
-                        })?;
-                Some(CapturedSandboxSnapshot::staged(staged))
-            }
-            // Idempotent pause may have no new staged capture.
-            None => None,
-        };
+        let staged: StagedSnapshot = wire::serialized(staged_value.as_ref(), "staged snapshot")
+            .map_err(SandboxCaptureError::terminal)?
+            .ok_or_else(|| {
+                SandboxCaptureError::terminal(anyhow!(
+                    "node {node_id} paused sandbox {sandbox_id} and staged nothing for it"
+                ))
+            })?;
 
-        // `stop` runs next and must preserve this capture.
+        // `stop` runs next; the node has already stopped and forgotten the VM.
         self.paused = true;
 
-        Ok(PausedSandboxCapture {
-            // Fence the capture with the incarnation this stub paused.
-            state: Arc::new(RemotePausedState::new(
-                node_id,
-                paused.artifact_root,
-                execution_id,
-                state,
-            )),
-            // The node already staged the bytes; publication commits this row directly.
-            publishable,
-        })
+        Ok(CapturedSandboxSnapshot::staged(staged))
     }
 
-    /// Rejects in-place resume because this remote backend owns no local persistence.
+    /// A remote pause cannot be undone: the node stops the VM as part of it.
     async fn resume(&mut self) -> Result<()> {
         bail!(
-            "sandbox {} cannot be resumed in place from here: this backend drives a sandbox on \
-             another machine, and reopening a paused capture happens on the machine holding it",
+            "sandbox {} cannot be resumed in place from here: the node that paused it has \
+             already stopped it, and only a resume from its snapshot brings it back",
             self.sandbox_id
         )
     }

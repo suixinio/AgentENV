@@ -388,9 +388,13 @@ type NewSandboxHint struct {
 	// MiB, matching SandboxResources::memory_mib, which is where the value
 	// comes from. Named for its unit precisely because the cold-start hint
 	// above spells the same quantity `memory_mb`.
-	MemoryMib     *uint64 `protobuf:"varint,3,opt,name=memory_mib,json=memoryMib,proto3,oneof" json:"memory_mib,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	MemoryMib *uint64 `protobuf:"varint,3,opt,name=memory_mib,json=memoryMib,proto3,oneof" json:"memory_mib,omitempty"`
+	// The node the caller would rather see chosen: where a paused sandbox's
+	// bytes were last warm. Honoured only while that node is schedulable;
+	// empty means no preference.
+	PreferredNodeId string `protobuf:"bytes,4,opt,name=preferred_node_id,json=preferredNodeId,proto3" json:"preferred_node_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *NewSandboxHint) Reset() {
@@ -442,6 +446,13 @@ func (x *NewSandboxHint) GetMemoryMib() uint64 {
 		return *x.MemoryMib
 	}
 	return 0
+}
+
+func (x *NewSandboxHint) GetPreferredNodeId() string {
+	if x != nil {
+		return x.PreferredNodeId
+	}
+	return ""
 }
 
 type ScheduleRequest struct {
@@ -699,17 +710,8 @@ type NodeSnapshot struct {
 	CreateSuccesses      uint64                 `protobuf:"varint,11,opt,name=create_successes,json=createSuccesses,proto3" json:"create_successes,omitempty"`
 	CreateFails          uint64                 `protobuf:"varint,12,opt,name=create_fails,json=createFails,proto3" json:"create_fails,omitempty"`
 	ReportedAtUnixMs     int64                  `protobuf:"varint,13,opt,name=reported_at_unix_ms,json=reportedAtUnixMs,proto3" json:"reported_at_unix_ms,omitempty"`
-	// Paused-sandbox resource accounting. These are *not* included in
-	// sandbox_count, allocated_cpu, or allocated_memory_bytes — those report the
-	// active running set only. Paused sandboxes have released their VM-side
-	// CPU / memory but still own persisted state on the node, so the scheduler
-	// can use these fields (together with the active fields) to apply
-	// "including paused" capacity limits.
-	PausedSandboxCount         uint32 `protobuf:"varint,14,opt,name=paused_sandbox_count,json=pausedSandboxCount,proto3" json:"paused_sandbox_count,omitempty"`
-	PausedAllocatedCpu         uint32 `protobuf:"varint,15,opt,name=paused_allocated_cpu,json=pausedAllocatedCpu,proto3" json:"paused_allocated_cpu,omitempty"`
-	PausedAllocatedMemoryBytes uint64 `protobuf:"varint,16,opt,name=paused_allocated_memory_bytes,json=pausedAllocatedMemoryBytes,proto3" json:"paused_allocated_memory_bytes,omitempty"`
-	unknownFields              protoimpl.UnknownFields
-	sizeCache                  protoimpl.SizeCache
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *NodeSnapshot) Reset() {
@@ -829,27 +831,6 @@ func (x *NodeSnapshot) GetCreateFails() uint64 {
 func (x *NodeSnapshot) GetReportedAtUnixMs() int64 {
 	if x != nil {
 		return x.ReportedAtUnixMs
-	}
-	return 0
-}
-
-func (x *NodeSnapshot) GetPausedSandboxCount() uint32 {
-	if x != nil {
-		return x.PausedSandboxCount
-	}
-	return 0
-}
-
-func (x *NodeSnapshot) GetPausedAllocatedCpu() uint32 {
-	if x != nil {
-		return x.PausedAllocatedCpu
-	}
-	return 0
-}
-
-func (x *NodeSnapshot) GetPausedAllocatedMemoryBytes() uint64 {
-	if x != nil {
-		return x.PausedAllocatedMemoryBytes
 	}
 	return 0
 }
@@ -1147,23 +1128,8 @@ type SandboxRosterEntry struct {
 	// Absent (an older node) lands on the same fallback, which is exactly the
 	// behaviour that shipped before this field existed.
 	ProjectionTtlSecs uint32 `protobuf:"varint,3,opt,name=projection_ttl_secs,json=projectionTtlSecs,proto3" json:"projection_ttl_secs,omitempty"`
-	// Whether this sandbox is parked: on this node's disk, with no VM behind it.
-	//
-	// The entry is still reported — the roster is the only thing that renews a
-	// paused sandbox's registry lease, and a node that stopped naming its paused
-	// sandboxes would let another node claim rows whose snapshot only exists
-	// here. What the flag changes is routing: a parked sandbox must NOT hold a
-	// routing projection, because the gateway reads a projection hit as "there
-	// is a VM at the other end" and answers the data plane straight from it
-	// instead of waking the sandbox. So the receiver keeps this entry in the
-	// registry and withholds it from binding reconciliation.
-	//
-	// 🔴 Absent (an older node) is false, which is byte-for-byte the behaviour
-	// that shipped before this field existed: every entry reconciled, paused
-	// ones included.
-	Paused        bool `protobuf:"varint,4,opt,name=paused,proto3" json:"paused,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *SandboxRosterEntry) Reset() {
@@ -1217,28 +1183,11 @@ func (x *SandboxRosterEntry) GetProjectionTtlSecs() uint32 {
 	return 0
 }
 
-func (x *SandboxRosterEntry) GetPaused() bool {
-	if x != nil {
-		return x.Paused
-	}
-	return false
-}
-
 type HeartbeatResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CpuConfigJson string                 `protobuf:"bytes,1,opt,name=cpu_config_json,json=cpuConfigJson,proto3" json:"cpu_config_json,omitempty"`
-	// Sandboxes this heartbeat reported paused that the control plane's registry
-	// says this node does not hold: nothing names them, or a row names another
-	// node. The node drops its record and artifacts for each.
-	//
-	// Silence means keep, and it is the only safe default. An api half with no
-	// cluster-backed registry, or one whose registry could not answer, names
-	// nothing here. A node must never turn an absence it observed itself into a
-	// deletion: only this side can tell a sandbox that was never recorded from
-	// one whose record moved to another machine.
-	DisownedSandboxIds []string `protobuf:"bytes,2,rep,name=disowned_sandbox_ids,json=disownedSandboxIds,proto3" json:"disowned_sandbox_ids,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HeartbeatResponse) Reset() {
@@ -1276,13 +1225,6 @@ func (x *HeartbeatResponse) GetCpuConfigJson() string {
 		return x.CpuConfigJson
 	}
 	return ""
-}
-
-func (x *HeartbeatResponse) GetDisownedSandboxIds() []string {
-	if x != nil {
-		return x.DisownedSandboxIds
-	}
-	return nil
 }
 
 type SandboxEvent struct {
@@ -2161,12 +2103,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xf8\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa4\x02\n" +
 	"\x0eNewSandboxHint\x12F\n" +
 	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x12 \n" +
 	"\tcpu_count\x18\x02 \x01(\rH\x00R\bcpuCount\x88\x01\x01\x12\"\n" +
 	"\n" +
-	"memory_mib\x18\x03 \x01(\x04H\x01R\tmemoryMib\x88\x01\x01\x1a;\n" +
+	"memory_mib\x18\x03 \x01(\x04H\x01R\tmemoryMib\x88\x01\x01\x12*\n" +
+	"\x11preferred_node_id\x18\x04 \x01(\tR\x0fpreferredNodeId\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\f\n" +
@@ -2193,7 +2136,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"used_bytes\x18\x04 \x01(\x04R\tusedBytes\x12\x1f\n" +
 	"\vtotal_bytes\x18\x05 \x01(\x04R\n" +
-	"totalBytes\"\xe2\x05\n" +
+	"totalBytes\"\x98\x05\n" +
 	"\fNodeSnapshot\x120\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x18.scheduler.v1.NodeStatusR\x06status\x12#\n" +
 	"\rallocated_cpu\x18\x02 \x01(\rR\fallocatedCpu\x124\n" +
@@ -2209,10 +2152,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	" \x01(\rR\x14sandboxStartingCount\x12)\n" +
 	"\x10create_successes\x18\v \x01(\x04R\x0fcreateSuccesses\x12!\n" +
 	"\fcreate_fails\x18\f \x01(\x04R\vcreateFails\x12-\n" +
-	"\x13reported_at_unix_ms\x18\r \x01(\x03R\x10reportedAtUnixMs\x120\n" +
-	"\x14paused_sandbox_count\x18\x0e \x01(\rR\x12pausedSandboxCount\x120\n" +
-	"\x14paused_allocated_cpu\x18\x0f \x01(\rR\x12pausedAllocatedCpu\x12A\n" +
-	"\x1dpaused_allocated_memory_bytes\x18\x10 \x01(\x04R\x1apausedAllocatedMemoryBytes\"A\n" +
+	"\x13reported_at_unix_ms\x18\r \x01(\x03R\x10reportedAtUnixMsJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10J\x04\b\x10\x10\x11R\x14paused_sandbox_countR\x14paused_allocated_cpuR\x1dpaused_allocated_memory_bytes\"A\n" +
 	"\vP2pEndpoint\x12\x18\n" +
 	"\abackend\x18\x01 \x01(\tR\abackend\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\"\xe5\x02\n" +
@@ -2238,16 +2178,14 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bsnapshot\x18\a \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12<\n" +
 	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x128\n" +
 	"\x06roster\x18\n" +
-	" \x03(\v2 .scheduler.v1.SandboxRosterEntryR\x06rosterJ\x04\b\b\x10\tR\vsandbox_ids\"\x9e\x01\n" +
+	" \x03(\v2 .scheduler.v1.SandboxRosterEntryR\x06rosterJ\x04\b\b\x10\tR\vsandbox_ids\"\x94\x01\n" +
 	"\x12SandboxRosterEntry\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12!\n" +
 	"\fexecution_id\x18\x02 \x01(\tR\vexecutionId\x12.\n" +
-	"\x13projection_ttl_secs\x18\x03 \x01(\rR\x11projectionTtlSecs\x12\x16\n" +
-	"\x06paused\x18\x04 \x01(\bR\x06paused\"m\n" +
+	"\x13projection_ttl_secs\x18\x03 \x01(\rR\x11projectionTtlSecsJ\x04\b\x04\x10\x05R\x06paused\"W\n" +
 	"\x11HeartbeatResponse\x12&\n" +
-	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\x120\n" +
-	"\x14disowned_sandbox_ids\x18\x02 \x03(\tR\x12disownedSandboxIds\"\x9c\x02\n" +
+	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJsonJ\x04\b\x02\x10\x03R\x14disowned_sandbox_ids\"\x9c\x02\n" +
 	"\fSandboxEvent\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12=\n" +

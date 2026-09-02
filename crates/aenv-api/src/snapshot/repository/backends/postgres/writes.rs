@@ -129,6 +129,7 @@ pub async fn begin_snapshot(
         created_at_unix_ms: record.created_at_unix_ms,
         updated_at_unix_ms: record.created_at_unix_ms,
         committed: None,
+        origin_node_id: None,
     }))
 }
 
@@ -190,6 +191,8 @@ struct CommitArgs<'a> {
     resources: SandboxResources,
     // Preserve the commit's template-versus-sandbox source in the returned record.
     source: SnapshotSource,
+    // The node that staged the bytes; recorded whether or not they are published.
+    origin_node_id: Option<String>,
 }
 
 async fn commit_snapshot(
@@ -200,11 +203,12 @@ async fn commit_snapshot(
     node_id: &str,
     updated_at_ms: i64,
 ) -> RepositoryResult<CatalogWrite<SnapshotRecord>> {
-    let origin_node_id = if published {
-        None
-    } else {
-        Some(node_id.to_string())
-    };
+    // A row always names where its bytes were staged: a resume prefers that
+    // node. Unpublished bytes are additionally pinned to it by the schema.
+    let origin_node_id = args
+        .origin_node_id
+        .clone()
+        .or_else(|| (!published).then(|| node_id.to_string()));
 
     let mut tx = pool
         .begin()
@@ -233,7 +237,7 @@ async fn commit_snapshot(
     .bind(&args.committed_payload)
     .bind(super::convert::COMMITTED_PAYLOAD_SCHEMA)
     .bind(published)
-    .bind(origin_node_id)
+    .bind(origin_node_id.clone())
     .bind(updated_at_ms)
     .bind(args.resources.cpu_count as i32)
     .bind(args.resources.memory_mib as i32)
@@ -298,6 +302,7 @@ async fn commit_snapshot(
         resources: args.resources,
         created_at_unix_ms: created_at_ms,
         updated_at_unix_ms: updated_at_ms,
+        origin_node_id,
         committed: Some(committed),
     }))
 }
@@ -525,6 +530,7 @@ pub async fn start_build(
             resources: SandboxResources::default(),
             created_at_unix_ms: started_at_ms,
             updated_at_unix_ms: started_at_ms,
+            origin_node_id: None,
             committed: None,
         },
         build_id: build_id.clone(),
@@ -601,6 +607,7 @@ pub async fn publish_commit(
             alias: commit.alias.as_ref(),
             resources: commit.resources,
             source: opening.source,
+            origin_node_id: commit.origin_node_id.clone(),
         },
         true,
         node_id,
@@ -614,6 +621,27 @@ pub async fn publish_commit(
         }
         CatalogWrite::Refused(refusal) => Err(refused("publish_commit", refusal)),
     }
+}
+
+/// Repoints a row at the node a resume of its sandbox landed on.
+pub async fn set_origin_node_id(
+    pool: &PgPool,
+    cluster_id: Uuid,
+    id: &SnapshotId,
+    origin_node_id: &str,
+) -> RepositoryResult<()> {
+    sqlx::query(
+        "UPDATE snapshots SET origin_node_id = $3, updated_at_ms = $4
+          WHERE id = $1 AND cluster_id = $2 AND deleted_at_ms IS NULL",
+    )
+    .bind(id.to_uuid())
+    .bind(cluster_id)
+    .bind(origin_node_id)
+    .bind(now_ms())
+    .execute(pool)
+    .await
+    .map_err(backend_error("set_origin_node_id"))?;
+    Ok(())
 }
 
 pub async fn delete_record(

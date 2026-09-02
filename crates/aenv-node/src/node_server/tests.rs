@@ -6,19 +6,20 @@ use std::time::Duration;
 use tonic::{Code, Request, Status};
 
 use crate::orchestrator::{
-    ControlPlaneConfig, CreateSandboxRequest, DisabledSandboxPersister, FileBackedSandboxPersister,
-    ForkChildAssignment, ForkChildren, InMemoryMetadataStore, NewTimeout, Orchestrator,
-    RecordingCall, RecordingPersister, SandboxExpiry, SandboxLaunchSource, SandboxMetadata,
-    SandboxOrchestration, SandboxTimeoutAction,
+    ControlPlaneConfig, CreateSandboxRequest, ForkChildAssignment, ForkChildren,
+    InMemoryMetadataStore, MetadataStore, NewTimeout, Orchestrator, SandboxExpiry,
+    SandboxLaunchSource, SandboxMetadata, SandboxOrchestration, SandboxTimeoutAction,
+    StagingPausePublisher,
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxService as _;
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::mock::{MockAction, MockBackendFactory, MockBehavior, MockOperation};
 use crate::sandbox::{
-    PausedSandboxState, RuntimeArtifactSet, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    RuntimeArtifactSet, SandboxBackendFactory, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
-use crate::snapshot::mock::mock_snapshot_manager;
+use crate::snapshot::mock::{mock_snapshot_manager, recording_snapshot_manager};
+use crate::snapshot::SnapshotManager;
 use crate::types::{ExecutionId, SandboxId};
 
 use super::service::NodeSandboxService;
@@ -32,22 +33,39 @@ async fn service() -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
 async fn service_with(
     factory: MockBackendFactory,
 ) -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
+    let orchestrator = orchestrator_with(InMemoryMetadataStore::new(), factory).await;
+    serve_node(orchestrator, mock_snapshot_manager())
+}
+
+async fn orchestrator_with<S, F>(store: S, factory: F) -> Arc<Orchestrator<S, F>>
+where
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+{
     crate::logging::init_for_tests();
-    let orchestrator = Orchestrator::new(
+    Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-        InMemoryMetadataStore::new(),
+        store,
         factory,
-        DisabledSandboxPersister,
         crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
-    .expect("an in-memory orchestrator");
+    .expect("an in-memory orchestrator")
+}
+
+// The node's wiring: pauses stage on the same repository the service answers from.
+fn serve_node<S, F>(
+    orchestrator: Arc<Orchestrator<S, F>>,
+    manager: SnapshotManager,
+) -> (Arc<dyn SandboxOrchestration>, NodeSandboxService)
+where
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+{
+    let manager = Arc::new(manager);
+    orchestrator.set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(&manager))));
     let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(mock_snapshot_manager()),
-        NODE.to_string(),
-    );
+    let service = NodeSandboxService::new(Arc::clone(&orchestration), manager, NODE.to_string());
     (orchestration, service)
 }
 
@@ -56,23 +74,10 @@ async fn service_with_catalog() -> (
     NodeSandboxService,
     Arc<crate::snapshot::mock::MockSnapshotCatalog>,
 ) {
-    crate::logging::init_for_tests();
-    let orchestrator = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::new(),
-        DisabledSandboxPersister,
-        crate::image::DisabledRuntimeImageRefs::shared(),
-    )
-    .await
-    .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let orchestrator =
+        orchestrator_with(InMemoryMetadataStore::new(), MockBackendFactory::new()).await;
     let (manager, catalog) = crate::snapshot::mock::mock_snapshot_manager_with_catalog();
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(manager),
-        NODE.to_string(),
-    );
+    let (orchestration, service) = serve_node(orchestrator, manager);
     (orchestration, service, catalog)
 }
 
@@ -90,6 +95,7 @@ fn launch(marker: Option<&[u8]>) -> CreateSandboxRequest {
         execution_id: None,
         auto_resume: false,
         secure: false,
+        preferred_node_id: None,
     }
 }
 
@@ -118,130 +124,6 @@ fn resolved_snapshot_source() -> pb::SnapshotSource {
     pb::SnapshotSource {
         snapshot_id: record.id.to_string(),
         resolved_record: Some(pb::encode_value(&record).expect("encode should succeed")),
-    }
-}
-
-struct FlakyRecords {
-    inner: InMemoryMetadataStore,
-    reads_fail: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl FlakyRecords {
-    fn new() -> Self {
-        Self {
-            inner: InMemoryMetadataStore::new(),
-            reads_fail: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    fn unreachable<T>(&self) -> Result<T, crate::orchestrator::StoreError> {
-        Err(crate::orchestrator::StoreError::Backend {
-            source: anyhow::anyhow!("the records could not be reached"),
-        })
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::orchestrator::MetadataStore for FlakyRecords {
-    async fn get(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
-        if self.reads_fail.load(std::sync::atomic::Ordering::SeqCst) {
-            return self.unreachable();
-        }
-        self.inner.get(sandbox_id).await
-    }
-
-    async fn add(&self, metadata: SandboxMetadata) -> Result<(), crate::orchestrator::StoreError> {
-        self.inner.add(metadata).await
-    }
-    async fn update(
-        &self,
-        metadata: SandboxMetadata,
-    ) -> Result<(), crate::orchestrator::StoreError> {
-        self.inner.update(metadata).await
-    }
-    async fn update_state_if_state(
-        &self,
-        sandbox_id: &SandboxId,
-        new_state: crate::orchestrator::SandboxState,
-        expected_states: &[crate::orchestrator::SandboxState],
-    ) -> Result<crate::orchestrator::SandboxState, crate::orchestrator::StoreError> {
-        self.inner
-            .update_state_if_state(sandbox_id, new_state, expected_states)
-            .await
-    }
-    async fn update_if_state<F>(
-        &self,
-        sandbox_id: &SandboxId,
-        expected_states: &[crate::orchestrator::SandboxState],
-        update: F,
-    ) -> Result<crate::orchestrator::MetadataUpdateResult, crate::orchestrator::StoreError>
-    where
-        F: FnOnce(&mut SandboxMetadata) + Send,
-    {
-        self.inner
-            .update_if_state(sandbox_id, expected_states, update)
-            .await
-    }
-    async fn remove(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
-        self.inner.remove(sandbox_id).await
-    }
-    async fn remove_if_execution(
-        &self,
-        sandbox_id: &SandboxId,
-        expected_execution_id: crate::types::ExecutionId,
-        expected_states: &[crate::orchestrator::SandboxState],
-    ) -> Result<crate::orchestrator::FencedRemoval, crate::orchestrator::StoreError> {
-        self.inner
-            .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
-            .await
-    }
-    async fn list(&self) -> Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
-        self.inner.list().await
-    }
-    async fn list_with_callback<F>(
-        &self,
-        callback: F,
-    ) -> Result<(), crate::orchestrator::StoreError>
-    where
-        F: FnMut(&SandboxMetadata) + Send,
-    {
-        self.inner.list_with_callback(callback).await
-    }
-    async fn list_filtered(
-        &self,
-        filter: crate::orchestrator::SandboxListFilter,
-    ) -> Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
-        self.inner.list_filtered(filter).await
-    }
-    async fn list_expired(
-        &self,
-        now: std::time::SystemTime,
-    ) -> Result<Vec<SandboxMetadata>, crate::orchestrator::StoreError> {
-        self.inner.list_expired(now).await
-    }
-    async fn list_ids(&self) -> Result<Vec<SandboxId>, crate::orchestrator::StoreError> {
-        self.inner.list_ids().await
-    }
-    async fn get_many(
-        &self,
-        ids: &[SandboxId],
-    ) -> Result<crate::orchestrator::MetadataRows, crate::orchestrator::StoreError> {
-        self.inner.get_many(ids).await
-    }
-    async fn wait_while_in_states(
-        &self,
-        sandbox_id: &SandboxId,
-        transitional_states: &[crate::orchestrator::SandboxState],
-    ) -> Result<Option<SandboxMetadata>, crate::orchestrator::StoreError> {
-        self.inner
-            .wait_while_in_states(sandbox_id, transitional_states)
-            .await
     }
 }
 
@@ -428,22 +310,12 @@ async fn a_partial_record_read_fails_the_listing_instead_of_shortening_it() {
         }
     }
 
-    crate::logging::init_for_tests();
-    let orchestrator = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+    let orchestrator = orchestrator_with(
         HalfAnswering(InMemoryMetadataStore::new()),
         MockBackendFactory::new(),
-        DisabledSandboxPersister,
-        crate::image::DisabledRuntimeImageRefs::shared(),
     )
-    .await
-    .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(mock_snapshot_manager()),
-        NODE.to_string(),
-    );
+    .await;
+    let (orchestration, service) = serve_node(orchestrator, mock_snapshot_manager());
 
     start(&orchestration, Some(b"owned-a")).await;
     start(&orchestration, Some(b"owned-b")).await;
@@ -460,28 +332,28 @@ async fn a_partial_record_read_fails_the_listing_instead_of_shortening_it() {
 }
 
 #[tokio::test]
-async fn a_paused_sandbox_keeps_its_record_and_leaves_the_listing() {
-    let (orchestration, service) = service().await;
-    let sandbox = start(&orchestration, Some(b"owned")).await;
-    let staying = start(&orchestration, Some(b"also-owned")).await;
-    assert_eq!(listed(&service).await.len(), 2);
+async fn a_paused_sandbox_leaves_the_listing_and_keeps_no_record() {
+    let harness = staging_service().await;
+    let (orchestration, service) = (&harness.orchestration, &harness.service);
+    let sandbox = start(orchestration, Some(b"owned")).await;
+    let staying = start(orchestration, Some(b"also-owned")).await;
+    assert_eq!(listed(service).await.len(), 2);
 
-    Arc::clone(&orchestration)
+    Arc::clone(orchestration)
         .pause_sandbox(sandbox.id)
         .await
         .expect("the mock backend pauses");
 
-    let record = Arc::clone(&orchestration)
-        .get_sandbox(&sandbox.id)
-        .await
-        .expect("read")
-        .expect("a paused sandbox keeps its record");
     assert!(
-        record.control_plane_config.is_some(),
-        "the marker did not survive the pause, so this test proves nothing"
+        Arc::clone(orchestration)
+            .get_sandbox(&sandbox.id)
+            .await
+            .expect("read")
+            .is_none(),
+        "a paused sandbox exists only as its snapshot"
     );
 
-    let sandboxes = listed(&service).await;
+    let sandboxes = listed(service).await;
     assert_eq!(
         sandboxes.len(),
         1,
@@ -503,10 +375,7 @@ async fn the_listing_names_the_run_that_is_live() {
 
 #[tokio::test]
 async fn the_listing_reports_the_incarnation_the_handle_is_running() {
-    use crate::sandbox::{
-        EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxBackend,
-        SandboxBackendFactory, SandboxLaunchConfig,
-    };
+    use crate::sandbox::{FreshSandboxBuildSpec, SandboxBackend, SandboxLaunchConfig};
 
     struct Drifting {
         inner: MockBackendFactory,
@@ -535,45 +404,18 @@ async fn the_listing_reports_the_incarnation_the_handle_is_running() {
             self.inner
                 .build_from_snapshot(snapshot, launch_config, drifted)
         }
-        fn decode_paused_state(
-            &self,
-            artifact_root: std::path::PathBuf,
-            state: serde_json::Value,
-        ) -> anyhow::Result<Arc<dyn PausedSandboxState>> {
-            self.inner.decode_paused_state(artifact_root, state)
-        }
-        fn build_from_paused_state(
-            &self,
-            sandbox_id: SandboxId,
-            execution_id: ExecutionId,
-            state: &dyn PausedSandboxState,
-            envd_access_token: Option<EnvdAccessToken>,
-        ) -> anyhow::Result<Box<dyn SandboxBackend>> {
-            self.inner
-                .build_from_paused_state(sandbox_id, execution_id, state, envd_access_token)
-        }
     }
 
-    crate::logging::init_for_tests();
     let drifted = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let orchestrator = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+    let orchestrator = orchestrator_with(
         InMemoryMetadataStore::new(),
         Drifting {
             inner: MockBackendFactory::new(),
             drifted: Arc::clone(&drifted),
         },
-        DisabledSandboxPersister,
-        crate::image::DisabledRuntimeImageRefs::shared(),
     )
-    .await
-    .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(mock_snapshot_manager()),
-        NODE.to_string(),
-    );
+    .await;
+    let (orchestration, service) = serve_node(orchestrator, mock_snapshot_manager());
 
     let record = start(&orchestration, Some(b"owned")).await;
     let running = *drifted.lock().expect("lock").first().expect("one backend");
@@ -595,23 +437,13 @@ async fn the_listing_reports_the_incarnation_the_handle_is_running() {
 async fn a_sandbox_whose_handle_is_busy_is_still_reported() {
     use crate::sandbox::mock::{MockAction, MockBehavior, MockOperation};
 
-    crate::logging::init_for_tests();
     let behavior = Arc::new(MockBehavior::new());
-    let orchestrator = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+    let orchestrator = orchestrator_with(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
-        DisabledSandboxPersister,
-        crate::image::DisabledRuntimeImageRefs::shared(),
     )
-    .await
-    .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(mock_snapshot_manager()),
-        NODE.to_string(),
-    );
+    .await;
+    let (orchestration, service) = serve_node(orchestrator, mock_snapshot_manager());
 
     let busy = start(&orchestration, Some(b"busy")).await;
     let idle = start(&orchestration, Some(b"idle")).await;
@@ -1620,291 +1452,6 @@ async fn a_busy_handle_is_described_as_read_from_no_handle() {
     let _ = forking.await;
 }
 
-async fn pause(orchestration: &Arc<dyn SandboxOrchestration>, marker: &[u8]) -> SandboxMetadata {
-    let sandbox = start(orchestration, Some(marker)).await;
-    let paused = Arc::clone(orchestration)
-        .pause_sandbox(sandbox.id)
-        .await
-        .expect("the mock backend pauses");
-    assert_eq!(
-        paused.execution_id, sandbox.execution_id,
-        "a pause changed the run the sandbox had been running"
-    );
-    paused
-}
-
-fn resume_request(
-    sandbox_id: SandboxId,
-    execution_id: ExecutionId,
-    resumed_execution_id: ExecutionId,
-    timeout_ms: u64,
-) -> pb::SandboxResumeRequest {
-    pb::SandboxResumeRequest {
-        sandbox_id: sandbox_id.to_string(),
-        execution_id: execution_id.to_string(),
-        resumed_execution_id: resumed_execution_id.to_string(),
-        timeout_ms,
-    }
-}
-
-#[tokio::test]
-async fn a_resume_reopens_the_capture_under_the_run_the_caller_claimed() {
-    let (orchestration, service) = service().await;
-    let paused = pause(&orchestration, b"owned").await;
-    let claimed = ExecutionId::new();
-    assert_ne!(claimed, paused.execution_id);
-    assert!(
-        listed(&service).await.is_empty(),
-        "a paused sandbox is live"
-    );
-
-    let err = service
-        .resume(Request::new(resume_request(
-            paused.id,
-            claimed,
-            paused.execution_id,
-            0,
-        )))
-        .await
-        .expect_err("a resume whose two incarnations were exchanged");
-    assert_eq!(err.code(), Code::FailedPrecondition, "{err}");
-    assert!(
-        listed(&service).await.is_empty(),
-        "a refused resume brought the sandbox back anyway"
-    );
-
-    let started = service
-        .resume(Request::new(resume_request(
-            paused.id,
-            paused.execution_id,
-            claimed,
-            0,
-        )))
-        .await
-        .expect("resume")
-        .into_inner()
-        .started
-        .expect("a resume that succeeded says what it started");
-
-    assert_eq!(started.sandbox_id, paused.id.to_string());
-    assert_eq!(
-        started.execution_id,
-        claimed.to_string(),
-        "the node brought the sandbox back under a run nobody claimed"
-    );
-
-    let sandboxes = listed(&service).await;
-    assert_eq!(sandboxes.len(), 1, "reported: {sandboxes:?}");
-    assert_eq!(sandboxes[0].sandbox_id, paused.id.to_string());
-    assert_eq!(sandboxes[0].execution_id, claimed.to_string());
-    assert_eq!(
-        sandboxes[0].control_plane_config, b"owned",
-        "the sandbox came back without the record that says whose it is"
-    );
-}
-
-#[tokio::test]
-async fn a_resume_whose_capture_record_is_gone_answers_not_found() {
-    crate::logging::init_for_tests();
-    let root = tempfile::tempdir().expect("a temp dir");
-    let orchestrator = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::new(),
-        FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
-        crate::image::DisabledRuntimeImageRefs::shared(),
-    )
-    .await
-    .expect("an orchestrator that keeps records");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(mock_snapshot_manager()),
-        NODE.to_string(),
-    );
-
-    let paused = pause(&orchestration, b"owned").await;
-    std::fs::remove_file(
-        root.path()
-            .join("records")
-            .join(format!("{}.json", paused.id)),
-    )
-    .expect("pausing wrote the record this deletes");
-
-    let err = service
-        .resume(Request::new(resume_request(
-            paused.id,
-            paused.execution_id,
-            ExecutionId::new(),
-            0,
-        )))
-        .await
-        .expect_err("the capture this resume needs is gone");
-
-    assert_eq!(
-        err.code(),
-        Code::NotFound,
-        "the api half rebuilds only an absence it can classify, and every other code reaches \
-         the caller as a 500 instead: {err}"
-    );
-    assert!(
-        matches!(
-            crate::node_client::wire::RemoteResumeFailure::from_status(NODE, paused.id, err),
-            crate::node_client::wire::RemoteResumeFailure::CaptureAbsent { .. }
-        ),
-        "the two halves have to agree: this status is what the api half classifies"
-    );
-}
-
-#[tokio::test]
-async fn a_resume_for_a_capture_this_node_does_not_hold_is_not_found() {
-    let (orchestration, service) = service().await;
-    let paused = pause(&orchestration, b"owned").await;
-
-    let err = service
-        .resume(Request::new(resume_request(
-            SandboxId::new(),
-            paused.execution_id,
-            ExecutionId::new(),
-            0,
-        )))
-        .await
-        .expect_err("a resume for a sandbox that was never here");
-    assert_eq!(err.code(), Code::NotFound, "{err}");
-
-    service
-        .resume(Request::new(resume_request(
-            paused.id,
-            paused.execution_id,
-            ExecutionId::new(),
-            0,
-        )))
-        .await
-        .expect("a resume for the capture this node holds");
-}
-
-#[tokio::test]
-async fn a_resume_whose_records_could_not_be_read_is_not_an_absence() {
-    crate::logging::init_for_tests();
-    let store = FlakyRecords::new();
-    let breaker = store.reads_fail.clone();
-    let orchestrator = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-        store,
-        MockBackendFactory::new(),
-        DisabledSandboxPersister,
-        crate::image::DisabledRuntimeImageRefs::shared(),
-    )
-    .await
-    .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(mock_snapshot_manager()),
-        NODE.to_string(),
-    );
-
-    let request = || resume_request(SandboxId::new(), ExecutionId::new(), ExecutionId::new(), 0);
-
-    let err = service
-        .resume(Request::new(request()))
-        .await
-        .expect_err("a resume for a sandbox that was never here");
-    assert_eq!(err.code(), Code::NotFound, "{err}");
-
-    breaker.store(true, std::sync::atomic::Ordering::SeqCst);
-    let err = service
-        .resume(Request::new(request()))
-        .await
-        .expect_err("a resume this node could not answer");
-    assert_ne!(
-        err.code(),
-        Code::NotFound,
-        "a store this node could not read was reported as a sandbox that is not here: {err}"
-    );
-    assert_eq!(err.code(), Code::Internal, "{err}");
-}
-
-#[tokio::test]
-async fn a_resume_into_the_run_it_is_replacing_is_refused() {
-    let (orchestration, service) = service().await;
-    let paused = pause(&orchestration, b"owned").await;
-
-    let err = service
-        .resume(Request::new(resume_request(
-            paused.id,
-            paused.execution_id,
-            paused.execution_id,
-            0,
-        )))
-        .await
-        .expect_err("a resume into the run it is replacing");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
-    assert!(listed(&service).await.is_empty());
-
-    let err = service
-        .resume(Request::new(pb::SandboxResumeRequest {
-            resumed_execution_id: String::new(),
-            ..resume_request(paused.id, paused.execution_id, ExecutionId::new(), 0)
-        }))
-        .await
-        .expect_err("a resume that named no run to start");
-    assert_eq!(err.code(), Code::InvalidArgument, "{err}");
-    assert!(listed(&service).await.is_empty());
-
-    service
-        .resume(Request::new(resume_request(
-            paused.id,
-            paused.execution_id,
-            ExecutionId::new(),
-            0,
-        )))
-        .await
-        .expect("a resume under a run of its own");
-    assert_eq!(listed(&service).await.len(), 1);
-}
-
-#[tokio::test]
-async fn a_zero_timeout_keeps_the_deadline_the_sandbox_was_paused_with() {
-    const AN_HOUR_MS: u64 = 60 * 60 * 1_000;
-    let (orchestration, service) = service().await;
-
-    let kept = pause(&orchestration, b"kept").await;
-    let replaced = pause(&orchestration, b"replaced").await;
-
-    let resume = |sandbox: &SandboxMetadata, timeout_ms| {
-        let request = resume_request(
-            sandbox.id,
-            sandbox.execution_id,
-            ExecutionId::new(),
-            timeout_ms,
-        );
-        async { service.resume(Request::new(request)).await }
-    };
-
-    let kept = resume(&kept, 0)
-        .await
-        .expect("resume keeping the paused deadline")
-        .into_inner()
-        .started
-        .expect("started");
-    let replaced = resume(&replaced, AN_HOUR_MS)
-        .await
-        .expect("resume with a new deadline")
-        .into_inner()
-        .started
-        .expect("started");
-
-    assert!(kept.expires_at_ms > 0, "{kept:?}");
-    assert!(replaced.expires_at_ms > 0, "{replaced:?}");
-    assert!(
-        replaced.expires_at_ms - kept.expires_at_ms > 3_000_000,
-        "the timeout on the request did not reach the sandbox: kept {}, replaced {}",
-        kept.expires_at_ms,
-        replaced.expires_at_ms
-    );
-}
-
 fn classification(status: &Status) -> Option<bool> {
     use prost::Message as _;
 
@@ -1916,68 +1463,28 @@ fn classification(status: &Status) -> Option<bool> {
         .map(|failure| failure.terminal)
 }
 
-async fn service_with_persister() -> (
-    Arc<dyn SandboxOrchestration>,
-    NodeSandboxService,
-    RecordingPersister,
-) {
-    crate::logging::init_for_tests();
-    let persister = RecordingPersister::default();
-    let orchestrator = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::new(),
-        persister.clone(),
-        crate::image::DisabledRuntimeImageRefs::shared(),
-    )
-    .await
-    .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(mock_snapshot_manager()),
-        NODE.to_string(),
-    );
-    (orchestration, service, persister)
-}
-
 struct StagingHarness {
     orchestration: Arc<dyn SandboxOrchestration>,
     service: NodeSandboxService,
     repository: Arc<crate::snapshot::mock::RecordingSnapshotRepository>,
     behavior: Arc<MockBehavior>,
-    _artifacts: tempfile::TempDir,
 }
 
 async fn staging_service() -> StagingHarness {
-    crate::logging::init_for_tests();
-    let artifacts = tempfile::tempdir().expect("tempdir");
-    let persister = RecordingPersister::default();
-    persister.allocates_artifact_root_at(artifacts.path().join("capture"));
     let behavior = Arc::new(MockBehavior::new());
     behavior.make_captures_stageable();
-    let orchestrator = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+    let orchestrator = orchestrator_with(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
-        persister,
-        crate::image::DisabledRuntimeImageRefs::shared(),
     )
-    .await
-    .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let (manager, repository) = crate::snapshot::mock::recording_snapshot_manager();
-    let service = NodeSandboxService::new(
-        Arc::clone(&orchestration),
-        Arc::new(manager),
-        NODE.to_string(),
-    );
+    .await;
+    let (manager, repository) = recording_snapshot_manager();
+    let (orchestration, service) = serve_node(orchestrator, manager);
     StagingHarness {
         orchestration,
         service,
         repository,
         behavior,
-        _artifacts: artifacts,
     }
 }
 
@@ -1995,110 +1502,23 @@ fn decode_staged(
     serde_json::from_slice(&value.json).expect("the staged row should decode")
 }
 
-fn pause_request(sandbox: &SandboxMetadata, publish: bool) -> pb::SandboxPauseRequest {
+fn pause_request(sandbox: &SandboxMetadata) -> pb::SandboxPauseRequest {
     pb::SandboxPauseRequest {
         sandbox_id: sandbox.id.to_string(),
         execution_id: sandbox.execution_id.to_string(),
-        publish,
     }
 }
 
 #[tokio::test]
-async fn a_pause_says_where_the_capture_went() {
-    let (orchestration, service, persister) = service_with_persister().await;
-
-    let nowhere = start(&orchestration, Some(b"owned")).await;
-    let reply = service
-        .pause(Request::new(pause_request(&nowhere, false)))
-        .await
-        .expect("pause")
-        .into_inner()
-        .paused_state
-        .expect("a pause that succeeded says how to reopen the sandbox");
-    assert_eq!(
-        reply.artifact_root, "",
-        "a node that allocated no directory named one anyway"
-    );
-
-    persister.holds_capture_at("/var/lib/agentenv/paused/abc/7");
-    let somewhere = start(&orchestration, Some(b"owned")).await;
-    let reply = service
-        .pause(Request::new(pause_request(&somewhere, false)))
-        .await
-        .expect("pause")
-        .into_inner()
-        .paused_state
-        .expect("a pause that succeeded says how to reopen the sandbox");
-    assert_eq!(reply.artifact_root, "/var/lib/agentenv/paused/abc/7");
-
-    let state = reply.state.expect("the backend's encoding of its capture");
-    assert_eq!(
-        state.schema_version,
-        crate::proto::node::SERIALIZED_VALUE_VERSION
-    );
-    let decoded: serde_json::Value =
-        serde_json::from_slice(&state.json).expect("the encoding is the value the backend wrote");
-    assert_eq!(
-        decoded,
-        crate::sandbox::mock::MockSnapshot
-            .encode()
-            .expect("the mock backend encodes its capture"),
-        "the reply carried something other than the capture the backend made"
-    );
-
-    for sandbox in [&nowhere, &somewhere] {
-        let record = orchestration
-            .get_sandbox(&sandbox.id)
-            .await
-            .expect("read")
-            .expect("the sandbox still has a record");
-        assert_eq!(record.state, crate::orchestrator::SandboxState::Paused);
-    }
-    assert!(
-        listed(&service).await.is_empty(),
-        "a paused sandbox is still running"
-    );
-}
-
-#[tokio::test]
-async fn a_pause_whose_record_could_not_be_read_is_not_a_pause_without_a_directory() {
-    let (orchestration, service, persister) = service_with_persister().await;
-    persister.holds_capture_at("/var/lib/agentenv/paused/abc/7");
-
-    let unreadable = start(&orchestration, Some(b"owned")).await;
-    persister.fail_next(RecordingCall::PausedArtifactRoot);
-    let err = service
-        .pause(Request::new(pause_request(&unreadable, false)))
-        .await
-        .expect_err("a pause whose record could not be read");
-    assert_ne!(
-        err.code(),
-        Code::NotFound,
-        "a disk that could not be read was reported as an absence: {err}"
-    );
-
-    let readable = start(&orchestration, Some(b"owned")).await;
-    let reply = service
-        .pause(Request::new(pause_request(&readable, false)))
-        .await
-        .expect("pause")
-        .into_inner()
-        .paused_state
-        .expect("paused state");
-    assert_eq!(reply.artifact_root, "/var/lib/agentenv/paused/abc/7");
-}
-
-#[tokio::test]
-async fn a_published_pause_stages_the_bytes_here_and_leaves_the_row_to_the_caller() {
+async fn a_pause_stages_the_bytes_here_and_leaves_the_row_to_the_caller() {
     let harness = staging_service().await;
     let published = start(&harness.orchestration, Some(b"owned")).await;
-    let unpublished = start(&harness.orchestration, Some(b"owned")).await;
 
     let reply = harness
         .service
-        .pause(Request::new(pause_request(&published, true)))
+        .pause(Request::new(pause_request(&published)))
         .await
-        .expect("a published pause")
+        .expect("a pause")
         .into_inner();
 
     let staged = decode_staged(reply.staged);
@@ -2133,39 +1553,34 @@ async fn a_published_pause_stages_the_bytes_here_and_leaves_the_row_to_the_calle
         staged.commit.alias.is_none(),
         "staging is never told a name; binding one is the committer's business"
     );
-    assert!(reply.paused_state.is_some());
-
-    let reply = harness
-        .service
-        .pause(Request::new(pause_request(&unpublished, false)))
-        .await
-        .expect("an unpublished pause")
-        .into_inner();
     assert!(
-        reply.staged.is_none(),
-        "a pause that did not ask to publish came back with a row"
-    );
-    assert!(reply.paused_state.is_some());
-    assert_eq!(
-        harness.repository.staged().len(),
-        1,
-        "a pause that did not ask to publish staged bytes anyway"
+        staged.commit.committed.paused_sandbox.is_some(),
+        "the row must carry what a resume needs to bring the sandbox back"
     );
 
     assert!(
         listed(&harness.service).await.is_empty(),
         "a sandbox that was paused is still running"
     );
+    assert!(
+        harness
+            .orchestration
+            .get_sandbox(&published.id)
+            .await
+            .expect("read")
+            .is_none(),
+        "a paused sandbox kept a record on the node"
+    );
 }
 
 #[tokio::test]
-async fn a_pause_that_had_already_happened_answers_with_no_row() {
+async fn a_pause_of_a_sandbox_already_paused_finds_nothing_to_pause() {
     let harness = staging_service().await;
     let sandbox = start(&harness.orchestration, Some(b"owned")).await;
 
     let first = harness
         .service
-        .pause(Request::new(pause_request(&sandbox, true)))
+        .pause(Request::new(pause_request(&sandbox)))
         .await
         .expect("the pause that does the work")
         .into_inner();
@@ -2174,78 +1589,94 @@ async fn a_pause_that_had_already_happened_answers_with_no_row() {
         "the pause that actually paused produced no row"
     );
 
-    let again = harness
+    let err = harness
         .service
-        .pause(Request::new(pause_request(&sandbox, true)))
+        .pause(Request::new(pause_request(&sandbox)))
         .await
-        .expect("a repeated pause is idempotent, not an error")
+        .expect_err("the sandbox is gone from this node");
+    assert_eq!(err.code(), Code::NotFound, "{err}");
+    assert_eq!(
+        harness.repository.staged().len(),
+        1,
+        "one capture was staged twice"
+    );
+}
+
+#[tokio::test]
+async fn a_pause_that_joins_another_callers_pause_is_refused_the_staged_value() {
+    let harness = staging_service().await;
+    let sandbox = start(&harness.orchestration, Some(b"owned")).await;
+    let service = Arc::new(harness.service);
+    harness.behavior.push_action(
+        MockOperation::Pause,
+        MockAction::SucceedAfter(Duration::from_secs(1)),
+    );
+
+    let first = tokio::spawn({
+        let service = Arc::clone(&service);
+        let request = pause_request(&sandbox);
+        async move { service.pause(Request::new(request)).await }
+    });
+    // The capture delay keeps the first pause in flight past this wait.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let joined = service
+        .pause(Request::new(pause_request(&sandbox)))
+        .await
+        .expect_err("a pause somebody else is performing has no row for this caller");
+    assert_eq!(joined.code(), Code::FailedPrecondition, "{joined}");
+
+    let first = first
+        .await
+        .expect("the first pause finishes")
+        .expect("the pause that did the work")
         .into_inner();
     assert!(
-        again.staged.is_none(),
-        "a pause that did nothing produced a second row for one capture"
+        first.staged.is_some(),
+        "the caller that made the pause was not handed its row"
     );
     assert_eq!(
         harness.repository.staged().len(),
         1,
         "one capture was staged twice"
     );
-    assert!(again.paused_state.is_some());
+    assert!(listed(&service).await.is_empty());
 }
 
 #[tokio::test]
-async fn a_pause_whose_staging_failed_still_pauses_and_says_what_was_lost() {
+async fn a_pause_whose_staging_failed_leaves_the_sandbox_running() {
     let harness = staging_service().await;
-    let works = start(&harness.orchestration, Some(b"owned")).await;
-    let breaks = start(&harness.orchestration, Some(b"owned")).await;
-
-    let ok = harness
-        .service
-        .pause(Request::new(pause_request(&works, true)))
-        .await
-        .expect("a published pause")
-        .into_inner();
-    assert!(ok.staged.is_some());
-    assert_eq!(
-        ok.staging_error, "",
-        "a staging that worked reported an error"
-    );
+    let sandbox = start(&harness.orchestration, Some(b"owned")).await;
 
     harness.repository.fail_staging();
-    let broken = harness
+    let err = harness
         .service
-        .pause(Request::new(pause_request(&breaks, true)))
+        .pause(Request::new(pause_request(&sandbox)))
         .await
-        .expect("a staging failure must not fail the pause")
-        .into_inner();
+        .expect_err("a pause that could not be staged");
     assert!(
-        broken.staged.is_none(),
-        "a staging that failed produced a row anyway"
+        err.message().contains("could not be published"),
+        "the failure did not say what went wrong: {err}"
     );
     assert!(
-        broken.staging_error.contains("no room on the device"),
-        "the reply did not say what failed: {:?}",
-        broken.staging_error
-    );
-    assert!(
-        broken.paused_state.is_some(),
-        "a pause that could not be staged came back with no way to reopen it"
-    );
-    assert!(
-        listed(&harness.service).await.is_empty(),
-        "a pause whose staging failed left the sandbox running"
+        harness.repository.staged().is_empty(),
+        "a staging that failed left a row behind"
     );
 
-    let again = harness
-        .service
-        .pause(Request::new(pause_request(&breaks, true)))
-        .await
-        .expect("a repeated pause")
-        .into_inner();
-    assert!(again.staged.is_none());
+    let live = listed(&harness.service).await;
     assert_eq!(
-        again.staging_error, "",
-        "a pause that had nothing to stage reported a staging failure"
+        live.len(),
+        1,
+        "a pause whose staging failed stopped the sandbox: {live:?}"
     );
+    assert_eq!(live[0].execution_id, sandbox.execution_id.to_string());
+    let record = harness
+        .orchestration
+        .get_sandbox(&sandbox.id)
+        .await
+        .expect("read")
+        .expect("a sandbox that was not paused keeps its record");
+    assert_eq!(record.state, crate::orchestrator::SandboxState::Running);
 }
 
 #[tokio::test]
@@ -2367,29 +1798,19 @@ async fn a_failed_pause_says_whether_the_sandbox_survived_it() {
             true,
         ),
     ] {
-        crate::logging::init_for_tests();
-        let behavior = Arc::new(crate::sandbox::mock::MockBehavior::new());
-        let orchestrator = Orchestrator::new(
-            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+        let behavior = Arc::new(MockBehavior::new());
+        let orchestrator = orchestrator_with(
             InMemoryMetadataStore::new(),
             MockBackendFactory::with_behavior(Arc::clone(&behavior)),
-            DisabledSandboxPersister,
-            crate::image::DisabledRuntimeImageRefs::shared(),
         )
-        .await
-        .expect("an in-memory orchestrator");
-        let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-        let service = NodeSandboxService::new(
-            Arc::clone(&orchestration),
-            Arc::new(mock_snapshot_manager()),
-            NODE.to_string(),
-        );
+        .await;
+        let (orchestration, service) = serve_node(orchestrator, mock_snapshot_manager());
 
         let sandbox = start(&orchestration, Some(b"owned")).await;
-        behavior.push_action(crate::sandbox::mock::MockOperation::Pause, action);
+        behavior.push_action(MockOperation::Pause, action);
 
         let err = service
-            .pause(Request::new(pause_request(&sandbox, false)))
+            .pause(Request::new(pause_request(&sandbox)))
             .await
             .expect_err("a pause the backend refused");
         assert_eq!(
@@ -2408,14 +1829,14 @@ async fn a_failed_pause_says_whether_the_sandbox_survived_it() {
 
 #[tokio::test]
 async fn a_pause_that_does_not_parse_is_refused_without_condemning_the_sandbox() {
-    let (orchestration, service) = service().await;
-    let sandbox = start(&orchestration, Some(b"owned")).await;
+    let harness = staging_service().await;
+    let (orchestration, service) = (&harness.orchestration, &harness.service);
+    let sandbox = start(orchestration, Some(b"owned")).await;
 
     let err = service
         .pause(Request::new(pb::SandboxPauseRequest {
             sandbox_id: sandbox.id.to_string(),
             execution_id: String::new(),
-            publish: false,
         }))
         .await
         .expect_err("a pause naming no run");
@@ -2426,28 +1847,28 @@ async fn a_pause_that_does_not_parse_is_refused_without_condemning_the_sandbox()
         "a request that never reached the runtime condemned the sandbox: {err}"
     );
     assert_eq!(
-        listed(&service).await.len(),
+        listed(service).await.len(),
         1,
         "a refused pause stopped the sandbox anyway"
     );
 
     service
-        .pause(Request::new(pause_request(&sandbox, false)))
+        .pause(Request::new(pause_request(&sandbox)))
         .await
         .expect("a pause that names the run it means");
-    assert!(listed(&service).await.is_empty());
+    assert!(listed(service).await.is_empty());
 }
 
 #[tokio::test]
 async fn a_pause_for_a_superseded_run_is_refused_without_condemning_the_sandbox() {
-    let (orchestration, service) = service().await;
-    let sandbox = start(&orchestration, Some(b"owned")).await;
+    let harness = staging_service().await;
+    let (orchestration, service) = (&harness.orchestration, &harness.service);
+    let sandbox = start(orchestration, Some(b"owned")).await;
 
     let err = service
         .pause(Request::new(pb::SandboxPauseRequest {
             sandbox_id: sandbox.id.to_string(),
             execution_id: ExecutionId::new().to_string(),
-            publish: false,
         }))
         .await
         .expect_err("a pause naming a run this node is not running");
@@ -2458,62 +1879,48 @@ async fn a_pause_for_a_superseded_run_is_refused_without_condemning_the_sandbox(
         "a fence check that never reached the runtime condemned the sandbox: {err}"
     );
     assert_eq!(
-        listed(&service).await.len(),
+        listed(service).await.len(),
         1,
         "a refused pause stopped the sandbox anyway"
     );
 
     service
-        .pause(Request::new(pause_request(&sandbox, false)))
+        .pause(Request::new(pause_request(&sandbox)))
         .await
         .expect("a pause naming the run this node is running");
-    assert!(listed(&service).await.is_empty());
+    assert!(listed(service).await.is_empty());
 }
 
 #[tokio::test]
-async fn a_sandbox_paused_through_the_rpc_is_reopened_through_the_rpc() {
-    let (orchestration, service) = service().await;
-    let sandbox = start(&orchestration, Some(b"owned")).await;
-    let claimed = ExecutionId::new();
-    assert_ne!(claimed, sandbox.execution_id);
+async fn a_sandbox_paused_through_the_rpc_is_created_again_under_its_own_id() {
+    let harness = staging_service().await;
+    let (orchestration, service) = (&harness.orchestration, &harness.service);
+    let sandbox = start(orchestration, Some(b"owned")).await;
 
     service
-        .pause(Request::new(pause_request(&sandbox, false)))
+        .pause(Request::new(pause_request(&sandbox)))
         .await
         .expect("pause through the RPC");
     assert!(
-        listed(&service).await.is_empty(),
+        listed(service).await.is_empty(),
         "the sandbox the RPC paused is still running"
     );
 
-    let stale = service
-        .resume(Request::new(resume_request(
-            sandbox.id,
-            ExecutionId::new(),
-            claimed,
-            0,
-        )))
+    let back = Arc::clone(orchestration)
+        .restore_sandbox(sandbox.id, launch(Some(b"owned")))
         .await
-        .expect_err("a resume fenced on a run this node never paused");
-    assert_eq!(stale.code(), Code::FailedPrecondition, "{stale}");
+        .expect("the id a pause freed can be created under again");
+    assert_eq!(back.id, sandbox.id);
+    assert_ne!(
+        back.execution_id, sandbox.execution_id,
+        "the sandbox came back as the run it was paused under"
+    );
 
-    let started = service
-        .resume(Request::new(resume_request(
-            sandbox.id,
-            sandbox.execution_id,
-            claimed,
-            0,
-        )))
-        .await
-        .expect("resume through the RPC")
-        .into_inner()
-        .started
-        .expect("a resume that succeeded says what it started");
-    assert_eq!(started.execution_id, claimed.to_string());
-
-    let live = listed(&service).await;
+    let live = listed(service).await;
     assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
-    assert_eq!(live[0].execution_id, claimed.to_string());
+    assert_eq!(live[0].sandbox_id, sandbox.id.to_string());
+    assert_eq!(live[0].execution_id, back.execution_id.to_string());
+    assert_eq!(live[0].control_plane_config, b"owned");
 }
 
 #[tokio::test]

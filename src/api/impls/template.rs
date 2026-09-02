@@ -836,6 +836,7 @@ fn adopted_build_metadata(
         virtualization_mode: VirtualizationMode::default(),
         image_configs: ImageConfigs::new(),
         custom_extension_params: None,
+        paused_sandbox: None,
     }
 }
 
@@ -999,12 +1000,8 @@ mod template_read_scope_tests {
     use agentenv_http_server::models;
 
     use super::{run_the_build_on_a_node, ApiImpl, TemplateBuildStartBaseSource};
-    use crate::identity::NodeIdentity;
     use crate::node_client::{FixedNodePlacement, NodeEndpoint, NodePlacement};
-    use crate::orchestrator::{
-        DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore,
-        Orchestrator,
-    };
+    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
         SnapshotCatalog, SnapshotCommit, SnapshotListPage, StartedBuild,
@@ -1157,6 +1154,7 @@ mod template_read_scope_tests {
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             committed: None,
+            origin_node_id: None,
         };
 
         let deletes = Arc::new(AtomicUsize::new(0));
@@ -1167,18 +1165,7 @@ mod template_read_scope_tests {
             build_starts: Arc::clone(&build_starts),
         });
 
-        let root = tempfile::tempdir().expect("a temp dir");
-        let orchestrator = Orchestrator::new(
-            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-            InMemoryMetadataStore::new(),
-            MockBackendFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
-            crate::image::DisabledRuntimeImageRefs::shared(),
-        )
-        .await
-        .expect("an orchestrator");
-        // Held for the process's lifetime: the persister above keeps reading it.
-        std::mem::forget(root);
+        let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
 
         let snapshot_manager = Arc::new(SnapshotManager::from_parts(
             Arc::new(SnapshotRepository::new(
@@ -1191,13 +1178,8 @@ mod template_read_scope_tests {
 
         let api = ApiImpl::new(
             orchestrator,
-            Arc::clone(&snapshot_manager),
+            snapshot_manager,
             None,
-            crate::api::PausedSandboxWiring::new(
-                Arc::new(DisabledPausedSandboxRegistry),
-                Arc::clone(&snapshot_manager),
-                &NodeIdentity::from_config(&Default::default()),
-            ),
             Vec::new(),
             crate::api::ResumeWiring::api_half_for_test(),
         );

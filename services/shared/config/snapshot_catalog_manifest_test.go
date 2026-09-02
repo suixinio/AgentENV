@@ -124,20 +124,20 @@ func TestNoAgentenvWorkloadDeclaresTheRemovedSnapshotCatalogSwitches(t *testing.
 
 // 🔴 The mutation control for the walk above. A scan for absence passes on a
 // tree it cannot read, so this proves the same walk *does* find an environment
-// variable that is genuinely there — AENV_PAUSED_REGISTRY_BACKEND, which the
-// api half still declares — using the same decode, the same population and
-// the same lookup.
+// variable that is genuinely there — AENV_ORCHESTRATOR_STORE_REDIS_URL, which
+// the api half declares — using the same decode, the same population and the
+// same lookup.
 //
 // 🔴 Used to require both halves: the node DaemonSet carried this key too,
 // pointed at a `paused-registry-config` ConfigMap the node ignored regardless
 // of what it named (`assemble_node` warns and wires a no-op registry for any
 // backend other than `local`). That reference and the ConfigMap it read from
-// are both deleted now — the node's copy bought nothing but a startup
-// warning — so only the api half's literal (`AENV_PAUSED_REGISTRY_BACKEND=
-// postgres` on `agentenv-api-deployment.yaml`) remains for this control to
-// find.
+// are both deleted now, and so is the api half's own paused-registry literal
+// (a paused sandbox is a snapshot catalog row), so the control is the api
+// half's `AENV_ORCHESTRATOR_STORE_REDIS_URL` literal on
+// `agentenv-api-deployment.yaml`.
 func TestTheRemovedSwitchWalkCanStillFindAnEnvironmentVariable(t *testing.T) {
-	const stillDeclared = "AENV_PAUSED_REGISTRY_BACKEND"
+	const stillDeclared = "AENV_ORCHESTRATOR_STORE_REDIS_URL"
 
 	found := 0
 	entries, err := os.ReadDir(manifestDir)

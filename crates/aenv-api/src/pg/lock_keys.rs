@@ -9,12 +9,6 @@
 pub enum AdvisoryLockKey {
     /// Catalog build reaper.
     CatalogBuildReaper = 1,
-    /// Paused-registry reconcile loop.
-    PausedRegistryReconcile = 2,
-    /// Paused-registry reclaim loop.
-    PausedRegistryReclaim = 3,
-    /// Retired restart-grace key; never reuse this value.
-    PausedRegistryRestartGrace = 4,
 }
 
 impl AdvisoryLockKey {
@@ -36,12 +30,7 @@ mod tests {
 
     #[test]
     fn every_key_is_distinct() {
-        let keys = [
-            AdvisoryLockKey::CatalogBuildReaper,
-            AdvisoryLockKey::PausedRegistryReconcile,
-            AdvisoryLockKey::PausedRegistryReclaim,
-            AdvisoryLockKey::PausedRegistryRestartGrace,
-        ];
+        let keys = [AdvisoryLockKey::CatalogBuildReaper];
         let mut seen = std::collections::HashSet::new();
         for key in keys {
             assert!(
@@ -57,23 +46,17 @@ mod tests {
         assert_eq!(GO_SCHEMA_LOCK_KEY, 0x0A6E_7653_4348_4D41);
         assert_eq!(GO_BUILD_ADMISSION_LOCK_KEY, 3_405_691_582);
 
-        for key in [
-            AdvisoryLockKey::CatalogBuildReaper,
-            AdvisoryLockKey::PausedRegistryReconcile,
-            AdvisoryLockKey::PausedRegistryReclaim,
-            AdvisoryLockKey::PausedRegistryRestartGrace,
-        ] {
-            assert_ne!(
-                key.as_i64(),
-                GO_SCHEMA_LOCK_KEY,
-                "{key:?} collides with schemaLockKey"
-            );
-            assert_ne!(
-                key.as_i64(),
-                GO_BUILD_ADMISSION_LOCK_KEY,
-                "{key:?} collides with buildAdmissionKey"
-            );
-        }
+        let key = AdvisoryLockKey::CatalogBuildReaper;
+        assert_ne!(
+            key.as_i64(),
+            GO_SCHEMA_LOCK_KEY,
+            "{key:?} collides with schemaLockKey"
+        );
+        assert_ne!(
+            key.as_i64(),
+            GO_BUILD_ADMISSION_LOCK_KEY,
+            "{key:?} collides with buildAdmissionKey"
+        );
         assert_ne!(GO_SCHEMA_LOCK_KEY, GO_BUILD_ADMISSION_LOCK_KEY);
     }
 }

@@ -10,7 +10,7 @@ mod extra_drive;
 
 pub use extra_drive::ExtraDrive;
 pub use firecracker::{
-    FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
+    FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
 };

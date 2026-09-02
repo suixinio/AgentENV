@@ -27,7 +27,7 @@ type projectionReader interface {
 // would be turning "I did not find a cached record" into "this sandbox does not
 // exist", which for a resume is the end of that sandbox as far as any client is
 // concerned. It would also skip everything the api half walks before it says
-// gone — the binding, the heartbeat roster, the paused registry — which is
+// gone — the binding, the heartbeat roster, the snapshot catalog — which is
 // what covers the window a heartbeat is late for and the window another node's
 // reconciliation dropped a binding this node still lists.
 func (s *Server) resolveFromProjection(ctx context.Context, sandboxID string) (routing.Answer, bool) {

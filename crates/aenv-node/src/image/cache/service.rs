@@ -42,30 +42,24 @@ const IMAGE_CACHE_INDEX_DIR: &str = "indexes";
 const LEGACY_IMAGE_CACHE_METADATA_DIR: &str = "metadata";
 const IMAGE_CACHE_STAGING_DIR: &str = "staging";
 const RUNTIME_HOLD_NAMESPACE: &str = "runtime";
-const PAUSED_HOLD_NAMESPACE: &str = "paused";
 
-/// Namespace of a local-image protection lease. Neutral to sandbox lifecycle —
-/// callers map their own lifecycle states (e.g. starting, paused) onto these.
+/// Namespace of a local-image protection lease.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HoldNamespace {
     /// Transient lease for an owner that is starting or running.
     Runtime,
-    /// Durable lease for an owner that is paused.
-    Paused,
 }
 
 impl HoldNamespace {
     fn as_str(self) -> &'static str {
         match self {
             HoldNamespace::Runtime => RUNTIME_HOLD_NAMESPACE,
-            HoldNamespace::Paused => PAUSED_HOLD_NAMESPACE,
         }
     }
 
     fn release_reason(self) -> &'static str {
         match self {
             HoldNamespace::Runtime => "runtime_release",
-            HoldNamespace::Paused => "paused_release",
         }
     }
 }
@@ -333,21 +327,7 @@ impl ImageCacheService {
         }
     }
 
-    /// Owner keys of all holds in `namespace` (e.g. the sandbox ids of
-    /// `paused/*` holds). Used by startup reconcile to find orphaned holds.
-    async fn list_hold_keys_in_namespace(&self, namespace: &str) -> Result<Vec<String>> {
-        Ok(self
-            .metadata_store()
-            .await?
-            .list_hold_owners_in_namespaces(&[namespace])
-            .await?
-            .into_iter()
-            .map(|owner| owner.key().to_string())
-            .collect())
-    }
-
-    /// Startup cleanup for transient holds only; durable `paused/*` holds and
-    /// source config roots are preserved.
+    /// Startup cleanup for transient holds; source config roots are preserved.
     async fn cleanup_stale_runtime_holds(&self) -> Result<usize> {
         let released = self
             .metadata_store()
@@ -449,31 +429,13 @@ impl ImageCacheService {
         }
     }
 
-    /// Startup reconcile: drop transient runtime/operation holds, then release
-    /// holds in `namespace` whose owner is no longer live.
-    ///
-    /// Reconciling [`HoldNamespace::Paused`] is what authorizes deleting
-    /// maintenance passes, because paused holds exist only once this process
-    /// has re-derived them from the paused sandboxes it restored.
-    pub async fn reconcile_namespace(
-        &self,
-        namespace: HoldNamespace,
-        live_owner_ids: &[String],
-    ) -> Result<()> {
+    /// Startup reconcile: drops holds a previous process left behind, then
+    /// authorizes deleting maintenance passes. Every hold this process needs
+    /// is re-derived from its running set on each pass.
+    pub async fn startup_reconcile(&self) -> Result<()> {
         self.cleanup_stale_runtime_holds().await?;
-        let live: BTreeSet<&str> = live_owner_ids.iter().map(String::as_str).collect();
-        for key in self.list_hold_keys_in_namespace(namespace.as_str()).await? {
-            if !live.contains(key.as_str()) {
-                if let Ok(owner) = ImageCacheHoldOwner::new(namespace.as_str(), key) {
-                    self.release_hold_best_effort(&owner, "startup_reconcile_orphan")
-                        .await;
-                }
-            }
-        }
-        if namespace == HoldNamespace::Paused {
-            let authority = self.metadata_store().await?.grant_reclaim_authority().await;
-            let _ = self.reclaim_authority.set(authority);
-        }
+        let authority = self.metadata_store().await?.grant_reclaim_authority().await;
+        let _ = self.reclaim_authority.set(authority);
         Ok(())
     }
 
@@ -487,10 +449,7 @@ impl ImageCacheService {
         min_age: Duration,
     ) -> Result<ImageCacheGcSummary> {
         let Some(&authority) = self.reclaim_authority.get() else {
-            bail!(
-                "image cache maintenance ran before paused holds were re-derived; \
-                 reconcile the paused namespace first"
-            );
+            bail!("image cache maintenance ran before the startup reconcile");
         };
         let reconciled = if let Some((high, low)) = watermark {
             self.evict_source_configs_over_capacity(high, low, min_age, authority)
@@ -1661,7 +1620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn maintenance_refuses_until_the_paused_namespace_is_reconciled() {
+    async fn maintenance_refuses_until_the_startup_reconcile_ran() {
         let temp = TempDir::new().expect("tempdir");
         let service = Arc::new(test_service(&temp));
         service.ensure_layout().await.expect("layout");
@@ -1669,20 +1628,20 @@ mod tests {
         let error = service
             .run_maintenance(Vec::new(), None, Duration::from_secs(0))
             .await
-            .expect_err("maintenance must not delete before paused holds exist");
+            .expect_err("maintenance must not delete before the startup reconcile");
         assert!(
-            error.to_string().contains("paused holds"),
+            error.to_string().contains("startup reconcile"),
             "unexpected error: {error:#}"
         );
 
         service
-            .reconcile_namespace(HoldNamespace::Paused, &[])
+            .startup_reconcile()
             .await
-            .expect("reconcile paused");
+            .expect("startup reconcile");
         service
             .run_maintenance(Vec::new(), None, Duration::from_secs(0))
             .await
-            .expect("maintenance runs once paused holds are re-derived");
+            .expect("maintenance runs once the startup reconcile ran");
     }
 
     #[tokio::test]
@@ -1976,14 +1935,6 @@ mod tests {
                 .expect("hold referrers"),
             vec![paused_owner]
         );
-        assert_eq!(
-            service
-                .list_hold_keys_in_namespace("paused")
-                .await
-                .expect("list paused holds"),
-            vec!["sandbox-paused".to_string()]
-        );
-
         let report = service
             .run_gc(
                 ImageCacheLiveRuntimeRefs::new(),

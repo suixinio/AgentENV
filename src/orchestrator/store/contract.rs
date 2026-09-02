@@ -5,9 +5,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use super::{
-    FencedRemoval, MetadataStore, PausedHandle, SandboxListFilter, SandboxMetadata, StoreError,
-};
+use super::{FencedRemoval, MetadataStore, SandboxListFilter, SandboxMetadata, StoreError};
 use crate::orchestrator::SandboxState;
 use crate::types::{ExecutionId, SandboxId};
 
@@ -142,7 +140,7 @@ pub async fn missing_records_are_reported_as_missing<S: MetadataStore>(store: &S
     let id = SandboxId::new();
     assert!(store.get(&id).await.unwrap().is_none());
     let error = store
-        .update_state_if_state(&id, SandboxState::Paused, &[SandboxState::Running])
+        .update_state_if_state(&id, SandboxState::Pausing, &[SandboxState::Running])
         .await
         .unwrap_err();
     assert!(
@@ -213,7 +211,7 @@ pub async fn update_if_state_refuses_the_wrong_state<S: MetadataStore>(store: &S
 
     let mut called = false;
     let error = store
-        .update_if_state(&id, &[SandboxState::Paused], |_| called = true)
+        .update_if_state(&id, &[SandboxState::Pausing], |_| called = true)
         .await
         .unwrap_err();
     assert!(!called);
@@ -243,12 +241,12 @@ pub async fn update_writes_the_whole_record<S: MetadataStore>(store: &S) {
 
 pub async fn filters_match_states_and_metadata<S: MetadataStore>(store: &S) {
     let running_id = SandboxId::new();
-    let paused_id = SandboxId::new();
+    let pausing_id = SandboxId::new();
 
     let mut a = running(running_id);
     a.user_metadata = Some(HashMap::from([("env".to_string(), "prod".to_string())]));
-    let mut b = running(paused_id);
-    b.state = SandboxState::Paused;
+    let mut b = running(pausing_id);
+    b.state = SandboxState::Pausing;
     b.user_metadata = Some(HashMap::from([("env".to_string(), "dev".to_string())]));
 
     store.add(a).await.unwrap();
@@ -264,15 +262,15 @@ pub async fn filters_match_states_and_metadata<S: MetadataStore>(store: &S) {
     assert_eq!(only_running.len(), 1);
     assert_eq!(only_running[0].id, running_id);
 
-    let not_paused = store
+    let not_pausing = store
         .list_filtered(SandboxListFilter {
-            excluded_states: Some(vec![SandboxState::Paused]),
+            excluded_states: Some(vec![SandboxState::Pausing]),
             ..Default::default()
         })
         .await
         .unwrap();
-    assert_eq!(not_paused.len(), 1);
-    assert_eq!(not_paused[0].id, running_id);
+    assert_eq!(not_pausing.len(), 1);
+    assert_eq!(not_pausing[0].id, running_id);
 
     let dev = store
         .list_filtered(SandboxListFilter {
@@ -282,7 +280,7 @@ pub async fn filters_match_states_and_metadata<S: MetadataStore>(store: &S) {
         .await
         .unwrap();
     assert_eq!(dev.len(), 1);
-    assert_eq!(dev[0].id, paused_id);
+    assert_eq!(dev[0].id, pausing_id);
 
     let plain = SandboxId::new();
     store.add(running(plain)).await.unwrap();
@@ -389,7 +387,7 @@ pub async fn waiting_wakes_when_the_state_settles<S: MetadataStore + 'static>(st
     let settling = async {
         tokio::time::sleep(Duration::from_millis(80)).await;
         store
-            .update_state_if_state(&id, SandboxState::Paused, &[SandboxState::Pausing])
+            .update_state_if_state(&id, SandboxState::Running, &[SandboxState::Pausing])
             .await
             .unwrap();
     };
@@ -398,7 +396,7 @@ pub async fn waiting_wakes_when_the_state_settles<S: MetadataStore + 'static>(st
     })
     .await
     .expect("waiter should have woken");
-    assert_eq!(settled.unwrap().unwrap().state, SandboxState::Paused);
+    assert_eq!(settled.unwrap().unwrap().state, SandboxState::Running);
 }
 
 pub async fn waiting_returns_none_when_the_record_is_removed<S: MetadataStore>(store: &S) {
@@ -428,96 +426,28 @@ pub async fn the_lifetime_clock_is_reconciled_after_every_write<S: MetadataStore
     store.add(metadata).await.unwrap();
 
     let got = store.get(&id).await.unwrap().unwrap();
-    assert!(
-        got.running_since.is_some(),
-        "a running record must have its clock started"
-    );
+    let opened = got
+        .running_since
+        .expect("a running record must have its clock started");
 
     store
-        .update_state_if_state(&id, SandboxState::Paused, &[SandboxState::Running])
+        .update_state_if_state(&id, SandboxState::Pausing, &[SandboxState::Running])
         .await
         .unwrap();
-    let paused = store.get(&id).await.unwrap().unwrap();
-    assert!(
-        paused.running_since.is_none(),
-        "a paused record spends nothing"
-    );
-
-    store
-        .update_if_state(&id, &[SandboxState::Paused], |metadata| {
-            metadata.state = SandboxState::Running;
-        })
-        .await
-        .unwrap();
-    let resumed = store.get(&id).await.unwrap().unwrap();
-    assert!(resumed.running_since.is_some());
-}
-
-pub async fn a_paused_sandbox_never_answers_not_paused<S: MetadataStore>(store: &S) {
-    #[derive(Debug)]
-    struct FakePausedState(&'static str);
-
-    impl crate::sandbox::PausedSandboxState for FakePausedState {
-        fn encode(&self) -> anyhow::Result<serde_json::Value> {
-            Ok(serde_json::json!({"fake": self.0}))
-        }
-
-        fn runtime_artifacts(&self) -> crate::sandbox::RuntimeArtifactSet {
-            crate::sandbox::RuntimeArtifactSet::default()
-        }
-    }
-
-    fn capture(handle: &PausedHandle) -> serde_json::Value {
-        match handle {
-            PausedHandle::Local(state) => state.encode().expect("a capture encodes"),
-            PausedHandle::Remote { reference, .. } => reference.state.clone(),
-            PausedHandle::NotPaused => panic!("a paused sandbox answered NotPaused"),
-        }
-    }
-
-    async fn pause<S: MetadataStore>(store: &S, marker: &'static str) -> SandboxId {
-        let id = SandboxId::new();
-        let mut metadata = running(id);
-        metadata.state = crate::orchestrator::SandboxState::Paused;
-        metadata.paused_state = Some(std::sync::Arc::new(FakePausedState(marker)));
-        store.add(metadata).await.unwrap();
-        id
-    }
-
-    let paused = pause(store, "one").await;
-    let handle = store.paused_handle(&paused).await.unwrap();
-    assert!(
-        !matches!(handle, PausedHandle::NotPaused),
-        "a paused sandbox reported as having no paused state: {handle:?}"
-    );
+    let pausing = store.get(&id).await.unwrap().unwrap();
     assert_eq!(
-        capture(&handle),
-        serde_json::json!({"fake": "one"}),
-        "the handle points at something other than this sandbox's capture"
+        pausing.running_since,
+        Some(opened),
+        "every recorded state spends the same run"
     );
 
-    let other = pause(store, "two").await;
-    assert_eq!(
-        capture(&store.paused_handle(&other).await.unwrap()),
-        serde_json::json!({"fake": "two"})
-    );
-    assert_eq!(
-        capture(&store.paused_handle(&paused).await.unwrap()),
-        serde_json::json!({"fake": "one"}),
-        "the first sandbox's capture changed when a second one was paused"
-    );
-
-    let live = SandboxId::new();
-    store.add(running(live)).await.unwrap();
-    assert!(matches!(
-        store.paused_handle(&live).await.unwrap(),
-        PausedHandle::NotPaused
-    ));
-
-    let error = store.paused_handle(&SandboxId::new()).await.unwrap_err();
+    let mut dropped_clock = pausing.clone();
+    dropped_clock.running_since = None;
+    store.update(dropped_clock).await.unwrap();
+    let written = store.get(&id).await.unwrap().unwrap();
     assert!(
-        matches!(error, StoreError::SandboxNotFound { .. }),
-        "{error:?}"
+        written.running_since.is_some(),
+        "a write that lost the clock has it reopened"
     );
 }
 
@@ -555,7 +485,6 @@ macro_rules! metadata_store_contract {
             waiting_wakes_when_the_state_settles,
             waiting_returns_none_when_the_record_is_removed,
             the_lifetime_clock_is_reconciled_after_every_write,
-            a_paused_sandbox_never_answers_not_paused,
         );
     };
 }

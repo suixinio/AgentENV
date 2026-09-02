@@ -152,6 +152,7 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
                 alias: Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
+                paused_sandbox: None,
                 source: SnapshotPublishSource::Template,
                 context: aenv_node::snapshot::CommandContext::default(),
                 startup: None,
@@ -269,6 +270,7 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
                 alias: Some(alias.clone()),
+                paused_sandbox: None,
                 source: SnapshotPublishSource::Template,
                 context: aenv_node::snapshot::CommandContext::default(),
                 startup: None,
@@ -324,6 +326,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
             SnapshotPublishMetadata {
                 id: snapshot_id,
                 alias: None,
+                paused_sandbox: None,
                 source: SnapshotPublishSource::Template,
                 context: aenv_node::snapshot::CommandContext::default(),
                 startup: None,
@@ -383,6 +386,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
                 alias: Some(alias.clone()),
+                paused_sandbox: None,
                 source: SnapshotPublishSource::Template,
                 context: aenv_node::snapshot::CommandContext::default(),
                 startup: None,

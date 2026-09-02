@@ -6,7 +6,6 @@
 //! need a real VM.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,27 +16,13 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxCapture, PausedSandboxState, RuntimeArtifactSet,
-    SandboxBackend, SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult,
-    SandboxForkSpec, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, RuntimeArtifactSet, SandboxBackend, SandboxBackendFactory,
+    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::CustomExtensionParams;
 use crate::types::ExecutionId;
-
-#[derive(Debug)]
-pub struct MockSnapshot;
-
-impl PausedSandboxState for MockSnapshot {
-    fn encode(&self) -> Result<serde_json::Value> {
-        Ok(serde_json::json!({}))
-    }
-
-    fn runtime_artifacts(&self) -> RuntimeArtifactSet {
-        RuntimeArtifactSet::empty()
-    }
-}
 
 #[derive(Debug)]
 pub struct MockCapturedSnapshot;
@@ -84,12 +69,9 @@ pub struct MockBehavior {
     update_network_calls: AtomicUsize,
     forked_children: AtomicUsize,
     fork_children_without_address: AtomicBool,
-    pause_committer_waiting: Mutex<Option<bool>>,
     last_custom_extension_params: Mutex<Option<Option<CustomExtensionParams>>>,
     captures_are_stageable: AtomicBool,
     holding_node_id: Mutex<Option<&'static str>>,
-    /// Record file a reopen needs, with the node and sandbox it belongs to.
-    capture_record: Mutex<Option<(std::path::PathBuf, String, crate::types::SandboxId)>>,
 }
 
 impl MockBehavior {
@@ -107,44 +89,6 @@ impl MockBehavior {
         self.captures_are_stageable.store(true, Ordering::SeqCst);
     }
 
-    /// Ties reopening to `record`, so deleting that file reproduces a node that
-    /// answers a resume with the capture-absent refusal.
-    pub fn reopen_needs_capture_record(
-        &self,
-        record: std::path::PathBuf,
-        node_id: &str,
-        sandbox_id: crate::types::SandboxId,
-    ) {
-        *self
-            .capture_record
-            .lock()
-            .expect("mock behavior mutex poisoned") =
-            Some((record, node_id.to_string(), sandbox_id));
-    }
-
-    /// The refusal a node produces when the record a reopen names is gone.
-    fn absent_capture(&self) -> Option<anyhow::Error> {
-        let guard = self
-            .capture_record
-            .lock()
-            .expect("mock behavior mutex poisoned");
-        let (record, node_id, sandbox_id) = guard.as_ref()?;
-        if record.exists() {
-            return None;
-        }
-
-        // Classify through the same path a real node status takes.
-        Some(anyhow::Error::new(
-            crate::node_client::wire::RemoteResumeFailure::from_status(
-                node_id,
-                *sandbox_id,
-                tonic::Status::not_found(format!(
-                    "sandbox {sandbox_id} is not paused on this node"
-                )),
-            ),
-        ))
-    }
-
     fn capture(&self) -> CapturedSandboxSnapshot {
         if self.captures_are_stageable.load(Ordering::SeqCst) {
             CapturedSandboxSnapshot::local(crate::snapshot::CallerOwnedArtifacts::new(
@@ -153,14 +97,6 @@ impl MockBehavior {
         } else {
             CapturedSandboxSnapshot::local(MockCapturedSnapshot)
         }
-    }
-
-    /// What the last `pause` was told, or `None` if none has run.
-    pub fn pause_committer_waiting(&self) -> Option<bool> {
-        *self
-            .pause_committer_waiting
-            .lock()
-            .expect("pause_committer_waiting mutex poisoned")
     }
 
     /// Returns the last successfully applied custom-extension parameters.
@@ -360,8 +296,6 @@ pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
     execution_id: ExecutionId,
-    /// Only a backend built from paused state reopens a capture.
-    reopens_a_capture: bool,
 }
 
 impl MockSandboxBackend {
@@ -382,23 +316,6 @@ impl MockSandboxBackend {
             behavior,
             host_ip,
             execution_id,
-            reopens_a_capture: false,
-        }
-    }
-
-    fn reopening(mut self) -> Self {
-        self.reopens_a_capture = true;
-        self
-    }
-
-    /// The capture-absent refusal, when this backend reopens a record that is gone.
-    fn refuse_absent_capture(&self) -> Result<()> {
-        match self
-            .reopens_a_capture
-            .then(|| self.behavior.absent_capture())
-        {
-            Some(Some(refusal)) => Err(refusal),
-            _ => Ok(()),
         }
     }
 }
@@ -410,12 +327,10 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     async fn start(&mut self) -> Result<()> {
-        self.refuse_absent_capture()?;
         self.behavior.apply_async(MockOperation::Start).await
     }
 
     async fn start_nowait(&mut self) -> Result<()> {
-        self.refuse_absent_capture()?;
         self.behavior.apply_async(MockOperation::StartNowait).await
     }
 
@@ -423,16 +338,7 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior.apply_async(MockOperation::WaitForReady).await
     }
 
-    async fn pause(
-        &mut self,
-        artifact_root: Option<&Path>,
-        committer_waiting: bool,
-    ) -> SandboxCaptureResult<PausedSandboxCapture> {
-        *self
-            .behavior
-            .pause_committer_waiting
-            .lock()
-            .expect("pause_committer_waiting mutex poisoned") = Some(committer_waiting);
+    async fn pause(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         let pause_result = self
             .behavior
             .apply_capture_result(MockOperation::Pause)
@@ -448,11 +354,7 @@ impl SandboxBackend for MockSandboxBackend {
             }
             return Err(pause_err);
         }
-        // Only caller-owned pause artifacts are publishable.
-        Ok(PausedSandboxCapture {
-            state: Arc::new(MockSnapshot),
-            publishable: artifact_root.map(|_| self.behavior.capture()),
-        })
+        Ok(self.behavior.capture())
     }
 
     async fn resume(&mut self) -> Result<()> {
@@ -614,31 +516,5 @@ impl SandboxBackendFactory for MockBackendFactory {
             self.host_ip,
             execution_id,
         )))
-    }
-
-    fn build_from_paused_state(
-        &self,
-        _sandbox_id: crate::types::SandboxId,
-        execution_id: ExecutionId,
-        _state: &dyn PausedSandboxState,
-        _envd_access_token: Option<super::EnvdAccessToken>,
-    ) -> Result<Box<dyn SandboxBackend>> {
-        self.behavior.apply_sync(MockOperation::BuildFromSnapshot)?;
-        Ok(Box::new(
-            MockSandboxBackend::new_with_host_ip(
-                Arc::clone(&self.behavior),
-                self.host_ip,
-                execution_id,
-            )
-            .reopening(),
-        ))
-    }
-
-    fn decode_paused_state(
-        &self,
-        _artifact_root: std::path::PathBuf,
-        _state: serde_json::Value,
-    ) -> Result<Arc<dyn PausedSandboxState>> {
-        Ok(Arc::new(MockSnapshot))
     }
 }

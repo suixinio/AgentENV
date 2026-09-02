@@ -22,10 +22,9 @@ pub use crate::types::{
 pub use ::envd::process::Signal;
 pub use access::{AccessTokenSeedPolicy, EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    CapturedSandboxSnapshot, InvalidSandboxRequest, PausedSandboxCapture, PausedSandboxState,
-    ResolvedImageFacts, RuntimeArtifactSet, RuntimeConfirmedGone, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
-    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, InvalidSandboxRequest, ResolvedImageFacts, RuntimeArtifactSet,
+    RuntimeConfirmedGone, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
+    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use network::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
@@ -90,6 +89,9 @@ pub struct SandboxLaunchConfig {
     ///
     /// `None` means unowned; producers must never emit an empty value.
     pub control_plane_config: Option<Vec<u8>>,
+    /// Node a remote placement should favour; ignored by backends that run
+    /// the sandbox on this machine.
+    pub preferred_node_id: Option<String>,
 }
 
 impl SandboxLaunchConfig {
@@ -103,6 +105,7 @@ impl SandboxLaunchConfig {
             custom_extension_params: None,
             envd_access_token: None,
             control_plane_config: None,
+            preferred_node_id: None,
         }
     }
 

@@ -190,9 +190,6 @@ impl From<&ObservedNodeRecord> for StoredObservedRecord {
                 create_successes: s.create_successes,
                 create_fails: s.create_fails,
                 reported_at_unix_ms: s.reported_at_unix_ms,
-                paused_sandbox_count: s.paused_sandbox_count,
-                paused_allocated_cpu: s.paused_allocated_cpu,
-                paused_allocated_memory_bytes: s.paused_allocated_memory_bytes,
             }),
             last_seen_unix_ms: record.node.last_seen_unix_ms,
             p2p_endpoint: record.p2p_endpoint.as_ref().map(|p| StoredP2pEndpoint {
@@ -207,7 +204,6 @@ impl From<&ObservedNodeRecord> for StoredObservedRecord {
                     sandbox_id: e.sandbox_id.clone(),
                     execution_id: e.execution_id.clone(),
                     projection_ttl_secs: e.projection_ttl.as_secs(),
-                    paused: e.paused,
                 })
                 .collect(),
         }
@@ -258,9 +254,6 @@ impl From<StoredObservedRecord> for ObservedNodeRecord {
                     create_successes: s.create_successes,
                     create_fails: s.create_fails,
                     reported_at_unix_ms: s.reported_at_unix_ms,
-                    paused_sandbox_count: s.paused_sandbox_count,
-                    paused_allocated_cpu: s.paused_allocated_cpu,
-                    paused_allocated_memory_bytes: s.paused_allocated_memory_bytes,
                 }),
                 last_seen_unix_ms,
             },
@@ -276,7 +269,6 @@ impl From<StoredObservedRecord> for ObservedNodeRecord {
                     sandbox_id: e.sandbox_id,
                     execution_id: e.execution_id,
                     projection_ttl: Duration::from_secs(e.projection_ttl_secs),
-                    paused: e.paused,
                 })
                 .collect(),
             // Reconstruct the writer's receive instant rather than using merge time.
@@ -1093,7 +1085,6 @@ pub fn roster_from_heartbeat(req: &HeartbeatRequest) -> Vec<RosterEntry> {
             sandbox_id,
             execution_id: normalize_execution_id(&item.execution_id),
             projection_ttl: projection_ttl_from_secs(item.projection_ttl_secs),
-            paused: item.paused,
         });
     }
     out
@@ -1779,39 +1770,6 @@ mod tests {
     }
 
     #[test]
-    fn roster_from_heartbeat_carries_the_paused_flag_both_ways() {
-        let entries = roster_from_heartbeat(&HeartbeatRequest {
-            node_id: "node-a".to_string(),
-            cluster_id: "cluster-a".to_string(),
-            service_instance_id: "svc-node-a".to_string(),
-            roster: vec![
-                SandboxRosterEntry {
-                    sandbox_id: "s-running".to_string(),
-                    paused: false,
-                    ..Default::default()
-                },
-                SandboxRosterEntry {
-                    sandbox_id: "s-parked".to_string(),
-                    paused: true,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        });
-
-        assert_eq!(
-            entries
-                .iter()
-                .map(|entry| (entry.sandbox_id.as_str(), entry.paused))
-                .collect::<Vec<_>>(),
-            vec![("s-running", false), ("s-parked", true)],
-            "the flag must survive the wire-to-registry conversion unchanged in both \
-             directions -- a conversion that hardcoded either value would make one of the \
-             two guards in grpc_service.rs vacuous"
-        );
-    }
-
-    #[test]
     fn roster_of_keeps_the_heartbeat_roster() {
         let registry = AtomicNodeRegistry::new(
             vec![node("node-a", "http://node-a")],
@@ -2459,9 +2417,6 @@ mod tests {
                     create_successes: 10,
                     create_fails: 2,
                     reported_at_unix_ms: 12345,
-                    paused_sandbox_count: 1,
-                    paused_allocated_cpu: 1,
-                    paused_allocated_memory_bytes: 512,
                 }),
                 last_seen_unix_ms: 999_000,
             },
@@ -2474,7 +2429,6 @@ mod tests {
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "018f0000-0000-7000-8000-000000000000".to_string(),
                 projection_ttl: Duration::from_secs(60),
-                paused: false,
             }],
             last_seen: SystemTime::UNIX_EPOCH + Duration::from_millis(999_000),
         };
@@ -2525,7 +2479,6 @@ mod tests {
             sandbox_id: "sbx-stale".to_string(),
             execution_id: String::new(),
             projection_ttl_secs: 0,
-            paused: false,
         }];
         registry.merge_remote_snapshot(HashMap::from([("node-a".to_string(), stale)]));
 
@@ -2550,7 +2503,6 @@ mod tests {
             sandbox_id: "sbx-new".to_string(),
             execution_id: String::new(),
             projection_ttl_secs: 0,
-            paused: false,
         }];
         registry.merge_remote_snapshot(HashMap::from([("node-a".to_string(), newer)]));
 

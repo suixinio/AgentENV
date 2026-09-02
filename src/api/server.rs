@@ -4,7 +4,7 @@ use axum::{middleware, routing::get, Router};
 
 use super::control_plane_gate::{require_control_plane, ControlPlaneGate};
 use super::role_gate;
-use super::{isolation, proxy, ApiImpl};
+use super::{proxy, ApiImpl};
 use crate::observability::prometheus;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
@@ -110,12 +110,7 @@ where
         gate,
         serves_user_facing_rest,
     )
-    .route("/metrics", get(metrics_handler))
-    // Isolated nodes reroute resumes before the generated handler runs.
-    .layer(middleware::from_fn_with_state(
-        api_impl.clone(),
-        isolation::resume_isolation_gate::<I>,
-    ));
+    .route("/metrics", get(metrics_handler));
 
     // Attach host classification only when its proxy routes exist.
     let router = match data_plane {
@@ -400,29 +395,15 @@ mod tests {
     }
 
     async fn build_api_impl_with_proxy_domains(domains: Vec<String>) -> Arc<ApiImpl> {
-        let root = tempfile::tempdir().unwrap();
-        let orchestrator = crate::orchestrator::Orchestrator::new(
-            crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-            crate::orchestrator::InMemoryMetadataStore::new(),
+        let orchestrator = crate::orchestrator::Orchestrator::with_in_memory_store(
             crate::sandbox::mock::MockBackendFactory::new(),
-            crate::orchestrator::FileBackedSandboxPersister::new_for_test(
-                root.path().to_path_buf(),
-            ),
-            crate::image::DisabledRuntimeImageRefs::shared(),
         )
-        .await
-        .unwrap();
+        .await;
         let snapshot_manager = Arc::new(crate::snapshot::mock::mock_snapshot_manager());
-        let identity = crate::identity::NodeIdentity::from_config(&Default::default());
         Arc::new(ApiImpl::new(
             orchestrator,
-            Arc::clone(&snapshot_manager),
+            snapshot_manager,
             None,
-            crate::api::PausedSandboxWiring::new(
-                Arc::new(crate::orchestrator::DisabledPausedSandboxRegistry),
-                snapshot_manager,
-                &identity,
-            ),
             domains,
             crate::api::ResumeWiring::api_half_for_test(),
         ))

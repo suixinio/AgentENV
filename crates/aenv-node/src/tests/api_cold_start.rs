@@ -11,10 +11,7 @@ use http::Method;
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 
-use crate::identity::NodeIdentity;
-use crate::orchestrator::{
-    DisabledPausedSandboxRegistry, FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator,
-};
+use crate::orchestrator::{InMemoryMetadataStore, Orchestrator};
 use crate::sandbox::mock::MockBackendFactory;
 use aenv_core::api::impls::ApiImpl;
 
@@ -54,7 +51,6 @@ async fn surface() -> Surface {
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
-        FileBackedSandboxPersister::new_for_test(root.path().join("paused")),
         crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
@@ -66,11 +62,6 @@ async fn surface() -> Surface {
         orchestrator,
         Arc::clone(&snapshot_manager),
         None,
-        crate::api::PausedSandboxWiring::new(
-            Arc::new(DisabledPausedSandboxRegistry),
-            Arc::clone(&snapshot_manager),
-            &NodeIdentity::from_config(&Default::default()),
-        ),
         Vec::new(),
         crate::api::ResumeWiring::api_half_for_test(),
     ));

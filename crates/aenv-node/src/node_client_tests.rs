@@ -8,8 +8,8 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
 use crate::orchestrator::{
-    DisabledSandboxPersister, InMemoryMetadataStore, MetadataStore, Orchestrator,
-    SandboxOrchestration,
+    DiscardingPausePublisher, InMemoryMetadataStore, MetadataStore, Orchestrator,
+    SandboxOrchestration, StagingPausePublisher,
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
@@ -21,7 +21,7 @@ use crate::sandbox::{
     CustomExtensionParams, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
     SandboxLaunchConfig,
 };
-use crate::snapshot::mock::MockSnapshotArtifactStore;
+use crate::snapshot::mock::RecordingSnapshotRepository;
 use crate::snapshot::repository::{
     RepositoryResult, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
     SnapshotRepository, SnapshotRuntimeResolver, StagedSnapshot, StartedBuild,
@@ -31,7 +31,6 @@ use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRe
 use crate::types::ExecutionId;
 
 use crate::node_client::factory::RemoteSandboxBackendFactory;
-use crate::node_client::paused_state::RemotePausedState;
 use crate::node_client::placement::{
     FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement,
 };
@@ -88,7 +87,9 @@ where
 }
 
 async fn real_node() -> RunningNode {
-    real_node_with_factory(MockBackendFactory::new()).await
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.make_captures_stageable();
+    real_node_with_factory(MockBackendFactory::with_behavior(behavior)).await
 }
 
 async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
@@ -97,15 +98,16 @@ async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         factory,
-        DisabledSandboxPersister,
         crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
+    let snapshots = Arc::new(resolvable_snapshot_manager());
+    orchestrator.set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(&snapshots))));
     let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
     let service = crate::node_server::NodeSandboxService::new(
         Arc::clone(&orchestration),
-        Arc::new(resolvable_snapshot_manager()),
+        snapshots,
         "node-under-test".to_string(),
     );
     serve(service, Some(orchestration)).await
@@ -147,7 +149,6 @@ async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) 
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
-        DisabledSandboxPersister,
         crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
@@ -225,7 +226,7 @@ fn resolvable_snapshot_manager() -> SnapshotManager {
     SnapshotManager::from_parts(
         Arc::new(SnapshotRepository::new(
             Arc::new(OneSnapshot),
-            Arc::new(MockSnapshotArtifactStore),
+            Arc::new(RecordingSnapshotRepository::default()),
         )),
         Some(Arc::new(AlwaysRunnable)),
         None,
@@ -239,13 +240,11 @@ struct ScriptedNode {
     checkpoint: Mutex<Option<Result<pb::SandboxCheckpointResponse, Status>>>,
     fork: Mutex<Option<Result<pb::SandboxForkResponse, Status>>>,
     delete: Mutex<Option<Result<pb::SandboxDeleteResponse, Status>>>,
-    resume: Mutex<Option<Result<pb::SandboxResumeResponse, Status>>>,
     describe: Mutex<Option<Result<pb::SandboxDescribeResponse, Status>>>,
     update_params: Mutex<Option<Result<pb::SandboxParamsResponse, Status>>>,
     seen_create: Mutex<Vec<pb::SandboxCreateRequest>>,
     seen_pause: Mutex<Vec<pb::SandboxPauseRequest>>,
     seen_delete: Mutex<Vec<pb::SandboxDeleteRequest>>,
-    seen_resume: Mutex<Vec<pb::SandboxResumeRequest>>,
     seen_describe: Mutex<Vec<pb::SandboxDescribeRequest>>,
     seen_update_params: Mutex<Vec<pb::SandboxParamsRequest>>,
 }
@@ -315,17 +314,6 @@ impl NodeSandboxService for ScriptedNodeService {
         _request: Request<pb::SandboxCheckpointRequest>,
     ) -> Result<Response<pb::SandboxCheckpointResponse>, Status> {
         ScriptedNode::take(&self.checkpoint, "checkpoint")
-    }
-
-    async fn resume(
-        &self,
-        request: Request<pb::SandboxResumeRequest>,
-    ) -> Result<Response<pb::SandboxResumeResponse>, Status> {
-        self.seen_resume
-            .lock()
-            .expect("lock")
-            .push(request.into_inner());
-        ScriptedNode::take(&self.resume, "resume")
     }
 
     async fn fork(
@@ -841,6 +829,7 @@ impl NodePlacement for ReplacementNodePlacement {
         &self,
         _sandbox_id: crate::types::SandboxId,
         _resources: crate::types::SandboxResources,
+        _preferred_node_id: Option<&str>,
     ) -> anyhow::Result<NodeEndpoint> {
         Ok(self.initial.clone())
     }
@@ -1102,6 +1091,7 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
             &self,
             _sandbox_id: crate::types::SandboxId,
             _resources: crate::types::SandboxResources,
+            _preferred_node_id: Option<&str>,
         ) -> anyhow::Result<NodeEndpoint> {
             Ok(self.initial.clone())
         }
@@ -1249,56 +1239,23 @@ fn stub_connect_timeout_leaves_headroom_in_the_retry_budget() {
 }
 
 #[tokio::test]
-async fn a_pause_comes_back_as_a_reference_to_the_nodes_bytes() {
+async fn a_pause_comes_back_as_the_row_the_node_staged() {
     let (script, node) = scripted_node().await;
-    let execution_id = ExecutionId::new();
-    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
-        sandbox_id: launch_config().sandbox_id.to_string(),
-        execution_id: execution_id.to_string(),
-        ..Default::default()
-    }));
-    *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
-        paused_state: Some(pb::PausedState {
-            artifact_root: "/var/lib/agentenv/paused/7".to_string(),
-            state: Some(
-                wire::serialize(&serde_json::json!({"memory": "mem.json"}), "state")
-                    .expect("encode"),
-            ),
-        }),
-        staged: None,
-        staging_error: String::new(),
-    }));
+    let staged = staged_snapshot();
+    let (mut backend, _) = paused_stub(&script, &node, &staged).await;
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let mut backend =
-        match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
-        {
-            Ok(backend) => backend,
-            Err(err) => panic!("building a stub should not fail: {err:#}"),
-        };
-    backend.start().await.expect("start");
-
-    let capture = backend.pause(None, false).await.expect("pause");
-    assert!(capture.publishable.is_none());
-
-    let encoded = capture.state.encode().expect("encode");
-    assert_eq!(encoded["origin_node_id"], "node-under-test");
-    assert_eq!(encoded["artifact_root"], "/var/lib/agentenv/paused/7");
-    assert_eq!(encoded["state"]["memory"], "mem.json");
-    assert!(capture.state.runtime_artifacts().is_empty());
-
-    // And it survives the round trip a record makes it take.
-    let restored = factory
-        .decode_paused_state(std::path::PathBuf::from("/ignored"), encoded)
-        .expect("decode");
-    assert_eq!(
-        restored.encode().expect("re-encode")["origin_node_id"],
-        "node-under-test"
-    );
+    let capture = backend.pause().await.expect("pause");
+    let sent = script.seen_pause.lock().expect("lock").clone();
+    assert_eq!(sent.len(), 1, "the pause did not reach the node");
+    let CapturedSandboxSnapshot::Staged(decoded) = capture else {
+        panic!("a remote pause carries the staged row, not local artifacts");
+    };
+    assert_eq!(decoded.id(), staged.id());
+    assert_eq!(decoded.origin_node_id, "node-under-test");
 }
 
 #[tokio::test]
-async fn a_pause_with_nothing_to_reopen_is_terminal() {
+async fn a_pause_the_node_staged_nothing_for_is_terminal() {
     let (script, node) = scripted_node().await;
     let execution_id = ExecutionId::new();
     *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
@@ -1306,24 +1263,17 @@ async fn a_pause_with_nothing_to_reopen_is_terminal() {
         execution_id: execution_id.to_string(),
         ..Default::default()
     }));
-    *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
-        paused_state: None,
-        staged: None,
-        staging_error: String::new(),
-    }));
+    *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse { staged: None }));
 
     let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let mut backend =
-        match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
-        {
-            Ok(backend) => backend,
-            Err(err) => panic!("building a stub should not fail: {err:#}"),
-        };
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        .expect("build a stub");
     backend.start().await.expect("start");
 
-    let err = match backend.pause(None, false).await {
+    let err = match backend.pause().await {
         Err(err) => err,
-        Ok(_) => panic!("a pause with no state to reopen must not look like a success"),
+        Ok(_) => panic!("a pause with no row to resume from must not look like a success"),
     };
     assert!(err.is_terminal(), "{err}");
 }
@@ -1387,6 +1337,7 @@ fn staged_snapshot() -> StagedSnapshot {
             source: crate::snapshot::SnapshotPublishSource::Template,
             resources: Default::default(),
             created_at_unix_ms: Some(1_700_000_000_000),
+            origin_node_id: Some("node-under-test".to_string()),
             committed: CommittedSnapshot::mock(),
         },
         staged_at_unix_ms: 1_700_000_000_000,
@@ -1597,34 +1548,6 @@ async fn an_unresolved_image_reference_ships_to_the_node_which_resolves_it_itsel
     );
 }
 
-#[tokio::test]
-async fn a_paused_state_without_a_node_is_refused() {
-    let (_script, node) = scripted_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-
-    let err = match factory.decode_paused_state(
-        std::path::PathBuf::from("/ignored"),
-        serde_json::json!({"artifact_root": "/var/lib/x", "state": {}}),
-    ) {
-        Err(err) => err,
-        Ok(_) => panic!("a paused state with no machine on it was accepted"),
-    };
-    assert!(err.to_string().contains("which node"), "{err:#}");
-
-    // The control probe: the same value with the machine on it decodes.
-    factory
-        .decode_paused_state(
-            std::path::PathBuf::from("/ignored"),
-            serde_json::json!({
-                "origin_node_id": "node-a",
-                "artifact_root": "/var/lib/x",
-                "execution_id": ExecutionId::new().to_string(),
-                "state": {},
-            }),
-        )
-        .expect("a paused state that says where its bytes are");
-}
-
 #[test]
 fn the_remote_factory_sends_no_blank_ownership_marker() {
     const BLANK_MARKER: &str = "control_plane_config: Vec::new()";
@@ -1734,7 +1657,6 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
-        DisabledSandboxPersister,
         crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
@@ -1803,412 +1725,10 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     );
 }
 
-#[tokio::test]
-async fn a_paused_sandbox_is_reopened_on_the_machine_that_holds_its_capture() {
-    let node = real_node().await;
-    let orchestration = node.orchestration.as_ref().expect("a real node").clone();
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-
-    let paused_execution_id = ExecutionId::new();
-    let config = launch_config();
-    let sandbox_id = config.sandbox_id;
-    let mut backend = factory
-        .build_from_snapshot(&RunnableSnapshot::mock(), config, paused_execution_id)
-        .expect("build a stub");
-    backend.start().await.expect("start on the node");
-
-    // The node pauses it through its own orchestrator, which is what the
-    // `Pause` RPC will drive once it is served: what matters here is that the
-    // capture and the record end up on the node.
-    Arc::clone(&orchestration)
-        .pause_sandbox(sandbox_id)
-        .await
-        .expect("the node pauses its own sandbox");
-    assert!(
-        orchestration
-            .list_live_sandboxes()
-            .await
-            .expect("list")
-            .is_empty(),
-        "a paused sandbox is still running"
-    );
-
-    let resumed_execution_id = ExecutionId::new();
-    let capture_on = |node_id: &str| {
-        RemotePausedState::new(
-            node_id.to_string(),
-            "/var/lib/agentenv/paused/7".to_string(),
-            paused_execution_id,
-            serde_json::json!({}),
-        )
-    };
-
-    let elsewhere = capture_on("node-that-holds-nothing");
-    let mut wrong = factory
-        .build_from_paused_state(sandbox_id, resumed_execution_id, &elsewhere, None)
-        .expect("build a stub");
-    let err = wrong
-        .start()
-        .await
-        .expect_err("a capture on another machine was reopened here");
-    assert!(
-        format!("{err:#}").contains("node-that-holds-nothing"),
-        "the refusal did not say where the capture actually is: {err:#}"
-    );
-    assert!(
-        orchestration
-            .list_live_sandboxes()
-            .await
-            .expect("list")
-            .is_empty(),
-        "a refused resume started something anyway"
-    );
-
-    let here = capture_on("node-under-test");
-    let mut backend = factory
-        .build_from_paused_state(sandbox_id, resumed_execution_id, &here, None)
-        .expect("build a stub");
-    backend.start().await.expect("reopen on the node");
-    assert_eq!(backend.execution_id(), resumed_execution_id);
-
-    let live = orchestration.list_live_sandboxes().await.expect("list");
-    assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
-    assert_eq!(live[0].sandbox_id, sandbox_id);
-    assert_eq!(
-        live[0].execution_id,
-        Some(resumed_execution_id),
-        "the node brought the sandbox back under a run nobody claimed"
-    );
-    assert_ne!(
-        live[0].execution_id,
-        Some(paused_execution_id),
-        "the node reopened the capture as the run it was paused under"
-    );
-}
-
-#[tokio::test]
-async fn the_resume_names_the_run_it_reopens_and_the_run_it_starts() {
-    let (script, node) = scripted_node().await;
-    let paused_execution_id = ExecutionId::new();
-    let resumed_execution_id = ExecutionId::new();
-    assert_ne!(paused_execution_id, resumed_execution_id);
-    let sandbox_id = launch_config().sandbox_id;
-
-    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
-        started: Some(pb::SandboxCreateResponse {
-            sandbox_id: sandbox_id.to_string(),
-            execution_id: resumed_execution_id.to_string(),
-            host_interaction_ip: "10.4.5.6".to_string(),
-            rootfs_virtual_size: 4096,
-            resources: Some(pb::SandboxResources {
-                cpu_count: 4,
-                memory_mib: 2048,
-                disk_size_mib: 10240,
-            }),
-            ..Default::default()
-        }),
-    }));
-
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let state = RemotePausedState::new(
-        "node-under-test".to_string(),
-        "/var/lib/agentenv/paused/7".to_string(),
-        paused_execution_id,
-        serde_json::json!({}),
-    );
-    let mut backend = factory
-        .build_from_paused_state(sandbox_id, resumed_execution_id, &state, None)
-        .expect("build a stub");
-    backend.start().await.expect("reopen");
-
-    let seen = script.seen_resume.lock().expect("lock").clone();
-    assert_eq!(seen.len(), 1);
-    assert_eq!(seen[0].sandbox_id, sandbox_id.to_string());
-    assert_eq!(
-        seen[0].execution_id,
-        paused_execution_id.to_string(),
-        "the fence named a run other than the one the capture is of"
-    );
-    assert_eq!(
-        seen[0].resumed_execution_id,
-        resumed_execution_id.to_string(),
-        "the node was told to start a run other than the one the claim allocated"
-    );
-    assert_ne!(seen[0].execution_id, resumed_execution_id.to_string());
-    assert_ne!(
-        seen[0].resumed_execution_id,
-        paused_execution_id.to_string()
-    );
-    assert_eq!(seen[0].timeout_ms, 0);
-
-    assert_eq!(
-        backend.host_interaction_ip(),
-        Some(std::net::Ipv4Addr::new(10, 4, 5, 6))
-    );
-    assert_eq!(backend.runtime_info().rootfs_virtual_size, Some(4096));
-}
-
-#[tokio::test]
-async fn a_node_that_could_not_be_reached_is_not_a_capture_that_is_gone() {
-    let paused_execution_id = ExecutionId::new();
-    let resumed_execution_id = ExecutionId::new();
-    let sandbox_id = launch_config().sandbox_id;
-
-    async fn attempt(
-        status: Status,
-        sandbox_id: crate::types::SandboxId,
-        paused_execution_id: ExecutionId,
-        resumed_execution_id: ExecutionId,
-    ) -> anyhow::Error {
-        let (script, node) = scripted_node().await;
-        *script.resume.lock().expect("lock") = Some(Err(status));
-        let factory = RemoteSandboxBackendFactory::new(node.placement());
-        let state = RemotePausedState::new(
-            "node-under-test".to_string(),
-            "/var/lib/agentenv/paused/7".to_string(),
-            paused_execution_id,
-            serde_json::json!({}),
-        );
-        let mut backend = factory
-            .build_from_paused_state(sandbox_id, resumed_execution_id, &state, None)
-            .expect("build a stub");
-        backend
-            .start()
-            .await
-            .expect_err("the node refused the resume")
-    }
-
-    let absent = attempt(
-        Status::not_found("no paused capture for that sandbox here"),
-        sandbox_id,
-        paused_execution_id,
-        resumed_execution_id,
-    )
-    .await;
-    assert!(
-        matches!(
-            absent.downcast_ref::<wire::RemoteResumeFailure>(),
-            Some(wire::RemoteResumeFailure::CaptureAbsent { .. })
-        ),
-        "{absent:#}"
-    );
-
-    let unreachable = attempt(
-        Status::unavailable("the node is restarting"),
-        sandbox_id,
-        paused_execution_id,
-        resumed_execution_id,
-    )
-    .await;
-    assert!(
-        matches!(
-            unreachable.downcast_ref::<wire::RemoteResumeFailure>(),
-            Some(wire::RemoteResumeFailure::NodeUnreachable { .. })
-        ),
-        "an unreachable node was read as a capture that is gone: {unreachable:#}"
-    );
-}
-
-#[tokio::test]
-async fn a_resume_that_named_no_run_is_a_failure() {
-    let (script, node) = scripted_node().await;
-    let sandbox_id = launch_config().sandbox_id;
-    let paused_execution_id = ExecutionId::new();
-    let resumed_execution_id = ExecutionId::new();
-    let state = RemotePausedState::new(
-        "node-under-test".to_string(),
-        "/var/lib/agentenv/paused/7".to_string(),
-        paused_execution_id,
-        serde_json::json!({}),
-    );
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-
-    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse { started: None }));
-    let mut backend = factory
-        .build_from_paused_state(sandbox_id, resumed_execution_id, &state, None)
-        .expect("build a stub");
-    let err = backend
-        .start()
-        .await
-        .expect_err("a reply with no run in it must not look like a success");
-    assert!(format!("{err:#}").contains("said nothing"), "{err:#}");
-
-    let (script, node) = scripted_node().await;
-    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
-        started: Some(pb::SandboxCreateResponse {
-            sandbox_id: sandbox_id.to_string(),
-            execution_id: resumed_execution_id.to_string(),
-            ..Default::default()
-        }),
-    }));
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let mut backend = factory
-        .build_from_paused_state(sandbox_id, resumed_execution_id, &state, None)
-        .expect("build a stub");
-    backend.start().await.expect("a reply that named the run");
-}
-
-#[tokio::test]
-async fn a_node_that_reopened_another_run_fails_the_start_and_is_not_told_to_delete() {
-    let (script, node) = scripted_node().await;
-    let sandbox_id = launch_config().sandbox_id;
-    let claimed = ExecutionId::new();
-    let started = ExecutionId::new();
-    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
-        started: Some(pb::SandboxCreateResponse {
-            sandbox_id: sandbox_id.to_string(),
-            execution_id: started.to_string(),
-            ..Default::default()
-        }),
-    }));
-
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let state = RemotePausedState::new(
-        "node-under-test".to_string(),
-        "/var/lib/agentenv/paused/7".to_string(),
-        ExecutionId::new(),
-        serde_json::json!({}),
-    );
-    let mut backend = factory
-        .build_from_paused_state(sandbox_id, claimed, &state, None)
-        .expect("build a stub");
-
-    let err = backend.start().await.expect_err("the node ran another run");
-    assert!(format!("{err:#}").contains(&started.to_string()), "{err:#}");
-    assert!(
-        script.seen_delete.lock().expect("lock").is_empty(),
-        "a resume that disagreed about the run tore the user's sandbox down"
-    );
-
-    *script.resume.lock().expect("lock") = Some(Ok(pb::SandboxResumeResponse {
-        started: Some(pb::SandboxCreateResponse {
-            sandbox_id: sandbox_id.to_string(),
-            execution_id: claimed.to_string(),
-            ..Default::default()
-        }),
-    }));
-    let mut agreed = factory
-        .build_from_paused_state(sandbox_id, claimed, &state, None)
-        .expect("build a stub");
-    agreed.start().await.expect("reopen");
-    agreed.stop().await.expect("stop");
-    let deletes = script.seen_delete.lock().expect("lock").clone();
-    assert_eq!(deletes.len(), 1);
-    assert_eq!(deletes[0].execution_id, claimed.to_string());
-}
-
-#[tokio::test]
-async fn a_paused_state_that_does_not_say_which_run_it_captured_is_refused() {
-    let (_script, node) = scripted_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let execution_id = ExecutionId::new();
-
-    let err = factory
-        .decode_paused_state(
-            std::path::PathBuf::from("/ignored"),
-            serde_json::json!({
-                "origin_node_id": "node-a",
-                "artifact_root": "/var/lib/x",
-                "state": {},
-            }),
-        )
-        .expect_err("a paused state with no run on it was accepted");
-    assert!(err.to_string().contains("which run"), "{err:#}");
-
-    // A value that is present but is not an incarnation is refused too, rather
-    // than becoming one.
-    let err = factory
-        .decode_paused_state(
-            std::path::PathBuf::from("/ignored"),
-            serde_json::json!({
-                "origin_node_id": "node-a",
-                "artifact_root": "/var/lib/x",
-                "execution_id": "the-last-one",
-                "state": {},
-            }),
-        )
-        .expect_err("a paused state naming something that is not a run");
-    assert!(err.to_string().contains("the-last-one"), "{err:#}");
-
-    let decoded = factory
-        .decode_paused_state(
-            std::path::PathBuf::from("/ignored"),
-            serde_json::json!({
-                "origin_node_id": "node-a",
-                "artifact_root": "/var/lib/x",
-                "execution_id": execution_id.to_string(),
-                "state": {},
-            }),
-        )
-        .expect("a paused state that says which run it captured");
-    assert_eq!(
-        decoded
-            .downcast_ref::<RemotePausedState>()
-            .expect("a remote paused state")
-            .paused_execution_id(),
-        execution_id
-    );
-}
-
-#[tokio::test]
-async fn a_resume_that_would_reuse_the_paused_run_is_refused() {
-    let (_script, node) = scripted_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let sandbox_id = launch_config().sandbox_id;
-    let paused_execution_id = ExecutionId::new();
-    let state = RemotePausedState::new(
-        "node-under-test".to_string(),
-        "/var/lib/agentenv/paused/7".to_string(),
-        paused_execution_id,
-        serde_json::json!({}),
-    );
-
-    let err = factory
-        .build_from_paused_state(sandbox_id, paused_execution_id, &state, None)
-        .err()
-        .expect("a resume into the run it is replacing");
-    assert!(err.to_string().contains("starts a new one"), "{err:#}");
-
-    factory
-        .build_from_paused_state(sandbox_id, ExecutionId::new(), &state, None)
-        .expect("a resume under a run of its own");
-}
-
-#[tokio::test]
-async fn a_paused_state_this_factory_did_not_produce_is_refused() {
-    let (_script, node) = scripted_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let sandbox_id = launch_config().sandbox_id;
-
-    let err = factory
-        .build_from_paused_state(
-            sandbox_id,
-            ExecutionId::new(),
-            &crate::sandbox::mock::MockSnapshot,
-            None,
-        )
-        .err()
-        .expect("a local paused state was accepted by the remote factory");
-    assert!(err.to_string().contains("which machine"), "{err:#}");
-
-    factory
-        .build_from_paused_state(
-            sandbox_id,
-            ExecutionId::new(),
-            &RemotePausedState::new(
-                "node-under-test".to_string(),
-                "/var/lib/agentenv/paused/7".to_string(),
-                ExecutionId::new(),
-                serde_json::json!({}),
-            ),
-            None,
-        )
-        .expect("a paused state from this factory");
-}
-
 async fn paused_stub(
     script: &Arc<ScriptedNode>,
     node: &RunningNode,
+    staged: &StagedSnapshot,
 ) -> (Box<dyn SandboxBackend>, ExecutionId) {
     let execution_id = ExecutionId::new();
     *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
@@ -2217,12 +1737,9 @@ async fn paused_stub(
         ..Default::default()
     }));
     *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
-        paused_state: Some(pb::PausedState {
-            artifact_root: "/var/lib/agentenv/paused/7".to_string(),
-            state: Some(wire::serialize(&serde_json::json!({}), "state").expect("encode")),
+        staged: Some(pb::StagedSnapshot {
+            value: Some(wire::serialize(staged, "staged snapshot").expect("encode")),
         }),
-        staged: None,
-        staging_error: String::new(),
     }));
     let factory = RemoteSandboxBackendFactory::new(node.placement());
     let mut backend = factory
@@ -2233,21 +1750,23 @@ async fn paused_stub(
 }
 
 #[tokio::test]
-async fn stopping_a_sandbox_that_was_just_paused_does_not_delete_its_capture() {
+async fn stopping_a_sandbox_that_was_just_paused_does_not_reach_the_node() {
     let (script, node) = scripted_node().await;
+    let staged = staged_snapshot();
 
-    let (mut paused, _) = paused_stub(&script, &node).await;
-    paused.pause(None, false).await.expect("pause");
+    let (mut paused, _) = paused_stub(&script, &node, &staged).await;
+    paused.pause().await.expect("pause");
     paused.stop().await.expect("stop");
     assert!(
         script.seen_delete.lock().expect("lock").is_empty(),
-        "the capture was deleted by the stop that follows every pause: {:?}",
+        "the node, which already forgot the VM, was sent a delete by the stop that follows \
+         every pause: {:?}",
         script.seen_delete.lock().expect("lock")
     );
 
     // The same call on a stub that was not paused: this one is a teardown and
     // has to reach the node.
-    let (mut running, execution_id) = paused_stub(&script, &node).await;
+    let (mut running, execution_id) = paused_stub(&script, &node, &staged).await;
     running.stop().await.expect("stop");
     let deletes = script.seen_delete.lock().expect("lock").clone();
     assert_eq!(deletes.len(), 1, "a running sandbox was not torn down");
@@ -2255,87 +1774,19 @@ async fn stopping_a_sandbox_that_was_just_paused_does_not_delete_its_capture() {
 }
 
 #[tokio::test]
-async fn a_pause_asks_for_a_row_only_when_its_caller_will_commit_one() {
-    let (script, node) = scripted_node().await;
-
-    let staged = staged_snapshot();
-    // Script after `paused_stub`, whose setup writes its own pause reply.
-    let (mut backend, _) = paused_stub(&script, &node).await;
-    *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
-        paused_state: Some(pb::PausedState {
-            artifact_root: "/var/lib/agentenv/paused/one".to_string(),
-            state: Some(wire::serialize(&serde_json::json!({}), "state").expect("encode")),
-        }),
-        staged: Some(pb::StagedSnapshot {
-            value: Some(wire::serialize(&staged, "staged snapshot").expect("encode")),
-        }),
-        staging_error: String::new(),
-    }));
-    let capture = backend
-        .pause(None, true)
-        .await
-        .expect("a pause whose caller will commit");
-    let sent = script.seen_pause.lock().expect("lock").clone();
-    assert_eq!(sent.len(), 1, "the pause did not reach the node");
-    assert!(
-        sent[0].publish,
-        "a caller that promised to commit asked the node for nothing"
-    );
-    let publishable = capture
-        .publishable
-        .expect("a pause that asked to publish came back with nothing to publish");
-    let CapturedSandboxSnapshot::Staged(decoded) = publishable else {
-        panic!("the capture carries a staged snapshot and not something else");
-    };
-    let decoded: crate::snapshot::repository::StagedSnapshot = *decoded;
-    assert_eq!(decoded.id(), staged.id());
-    assert_eq!(decoded.origin_node_id, "node-under-test");
-
-    // The other arm: nobody is going to commit, so nothing is asked for — and
-    // the node's row, if it sent one anyway, is not adopted.
-    let (script, node) = scripted_node().await;
-    let (mut backend, _) = paused_stub(&script, &node).await;
-    *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse {
-        paused_state: Some(pb::PausedState {
-            artifact_root: "/var/lib/agentenv/paused/two".to_string(),
-            state: Some(wire::serialize(&serde_json::json!({}), "state").expect("encode")),
-        }),
-        staged: Some(pb::StagedSnapshot {
-            value: Some(wire::serialize(&staged, "staged snapshot").expect("encode")),
-        }),
-        staging_error: String::new(),
-    }));
-    let capture = backend
-        .pause(None, false)
-        .await
-        .expect("a pause whose caller will not commit");
-    let sent = script.seen_pause.lock().expect("lock").clone();
-    assert!(
-        !sent[0].publish,
-        "this half asked a node to stage a row it does not commit"
-    );
-    assert!(
-        capture.publishable.is_none(),
-        "a row nobody asked for was adopted anyway"
-    );
-}
-
-#[tokio::test]
-async fn a_published_pause_crosses_both_halves() {
+async fn a_pause_crosses_both_halves() {
     let real = real_node().await;
     let orchestration = real.orchestration.as_ref().expect("a real node").clone();
     let factory = RemoteSandboxBackendFactory::new(real.placement());
     let execution_id = ExecutionId::new();
     let config = launch_config();
+    let sandbox_id = config.sandbox_id;
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
         .expect("build a stub");
     backend.start().await.expect("start on the node");
 
-    let capture = backend
-        .pause(None, true)
-        .await
-        .expect("the published pause this half sends");
+    let capture = backend.pause().await.expect("the pause this half sends");
     assert!(
         orchestration
             .list_live_sandboxes()
@@ -2344,84 +1795,32 @@ async fn a_published_pause_crosses_both_halves() {
             .is_empty(),
         "the pause this half sends did not pause anything"
     );
-
-    assert!(
-        capture.publishable.is_none(),
-        "a node whose repository refuses to stage handed back a row anyway"
-    );
-}
-
-#[tokio::test]
-async fn a_sandbox_paused_from_here_is_reopened_where_its_bytes_are() {
-    let node = real_node().await;
-    let orchestration = node.orchestration.as_ref().expect("a real node").clone();
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-
-    let paused_execution_id = ExecutionId::new();
-    let config = launch_config();
-    let sandbox_id = config.sandbox_id;
-    let mut backend = factory
-        .build_from_snapshot(&RunnableSnapshot::mock(), config, paused_execution_id)
-        .expect("build a stub");
-    backend.start().await.expect("start on the node");
-
-    let capture = backend.pause(None, false).await.expect("pause on the node");
-    backend.stop().await.expect("stop after the pause");
     assert!(
         orchestration
-            .list_live_sandboxes()
+            .get_sandbox(&sandbox_id)
             .await
-            .expect("list")
-            .is_empty(),
-        "the paused sandbox is still running"
+            .expect("read")
+            .is_none(),
+        "the node kept a record of a sandbox it paused"
     );
 
-    let encoded = capture.state.encode().expect("encode");
-    assert_eq!(encoded["origin_node_id"], "node-under-test");
+    let CapturedSandboxSnapshot::Staged(staged) = capture else {
+        panic!("the node's answer is the row it staged, not local artifacts");
+    };
     assert_eq!(
-        encoded["execution_id"],
-        paused_execution_id.to_string(),
-        "the capture named a run other than the one it was taken from"
+        staged.origin_node_id,
+        crate::identity::local_node_id(),
+        "the row must name the machine holding the bytes"
     );
-    let restored = factory
-        .decode_paused_state(std::path::PathBuf::from("/ignored"), encoded.clone())
-        .expect("decode");
-
-    let mut elsewhere = encoded.clone();
-    elsewhere["origin_node_id"] = serde_json::json!("node-that-holds-nothing");
-    let elsewhere = factory
-        .decode_paused_state(std::path::PathBuf::from("/ignored"), elsewhere)
-        .expect("decode");
-    let resumed_execution_id = ExecutionId::new();
-    let mut wrong = factory
-        .build_from_paused_state(sandbox_id, resumed_execution_id, elsewhere.as_ref(), None)
-        .expect("build a stub");
-    wrong
-        .start()
-        .await
-        .expect_err("a capture on another machine was reopened here");
+    assert_ne!(staged.origin_node_id, "");
     assert!(
-        orchestration
-            .list_live_sandboxes()
-            .await
-            .expect("list")
-            .is_empty(),
-        "a refused resume started something anyway"
-    );
-
-    let mut back = factory
-        .build_from_paused_state(sandbox_id, resumed_execution_id, restored.as_ref(), None)
-        .expect("build a stub");
-    back.start().await.expect("reopen on the node that has it");
-
-    let live = orchestration.list_live_sandboxes().await.expect("list");
-    assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
-    assert_eq!(live[0].sandbox_id, sandbox_id);
-    assert_eq!(live[0].execution_id, Some(resumed_execution_id));
-    assert_ne!(
-        live[0].execution_id,
-        Some(paused_execution_id),
-        "the sandbox came back as the run it was paused under"
+        matches!(
+            &staged.commit.source,
+            crate::snapshot::SnapshotPublishSource::Sandbox { source_sandbox_id }
+                if source_sandbox_id == &sandbox_id.to_string()
+        ),
+        "the row names {:?} rather than the sandbox it came from",
+        staged.commit.source
     );
 }
 
@@ -2539,12 +1938,6 @@ impl crate::orchestrator::MetadataStore for SharedLedger {
     ) -> StoreResult<crate::orchestrator::TransitionOutcome> {
         self.0.start_transition(sandbox_id, request).await
     }
-    async fn paused_handle(
-        &self,
-        sandbox_id: &crate::types::SandboxId,
-    ) -> StoreResult<crate::orchestrator::PausedHandle> {
-        self.0.paused_handle(sandbox_id).await
-    }
     async fn transition_settlement(
         &self,
         sandbox_id: &crate::types::SandboxId,
@@ -2565,33 +1958,33 @@ impl crate::orchestrator::MetadataStore for SharedLedger {
     }
 }
 
-type ApiReplica =
-    Arc<Orchestrator<SharedLedger, RemoteSandboxBackendFactory, DisabledSandboxPersister>>;
+type ApiReplica = Arc<Orchestrator<SharedLedger, RemoteSandboxBackendFactory>>;
 
 async fn api_replica(node: &RunningNode, ledger: &SharedLedger) -> ApiReplica {
-    Orchestrator::new(
+    let replica = Orchestrator::new(
         // Test replicas may generate an otherwise irrelevant access-token seed.
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         ledger.clone(),
         RemoteSandboxBackendFactory::new(node.placement()),
-        DisabledSandboxPersister,
         crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
-    .expect("a replica of the deciding half")
+    .expect("a replica of the deciding half");
+    replica.set_pause_publisher(DiscardingPausePublisher::shared());
+    replica
 }
 
-async fn local_half(
-) -> Arc<Orchestrator<InMemoryMetadataStore, MockBackendFactory, DisabledSandboxPersister>> {
-    Orchestrator::new(
+async fn local_half() -> Arc<Orchestrator<InMemoryMetadataStore, MockBackendFactory>> {
+    let local = Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
-        DisabledSandboxPersister,
         crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
-    .expect("a machine-local orchestrator")
+    .expect("a machine-local orchestrator");
+    local.set_pause_publisher(DiscardingPausePublisher::shared());
+    local
 }
 
 fn cluster_create_request() -> crate::orchestrator::CreateSandboxRequest {
@@ -2611,6 +2004,7 @@ fn cluster_create_request() -> crate::orchestrator::CreateSandboxRequest {
         execution_id: None,
         auto_resume: false,
         secure: false,
+        preferred_node_id: None,
     }
 }
 
@@ -2687,37 +2081,35 @@ async fn a_pause_pauses_the_same_vm_whichever_replica_it_lands_on() {
     );
 
     for sandbox_id in [owned.id, stray.id] {
-        assert_eq!(
+        assert!(
             on_the_node
                 .get_sandbox(&sandbox_id)
                 .await
                 .expect("the node's own record")
-                .expect("the node kept a record")
-                .state,
-            crate::orchestrator::SandboxState::Paused,
+                .is_none(),
+            "the node kept a record of a sandbox it paused"
         );
-        assert_eq!(
+        assert!(
             ledger
                 .0
                 .get(&sandbox_id)
                 .await
                 .expect("read the ledger")
-                .expect("the shared record survived the pause")
-                .state,
-            crate::orchestrator::SandboxState::Paused,
+                .is_none(),
+            "the shared record outlived the pause"
         );
     }
 }
 
 #[tokio::test]
-async fn a_missing_handle_removes_the_record_only_when_nothing_can_be_addressed() {
+async fn a_missing_handle_is_an_absence_only_where_the_runtime_would_be_in_process() {
     let node = real_node().await;
     let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
     let started_here = api_replica(&node, &ledger).await;
     let landed_elsewhere = api_replica(&node, &ledger).await;
 
     // Face 1: sandboxes on other machines. The replica taking the call holds no
-    // handle, and the record must survive.
+    // handle, and the pause still has to reach the machine.
     let remote = Arc::clone(&started_here)
         .create_sandbox(cluster_create_request())
         .await
@@ -2726,13 +2118,10 @@ async fn a_missing_handle_removes_the_record_only_when_nothing_can_be_addressed(
         .pause_sandbox(remote.id)
         .await
         .expect("a replica holding no handle pauses the sandbox");
-    let record = ledger
-        .0
-        .get(&remote.id)
-        .await
-        .expect("read the ledger")
-        .expect("🔴 the shared record was deleted by a pause on a replica that held no handle");
-    assert_eq!(record.state, crate::orchestrator::SandboxState::Paused);
+    assert!(
+        running_on(&node).await.is_empty(),
+        "a replica holding no handle answered the pause without reaching the machine"
+    );
 
     // Face 2: sandboxes in this process. The same missing handle, and here it
     // really does mean the runtime is gone — so the record goes.
@@ -2807,15 +2196,14 @@ async fn a_pause_that_cannot_reach_the_machine_leaves_the_record_alone() {
         .expect("🔴 an unreachable machine caused the shared record to be deleted");
     assert_eq!(record.state, crate::orchestrator::SandboxState::Running);
 
-    assert_eq!(
+    assert!(
         ledger
             .0
             .get(&reachable.id)
             .await
             .expect("read the ledger")
-            .expect("the paused sandbox kept its record")
-            .state,
-        crate::orchestrator::SandboxState::Paused,
+            .is_none(),
+        "the sandbox the pause did reach kept its record"
     );
 }
 
@@ -2908,8 +2296,8 @@ async fn a_replica_going_away_leaves_the_clusters_sandboxes_running() {
         crate::orchestrator::SandboxState::Running,
     );
 
-    // Control face: a half whose VMs are in its own process still preserves
-    // them on the way out.
+    // Control face: a half whose VMs are in its own process stops them on the
+    // way out.
     let local = local_half().await;
     let mine = Arc::clone(&local)
         .create_sandbox(cluster_create_request())
@@ -2919,15 +2307,17 @@ async fn a_replica_going_away_leaves_the_clusters_sandboxes_running() {
         .shutdown()
         .await
         .expect("the local half shuts down");
-    assert_eq!(
+    assert!(
         local
             .get_sandbox(&mine.id)
             .await
             .expect("read the record")
-            .expect("a preserved sandbox keeps its record")
-            .state,
-        crate::orchestrator::SandboxState::Paused,
-        "a half that runs its own VMs stopped preserving them"
+            .is_none(),
+        "a half that runs its own VMs left one behind on the way out"
+    );
+    assert!(
+        local.list_live_sandboxes().await.expect("list").is_empty(),
+        "a half that runs its own VMs shut down with one still up"
     );
 }
 
@@ -3339,16 +2729,6 @@ async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded(
 // Exercises the interval between sandbox creation and the cluster learning its
 // node binding.
 
-#[derive(Clone)]
-enum LookupAnswer {
-    FromBindings,
-    Holder(NodeEndpoint),
-    Unavailable,
-    /// The scheduler answered about this sandbox and refused, as it does once the
-    /// claim has moved the row to `resuming` and the origin has left the cluster.
-    Refused,
-}
-
 struct ClusterPlacement {
     node: NodeEndpoint,
     bindings: Mutex<std::collections::HashSet<crate::types::SandboxId>>,
@@ -3364,10 +2744,9 @@ struct ClusterPlacement {
     /// create-time reservation, kept so a test can show what the delete verdict
     /// does without it.
     reserves_at_all: bool,
-    lookup: LookupAnswer,
-    resolves: Option<NodeEndpoint>,
     recorded: Mutex<Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint, u32)>>,
-    resolve_calls: Mutex<usize>,
+    /// The placement preference each launch arrived with, in order.
+    preferred: Mutex<Vec<Option<String>>>,
     membership: Mutex<MembershipAnswer>,
 }
 
@@ -3387,21 +2766,11 @@ impl ClusterPlacement {
             record_fails: false,
             reserves: true,
             reserves_at_all: true,
-            lookup: LookupAnswer::FromBindings,
-            resolves: Some(node.clone()),
             recorded: Mutex::new(Vec::new()),
-            resolve_calls: Mutex::new(0),
+            preferred: Mutex::new(Vec::new()),
             membership: Mutex::new(MembershipAnswer::Present),
             node,
         })
-    }
-
-    fn silent(node: NodeEndpoint) -> Arc<Self> {
-        let mut placement = Arc::try_unwrap(Self::recording(node))
-            .ok()
-            .expect("sole owner");
-        placement.records = false;
-        Arc::new(placement)
     }
 
     // A cluster whose binding store refuses the reservation write.
@@ -3427,22 +2796,6 @@ impl ClusterPlacement {
             .ok()
             .expect("sole owner");
         placement.record_fails = true;
-        Arc::new(placement)
-    }
-
-    fn answering(node: NodeEndpoint, lookup: LookupAnswer) -> Arc<Self> {
-        let mut placement = Arc::try_unwrap(Self::silent(node))
-            .ok()
-            .expect("sole owner");
-        placement.lookup = lookup;
-        Arc::new(placement)
-    }
-
-    fn resolving_to(node: NodeEndpoint, resolves: Option<NodeEndpoint>) -> Arc<Self> {
-        let mut placement = Arc::try_unwrap(Self::silent(node))
-            .ok()
-            .expect("sole owner");
-        placement.resolves = resolves;
         Arc::new(placement)
     }
 
@@ -3481,8 +2834,8 @@ impl ClusterPlacement {
         self.recorded.lock().expect("lock").clone()
     }
 
-    fn resolve_calls(&self) -> usize {
-        *self.resolve_calls.lock().expect("lock")
+    fn preferred(&self) -> Vec<Option<String>> {
+        self.preferred.lock().expect("lock").clone()
     }
 
     fn set_membership(&self, answer: MembershipAnswer) {
@@ -3496,7 +2849,12 @@ impl NodePlacement for ClusterPlacement {
         &self,
         _sandbox_id: crate::types::SandboxId,
         _resources: crate::types::SandboxResources,
+        preferred_node_id: Option<&str>,
     ) -> anyhow::Result<NodeEndpoint> {
+        self.preferred
+            .lock()
+            .expect("lock")
+            .push(preferred_node_id.map(str::to_string));
         Ok(self.node.clone())
     }
 
@@ -3504,36 +2862,19 @@ impl NodePlacement for ClusterPlacement {
         &self,
         sandbox_id: crate::types::SandboxId,
     ) -> anyhow::Result<Option<NodeEndpoint>> {
-        match &self.lookup {
-            // A reservation is neither an answer nor an absence, exactly as
-            // `lookup_node` treats a `Starting` binding.
-            LookupAnswer::FromBindings if self.is_reserved(sandbox_id) => Err(anyhow::Error::new(
-                tonic::Status::unavailable("a create for this sandbox has not finished"),
-            )
-            .context(format!("the local scheduler could not locate {sandbox_id}"))),
-            LookupAnswer::FromBindings => Ok(self.is_bound(sandbox_id).then(|| self.node.clone())),
-            LookupAnswer::Holder(holder) => Ok(Some(holder.clone())),
-            // Both carry the status the way NativeNodePlacement does, so the
-            // classification is exercised on the code rather than on the wording.
-            LookupAnswer::Unavailable => Err(anyhow::Error::new(tonic::Status::unavailable(
-                "scheduler is still seeding sandbox assignments",
+        // A reservation is neither an answer nor an absence, exactly as
+        // `lookup_node` treats a `Starting` binding.
+        if self.is_reserved(sandbox_id) {
+            return Err(anyhow::Error::new(tonic::Status::unavailable(
+                "a create for this sandbox has not finished",
             ))
-            .context(format!("the local scheduler could not locate {sandbox_id}"))),
-            LookupAnswer::Refused => Err(anyhow::Error::new(tonic::Status::failed_precondition(
-                format!(
-                    "sandbox is resuming on node {}, which is not reporting",
-                    self.node.node_id
-                ),
-            ))
-            .context(format!("the local scheduler could not locate {sandbox_id}"))),
+            .context(format!("the local scheduler could not locate {sandbox_id}")));
         }
+        Ok(self.is_bound(sandbox_id).then(|| self.node.clone()))
     }
 
-    async fn resolve_node(&self, node_id: &str) -> anyhow::Result<NodeEndpoint> {
-        *self.resolve_calls.lock().expect("lock") += 1;
-        self.resolves
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("the scheduler could not say where node {node_id} is"))
+    async fn resolve_node(&self, _node_id: &str) -> anyhow::Result<NodeEndpoint> {
+        Ok(self.node.clone())
     }
 
     async fn node_membership(&self, node_id: &str) -> anyhow::Result<NodeMembership> {
@@ -3691,15 +3032,16 @@ async fn a_create_the_node_refused_withdraws_its_reservation() {
 }
 
 async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger) -> ApiReplica {
-    Orchestrator::new(
+    let replica = Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         ledger.clone(),
         RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>),
-        DisabledSandboxPersister,
         crate::image::DisabledRuntimeImageRefs::shared(),
     )
     .await
-    .expect("a replica of the deciding half")
+    .expect("a replica of the deciding half");
+    replica.set_pause_publisher(DiscardingPausePublisher::shared());
+    replica
 }
 
 #[tokio::test]
@@ -3850,49 +3192,40 @@ async fn a_create_survives_a_cluster_that_refuses_the_assignment() {
 }
 
 #[tokio::test]
-async fn a_resume_tells_the_cluster_the_sandbox_is_live_again() {
+async fn a_launch_tells_the_cluster_which_machine_last_held_the_bytes() {
     let node = real_node().await;
     let placement = ClusterPlacement::recording(node.endpoint.clone());
     let factory =
         RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
 
-    let paused_execution_id = ExecutionId::new();
-    let config = launch_config();
-    let sandbox_id = config.sandbox_id;
-    let mut backend = factory
-        .build_from_snapshot(&RunnableSnapshot::mock(), config, paused_execution_id)
-        .expect("build a stub");
-    backend.start().await.expect("start on the node");
-    let capture = backend.pause(None, false).await.expect("pause on the node");
-    backend.stop().await.expect("stop after the pause");
-
-    let restored = factory
-        .decode_paused_state(
-            std::path::PathBuf::from("/ignored"),
-            capture.state.encode().expect("encode"),
+    let mut fresh = factory
+        .build_from_snapshot(
+            &RunnableSnapshot::mock(),
+            launch_config(),
+            ExecutionId::new(),
         )
-        .expect("decode");
-    let resumed_execution_id = ExecutionId::new();
-    assert_ne!(resumed_execution_id, paused_execution_id);
-    let mut back = factory
-        .build_from_paused_state(sandbox_id, resumed_execution_id, restored.as_ref(), None)
         .expect("build a stub");
-    back.start().await.expect("reopen on the node that has it");
+    fresh.start().await.expect("start on the node");
 
-    let recorded = placement.recorded();
+    let warm = SandboxLaunchConfig {
+        sandbox_id: crate::types::SandboxId::new(),
+        preferred_node_id: Some("node-that-held-the-bytes".to_string()),
+        ..launch_config()
+    };
+    let mut resumed = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), warm, ExecutionId::new())
+        .expect("build a stub");
+    resumed.start().await.expect("start on the node");
+
     assert_eq!(
-        recorded.len(),
+        placement.preferred(),
+        vec![None, Some("node-that-held-the-bytes".to_string())],
+        "the cluster was not told where the bytes were last warm"
+    );
+    assert_eq!(
+        running_on(&node).await.len(),
         2,
-        "the create and the resume did not both tell the cluster: {recorded:?}"
-    );
-    assert_eq!(recorded[0].1, paused_execution_id, "the create's run");
-    assert_eq!(
-        recorded[1].1, resumed_execution_id,
-        "the resume told the cluster about a run other than the one it started"
-    );
-    assert_ne!(
-        recorded[1].1, paused_execution_id,
-        "the resume recorded the run it reopened instead of the run it started"
+        "a preference the cluster did not honour stopped the launch"
     );
 }
 
@@ -3916,14 +3249,19 @@ async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
         told.is_bound(sandbox.id),
         "the create left the cluster unable to say where the sandbox is"
     );
-    Arc::clone(&replica)
-        .pause_sandbox(sandbox.id)
+    // The machine stops holding it before any heartbeat could say so.
+    Arc::clone(&on_the_node)
+        .delete_sandbox(sandbox.id)
         .await
-        .expect("pause");
+        .expect("the node tears its own sandbox down");
+    assert!(
+        replica.forget_sandbox_handle_for_test(&sandbox.id).await,
+        "the replica held no handle to forget, so this face proves nothing"
+    );
     Arc::clone(&replica)
         .delete_sandbox(sandbox.id)
         .await
-        .expect("🔴 a sandbox paused before its first heartbeat could not be deleted");
+        .expect("🔴 a sandbox the machine lost before its first heartbeat could not be deleted");
     assert!(
         ledger
             .0
@@ -3974,12 +3312,16 @@ async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
         .create_sandbox(cluster_create_request())
         .await
         .expect("create on the node");
-    Arc::clone(&replica)
-        .pause_sandbox(orphan.id)
+    Arc::clone(&on_the_node)
+        .delete_sandbox(orphan.id)
         .await
-        .expect("pause");
-    // What a pause that never reached the registry, plus an expired reservation,
-    // leaves behind.
+        .expect("the node tears its own sandbox down");
+    assert!(
+        replica.forget_sandbox_handle_for_test(&orphan.id).await,
+        "the replica held no handle to forget, so this face proves nothing"
+    );
+    // What a machine that lost the sandbox, plus an expired reservation, leaves
+    // behind.
     told2.forget(orphan.id);
     Arc::clone(&replica)
         .delete_sandbox(orphan.id)
@@ -4004,10 +3346,10 @@ async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
         .create_sandbox(cluster_create_request())
         .await
         .expect("create on the node");
-    Arc::clone(&replica)
-        .pause_sandbox(contested.id)
-        .await
-        .expect("pause");
+    assert!(
+        replica.forget_sandbox_handle_for_test(&contested.id).await,
+        "the replica held no handle to forget, so this face proves nothing"
+    );
     racing.forget(contested.id);
     racing.reserve_elsewhere(contested.id);
     Arc::clone(&replica)
@@ -4058,10 +3400,10 @@ async fn without_the_create_time_reservation_the_delete_verdict_reaps_a_live_san
         .create_sandbox(cluster_create_request())
         .await
         .expect("a build without reservations still creates");
-    Arc::clone(&replica)
-        .pause_sandbox(sandbox.id)
-        .await
-        .expect("pause");
+    assert!(
+        replica.forget_sandbox_handle_for_test(&sandbox.id).await,
+        "the replica held no handle to forget, so this face proves nothing"
+    );
     // The window a reservation exists to cover: the cluster's record of this
     // sandbox is gone while the machine still holds it.
     no_reservations.forget(sandbox.id);
@@ -4180,167 +3522,4 @@ async fn a_delete_forgets_a_sandbox_only_once_its_node_has_left_the_cluster() {
             .state,
         crate::orchestrator::SandboxState::Running,
     );
-}
-
-#[tokio::test]
-async fn a_capture_is_reopened_on_its_own_machine_when_the_cluster_has_no_record() {
-    let node = real_node().await;
-    let setup = RemoteSandboxBackendFactory::new(node.placement());
-
-    let paused_execution_id = ExecutionId::new();
-    let config = launch_config();
-    let sandbox_id = config.sandbox_id;
-    let mut backend = setup
-        .build_from_snapshot(&RunnableSnapshot::mock(), config, paused_execution_id)
-        .expect("build a stub");
-    backend.start().await.expect("start on the node");
-    let capture = backend.pause(None, false).await.expect("pause on the node");
-    backend.stop().await.expect("stop after the pause");
-    let encoded = capture.state.encode().expect("encode");
-    assert_eq!(encoded["origin_node_id"], node.endpoint.node_id.as_str());
-    assert!(
-        running_on(&node).await.is_empty(),
-        "the pause left the VM running"
-    );
-
-    let resumed_execution_id = ExecutionId::new();
-    let reopen = |placement: Arc<ClusterPlacement>| {
-        let encoded = encoded.clone();
-        async move {
-            let factory = RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>);
-            let state = factory
-                .decode_paused_state(std::path::PathBuf::from("/ignored"), encoded)
-                .expect("decode");
-            let mut backend = factory
-                .build_from_paused_state(sandbox_id, resumed_execution_id, state.as_ref(), None)
-                .expect("build a stub");
-            backend.start().await
-        }
-    };
-
-    // A machine that is not the origin, wearing the origin's *address*: if the
-    // identity check went, this would be reopened successfully.
-    let impostor = NodeEndpoint {
-        node_id: "node-that-holds-nothing".to_string(),
-        endpoint: node.endpoint.endpoint.clone(),
-        advertised_endpoint: node.endpoint.advertised_endpoint.clone(),
-    };
-
-    // Face 1: the cluster names another holder. An answer, so it is refused.
-    let named_elsewhere = ClusterPlacement::answering(
-        node.endpoint.clone(),
-        LookupAnswer::Holder(impostor.clone()),
-    );
-    let named_elsewhere_err = reopen(Arc::clone(&named_elsewhere))
-        .await
-        .expect_err("a capture was reopened although the cluster named another holder");
-    assert!(
-        crate::node_client::wire::warrants_rebuild(&named_elsewhere_err),
-        "the machine this capture names is no longer where the cluster puts the sandbox, so a \
-         published row has to rebuild rather than answer 500: {named_elsewhere_err:#}"
-    );
-    assert!(
-        running_on(&node).await.is_empty(),
-        "a refused resume started something anyway"
-    );
-
-    // Face 2: the cluster could not be consulted. Not an absence, so not a
-    // fallback — an error.
-    let unavailable = ClusterPlacement::answering(node.endpoint.clone(), LookupAnswer::Unavailable);
-    let unavailable_err = reopen(Arc::clone(&unavailable))
-        .await
-        .expect_err("a capture was reopened although the placement source could not be asked");
-    assert!(
-        !crate::node_client::wire::warrants_rebuild(&unavailable_err),
-        "the control: a placement source that could not be asked is not proof the origin is \
-         gone, and rebuilding on it discards a capture that is still there: {unavailable_err:#}"
-    );
-    assert_eq!(
-        unavailable.resolve_calls(),
-        0,
-        "an unreadable placement source was treated as an absent record"
-    );
-    assert!(running_on(&node).await.is_empty());
-
-    // Face 5: the scheduler answered about this sandbox and refused, which is what
-    // it does once the claim has flipped the row to resuming and the origin has
-    // left. This is the pve-mf criterion-(b) shape.
-    let refused_by_scheduler =
-        ClusterPlacement::answering(node.endpoint.clone(), LookupAnswer::Refused);
-    let refused_err = reopen(Arc::clone(&refused_by_scheduler))
-        .await
-        .expect_err("the origin is gone, so no reopen can happen");
-    assert!(
-        crate::node_client::wire::warrants_rebuild(&refused_err),
-        "🔴 the assertion. A scheduler verdict that the origin is not reporting is exactly \
-         when a published row must rebuild elsewhere; leaving it unclassified is the 500 that \
-         failed criterion (b) 14 times out of 14: {refused_err:#}"
-    );
-    assert!(
-        running_on(&node).await.is_empty(),
-        "a refused resume started something anyway"
-    );
-
-    // Face 3: no record, and the fallback answers about a different machine.
-    let misdirected = ClusterPlacement::resolving_to(node.endpoint.clone(), Some(impostor.clone()));
-    let misdirected_err = reopen(Arc::clone(&misdirected))
-        .await
-        .expect_err("a capture was reopened on a machine the fallback misnamed");
-    assert!(
-        crate::node_client::wire::warrants_rebuild(&misdirected_err),
-        "the fallback resolved the origin's name to another machine, which is the origin \
-         being gone under a different face: {misdirected_err:#}"
-    );
-    assert_eq!(
-        misdirected.resolve_calls(),
-        1,
-        "the fallback was not reached, so the refusal above is about something else"
-    );
-    assert!(running_on(&node).await.is_empty());
-
-    // Face 4: no record, and the fallback answers about the machine the capture
-    // names. The one case the fallback exists for.
-    let absent = ClusterPlacement::silent(node.endpoint.clone());
-    reopen(Arc::clone(&absent))
-        .await
-        .expect("🔴 a capture could not be reopened because the cluster had never heard of it");
-    assert_eq!(
-        absent.resolve_calls(),
-        1,
-        "the resume did not go through the fallback"
-    );
-    let live = node
-        .orchestration
-        .as_ref()
-        .expect("a real node")
-        .list_live_sandboxes()
-        .await
-        .expect("list");
-    assert_eq!(live.len(), 1, "the sandbox did not come back: {live:?}");
-    assert_eq!(live[0].sandbox_id, sandbox_id);
-    assert_eq!(live[0].execution_id, Some(resumed_execution_id));
-
-    let attaching = setup_attach(Arc::clone(&absent), sandbox_id, resumed_execution_id).await;
-    assert!(
-        attaching.is_err(),
-        "an attach invented a machine for a sandbox the cluster could not place"
-    );
-    assert_eq!(
-        absent.resolve_calls(),
-        1,
-        "an attach took the resume's fallback"
-    );
-}
-
-async fn setup_attach(
-    placement: Arc<ClusterPlacement>,
-    sandbox_id: crate::types::SandboxId,
-    execution_id: ExecutionId,
-) -> anyhow::Result<()> {
-    let factory = RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>);
-    let mut backend = factory
-        .adopt_running(sandbox_id, execution_id, Default::default())
-        .expect("a remote factory adopts every sandbox")
-        .expect("a remote factory never answers that the runtime is gone");
-    backend.start().await
 }

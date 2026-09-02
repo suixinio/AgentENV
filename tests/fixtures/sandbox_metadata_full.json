@@ -103,7 +103,7 @@
     "ready_cmd": "curl -sf http://127.0.0.1:5173",
     "start_cmd": "npm run dev"
   },
-  "state": "Paused",
+  "state": "Pausing",
   "timeout": {
     "nanos": 0,
     "secs": 900

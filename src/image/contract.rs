@@ -80,7 +80,6 @@ pub struct ResolvedBlockImage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RuntimeImageOwner {
     StartingSandbox(SandboxId),
-    PausedSandbox(SandboxId),
 }
 
 /// The node-local layer cache's view of what is still in use.
@@ -90,7 +89,11 @@ pub trait RuntimeImageRefs: Send + Sync + std::fmt::Debug {
 
     async fn unpin_best_effort(&self, owner: RuntimeImageOwner);
 
-    async fn reconcile_paused(&self, live_paused: &[SandboxId]) -> Result<()>;
+    /// Startup reconcile that authorizes deleting maintenance passes: holds
+    /// left by a previous process are released before anything is reclaimed.
+    async fn prepare_maintenance(&self) -> Result<()> {
+        Ok(())
+    }
 
     async fn maintain_running(&self, running: Vec<(SandboxId, RuntimeArtifactSet)>) -> Result<()>;
 }
@@ -106,10 +109,6 @@ impl RuntimeImageRefs for DisabledRuntimeImageRefs {
     }
 
     async fn unpin_best_effort(&self, _owner: RuntimeImageOwner) {}
-
-    async fn reconcile_paused(&self, _live_paused: &[SandboxId]) -> Result<()> {
-        Ok(())
-    }
 
     async fn maintain_running(&self, _running: Vec<(SandboxId, RuntimeArtifactSet)>) -> Result<()> {
         Ok(())

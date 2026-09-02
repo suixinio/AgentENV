@@ -10,11 +10,14 @@ use super::repository::{
     SnapshotRepository, SnapshotRuntimeResolver, StartedBuild,
 };
 use super::{
-    PersistedDiskImagePublication, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedSnapshot, PausedSandboxConfig, PersistedDiskImagePublication, SnapshotId,
+    SnapshotManager, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };
+use crate::orchestrator::SandboxTimeoutAction;
 use crate::runtime_snapshot::RunnableSnapshot;
-use crate::types::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxNetworkPolicy;
+use crate::types::{FirecrackerSnapshotManifest, SandboxId};
 
 /// Refusing catalog test double that records whether reads were attempted.
 #[derive(Debug, Default)]
@@ -211,6 +214,7 @@ impl SnapshotCatalog for RecordingSnapshotRepository {
             resources: commit.resources,
             created_at_unix_ms: commit.created_at_unix_ms.unwrap_or_default(),
             updated_at_unix_ms: commit.created_at_unix_ms.unwrap_or_default(),
+            origin_node_id: None,
             committed: Some(commit.committed),
         })
     }
@@ -323,6 +327,65 @@ impl SnapshotCatalog for OneRowSnapshotCatalog {
         _reason: crate::snapshot::TemplateBuildErrorReason,
     ) -> RepositoryResult<()> {
         Err(MockSnapshotCatalog::unsupported())
+    }
+}
+
+/// Builds a manager over an in-memory catalog a test can seed and read back.
+/// Artifacts are discarded and the runtime resolver refuses.
+pub fn in_memory_snapshot_manager() -> (SnapshotManager, Arc<InMemorySnapshotCatalog>) {
+    let catalog = Arc::new(InMemorySnapshotCatalog::default());
+    let manager = SnapshotManager::from_parts(
+        Arc::new(SnapshotRepository::new(
+            Arc::clone(&catalog) as Arc<dyn SnapshotCatalog>,
+            Arc::new(MockSnapshotArtifactStore),
+        )),
+        Some(Arc::new(MockSnapshotRuntimeResolver)),
+        None,
+    );
+    (manager, catalog)
+}
+
+/// The pause configuration of a test row: a resumable, insecure sandbox from
+/// template `tpl-paused` with no timeout of its own.
+pub fn mock_paused_sandbox_config() -> PausedSandboxConfig {
+    PausedSandboxConfig {
+        template_id: "tpl-paused".to_string(),
+        template_alias: None,
+        created_at_unix_ms: 1_700_000_000_000,
+        timeout_secs: None,
+        timeout_action: SandboxTimeoutAction::Pause,
+        auto_resume: true,
+        user_metadata: None,
+        network_policy: SandboxNetworkPolicy::default(),
+        secure: false,
+        control_plane_config: None,
+        max_lifetime_secs: None,
+        running_elapsed_secs: 0,
+    }
+}
+
+/// A committed row paused from `sandbox_id` at `paused_at_unix_ms`, staged on
+/// `origin_node_id` when one is named.
+pub fn paused_sandbox_record(
+    sandbox_id: SandboxId,
+    origin_node_id: Option<&str>,
+    paused: PausedSandboxConfig,
+    paused_at_unix_ms: i64,
+) -> SnapshotRecord {
+    SnapshotRecord {
+        id: SnapshotId::generate(),
+        alias: None,
+        source: SnapshotSource::Sandbox {
+            source_sandbox_id: sandbox_id.to_string(),
+        },
+        resources: Default::default(),
+        created_at_unix_ms: paused_at_unix_ms,
+        updated_at_unix_ms: paused_at_unix_ms,
+        committed: Some(CommittedSnapshot {
+            paused_sandbox: Some(paused),
+            ..CommittedSnapshot::mock()
+        }),
+        origin_node_id: origin_node_id.map(str::to_string),
     }
 }
 
@@ -612,6 +675,7 @@ impl SnapshotCatalog for InMemorySnapshotCatalog {
                     resources: commit.resources,
                     created_at_unix_ms: commit.created_at_unix_ms.unwrap_or(now),
                     updated_at_unix_ms: now,
+                    origin_node_id: commit.origin_node_id.clone(),
                     committed: Some(commit.committed.clone()),
                 }
             }
@@ -745,6 +809,21 @@ impl SnapshotCatalog for InMemorySnapshotCatalog {
         build.finished_at_unix_ms = Some(now);
         build.error_reason = Some(reason);
         record.updated_at_unix_ms = now;
+        Ok(())
+    }
+
+    async fn set_origin_node_id(
+        &self,
+        id: &SnapshotId,
+        origin_node_id: &str,
+    ) -> RepositoryResult<()> {
+        let mut rows = self.rows.lock().expect("rows");
+        let record =
+            rows.get_mut(&id.to_string())
+                .ok_or_else(|| RepositoryError::SnapshotNotFound {
+                    lookup: id.to_string(),
+                })?;
+        record.origin_node_id = Some(origin_node_id.to_string());
         Ok(())
     }
 

@@ -12,7 +12,6 @@ pub struct ProxyTarget {
 pub enum ProxyLookupResult {
     Ready(ProxyTarget),
     NotFound,
-    Paused { auto_resume: bool },
     Unavailable(SandboxState),
     RouteMissing,
 }

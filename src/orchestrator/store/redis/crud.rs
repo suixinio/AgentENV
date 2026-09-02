@@ -9,7 +9,7 @@ use tracing::{debug, warn};
 
 use super::super::{
     state_from_token, state_token, FencedRemoval, MetadataRows, MetadataStore,
-    MetadataUpdateResult, PausedHandle, Result, SandboxListFilter, SandboxMetadata, StoreError,
+    MetadataUpdateResult, Result, SandboxListFilter, SandboxMetadata, StoreError,
     TransitionOutcome, TransitionRequest, TransitionSettlement,
 };
 use super::keys::{routing, ExpiryMember};
@@ -647,18 +647,6 @@ impl MetadataStore for RedisMetadataStore {
         request: TransitionRequest,
     ) -> Result<TransitionOutcome> {
         super::transition::start_transition(self.inner(), sandbox_id, request).await
-    }
-
-    /// Returns a remote handle for stored paused references, never false absence.
-    async fn paused_handle(&self, sandbox_id: &SandboxId) -> Result<PausedHandle> {
-        let record = self.inner().require_record(sandbox_id).await?;
-        Ok(match record.paused_state_ref {
-            Some(reference) => PausedHandle::Remote {
-                reference,
-                origin_node_id: record.origin_node_id,
-            },
-            None => PausedHandle::NotPaused,
-        })
     }
 
     async fn transition_settlement(

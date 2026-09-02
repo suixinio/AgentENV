@@ -32,8 +32,9 @@ service NodeSandboxService {
   // Tears the sandbox down on this node and forgets it.
   rpc Delete (SandboxDeleteRequest) returns (SandboxDeleteResponse);
 
-  // Pauses the sandbox, stops it, and returns what is needed to bring it back
-  // — here or, when it was published, anywhere.
+  // Pauses the sandbox, stages its capture on this node's repository, stops
+  // it and forgets it. The staged value is what the caller commits; after this
+  // call the sandbox exists nowhere but in that value.
   //
   // 🔴 **Every failure on this call carries a capture classification**, and
   // not only the ones that come from a capture. The caller reads an
@@ -45,31 +46,6 @@ service NodeSandboxService {
 
   // Captures a snapshot of a running sandbox and leaves it running.
   rpc Checkpoint (SandboxCheckpointRequest) returns (SandboxCheckpointResponse);
-
-  // Reopens the capture this node is holding, under the incarnation the
-  // caller's resume claim allocated.
-  //
-  // 🔴 **Nothing about the capture travels on this call, and that is the
-  // point.** `Pause` hands the API half a `PausedState`, and the API half
-  // stores it — but what it stores is a path on *this* node's disk plus this
-  // node's own encoding of its backend state. The bytes never moved, so
-  // reopening them is not a matter of sending them back; it is a matter of
-  // asking the machine they are on. What crosses is therefore an identity, a
-  // fence, and the run to start.
-  //
-  // 🔴 **This is the pinned arm of the two a paused sandbox has, and only that
-  // one.** A sandbox whose capture was published to shared storage can be
-  // rebuilt anywhere, and that is a `Create` with a `SnapshotSource` — a
-  // different call, answered by a node that has never seen this sandbox. This
-  // one is for the sandbox whose only copy is on one machine's disk, and it is
-  // addressed to that machine or to nobody.
-  //
-  // 🔴 A node that does not hold the capture answers `NOT_FOUND`, and a node
-  // that could not look answers something else. The caller acts on the
-  // difference: the first means the only copy is gone and the sandbox has to
-  // be rebuilt from a published snapshot or given up on, the second means ask
-  // again. Collapsing them destroys a sandbox whose bytes are fine.
-  rpc Resume (SandboxResumeRequest) returns (SandboxResumeResponse);
 
   // Forks one running sandbox into running children on this same node.
   rpc Fork (SandboxForkRequest) returns (SandboxForkResponse);
@@ -245,25 +221,6 @@ enum TimeoutAction {
 // after it ships.
 message StagedSnapshot {
   SerializedValue value = 1;
-}
-
-// The paused state of one sandbox, as the pausing node encoded it.
-//
-// 🔴 Two fields and both are needed. `artifact_root` is a path on the *node*
-// that produced it, so it is meaningless to the API half on its own — which is
-// exactly why the API half must also record which node that was. Handing this
-// back to a different machine reopens nothing.
-message PausedState {
-  // The directory on the origin node holding the paused sandbox's artifacts.
-  //
-  // 🔴 Empty when that node's persister allocated none — a node configured
-  // without paused-sandbox persistence captured into temporaries it manages
-  // itself, and there is no directory to name. Empty is therefore "no
-  // directory", never "the node did not say": a node that could not read where
-  // the capture went fails the call instead.
-  string artifact_root = 1;
-  // The backend's own encoding of its paused state.
-  SerializedValue state = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -531,44 +488,18 @@ message SandboxDeleteResponse {}
 message SandboxPauseRequest {
   string sandbox_id = 1;
   string execution_id = 2;
-  // Whether the capture should also be staged for publication, so that a node
-  // other than this one can rebuild the sandbox.
-  //
-  // 🔴 Not served yet, and **refused** rather than answered with an absent
-  // `staged`. A node that quietly returned nothing here would be
-  // indistinguishable from a node whose backend had nothing publishable to
-  // offer, and the difference is whether the sandbox has a copy anywhere but
-  // one machine's disk. The refusal is classified as non-terminal and is taken
-  // before the sandbox is touched, so asking for something this build cannot do
-  // costs nothing.
-  bool publish = 3;
+  // A pause always stages; there is no local-only pause to ask for.
+  reserved 3;
+  reserved "publish";
 }
 
 message SandboxPauseResponse {
-  PausedState paused_state = 1;
-  // Present only when `publish` was asked for and the backend could offer a
-  // publishable capture.
+  // The pause's staged snapshot, for the caller to commit. Always present on
+  // success: a pause that stopped the VM and staged nothing has failed, and
+  // says so with a terminal capture failure rather than an empty reply.
   StagedSnapshot staged = 2;
-  // Why `staged` is absent, when `publish` was asked for and the staging was
-  // attempted and failed. Empty otherwise.
-  //
-  // 🔴 A field rather than a failed call, and this is the one place on this
-  // service where a failure is reported inside a success. By the time staging
-  // runs the sandbox is already paused, persisted and stopped, and the
-  // classification the caller reads off a failed pause has only two answers:
-  // *recoverable*, which it acts on by putting the sandbox back to running, and
-  // *terminal*, which it acts on by tearing it down. Neither is true here. A
-  // recoverable answer would leave the caller believing a sandbox is running
-  // that this node has stopped; a terminal one would destroy a pause that
-  // worked. So the pause succeeds, and what failed is named.
-  //
-  // 🔴 It is also what keeps an absent `staged` unambiguous. Without it, a
-  // caller that asked to publish and got nothing could not tell a pause that
-  // had nothing to stage — an idempotent re-pause, whose capture belongs to the
-  // pause that made it — from a staging that broke. The first is normal and the
-  // second means this sandbox now exists on one machine's disk and nowhere
-  // else.
-  string staging_error = 3;
+  reserved 1, 3;
+  reserved "paused_state", "staging_error";
 }
 
 message SandboxCheckpointRequest {
@@ -578,55 +509,6 @@ message SandboxCheckpointRequest {
 
 message SandboxCheckpointResponse {
   StagedSnapshot staged = 1;
-}
-
-// ---------------------------------------------------------------------------
-// Resume
-// ---------------------------------------------------------------------------
-
-message SandboxResumeRequest {
-  string sandbox_id = 1;
-
-  // 🔴 The incarnation the sandbox was **paused** under — the fence, spelled
-  // the same way as on every other call here.
-  //
-  // It is what tells a capture this caller means from a capture this node
-  // happens to still be holding. A node keeps its paused record until
-  // something tells it the cluster has moved on, so a sandbox that was paused
-  // here, resumed elsewhere and paused there leaves a stale record on this
-  // machine — and a resume that named only the sandbox would reopen a run the
-  // user abandoned two runs ago, with their newer work still sitting on
-  // another disk.
-  string execution_id = 2;
-
-  // 🔴 The incarnation this resume must run under: the one the caller's resume
-  // claim allocated.
-  //
-  // Required, and never defaulted to "you choose" the way a create's is. A
-  // create with no incarnation is a caller that keeps no record; a resume with
-  // no incarnation is a resume nobody licensed, because the only way to obtain
-  // one is the arbitration that decides a paused sandbox may come back at all.
-  // A node that minted its own here would start a run the cluster's record of
-  // the sandbox does not name, and fencing compares exactly that value.
-  //
-  // 🔴 It must differ from `execution_id`. A resume starts a new run; one that
-  // reused the paused run's identity would leave commands written before the
-  // pause indistinguishable from commands written after it.
-  string resumed_execution_id = 3;
-
-  // 0 means the sandbox keeps the timeout it was paused with — never "no
-  // timeout", and never the node's default.
-  uint64 timeout_ms = 4;
-}
-
-// 🔴 The same facts a create reports, in a message of its own rather than
-// `SandboxCreateResponse` reused directly. A resume and a create both end with
-// a running sandbox, so today the two answers are the same; what differs is
-// what each may later need to say — how long the capture had been paused, say
-// — and a shared reply would have no place to put it that did not also appear
-// on the other call.
-message SandboxResumeResponse {
-  SandboxCreateResponse started = 1;
 }
 
 // Why a capture failed, told apart the way the node's own code tells it apart.

@@ -138,13 +138,11 @@ pub async fn reconcile_node_installs_every_roster_entry<S: BindingStore>(store: 
                     sandbox_id: "sbx-1".to_string(),
                     execution_id: "exec-1".to_string(),
                     projection_ttl: Duration::ZERO,
-                    paused: false,
                 },
                 RosterEntry {
                     sandbox_id: "sbx-2".to_string(),
                     execution_id: String::new(),
                     projection_ttl: Duration::ZERO,
-                    paused: false,
                 },
             ],
             unix(0),
@@ -166,7 +164,6 @@ pub async fn reconcile_node_with_an_empty_roster_removes_everything_it_owns<S: B
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::ZERO,
-                paused: false,
             }],
             unix(0),
         )
@@ -191,13 +188,11 @@ pub async fn reconcile_node_drops_entries_the_node_no_longer_reports<S: BindingS
                     sandbox_id: "sbx-1".to_string(),
                     execution_id: "exec-1".to_string(),
                     projection_ttl: Duration::ZERO,
-                    paused: false,
                 },
                 RosterEntry {
                     sandbox_id: "sbx-2".to_string(),
                     execution_id: "exec-2".to_string(),
                     projection_ttl: Duration::ZERO,
-                    paused: false,
                 },
             ],
             unix(0),
@@ -212,7 +207,6 @@ pub async fn reconcile_node_drops_entries_the_node_no_longer_reports<S: BindingS
                 sandbox_id: "sbx-1".to_string(),
                 execution_id: "exec-1".to_string(),
                 projection_ttl: Duration::ZERO,
-                paused: false,
             }],
             unix(1),
         )
@@ -427,7 +421,6 @@ fn roster(sandbox_id: &str, execution_id: &str) -> RosterEntry {
         sandbox_id: sandbox_id.to_string(),
         execution_id: execution_id.to_string(),
         projection_ttl: Duration::ZERO,
-        paused: false,
     }
 }
 

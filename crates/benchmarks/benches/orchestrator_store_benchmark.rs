@@ -162,7 +162,7 @@ fn bench_orchestrator_store_cas(c: &mut Criterion) {
     });
 
     let expected_running = vec![SandboxState::Running];
-    let expected_paused = vec![SandboxState::Paused];
+    let expected_pausing = vec![SandboxState::Pausing];
 
     let mut cas_group = c.benchmark_group("orchestrator_store_cas");
     cas_group.throughput(Throughput::Elements(1));
@@ -192,7 +192,7 @@ fn bench_orchestrator_store_cas(c: &mut Criterion) {
                     .update_state_if_state(
                         sandbox_id,
                         SandboxState::Running,
-                        expected_paused.as_slice(),
+                        expected_pausing.as_slice(),
                     )
                     .await
                     .expect_err("update_state_if_state should conflict");
@@ -220,7 +220,7 @@ fn bench_orchestrator_store_cas(c: &mut Criterion) {
         |b, metadata| {
             b.to_async(&rt).iter(|| async {
                 cas_store
-                    .update_if_state(&metadata.id, expected_paused.as_slice(), |current| {
+                    .update_if_state(&metadata.id, expected_pausing.as_slice(), |current| {
                         *current = (*metadata).clone();
                     })
                     .await
@@ -346,7 +346,6 @@ fn bench_metrics_snapshot_resource_scan(c: &mut Criterion) {
             let mut allocated_memory_bytes = 0u64;
             store
                 .list_with_callback(|metadata| {
-                    let contributes_resources = metadata.state != SandboxState::Paused;
                     if matches!(
                         metadata.state,
                         SandboxState::Running
@@ -357,13 +356,10 @@ fn bench_metrics_snapshot_resource_scan(c: &mut Criterion) {
                     ) {
                         running_sandbox_count = running_sandbox_count.saturating_add(1);
                     }
-                    if matches!(
-                        metadata.state,
-                        SandboxState::Creating | SandboxState::Resuming
-                    ) {
+                    if matches!(metadata.state, SandboxState::Creating) {
                         starting_sandbox_count = starting_sandbox_count.saturating_add(1);
                     }
-                    if contributes_resources {
+                    {
                         allocated_cpu = allocated_cpu.saturating_add(metadata.resources.cpu_count);
                         allocated_memory_bytes = allocated_memory_bytes
                             .saturating_add(u64::from(metadata.resources.memory_mib) * 1024 * 1024);
@@ -387,9 +383,9 @@ fn benchmark_dataset(now: SystemTime, count: usize) -> Vec<SandboxMetadata> {
     for idx in 0..count {
         let state = match idx % 100 {
             0 => SandboxState::Running,
-            1..=9 => SandboxState::Paused,
+            1..=9 => SandboxState::Snapshotting,
             10..=14 => SandboxState::Pausing,
-            15..=19 => SandboxState::Resuming,
+            15..=19 => SandboxState::Forking,
             _ => SandboxState::Creating,
         };
         let expires_at = match idx % 200 {

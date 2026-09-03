@@ -1496,7 +1496,8 @@ fn decode_staged(
         .value
         .expect("the staged snapshot carried no value");
     assert_eq!(
-        value.schema_version, 1,
+        value.schema_version,
+        pb::SERIALIZED_VALUE_VERSION,
         "a staged row went out stamped with a schema this build does not write"
     );
     serde_json::from_slice(&value.json).expect("the staged row should decode")

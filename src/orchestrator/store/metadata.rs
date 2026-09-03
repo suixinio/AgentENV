@@ -908,13 +908,14 @@ mod tests {
 /// Cross-language golden fixtures for the metadata JSONB contract.
 #[cfg(test)]
 mod golden {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::path::PathBuf;
     use std::time::{Duration, UNIX_EPOCH};
 
     use serde_json::{json, Value};
 
     use super::*;
+    use crate::sandbox::network::policy::{DomainRule, HeaderTransform};
     use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy};
     use crate::snapshot::CommandContext;
     use crate::types::ImageConfigs;
@@ -1045,12 +1046,27 @@ mod golden {
             ])),
             network_policy: SandboxNetworkPolicy::new(
                 BaseSandboxNetworkPolicy::Deny,
-                SandboxNetworkEgressPolicy {
-                    allowed_cidrs: vec!["10.20.0.0/16".to_string()],
-                    allowed_domains: vec!["registry.npmjs.org".to_string()],
-                    denied_cidrs: vec!["10.20.30.0/24".to_string()],
-                    ..Default::default()
-                },
+                // Derived the way the api half derives it, so the fixture pins
+                // both the public `rules` and the internal `brokers` shape.
+                SandboxNetworkEgressPolicy::with_rules(
+                    Some(vec![
+                        "10.20.0.0/16".to_string(),
+                        "registry.npmjs.org".to_string(),
+                    ]),
+                    Some(vec!["10.20.30.0/24".to_string()]),
+                    Some(BTreeMap::from([(
+                        "api.openai.com".to_string(),
+                        vec![DomainRule {
+                            transform: HeaderTransform {
+                                headers: BTreeMap::from([(
+                                    "authorization".to_string(),
+                                    "Bearer ${aenv.secrets.openai}".to_string(),
+                                )]),
+                            },
+                        }],
+                    )])),
+                )
+                .expect("the fixture policy is valid"),
             ),
             custom_extension_params: Some(custom_extension_params),
             secure: true,
@@ -1230,5 +1246,33 @@ mod golden {
             serde_json::from_value::<SandboxMetadata>(trimmed)
                 .unwrap_or_else(|err| panic!("dropping {field} should still decode: {err}"));
         }
+    }
+
+    #[test]
+    fn a_policy_written_before_brokered_egress_still_decodes() {
+        let mut full: Value = serde_json::from_str(
+            &std::fs::read_to_string(fixture_path("sandbox_metadata_full.json"))
+                .expect("read the fixture"),
+        )
+        .expect("the fixture is JSON");
+
+        let egress = full["network_policy"]["egress"]
+            .as_object_mut()
+            .expect("an egress object");
+        for field in ["rules", "brokers"] {
+            egress
+                .remove(field)
+                .unwrap_or_else(|| panic!("{field} is not in the fixture"));
+        }
+
+        let decoded: SandboxMetadata =
+            serde_json::from_value(full).expect("a record written before rules existed must load");
+        assert!(decoded.network_policy.egress.rules.is_empty());
+        assert!(decoded.network_policy.egress.brokers.is_empty());
+        assert_eq!(
+            decoded.network_policy.egress.allowed_domains,
+            vec!["registry.npmjs.org".to_string()],
+            "the rest of the policy must survive the older shape"
+        );
     }
 }

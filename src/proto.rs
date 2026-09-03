@@ -18,7 +18,7 @@ pub mod node {
     tonic::include_proto!("agentenv.node.v1");
 
     /// Schema version written and accepted for serialized values.
-    pub const SERIALIZED_VALUE_VERSION: u32 = 1;
+    pub const SERIALIZED_VALUE_VERSION: u32 = 2;
 
     /// Encodes a serde value with this build's schema version.
     pub fn encode_value<T: serde::Serialize>(
@@ -197,20 +197,43 @@ mod serialized_value_golden {
 
     #[test]
     fn a_sandbox_network_policy_still_encodes_the_way_the_other_half_reads_it() {
+        use std::collections::BTreeMap;
+
+        use crate::sandbox::network::policy::{DomainRule, HeaderTransform};
         use crate::sandbox::{
             BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
         };
 
+        let rules = BTreeMap::from([(
+            "api.openai.com".to_string(),
+            vec![DomainRule {
+                transform: HeaderTransform {
+                    headers: BTreeMap::from([(
+                        "authorization".to_string(),
+                        "Bearer ${aenv.secrets.openai}".to_string(),
+                    )]),
+                },
+            }],
+        )]);
+        // Derive `brokers` the way the api half does, so the golden pins the
+        // shape the node actually receives.
+        let egress = SandboxNetworkEgressPolicy::with_rules(
+            Some(vec![
+                "10.0.0.0/8".to_string(),
+                "example.invalid".to_string(),
+            ]),
+            Some(vec!["192.168.0.0/16".to_string()]),
+            Some(rules),
+        )
+        .expect("the golden policy is valid");
         let policy = SandboxNetworkPolicy {
             base_policy: BaseSandboxNetworkPolicy::Deny,
-            egress: SandboxNetworkEgressPolicy {
-                allowed_cidrs: vec!["10.0.0.0/8".to_string()],
-                allowed_domains: vec!["example.invalid".to_string()],
-                denied_cidrs: vec!["192.168.0.0/16".to_string()],
-                ..Default::default()
-            },
+            egress,
         };
 
+        let transform = json!({
+            "transform": {"headers": {"authorization": "Bearer ${aenv.secrets.openai}"}}
+        });
         assert_eq!(
             serde_json::to_value(&policy).expect("a policy serialises"),
             json!({
@@ -219,6 +242,38 @@ mod serialized_value_golden {
                     "allowed_cidrs": ["10.0.0.0/8"],
                     "allowed_domains": ["example.invalid"],
                     "denied_cidrs": ["192.168.0.0/16"],
+                    "rules": {"api.openai.com": [transform]},
+                    "brokers": [{
+                        "port": 0,
+                        "handler": "http",
+                        "params": {"rules": {"api.openai.com": [transform]}},
+                        "intercept": {"dports": [443]},
+                    }],
+                }
+            }),
+            "{BUMP}"
+        );
+    }
+
+    #[test]
+    fn a_policy_without_rules_still_omits_the_brokered_fields() {
+        use crate::sandbox::{
+            BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+        };
+
+        let policy = SandboxNetworkPolicy {
+            base_policy: BaseSandboxNetworkPolicy::Default,
+            egress: SandboxNetworkEgressPolicy::new(None, None).expect("an empty policy is valid"),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&policy).expect("a policy serialises"),
+            json!({
+                "base_policy": "Default",
+                "egress": {
+                    "allowed_cidrs": [],
+                    "allowed_domains": [],
+                    "denied_cidrs": [],
                 }
             }),
             "{BUMP}"

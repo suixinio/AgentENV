@@ -70,9 +70,44 @@
       "allowed_domains": [
         "registry.npmjs.org"
       ],
+      "brokers": [
+        {
+          "handler": "http",
+          "intercept": {
+            "dports": [
+              443
+            ]
+          },
+          "params": {
+            "rules": {
+              "api.openai.com": [
+                {
+                  "transform": {
+                    "headers": {
+                      "authorization": "Bearer ${aenv.secrets.openai}"
+                    }
+                  }
+                }
+              ]
+            }
+          },
+          "port": 0
+        }
+      ],
       "denied_cidrs": [
         "10.20.30.0/24"
-      ]
+      ],
+      "rules": {
+        "api.openai.com": [
+          {
+            "transform": {
+              "headers": {
+                "authorization": "Bearer ${aenv.secrets.openai}"
+              }
+            }
+          }
+        ]
+      }
     }
   },
   "resources": {

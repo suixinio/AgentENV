@@ -8,7 +8,7 @@ use super::super::{Result, SandboxMetadata, StoreError};
 use crate::types::{ExecutionId, SandboxId};
 
 /// Current stored-record schema version.
-pub const RECORD_VERSION: u32 = 1;
+pub const RECORD_VERSION: u32 = 2;
 
 /// Versioned JSON stored under a sandbox record key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -180,7 +180,29 @@ mod tests {
         );
         assert_eq!(json.get("state").and_then(Value::as_str), Some("Running"));
         assert_eq!(json.get("rev").and_then(Value::as_u64), Some(7));
-        assert_eq!(json.get("version").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            json.get("version").and_then(Value::as_u64),
+            Some(u64::from(RECORD_VERSION))
+        );
+    }
+
+    #[test]
+    fn a_record_written_before_the_brokered_egress_fields_existed_still_decodes() {
+        let mut json: Value = serde_json::from_slice(
+            &StoredSandboxRecord::new(&metadata(), 3)
+                .unwrap()
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+        json["version"] = serde_json::json!(1);
+        let raw = serde_json::to_vec(&json).unwrap();
+
+        let decoded =
+            StoredSandboxRecord::decode(&raw).expect("a version 1 record must still load");
+        assert_eq!(decoded.version, 1);
+        assert!(decoded.metadata.network_policy.egress.rules.is_empty());
+        assert!(decoded.metadata.network_policy.egress.brokers.is_empty());
     }
 
     #[test]

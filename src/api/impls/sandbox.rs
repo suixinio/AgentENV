@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
@@ -10,14 +10,17 @@ use http::Method;
 use tracing::{info, warn};
 
 use crate::cfg::ConfigManager;
+use crate::node_client::placement::PlacementRefused;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
     CreateSandboxRequest, ForkChildren, NewTimeout, OrchestratorError, SandboxExpiry,
     SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
     StoreError,
 };
+use crate::sandbox::network::policy::{DomainRule, HeaderTransform};
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
+use crate::secrets::MissingSecrets;
 use crate::snapshot::SnapshotAlias;
 use crate::types::{SandboxId, SandboxResources};
 use agentenv_http_server::apis::sandboxes::*;
@@ -180,8 +183,70 @@ impl From<&SandboxNetworkPolicy> for models::SandboxNetworkConfig {
                         .collect()
                 }),
             deny_out: (!egress.denied_cidrs.is_empty()).then(|| egress.denied_cidrs.clone()),
+            rules: (!egress.rules.is_empty()).then(|| rules_model(&egress.rules)),
             mask_request_host: None,
         }
+    }
+}
+
+fn rules_model(
+    rules: &BTreeMap<String, Vec<DomainRule>>,
+) -> HashMap<String, Vec<models::SandboxNetworkRule>> {
+    rules
+        .iter()
+        .map(|(domain, domain_rules)| {
+            (
+                domain.clone(),
+                domain_rules
+                    .iter()
+                    .map(|rule| models::SandboxNetworkRule {
+                        transform: Some(models::SandboxNetworkTransform {
+                            headers: Some(rule.transform.headers.clone().into_iter().collect()),
+                        }),
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn rules_from_model(
+    rules: Option<&HashMap<String, Vec<models::SandboxNetworkRule>>>,
+) -> Option<BTreeMap<String, Vec<DomainRule>>> {
+    rules.map(|rules| {
+        rules
+            .iter()
+            .map(|(domain, domain_rules)| {
+                (
+                    domain.clone(),
+                    domain_rules
+                        .iter()
+                        .map(|rule| DomainRule {
+                            transform: HeaderTransform {
+                                headers: rule
+                                    .transform
+                                    .as_ref()
+                                    .and_then(|t| t.headers.as_ref())
+                                    .map(|h| {
+                                        h.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                                    })
+                                    .unwrap_or_default(),
+                            },
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    })
+}
+
+/// Whether a create or update was refused because no node can broker it.
+fn placement_refused(err: &OrchestratorError) -> bool {
+    match err {
+        OrchestratorError::SandboxOperationFailed { source, .. } => source
+            .chain()
+            .any(|cause| cause.downcast_ref::<PlacementRefused>().is_some()),
+        _ => false,
     }
 }
 
@@ -397,6 +462,37 @@ fn validate_custom_extension_params(params: Option<&CustomExtensionParams>) -> a
     Ok(())
 }
 
+impl ApiImpl {
+    /// Every secret a policy's rules name must exist before the sandbox is
+    /// placed; without a store, rules that name secrets cannot be honoured.
+    async fn check_rule_secrets(&self, policy: &SandboxNetworkPolicy) -> Result<(), models::Error> {
+        let names = policy.egress.referenced_secret_names();
+        if names.is_empty() {
+            return Ok(());
+        }
+        let Some(secrets) = self.secrets() else {
+            return Err(Self::error(
+                503,
+                "network rules reference secrets but no secrets store is configured",
+            ));
+        };
+        match secrets.ensure_names_exist(&names).await {
+            Ok(()) => Ok(()),
+            Err(MissingSecrets::Missing(missing)) => Err(Self::error(
+                400,
+                format!(
+                    "network rules reference unknown secret(s): {}",
+                    missing.join(", ")
+                ),
+            )),
+            Err(MissingSecrets::Store(err)) => {
+                warn!(error = %format_args!("{err:#}"), "could not check secret names");
+                Err(Self::error(503, "the secrets store could not be reached"))
+            }
+        }
+    }
+}
+
 fn network_policy_from_create(
     allow_internet_access: Option<bool>,
     network: Option<&models::SandboxNetworkConfig>,
@@ -404,7 +500,8 @@ fn network_policy_from_create(
     let base_policy = base_policy_from_allow_internet_access(allow_internet_access);
     let allow_out = network.and_then(|network| network.allow_out.clone());
     let deny_out = network.and_then(|network| network.deny_out.clone());
-    let egress = SandboxNetworkEgressPolicy::new(allow_out, deny_out)?;
+    let rules = rules_from_model(network.and_then(|network| network.rules.as_ref()));
+    let egress = SandboxNetworkEgressPolicy::with_rules(allow_out, deny_out, rules)?;
     let policy = SandboxNetworkPolicy::new(base_policy, egress);
     if policy.has_domain_allow_rules() {
         anyhow::bail!(
@@ -417,7 +514,11 @@ fn network_policy_from_create(
 fn network_policy_from_update(
     body: &models::SandboxNetworkUpdateConfig,
 ) -> anyhow::Result<SandboxNetworkPolicy> {
-    let policy = SandboxNetworkEgressPolicy::new(body.allow_out.clone(), body.deny_out.clone())?;
+    let policy = SandboxNetworkEgressPolicy::with_rules(
+        body.allow_out.clone(),
+        body.deny_out.clone(),
+        rules_from_model(body.rules.as_ref()),
+    )?;
     if policy.has_domain_allow_rules() {
         anyhow::bail!(
             "domain entries in allowOut are not supported until TCP egress proxy is enabled"
@@ -457,6 +558,9 @@ impl Sandboxes<()> for ApiImpl {
                     ));
                 }
             };
+        if let Err(err) = self.check_rule_secrets(&network_policy).await {
+            return Ok(SandboxesColdPostResponse::Status400_BadRequest(err));
+        }
 
         let custom_params = body
             .custom_extension_params
@@ -549,6 +653,11 @@ impl Sandboxes<()> for ApiImpl {
                     Some(message) => Ok(SandboxesColdPostResponse::Status400_BadRequest(
                         Self::error(400, message),
                     )),
+                    None if placement_refused(&err) => Ok(
+                        SandboxesColdPostResponse::Status503_NoNodeCanTakeASandboxWithTheseNetworkRulesRightNow(
+                            Self::error(503, err.to_string()),
+                        ),
+                    ),
                     None => Ok(SandboxesColdPostResponse::Status500_ServerError(
                         Self::internal_error(&err),
                     )),
@@ -626,6 +735,9 @@ impl Sandboxes<()> for ApiImpl {
                     )));
                 }
             };
+        if let Err(err) = self.check_rule_secrets(&network_policy).await {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(err));
+        }
 
         let custom_params = body
             .custom_extension_params
@@ -679,6 +791,11 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 )
             }
+            Err(err) if placement_refused(&err) => Ok(
+                SandboxesPostResponse::Status503_NoNodeCanTakeASandboxWithTheseNetworkRulesRightNow(
+                    Self::error(503, err.to_string()),
+                ),
+            ),
             Err(err) => Ok(SandboxesPostResponse::Status500_ServerError(
                 Self::internal_error(&err),
             )),
@@ -1037,6 +1154,13 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
         };
+        if let Err(err) = self.check_rule_secrets(&network).await {
+            return Ok(if err.code == 503 {
+                SandboxesSandboxIdNetworkPutResponse::Status503_NoSecretsStoreIsConfigured(err)
+            } else {
+                SandboxesSandboxIdNetworkPutResponse::Status400_BadRequest(err)
+            });
+        }
 
         match self
             .orchestrator()
@@ -1723,6 +1847,7 @@ mod tests {
     #[test]
     fn network_update_replaces_base_policy_and_egress() {
         let body = models::SandboxNetworkUpdateConfig {
+            rules: None,
             allow_out: Some(vec!["8.8.8.8".to_string()]),
             deny_out: Some(vec!["203.0.113.0/24".to_string()]),
             allow_internet_access: Some(false),

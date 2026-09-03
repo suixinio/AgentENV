@@ -16,11 +16,18 @@ struct Migration {
 }
 
 // Ordered, dense migration list; tests enforce the sequence.
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "0001_initial_schema.sql",
-    body: include_str!("migrations/0001_initial_schema.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "0001_initial_schema.sql",
+        body: include_str!("migrations/0001_initial_schema.sql"),
+    },
+    Migration {
+        version: 2,
+        name: "0002_secret_refs.sql",
+        body: include_str!("migrations/0002_secret_refs.sql"),
+    },
+];
 
 const VERSION_TABLE_DDL: &str = "
 CREATE TABLE IF NOT EXISTS catalog_schema_migrations (
@@ -90,16 +97,19 @@ async fn apply(conn: &mut sqlx::PgConnection) -> Result<()> {
 }
 
 // Relations required by each recorded migration version, including views.
-const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[(
-    1,
-    &[
-        "snapshots",
-        "templates",
-        "builds",
-        "aliases",
-        "active_templates",
-    ],
-)];
+const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[
+    (
+        1,
+        &[
+            "snapshots",
+            "templates",
+            "builds",
+            "aliases",
+            "active_templates",
+        ],
+    ),
+    (2, &["secret_refs"]),
+];
 
 fn owned_relations() -> Vec<&'static str> {
     RELATIONS_BY_VERSION
@@ -256,11 +266,12 @@ mod pg {
         .expect("querying information_schema should succeed")
     }
 
-    const OWNED_TABLES: [&str; 5] = [
+    const OWNED_TABLES: [&str; 6] = [
         "snapshots",
         "templates",
         "builds",
         "aliases",
+        "secret_refs",
         "catalog_schema_migrations",
     ];
 
@@ -281,7 +292,7 @@ mod pg {
                 .fetch_all(&pool)
                 .await
                 .expect("reading the ledger should succeed");
-        assert_eq!(recorded, vec![1]);
+        assert_eq!(recorded, vec![1, 2]);
     }
 
     #[tokio::test]
@@ -308,7 +319,7 @@ mod pg {
         migrate(&pool).await.expect("migration should succeed");
 
         sqlx::raw_sql(
-            "DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;\
+            "DROP TABLE IF EXISTS aliases, builds, templates, snapshots, secret_refs CASCADE;\
              DROP TABLE IF EXISTS catalog_schema_migrations;",
         )
         .execute(&pool)
@@ -341,7 +352,7 @@ mod pg {
                 .fetch_all(&pool)
                 .await
                 .expect("reading the ledger should succeed");
-        assert_eq!(recorded, vec![1], "no duplicate or missing ledger rows");
+        assert_eq!(recorded, vec![1, 2], "no duplicate or missing ledger rows");
     }
 
     #[tokio::test]
@@ -442,6 +453,7 @@ mod pg {
                 "aliases (r)",
                 "builds (r)",
                 "catalog_schema_migrations (r)",
+                "secret_refs (r)",
                 "snapshots (r)",
                 "templates (r)",
             ],
@@ -478,6 +490,9 @@ mod pg {
                 "builds.builds_status_group_check (c)",
                 "builds.builds_template_fk (f)",
                 "catalog_schema_migrations.catalog_schema_migrations_pkey (p)",
+                "secret_refs.secret_refs_name_unique (u)",
+                "secret_refs.secret_refs_pkey (p)",
+                "secret_refs.secret_refs_version_nonnegative (c)",
                 "snapshots.snapshots_committed_axis (c)",
                 "snapshots.snapshots_cpu_count_check (c)",
                 "snapshots.snapshots_disk_size_floor (c)",
@@ -525,6 +540,8 @@ mod pg {
                 "builds_one_active_per_template unique=true partial=true",
                 "builds_pkey unique=true partial=false",
                 "catalog_schema_migrations_pkey unique=true partial=false",
+                "secret_refs_name_unique unique=true partial=false",
+                "secret_refs_pkey unique=true partial=false",
                 "snapshots_list_idx unique=false partial=true",
                 "snapshots_pkey unique=true partial=false",
                 "snapshots_source_sandbox_idx unique=false partial=true",

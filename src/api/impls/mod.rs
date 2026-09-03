@@ -6,6 +6,7 @@ pub use pagination::{snapshot_cursor_from_token, snapshot_next_token, Pagination
 mod paused;
 mod resume_surface;
 pub mod sandbox;
+mod secrets;
 mod snapshots;
 mod template;
 mod template_helpers;
@@ -21,6 +22,7 @@ use crate::node_registry::fleet::NodeFleetView;
 use crate::node_registry::registry::NodeRegistry;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::SandboxOrchestration;
+use crate::secrets::SecretsService;
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use agentenv_http_server::{apis, models};
@@ -48,6 +50,8 @@ pub struct ApiImpl {
     node_placement: Option<Arc<dyn NodePlacement>>,
     /// Whose nodes `/nodes` reports: the cluster's, or this process's own.
     node_fleet: NodeFleetView,
+    /// `/secrets` and the name check behind `network.rules`; `None` answers 503.
+    secrets: Option<Arc<SecretsService>>,
 }
 
 impl ApiImpl {
@@ -67,7 +71,19 @@ impl ApiImpl {
             resume_wiring,
             node_placement: None,
             node_fleet: NodeFleetView::self_report(),
+            secrets: None,
         }
+    }
+
+    /// Serves `/secrets` and lets `network.rules` reference stored names.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Arc<SecretsService>) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    pub fn secrets(&self) -> Option<Arc<SecretsService>> {
+        self.secrets.as_ref().map(Arc::clone)
     }
 
     /// Configures remote placement for template builds.

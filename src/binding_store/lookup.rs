@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use crate::binding_store::{BindingState, BindingStore};
-use crate::node_registry::filter::filter_unschedulable;
+use crate::node_registry::filter::{filter_unschedulable, filter_without_egress_broker};
 use crate::node_registry::placement::score::SnapshotFreshness;
 use crate::node_registry::placement::{
     request_from_hint, ShadowCandidate, ShadowPlacement, ShadowRequest, ShadowSource,
@@ -37,6 +37,17 @@ pub struct Placement {
     pub eligible: usize,
 }
 
+/// Why `select_node` chose nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SelectNodeError {
+    #[error(transparent)]
+    NoNodes(#[from] NoNodesAvailable),
+    /// Schedulable nodes exist, but the hint needs an egress broker and none
+    /// of them reports one.
+    #[error("no schedulable node reports a usable egress broker")]
+    NoEgressBrokerNode,
+}
+
 /// Selects an eligible node, honoring preference before shared round-robin.
 /// Nodes named in `excluded_node_ids` are never chosen, preferred or not.
 /// Shadow scoring runs only after real selection using the same registry reads.
@@ -47,7 +58,7 @@ pub fn select_node(
     excluded_node_ids: &[String],
     source: ShadowSource,
     now: SystemTime,
-) -> Result<Placement, NoNodesAvailable> {
+) -> Result<Placement, SelectNodeError> {
     let discovered = deps.node_registry.snapshot(/* allow_lingering */ false);
     let candidates = discovered.len();
     // Preserve one snapshot/freshness read per node and the existing candidate set.
@@ -80,6 +91,24 @@ pub fn select_node(
         .into_iter()
         .filter(|rich| !excluded.contains(&rich.node.id))
         .collect();
+    let requires_egress_broker = hint
+        .and_then(|hint| match hint.kind.as_ref() {
+            Some(crate::proto::scheduler::schedule_request_hint::Kind::NewSandbox(hint)) => {
+                Some(hint.requires_egress_broker)
+            }
+            _ => None,
+        })
+        .unwrap_or(false);
+    let eligible_nodes = if requires_egress_broker {
+        let schedulable = eligible_nodes.len();
+        let capable = filter_without_egress_broker(eligible_nodes);
+        if capable.is_empty() && schedulable > 0 {
+            return Err(SelectNodeError::NoEgressBrokerNode);
+        }
+        capable
+    } else {
+        eligible_nodes
+    };
     let eligible = eligible_nodes.len();
 
     let prefer_node_id = prefer_node_id.trim();

@@ -26,6 +26,7 @@ static ENVD_BOOTSTRAP_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .expect("build envd bootstrap HTTP client")
 });
 
+#[derive(Clone)]
 pub struct EnvdInstance {
     config: Configuration,
     grpc_address: String,
@@ -125,14 +126,21 @@ impl EnvdInstance {
         }
     }
 
-    #[tracing::instrument(skip(self, env_vars))]
+    /// `ca_bundle` is sent on every init: a PEM to add to the guest's trust
+    /// store, or an empty string when this sandbox must trust nothing extra.
+    #[tracing::instrument(skip(self, env_vars, ca_bundle))]
     pub async fn init(
         &self,
         env_vars: Option<HashMap<String, String>>,
         default_workdir: Option<String>,
         default_user: Option<String>,
+        ca_bundle: Option<String>,
     ) -> Result<()> {
-        debug!(has_env_vars = env_vars.is_some(), "initializing envd");
+        debug!(
+            has_env_vars = env_vars.is_some(),
+            has_ca_bundle = ca_bundle.as_ref().is_some_and(|pem| !pem.is_empty()),
+            "initializing envd"
+        );
         let now = chrono::Utc::now().fixed_offset();
         let init_post_request = InitPostRequest {
             access_token: self
@@ -143,6 +151,7 @@ impl EnvdInstance {
             default_workdir,
             default_user,
             timestamp: Some(now),
+            ca_bundle,
             ..Default::default()
         };
         default_api::init_post(&self.config, Some(init_post_request)).await?;
@@ -187,7 +196,7 @@ mod tests {
             .generate(crate::types::SandboxId::new());
         let envd = EnvdInstance::new(format!("http://{address}"), Some(token.clone()));
 
-        envd.init(None, None, None).await?;
+        envd.init(None, None, None, Some(String::new())).await?;
 
         let (headers, body) = receiver.recv().await.expect("captured init request");
         assert_eq!(headers["x-access-token"], token.expose());

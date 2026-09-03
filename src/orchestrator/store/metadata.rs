@@ -1049,6 +1049,7 @@ mod golden {
                     allowed_cidrs: vec!["10.20.0.0/16".to_string()],
                     allowed_domains: vec!["registry.npmjs.org".to_string()],
                     denied_cidrs: vec!["10.20.30.0/24".to_string()],
+                    ..Default::default()
                 },
             ),
             custom_extension_params: Some(custom_extension_params),

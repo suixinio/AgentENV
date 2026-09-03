@@ -1232,6 +1232,7 @@ mod fleet_node_tests {
                 cpu_config_json: "{}".to_string(),
             }),
             snapshot: Some(scheduler_proto::NodeSnapshot {
+                egress_broker: 0,
                 status: scheduler_proto::NodeStatus::Ready as i32,
                 allocated_cpu: 11,
                 allocated_memory_bytes: 12,

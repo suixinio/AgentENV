@@ -6,6 +6,7 @@ use anyhow::{bail, Result};
 
 use crate::proto::node as pb;
 use crate::runtime_snapshot::RunnableSnapshot;
+use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::{
     FreshSandboxBuildSpec, SandboxBackend, SandboxBackendFactory, SandboxLaunchConfig,
     UnresolvedImageBuildSpec,
@@ -13,7 +14,7 @@ use crate::sandbox::{
 use crate::snapshot::SnapshotRecord;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-use super::placement::NodePlacement;
+use super::placement::{NodePlacement, PlacementNeeds};
 use super::stub::{PendingLaunch, RemoteSandboxStub};
 use super::wire;
 
@@ -111,6 +112,7 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             PendingLaunch::Launch {
                 request: Box::new(request),
                 preferred_node_id: launch_config.preferred_node_id,
+                needs: placement_needs(&launch_config.network),
             },
         )))
     }
@@ -184,6 +186,7 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             PendingLaunch::Launch {
                 request: Box::new(request),
                 preferred_node_id: launch_config.preferred_node_id,
+                needs: placement_needs(&launch_config.network),
             },
         )))
     }
@@ -208,5 +211,12 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             resources,
             Arc::clone(&self.placement),
         ))))
+    }
+}
+
+/// What a launch needs from its node, read off the policy it will run under.
+fn placement_needs(network: &Option<SandboxNetworkPolicy>) -> PlacementNeeds {
+    PlacementNeeds {
+        egress_broker: network.as_ref().is_some_and(|policy| policy.has_brokers()),
     }
 }

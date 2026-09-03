@@ -353,6 +353,20 @@ impl NetworkManager {
         if self.shutting_down() {
             return self.cleanup_slot_and_release_bit(slot);
         }
+        // A pooled namespace must carry no intercept from its previous tenant.
+        let cleared = if slot.has_namespace() {
+            slot.remove_intercept()
+        } else {
+            Ok(())
+        };
+        if let Err(err) = cleared {
+            warn!(
+                slot = slot.idx,
+                error = %err,
+                "could not clear the namespace intercept; tearing the slot down instead of pooling it"
+            );
+            return self.cleanup_slot_and_release_bit(slot);
+        }
         let slot_idx = slot.idx;
         match self.pool.release(slot) {
             Ok(()) => {

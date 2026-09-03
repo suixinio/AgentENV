@@ -2,6 +2,7 @@
 
 pub use aenv_core::sandbox::*;
 
+pub mod egress;
 pub mod firecracker;
 pub mod network;
 pub mod ublk;

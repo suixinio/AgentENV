@@ -18,6 +18,8 @@ mod reporter;
 mod service;
 
 pub use host::{DiskMetric, HostMetrics, HostMetricsCollector};
-pub use model::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
+pub use model::{
+    EgressBrokerProbe, EgressBrokerState, MachineInfo, NodeMetricsSnapshot, NodeSnapshot,
+};
 pub use reporter::ObservabilityReporter;
 pub use service::ObservabilityService;

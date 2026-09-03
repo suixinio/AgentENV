@@ -108,6 +108,13 @@ components:
       required: false
       schema:
         type: string
+    secretID:
+      name: secretID
+      in: path
+      required: true
+      schema:
+        type: string
+        description: Identifier or name of the secret
 
   responses:
     "400":
@@ -313,6 +320,20 @@ components:
           description: List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
           items:
             type: string
+        rules:
+          type: object
+          description: >
+            Per-domain transform rules applied to matching outbound HTTPS requests.
+            Keys are exact DNS names (for example "api.example.com") or a single leading
+            wildcard (for example "*.example.com"), normalized to lowercase. Header values
+            may carry `${aenv.secrets.NAME}` markers (`${e2b.secrets.NAME}` is accepted as an
+            alias); the egress broker resolves them when the request leaves the sandbox, and
+            no sandbox ever holds the value. Rules do not grant network access; configure
+            allowOut and allow_internet_access separately.
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/SandboxNetworkRule"
         maskRequestHost:
           type: string
           description: Specify host mask which will be used for all sandbox requests
@@ -331,11 +352,124 @@ components:
           description: List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
           items:
             type: string
+        rules:
+          type: object
+          description: >
+            Per-domain transform rules applied to matching outbound HTTPS requests.
+            Keys are exact DNS names (for example "api.example.com") or a single leading
+            wildcard (for example "*.example.com"), normalized to lowercase. Header values
+            may carry `${aenv.secrets.NAME}` markers (`${e2b.secrets.NAME}` is accepted as an
+            alias); the egress broker resolves them when the request leaves the sandbox, and
+            no sandbox ever holds the value. Rules do not grant network access; configure
+            allowOut and allow_internet_access separately.
+          additionalProperties:
+            type: array
+            items:
+              $ref: "#/components/schemas/SandboxNetworkRule"
         allow_internet_access:
           type: boolean
           description:
             Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
             to 0.0.0.0/0 in the network config.
+
+    SandboxNetworkRule:
+      type: object
+      description: Transform rule applied to egress requests matching a domain pattern.
+      properties:
+        transform:
+          $ref: "#/components/schemas/SandboxNetworkTransform"
+
+    SandboxNetworkTransform:
+      type: object
+      description: Transformations applied to matching egress requests before forwarding.
+      properties:
+        headers:
+          type: object
+          description: >
+            HTTP headers to set on matching requests. A header the sandbox sent under the
+            same name is replaced. Values are plain strings; `${aenv.secrets.NAME}` markers
+            are resolved by the egress broker, never inside the sandbox.
+          additionalProperties:
+            type: string
+
+    SecretString:
+      type: string
+      description: >
+        A secret value in transit. It is passed to the secrets store and never stored,
+        logged or returned by this API.
+
+    SecretMetadata:
+      type: object
+      description: >
+        Customer metadata of the secret. Always present, empty when unset.
+        At most 32 entries; keys are limited to 128 bytes, values to 1024
+        bytes, and a secret's metadata to 8192 bytes in total.
+      maxProperties: 32
+      additionalProperties:
+        type: string
+        maxLength: 1024
+
+    Secret:
+      type: object
+      description: Metadata of a secret. It never carries the secret value.
+      required:
+        - secretID
+        - name
+        - currentVersion
+        - metadata
+        - createdAt
+        - updatedAt
+      properties:
+        secretID:
+          type: string
+          description: Identifier of the secret
+        name:
+          type: string
+          description: Name of the secret, unique within the deployment
+        currentVersion:
+          type: integer
+          format: int64
+          description: Version served to readers that do not name one
+        metadata:
+          $ref: "#/components/schemas/SecretMetadata"
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the secret was created
+        updatedAt:
+          type: string
+          format: date-time
+          description: Time when the secret was last updated
+
+    NewSecret:
+      type: object
+      required:
+        - name
+        - value
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[a-zA-Z0-9_-]+$'
+          description: >
+            Name of the secret, unique within the deployment and referenced from
+            network rules as `${aenv.secrets.NAME}`. The sec_ prefix is reserved for
+            secret identifiers.
+        value:
+          $ref: "#/components/schemas/SecretString"
+        metadata:
+          $ref: "#/components/schemas/SecretMetadata"
+
+    SecretUpdate:
+      type: object
+      required:
+        - value
+      properties:
+        value:
+          $ref: "#/components/schemas/SecretString"
+        metadata:
+          $ref: "#/components/schemas/SecretMetadata"
 
     SandboxAutoResumeEnabled:
       type: boolean
@@ -1419,6 +1553,7 @@ tags:
   - name: admin
   - name: templates
   - name: sandboxes
+  - name: secrets
   - name: snapshots
 
 paths:
@@ -1520,6 +1655,12 @@ paths:
           $ref: "#/components/responses/400"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          description: No node can take a sandbox with these network rules right now
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /sandboxes-cold:
     post:
@@ -1576,6 +1717,12 @@ paths:
           $ref: "#/components/responses/400"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          description: No node can take a sandbox with these network rules right now
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /v2/sandboxes:
     get:
@@ -1924,6 +2071,183 @@ paths:
         "500":
           $ref: "#/components/responses/500"
 
+  /secrets:
+    get:
+      summary: List secrets
+      description: List the deployment's secrets. No response carries a secret value.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/paginationNextToken"
+        - $ref: "#/components/parameters/paginationLimit"
+      responses:
+        "200":
+          description: Successfully listed the secrets
+          headers:
+            X-Next-Token:
+              description: Cursor to fetch the next page of results, if more exist
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Secret"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          description: No secrets store is configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Create a secret
+      description: Create a secret by storing its first version. The response carries metadata only.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewSecret"
+      responses:
+        "201":
+          description: Successfully created the secret
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Secret"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          description: No secrets store is configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /secrets/{secretID}:
+    get:
+      summary: Get a secret
+      description: Get one secret's metadata, selected by identifier or name.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/secretID"
+      responses:
+        "200":
+          description: Successfully retrieved the secret
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Secret"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          description: No secrets store is configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      summary: Update a secret
+      description: Replace the secret's value by appending a new version. The response carries metadata only.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/secretID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecretUpdate"
+      responses:
+        "200":
+          description: Successfully updated the secret
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Secret"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          description: No secrets store is configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Delete a secret
+      description: Delete the secret and every version of its value. Sandboxes whose rules reference it fail at egress from then on.
+      tags: [secrets]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/secretID"
+      responses:
+        "204":
+          description: Successfully deleted the secret
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          description: No secrets store is configured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /sandboxes/{sandboxID}/network:
     put:
       summary: Update sandbox network
@@ -1956,6 +2280,12 @@ paths:
           $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          description: No secrets store is configured, so rules referencing secrets cannot be checked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /sandboxes/{sandboxID}/custom-extension-params:
     get:

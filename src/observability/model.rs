@@ -1,6 +1,43 @@
 use super::DiskMetric;
 use crate::orchestrator::SandboxRosterEntry;
 
+/// How this node reaches the egress broker. The api half places a sandbox
+/// that declares network rules only on `Embedded` or `RemoteOk` nodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EgressBrokerState {
+    #[default]
+    Disabled,
+    Embedded,
+    RemoteOk,
+    RemoteUnreachable,
+}
+
+impl EgressBrokerState {
+    pub fn can_broker(&self) -> bool {
+        matches!(self, Self::Embedded | Self::RemoteOk)
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Embedded => "embedded",
+            Self::RemoteOk => "remote_ok",
+            Self::RemoteUnreachable => "remote_unreachable",
+        }
+    }
+}
+
+/// Answers the current broker state at heartbeat time.
+pub trait EgressBrokerProbe: Send + Sync {
+    fn egress_broker_state(&self) -> EgressBrokerState;
+}
+
+impl<F: Fn() -> EgressBrokerState + Send + Sync> EgressBrokerProbe for F {
+    fn egress_broker_state(&self) -> EgressBrokerState {
+        self()
+    }
+}
+
 /// Static machine descriptors reported as part of node observability.
 #[derive(Clone, Debug)]
 pub struct MachineInfo {
@@ -48,4 +85,5 @@ pub struct NodeSnapshot {
     pub create_successes: u64,
     pub create_fails: u64,
     pub sandbox_starting_count: u32,
+    pub egress_broker: EgressBrokerState,
 }

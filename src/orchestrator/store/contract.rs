@@ -43,6 +43,49 @@ pub async fn add_get_remove_round_trip<S: MetadataStore>(store: &S) {
     assert!(store.list_ids().await.unwrap().is_empty());
 }
 
+pub async fn network_rules_and_brokers_round_trip<S: MetadataStore>(store: &S) {
+    use crate::sandbox::network::policy::{DomainRule, HeaderTransform};
+    use crate::sandbox::{
+        BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    };
+
+    let id = SandboxId::new();
+    let mut metadata = running(id);
+    let mut rules = std::collections::BTreeMap::new();
+    rules.insert(
+        "api.example.com".to_string(),
+        vec![DomainRule {
+            transform: HeaderTransform {
+                headers: [(
+                    "Authorization".to_string(),
+                    "Bearer ${aenv.secrets.openai}".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        }],
+    );
+    metadata.network_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Default,
+        SandboxNetworkEgressPolicy::with_rules(
+            Some(vec!["8.8.8.8".to_string()]),
+            None,
+            Some(rules),
+        )
+        .unwrap(),
+    );
+    assert!(metadata.network_policy.has_brokers());
+
+    store.add(metadata.clone()).await.unwrap();
+    let got = store.get(&id).await.unwrap().expect("record should exist");
+    assert_eq!(got.network_policy, metadata.network_policy);
+    assert_eq!(got.network_policy.egress.brokers.len(), 1);
+    assert_eq!(
+        got.network_policy.egress.referenced_secret_names(),
+        ["openai".to_string()].into_iter().collect()
+    );
+}
+
 pub async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(store: &S) {
     let mine = ExecutionId::new();
     let theirs = ExecutionId::new();
@@ -469,6 +512,7 @@ macro_rules! metadata_store_contract {
     () => {
         crate::orchestrator::store::contract::metadata_store_contract_suite!(
             add_get_remove_round_trip,
+            network_rules_and_brokers_round_trip,
             a_fenced_removal_takes_back_only_its_own_record,
             add_refuses_a_duplicate,
             missing_records_are_reported_as_missing,

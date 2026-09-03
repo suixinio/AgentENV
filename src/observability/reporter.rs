@@ -425,6 +425,7 @@ impl ObservabilityReporter {
                 create_successes: snapshot.create_successes,
                 create_fails: snapshot.create_fails,
                 reported_at_unix_ms: now_ms,
+                egress_broker: egress_broker_wire(snapshot.egress_broker).into(),
             }),
             p2p_endpoint: p2p_endpoint.map(|endpoint| scheduler::P2pEndpoint {
                 backend: endpoint.backend.clone(),
@@ -528,6 +529,18 @@ impl ReporterConfig {
             scheduler_endpoint_file,
             interval: Duration::from_secs(config.interval_secs.max(1)),
         })
+    }
+}
+
+pub fn egress_broker_wire(
+    state: crate::observability::EgressBrokerState,
+) -> scheduler::EgressBrokerState {
+    use crate::observability::EgressBrokerState as Local;
+    match state {
+        Local::Disabled => scheduler::EgressBrokerState::Disabled,
+        Local::Embedded => scheduler::EgressBrokerState::Embedded,
+        Local::RemoteOk => scheduler::EgressBrokerState::RemoteOk,
+        Local::RemoteUnreachable => scheduler::EgressBrokerState::RemoteUnreachable,
     }
 }
 
@@ -642,6 +655,7 @@ mod tests {
             create_successes: 0,
             create_fails: 0,
             sandbox_starting_count: 0,
+            egress_broker: Default::default(),
         }
     }
 

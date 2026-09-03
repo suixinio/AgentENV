@@ -240,6 +240,38 @@ pub struct V2SandboxesGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SecretsGetQueryParams {
+    /// Cursor to start the list from
+    #[serde(rename = "nextToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+    /// Maximum number of items to return per page
+    #[serde(rename = "limit")]
+    #[validate(range(min = 1u32, max = 100u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SecretsSecretIdDeletePathParams {
+    pub secret_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SecretsSecretIdGetPathParams {
+    pub secret_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SecretsSecretIdPostPathParams {
+    pub secret_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotsGetQueryParams {
     #[serde(rename = "sandboxID")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3222,6 +3254,186 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NewSandbox> 
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into NewSandbox - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct NewSecret {
+    /// Name of the secret, unique within the deployment and referenced from network rules as `${aenv.secrets.NAME}`. The sec_ prefix is reserved for secret identifiers.
+    #[serde(rename = "name")]
+    #[validate(
+            length(min = 1, max = 128),
+            regex(path = *RE_NEWSECRET_NAME),
+          custom(function = "check_xss_string"),
+    )]
+    pub name: String,
+
+    /// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
+    #[serde(rename = "value")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub value: String,
+
+    /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
+    #[serde(rename = "metadata")]
+    #[validate(length(max = 32), custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_NEWSECRET_NAME: regex::Regex = regex::Regex::new("^[a-zA-Z0-9_-]+$").unwrap();
+}
+
+impl NewSecret {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(name: String, value: String) -> NewSecret {
+        NewSecret {
+            name,
+            value,
+            metadata: None,
+        }
+    }
+}
+
+/// Converts the NewSecret value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for NewSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("name".to_string()),
+            Some(self.name.to_string()),
+            Some("value".to_string()),
+            Some(self.value.to_string()),
+            // Skipping metadata in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a NewSecret value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for NewSecret {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub name: Vec<String>,
+            pub value: Vec<String>,
+            pub metadata: Vec<std::collections::HashMap<String, String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing NewSecret".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "value" => intermediate_rep.value.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "metadata" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSecret"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing NewSecret".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(NewSecret {
+            name: intermediate_rep
+                .name
+                .into_iter()
+                .next()
+                .ok_or_else(|| "name missing in NewSecret".to_string())?,
+            value: intermediate_rep
+                .value
+                .into_iter()
+                .next()
+                .ok_or_else(|| "value missing in NewSecret".to_string())?,
+            metadata: intermediate_rep.metadata.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<NewSecret> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<NewSecret>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<NewSecret>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for NewSecret - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NewSecret> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <NewSecret as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into NewSecret - {err}"#
                     )),
                 }
             }
@@ -6548,6 +6760,12 @@ pub struct SandboxNetworkConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_out: Option<Vec<String>>,
 
+    /// Per-domain transform rules applied to matching outbound HTTPS requests. Keys are exact DNS names (for example \"api.example.com\") or a single leading wildcard (for example \"*.example.com\"), normalized to lowercase. Header values may carry `${aenv.secrets.NAME}` markers (`${e2b.secrets.NAME}` is accepted as an alias); the egress broker resolves them when the request leaves the sandbox, and no sandbox ever holds the value. Rules do not grant network access; configure allowOut and allow_internet_access separately.
+    #[serde(rename = "rules")]
+    #[validate(custom(function = "check_xss_map"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<std::collections::HashMap<String, Vec<models::SandboxNetworkRule>>>,
+
     /// Specify host mask which will be used for all sandbox requests
     #[serde(rename = "maskRequestHost")]
     #[validate(custom(function = "check_xss_string"))]
@@ -6562,6 +6780,7 @@ impl SandboxNetworkConfig {
             allow_public_traffic: Some(true),
             allow_out: None,
             deny_out: None,
+            rules: None,
             mask_request_host: None,
         }
     }
@@ -6604,6 +6823,8 @@ impl std::fmt::Display for SandboxNetworkConfig {
                 ]
                 .join(",")
             }),
+            // Skipping rules in query parameter serialization
+            // Skipping rules in query parameter serialization
             self.mask_request_host.as_ref().map(|mask_request_host| {
                 ["maskRequestHost".to_string(), mask_request_host.to_string()].join(",")
             }),
@@ -6631,6 +6852,7 @@ impl std::str::FromStr for SandboxNetworkConfig {
             pub allow_public_traffic: Vec<bool>,
             pub allow_out: Vec<Vec<String>>,
             pub deny_out: Vec<Vec<String>>,
+            pub rules: Vec<std::collections::HashMap<String, Vec<models::SandboxNetworkRule>>>,
             pub mask_request_host: Vec<String>,
         }
 
@@ -6657,6 +6879,7 @@ impl std::str::FromStr for SandboxNetworkConfig {
                     "allowPublicTraffic" => intermediate_rep.allow_public_traffic.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     "allowOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkConfig".to_string()),
                     "denyOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkConfig".to_string()),
+                    "rules" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkConfig".to_string()),
                     #[allow(clippy::redundant_clone)]
                     "maskRequestHost" => intermediate_rep.mask_request_host.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     _ => return std::result::Result::Err("Unexpected key while parsing SandboxNetworkConfig".to_string())
@@ -6672,6 +6895,7 @@ impl std::str::FromStr for SandboxNetworkConfig {
             allow_public_traffic: intermediate_rep.allow_public_traffic.into_iter().next(),
             allow_out: intermediate_rep.allow_out.into_iter().next(),
             deny_out: intermediate_rep.deny_out.into_iter().next(),
+            rules: intermediate_rep.rules.into_iter().next(),
             mask_request_host: intermediate_rep.mask_request_host.into_iter().next(),
         })
     }
@@ -6719,6 +6943,267 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxNetwo
     }
 }
 
+/// Transform rule applied to egress requests matching a domain pattern.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxNetworkRule {
+    #[serde(rename = "transform")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<models::SandboxNetworkTransform>,
+}
+
+impl SandboxNetworkRule {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> SandboxNetworkRule {
+        SandboxNetworkRule { transform: None }
+    }
+}
+
+/// Converts the SandboxNetworkRule value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxNetworkRule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping transform in query parameter serialization
+
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxNetworkRule value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxNetworkRule {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub transform: Vec<models::SandboxNetworkTransform>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxNetworkRule".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "transform" => intermediate_rep.transform.push(
+                        <models::SandboxNetworkTransform as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxNetworkRule".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxNetworkRule {
+            transform: intermediate_rep.transform.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxNetworkRule> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxNetworkRule>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxNetworkRule>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxNetworkRule - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxNetworkRule> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxNetworkRule as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxNetworkRule - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Transformations applied to matching egress requests before forwarding.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxNetworkTransform {
+    /// HTTP headers to set on matching requests. A header the sandbox sent under the same name is replaced. Values are plain strings; `${aenv.secrets.NAME}` markers are resolved by the egress broker, never inside the sandbox.
+    #[serde(rename = "headers")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<std::collections::HashMap<String, String>>,
+}
+
+impl SandboxNetworkTransform {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> SandboxNetworkTransform {
+        SandboxNetworkTransform { headers: None }
+    }
+}
+
+/// Converts the SandboxNetworkTransform value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxNetworkTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping headers in query parameter serialization
+
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxNetworkTransform value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxNetworkTransform {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub headers: Vec<std::collections::HashMap<String, String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxNetworkTransform".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "headers" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkTransform".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing SandboxNetworkTransform".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxNetworkTransform {
+            headers: intermediate_rep.headers.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxNetworkTransform> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxNetworkTransform>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxNetworkTransform>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxNetworkTransform - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxNetworkTransform> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxNetworkTransform as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxNetworkTransform - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
 /// Network configuration update for a running sandbox. Replaces the current egress rules with the provided configuration. Omitting a field clears it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
@@ -6735,6 +7220,12 @@ pub struct SandboxNetworkUpdateConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deny_out: Option<Vec<String>>,
 
+    /// Per-domain transform rules applied to matching outbound HTTPS requests. Keys are exact DNS names (for example \"api.example.com\") or a single leading wildcard (for example \"*.example.com\"), normalized to lowercase. Header values may carry `${aenv.secrets.NAME}` markers (`${e2b.secrets.NAME}` is accepted as an alias); the egress broker resolves them when the request leaves the sandbox, and no sandbox ever holds the value. Rules do not grant network access; configure allowOut and allow_internet_access separately.
+    #[serde(rename = "rules")]
+    #[validate(custom(function = "check_xss_map"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<std::collections::HashMap<String, Vec<models::SandboxNetworkRule>>>,
+
     /// Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut to 0.0.0.0/0 in the network config.
     #[serde(rename = "allow_internet_access")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6747,6 +7238,7 @@ impl SandboxNetworkUpdateConfig {
         SandboxNetworkUpdateConfig {
             allow_out: None,
             deny_out: None,
+            rules: None,
             allow_internet_access: None,
         }
     }
@@ -6780,6 +7272,8 @@ impl std::fmt::Display for SandboxNetworkUpdateConfig {
                 ]
                 .join(",")
             }),
+            // Skipping rules in query parameter serialization
+            // Skipping rules in query parameter serialization
             self.allow_internet_access
                 .as_ref()
                 .map(|allow_internet_access| {
@@ -6812,6 +7306,7 @@ impl std::str::FromStr for SandboxNetworkUpdateConfig {
         struct IntermediateRep {
             pub allow_out: Vec<Vec<String>>,
             pub deny_out: Vec<Vec<String>>,
+            pub rules: Vec<std::collections::HashMap<String, Vec<models::SandboxNetworkRule>>>,
             pub allow_internet_access: Vec<bool>,
         }
 
@@ -6836,6 +7331,7 @@ impl std::str::FromStr for SandboxNetworkUpdateConfig {
                 match key {
                     "allowOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
                     "denyOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
+                    "rules" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
                     #[allow(clippy::redundant_clone)]
                     "allow_internet_access" => intermediate_rep.allow_internet_access.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     _ => return std::result::Result::Err("Unexpected key while parsing SandboxNetworkUpdateConfig".to_string())
@@ -6850,6 +7346,7 @@ impl std::str::FromStr for SandboxNetworkUpdateConfig {
         std::result::Result::Ok(SandboxNetworkUpdateConfig {
             allow_out: intermediate_rep.allow_out.into_iter().next(),
             deny_out: intermediate_rep.deny_out.into_iter().next(),
+            rules: intermediate_rep.rules.into_iter().next(),
             allow_internet_access: intermediate_rep.allow_internet_access.into_iter().next(),
         })
     }
@@ -7377,6 +7874,445 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxTimeo
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into SandboxTimeoutRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Metadata of a secret. It never carries the secret value.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct Secret {
+    /// Identifier of the secret
+    #[serde(rename = "secretID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub secret_id: String,
+
+    /// Name of the secret, unique within the deployment
+    #[serde(rename = "name")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub name: String,
+
+    /// Version served to readers that do not name one
+    #[serde(rename = "currentVersion")]
+    pub current_version: i64,
+
+    /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
+    #[serde(rename = "metadata")]
+    #[validate(length(max = 32), custom(function = "check_xss_map_string"))]
+    pub metadata: std::collections::HashMap<String, String>,
+
+    /// Time when the secret was created
+    #[serde(rename = "createdAt")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+
+    /// Time when the secret was last updated
+    #[serde(rename = "updatedAt")]
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Secret {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        secret_id: String,
+        name: String,
+        current_version: i64,
+        metadata: std::collections::HashMap<String, String>,
+        created_at: chrono::DateTime<chrono::Utc>,
+        updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Secret {
+        Secret {
+            secret_id,
+            name,
+            current_version,
+            metadata,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
+/// Converts the Secret value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("secretID".to_string()),
+            Some(self.secret_id.to_string()),
+            Some("name".to_string()),
+            Some(self.name.to_string()),
+            Some("currentVersion".to_string()),
+            Some(self.current_version.to_string()),
+            // Skipping metadata in query parameter serialization
+
+            // Skipping createdAt in query parameter serialization
+
+            // Skipping updatedAt in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a Secret value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for Secret {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub secret_id: Vec<String>,
+            pub name: Vec<String>,
+            pub current_version: Vec<i64>,
+            pub metadata: Vec<std::collections::HashMap<String, String>>,
+            pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
+            pub updated_at: Vec<chrono::DateTime<chrono::Utc>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing Secret".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "secretID" => intermediate_rep.secret_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "currentVersion" => intermediate_rep.current_version.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "metadata" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in Secret"
+                                .to_string(),
+                        );
+                    }
+                    #[allow(clippy::redundant_clone)]
+                    "createdAt" => intermediate_rep.created_at.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "updatedAt" => intermediate_rep.updated_at.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing Secret".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(Secret {
+            secret_id: intermediate_rep
+                .secret_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "secretID missing in Secret".to_string())?,
+            name: intermediate_rep
+                .name
+                .into_iter()
+                .next()
+                .ok_or_else(|| "name missing in Secret".to_string())?,
+            current_version: intermediate_rep
+                .current_version
+                .into_iter()
+                .next()
+                .ok_or_else(|| "currentVersion missing in Secret".to_string())?,
+            metadata: intermediate_rep
+                .metadata
+                .into_iter()
+                .next()
+                .ok_or_else(|| "metadata missing in Secret".to_string())?,
+            created_at: intermediate_rep
+                .created_at
+                .into_iter()
+                .next()
+                .ok_or_else(|| "createdAt missing in Secret".to_string())?,
+            updated_at: intermediate_rep
+                .updated_at
+                .into_iter()
+                .next()
+                .ok_or_else(|| "updatedAt missing in Secret".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<Secret> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<Secret>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<Secret>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for Secret - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<Secret> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <Secret as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into Secret - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
+#[derive(Debug, Clone, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SecretString(pub String);
+
+impl validator::Validate for SecretString {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::convert::From<String> for SecretString {
+    fn from(x: String) -> Self {
+        SecretString(x)
+    }
+}
+
+impl std::fmt::Display for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for SecretString {
+    type Err = std::string::ParseError;
+    fn from_str(x: &str) -> std::result::Result<Self, Self::Err> {
+        std::result::Result::Ok(SecretString(x.to_string()))
+    }
+}
+
+impl std::convert::From<SecretString> for String {
+    fn from(x: SecretString) -> Self {
+        x.0
+    }
+}
+
+impl std::ops::Deref for SecretString {
+    type Target = String;
+    fn deref(&self) -> &String {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SecretString {
+    fn deref_mut(&mut self) -> &mut String {
+        &mut self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SecretUpdate {
+    /// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
+    #[serde(rename = "value")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub value: String,
+
+    /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
+    #[serde(rename = "metadata")]
+    #[validate(length(max = 32), custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+impl SecretUpdate {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(value: String) -> SecretUpdate {
+        SecretUpdate {
+            value,
+            metadata: None,
+        }
+    }
+}
+
+/// Converts the SecretUpdate value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SecretUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("value".to_string()),
+            Some(self.value.to_string()),
+            // Skipping metadata in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SecretUpdate value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SecretUpdate {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub value: Vec<String>,
+            pub metadata: Vec<std::collections::HashMap<String, String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SecretUpdate".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "value" => intermediate_rep.value.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "metadata" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in SecretUpdate"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SecretUpdate".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SecretUpdate {
+            value: intermediate_rep
+                .value
+                .into_iter()
+                .next()
+                .ok_or_else(|| "value missing in SecretUpdate".to_string())?,
+            metadata: intermediate_rep.metadata.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SecretUpdate> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SecretUpdate>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SecretUpdate>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SecretUpdate - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SecretUpdate> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SecretUpdate as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SecretUpdate - {err}"#
                     )),
                 }
             }

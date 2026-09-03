@@ -27,6 +27,7 @@ where
     A: apis::admin::Admin<E, Claims = C>
         + apis::default::Default<E>
         + apis::sandboxes::Sandboxes<E, Claims = C>
+        + apis::secrets::Secrets<E, Claims = C>
         + apis::snapshots::Snapshots<E, Claims = C>
         + apis::templates::Templates<E, Claims = C>
         + apis::ApiKeyAuthHeader<Claims = C>
@@ -52,6 +53,7 @@ where
     A: apis::admin::Admin<E, Claims = C>
         + apis::default::Default<E>
         + apis::sandboxes::Sandboxes<E, Claims = C>
+        + apis::secrets::Secrets<E, Claims = C>
         + apis::snapshots::Snapshots<E, Claims = C>
         + apis::templates::Templates<E, Claims = C>
         + apis::ApiKeyAuthHeader<Claims = C>
@@ -83,6 +85,7 @@ where
     A: apis::admin::Admin<E, Claims = C>
         + apis::default::Default<E>
         + apis::sandboxes::Sandboxes<E, Claims = C>
+        + apis::secrets::Secrets<E, Claims = C>
         + apis::snapshots::Snapshots<E, Claims = C>
         + apis::templates::Templates<E, Claims = C>
         + apis::ApiKeyAuthHeader<Claims = C>

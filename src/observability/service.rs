@@ -8,6 +8,7 @@ use crate::orchestrator::{SandboxLifecycleEvent, SandboxOrchestration};
 
 use super::host::HostMetricsCollector;
 use super::machine::detect_machine_info;
+use super::model::{EgressBrokerProbe, EgressBrokerState};
 use super::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
 use crate::identity::NodeIdentity;
 
@@ -28,6 +29,8 @@ pub struct ObservabilityService {
     host_metrics: HostMetricsCollector,
     pending_cpu_config: Arc<Mutex<Option<String>>>,
     cluster_cpu_config: Arc<RwLock<Option<String>>>,
+    /// Answers the heartbeat's broker state; `None` reports `Disabled`.
+    egress_broker_probe: Option<Arc<dyn EgressBrokerProbe>>,
 }
 
 impl ObservabilityService {
@@ -51,7 +54,15 @@ impl ObservabilityService {
             host_metrics,
             pending_cpu_config: Arc::new(Mutex::new(cpu_config_json)),
             cluster_cpu_config: cluster_cpu_arc,
+            egress_broker_probe: None,
         }
+    }
+
+    /// Reports the broker state this probe answers instead of `Disabled`.
+    #[must_use]
+    pub fn with_egress_broker_probe(mut self, probe: Arc<dyn EgressBrokerProbe>) -> Self {
+        self.egress_broker_probe = Some(probe);
+        self
     }
 
     pub fn take_cpu_config_json(&self) -> Option<String> {
@@ -93,6 +104,11 @@ impl ObservabilityService {
             create_successes: runtime.create_successes,
             create_fails: runtime.create_fails,
             sandbox_starting_count: runtime.starting_sandbox_count,
+            egress_broker: self
+                .egress_broker_probe
+                .as_ref()
+                .map(|probe| probe.egress_broker_state())
+                .unwrap_or(EgressBrokerState::Disabled),
         })
     }
 

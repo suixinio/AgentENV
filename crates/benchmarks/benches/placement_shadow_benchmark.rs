@@ -63,6 +63,7 @@ fn registry_with(node_count: usize) -> AtomicNodeRegistry {
 fn hint() -> ScheduleRequestHint {
     ScheduleRequestHint {
         kind: Some(Kind::NewSandbox(NewSandboxHint {
+            requires_egress_broker: false,
             metadata: Default::default(),
             cpu_count: Some(2),
             memory_mib: Some(2048),

@@ -81,6 +81,9 @@ message NewSandboxHint {
   // Nodes that already refused this sandbox in this launch, so the retry is
   // placed elsewhere. A preferred node listed here is not preferred.
   repeated string excluded_node_ids = 5;
+  // The sandbox declares network rules, so only a node whose heartbeat reports
+  // a usable egress broker may take it.
+  bool requires_egress_broker = 6;
 }
 
 message ScheduleRequest {
@@ -150,6 +153,18 @@ message NodeSnapshot {
   // A node holds no paused sandboxes: a paused sandbox is a snapshot row.
   reserved 14, 15, 16;
   reserved "paused_sandbox_count", "paused_allocated_cpu", "paused_allocated_memory_bytes";
+  // Whether this node can run sandboxes that declare network rules. The api
+  // half places such sandboxes only on nodes reporting EMBEDDED or REMOTE_OK.
+  EgressBrokerState egress_broker = 17;
+}
+
+// How a node reaches the egress broker, as the node itself reports it.
+enum EgressBrokerState {
+  EGRESS_BROKER_STATE_UNSPECIFIED = 0;
+  EGRESS_BROKER_STATE_DISABLED = 1;
+  EGRESS_BROKER_STATE_EMBEDDED = 2;
+  EGRESS_BROKER_STATE_REMOTE_OK = 3;
+  EGRESS_BROKER_STATE_REMOTE_UNREACHABLE = 4;
 }
 
 message P2pEndpoint {

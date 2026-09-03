@@ -151,6 +151,38 @@ peer_discovery_refresh_interval_secs = 5
 # Timeout in milliseconds for non-stop extension hook calls.
 # timeout_ms = 5000
 
+[egress_broker]
+# How this node reaches the egress broker that serves sandboxes declaring
+# `network.rules`: "disabled" (such sandboxes are never placed here),
+# "embedded" (the broker core runs inside aenv-node; single static node only)
+# or "remote" (TLS to the aenv-egress deployment; endpoint, ca_cert_path and
+# shared_secret are then required).
+mode = "disabled"
+# endpoint = "aenv-egress.aenv.svc:8443"
+# ca_cert_path = "/etc/aenv/egress-ca/ca.crt"
+# shared_secret = "replace-with-the-hmac-key-from-the-egress-hmac secret"
+# Identity headers older or newer than this are refused by the broker.
+max_skew_ms = 30000
+# Concurrent brokered connections per sandbox and per node; excess is closed.
+per_sandbox_conns = 256
+node_conns = 20000
+# How long the runtime waits for the broker to accept one connection.
+open_timeout_ms = 3000
+
+[secrets]
+# Where aenv-api stores secret values and grants: "disabled" or "vault".
+# aenv-api's PostgreSQL holds names and versions only; a node reads none of this.
+backend = "disabled"
+
+[secrets.vault]
+# addr = "https://vault.vault.svc:8200"
+# token = "replace-with-a-vault-token"
+# KV v2 mount; values live under <mount>/secrets/<name>, grants under
+# <mount>/grants/<execution_id>.
+mount = "aenv"
+# namespace = "admin"
+timeout_ms = 5000
+
 [cluster]
 # `aenv-api` resolves node placement (`Schedule`/`LookupNode`/
 # `RecordAssignment`, and a known node's own address) entirely from its own

@@ -25,7 +25,8 @@ use tracing::{debug, info, warn};
 
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::policy::{
-    initialize_namespace_egress_chain, set_namespace_egress_policy, SandboxNetworkPolicy,
+    initialize_namespace_egress_chain, install_namespace_intercept, remove_namespace_intercept,
+    set_namespace_egress_policy, SandboxNetworkPolicy,
 };
 use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS_PREFIX};
 
@@ -449,20 +450,72 @@ impl Slot {
     }
 
     pub fn set_egress_policy(&self, policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
-        let netns_path = self.namespace_path();
         let policy = policy.cloned();
-        let handle = thread::spawn(move || -> Result<()> {
+        self.in_namespace("egress policy setup", move || {
+            set_namespace_egress_policy(policy.as_ref())
+        })
+    }
+
+    /// The address a brokered listener binds inside this namespace: the tap
+    /// side of the VM link, reachable from the guest and from nowhere else.
+    pub fn tap_ip(&self) -> Ipv4Addr {
+        self.address_plan.tap_ip()
+    }
+
+    /// Binds a non-blocking listener on `tap_ip:port` inside the namespace
+    /// and brings the socket back to the caller's namespace. The socket keeps
+    /// its namespace for life, so every connection it accepts is the guest's.
+    /// Port zero lets the kernel choose.
+    pub fn listen_in_namespace(&self, port: u16) -> Result<std::net::TcpListener> {
+        let addr = std::net::SocketAddrV4::new(self.tap_ip(), port);
+        self.in_namespace("brokered listener setup", move || {
+            let listener = std::net::TcpListener::bind(addr)
+                .with_context(|| format!("bind brokered listener on {addr}"))?;
+            listener
+                .set_nonblocking(true)
+                .context("set brokered listener non-blocking")?;
+            Ok(listener)
+        })
+    }
+
+    /// DNATs the guest's TCP traffic to `dports` onto the listener at
+    /// `listener_port` and rejects UDP to the same ports.
+    pub fn install_intercept(&self, listener_port: u16, dports: &[u16]) -> Result<()> {
+        let listener = std::net::SocketAddrV4::new(self.tap_ip(), listener_port);
+        let dports = dports.to_vec();
+        self.in_namespace("intercept setup", move || {
+            install_namespace_intercept(listener, &dports)
+        })
+    }
+
+    /// Whether this slot set up a namespace that cleanup will have to undo.
+    pub fn has_namespace(&self) -> bool {
+        self.cleanup_armed.load(Ordering::Acquire)
+    }
+
+    /// Leaves the namespace's intercept chains empty. Idempotent.
+    pub fn remove_intercept(&self) -> Result<()> {
+        self.in_namespace("intercept removal", remove_namespace_intercept)
+    }
+
+    fn in_namespace<T: Send + 'static>(
+        &self,
+        what: &'static str,
+        work: impl FnOnce() -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let netns_path = self.namespace_path();
+        let handle = thread::spawn(move || -> Result<T> {
             let netns = File::open(&netns_path).with_context(|| {
                 format!("failed to open network namespace {}", netns_path.display())
             })?;
             nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
                 .context("failed to enter sandbox network namespace")?;
-            set_namespace_egress_policy(policy.as_ref())
+            work()
         });
 
         match handle.join() {
             Ok(result) => result,
-            Err(e) => Err(anyhow!("egress policy setup thread panicked: {:?}", e)),
+            Err(e) => Err(anyhow!("{what} thread panicked: {:?}", e)),
         }
     }
 

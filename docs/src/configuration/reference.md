@@ -446,6 +446,41 @@ Custom extension service configuration. When `url` is unset, the integration is 
 | `url` | string | unset | HTTP base URL of the custom extension service. When set, AgentENV invokes sandbox lifecycle hooks under `POST {url}/sandbox-hook/*`. |
 | `timeout_ms` | integer | `5000` | Timeout for each custom extension HTTP call, in milliseconds. |
 
+## `[egress_broker]`
+
+How a node reaches the egress broker that serves sandboxes declaring `network.rules`. A sandbox with rules is placed only on nodes whose heartbeat reports a usable broker; with `mode = "disabled"` this node reports none. See the proposal in `docs/proposals/2026-09-03-sandbox-egress-credential-brokering.md`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | string | `"disabled"` | `disabled`, `embedded` (the broker core runs inside `aenv-node`; only valid with `[cluster].node_discovery_mode = "static"` and at most one static node) or `remote` (TLS to the `aenv-egress` deployment). |
+| `endpoint` | string | unset | `host:port` of the broker. Required in `remote` mode. |
+| `ca_cert_path` | path | unset | PEM bundle that verifies the broker's server certificate and is handed to guests with rules as an extra trust anchor. Required in `remote` mode. |
+| `shared_secret` | string | unset | HMAC key the identity header is signed with. Required in `remote` mode; inject it from a Secret. |
+| `max_skew_ms` | integer | `30000` | Identity headers issued outside this window are refused by the broker. |
+| `per_sandbox_conns` | integer | `256` | Concurrent brokered connections one sandbox may hold; excess connections are closed. |
+| `node_conns` | integer | `20000` | Concurrent brokered connections across the node. |
+| `open_timeout_ms` | integer | `3000` | How long the runtime waits for the broker to accept one connection. |
+
+## `[secrets]`
+
+Where `aenv-api` stores secret values and grants for `/secrets` and `network.rules`. Only the api half reads this section; its PostgreSQL holds names and versions in `secret_refs`, never a value. With `backend = "disabled"`, `/secrets` answers 503 and rules that reference secrets are refused.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `backend` | string | `"disabled"` | `disabled` or `vault`. |
+
+## `[secrets.vault]`
+
+HashiCorp Vault KV v2. Values live at `<mount>/secrets/<name>`, grants at `<mount>/grants/<execution_id>`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `addr` | string | unset | Base URL of the Vault server. Required when `backend = "vault"`. |
+| `token` | string | unset | Vault token. Required when `backend = "vault"`; inject it from a Secret. |
+| `mount` | string | `"aenv"` | KV v2 mount, one path segment. |
+| `namespace` | string | unset | Vault Enterprise namespace header, when used. |
+| `timeout_ms` | integer | `5000` | Timeout for each Vault call. |
+
 ## `[snapshot]`
 
 Snapshot storage/build configuration.

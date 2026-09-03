@@ -1,5 +1,8 @@
 mod common;
 
+#[path = "integration/egress.rs"]
+mod egress;
+
 #[path = "integration/envd_supervisor.rs"]
 mod envd_supervisor;
 

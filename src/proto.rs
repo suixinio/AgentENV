@@ -207,6 +207,7 @@ mod serialized_value_golden {
                 allowed_cidrs: vec!["10.0.0.0/8".to_string()],
                 allowed_domains: vec!["example.invalid".to_string()],
                 denied_cidrs: vec!["192.168.0.0/16".to_string()],
+                ..Default::default()
             },
         };
 
@@ -381,6 +382,7 @@ mod scheduler_wire_tests {
             hint: Some(pb::ScheduleRequestHint {
                 kind: Some(pb::schedule_request_hint::Kind::NewSandbox(
                     pb::NewSandboxHint {
+                        requires_egress_broker: false,
                         metadata: Default::default(),
                         cpu_count,
                         memory_mib,

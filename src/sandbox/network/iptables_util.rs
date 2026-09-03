@@ -33,7 +33,7 @@ pub enum IptablesRestoreCommand {
 }
 
 impl IptablesRestoreCommand {
-    fn table(&self) -> &'static str {
+    pub(crate) fn table(&self) -> &'static str {
         match self {
             Self::NewChain { table, .. }
             | Self::FlushChain { table, .. }

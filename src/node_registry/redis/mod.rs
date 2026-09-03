@@ -135,6 +135,9 @@ pub struct StoredNodeSnapshot {
     pub disks: Vec<StoredDiskMetric>,
     pub sandbox_count: u32,
     pub sandbox_starting_count: u32,
+    /// Absent in records written before nodes reported a broker state.
+    #[serde(default)]
+    pub egress_broker: i32,
     pub create_successes: u64,
     pub create_fails: u64,
     pub reported_at_unix_ms: i64,

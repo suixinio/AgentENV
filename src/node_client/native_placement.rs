@@ -22,7 +22,10 @@ use crate::proto::scheduler::{self, ObservedNode};
 use crate::scheduler_endpoint::qualified;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-use super::placement::{NodeEndpoint, NodeMembership, NodePlacement, PLACEMENT_RESERVATION_TTL};
+use super::placement::{
+    NodeEndpoint, NodeMembership, NodePlacement, PlacementNeeds, PlacementRefused,
+    PLACEMENT_RESERVATION_TTL,
+};
 
 /// Replaces the port in an HTTP node address, including bracketed IPv6 literals.
 pub fn rewrite_port(endpoint: &str, port: u16) -> Result<String> {
@@ -135,10 +138,28 @@ impl NodePlacement for NativeNodePlacement {
     /// Places a new sandbox through the local scheduler surface.
     async fn place_new(
         &self,
+        sandbox_id: SandboxId,
+        resources: SandboxResources,
+        preferred_node_id: Option<&str>,
+        excluded_node_ids: &[String],
+    ) -> Result<NodeEndpoint> {
+        self.place_new_with(
+            sandbox_id,
+            resources,
+            preferred_node_id,
+            excluded_node_ids,
+            PlacementNeeds::default(),
+        )
+        .await
+    }
+
+    async fn place_new_with(
+        &self,
         _sandbox_id: SandboxId,
         resources: SandboxResources,
         preferred_node_id: Option<&str>,
         excluded_node_ids: &[String],
+        needs: PlacementNeeds,
     ) -> Result<NodeEndpoint> {
         let response = self
             .local
@@ -152,12 +173,19 @@ impl NodePlacement for NativeNodePlacement {
                             memory_mib: Some(u64::from(resources.memory_mib)),
                             preferred_node_id: preferred_node_id.unwrap_or_default().to_string(),
                             excluded_node_ids: excluded_node_ids.to_vec(),
+                            requires_egress_broker: needs.egress_broker,
                         },
                     )),
                 }),
             }))
             .await
-            .map_err(|status| anyhow!("the local scheduler refused to place a sandbox: {status}"))?
+            .map_err(|status| match status.code() {
+                // The scheduler had nodes, none with the capability asked for.
+                Code::FailedPrecondition if needs.egress_broker => {
+                    anyhow::Error::new(PlacementRefused::NoEgressBrokerNode)
+                }
+                _ => anyhow!("the local scheduler refused to place a sandbox: {status}"),
+            })?
             .into_inner();
         self.node_service_endpoint_from_wire(response.node)
     }

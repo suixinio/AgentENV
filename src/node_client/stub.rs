@@ -25,7 +25,7 @@ use crate::sandbox::{
 use crate::snapshot::repository::interfaces::StagedSnapshot;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-use super::placement::{NodeEndpoint, NodeMembership, NodePlacement};
+use super::placement::{NodeEndpoint, NodeMembership, NodePlacement, PlacementNeeds};
 use super::wire;
 
 use std::sync::Arc;
@@ -37,6 +37,8 @@ pub enum PendingLaunch {
         request: Box<pb::SandboxCreateRequest>,
         /// Where the sandbox's bytes were last warm, if anywhere.
         preferred_node_id: Option<String>,
+        /// Node capabilities the launch needs, read off the launch config.
+        needs: PlacementNeeds,
     },
     /// A fork child the node already started.
     AlreadyStarted,
@@ -517,14 +519,15 @@ impl SandboxBackend for RemoteSandboxStub {
         if self.placed.is_some() {
             return Ok(());
         }
-        let (request, preferred_node_id) = match &self.pending {
+        let (request, preferred_node_id, needs) = match &self.pending {
             PendingLaunch::AlreadyStarted => return Ok(()),
             // Attach resolves an existing sandbox rather than starting one.
             PendingLaunch::Attach => return self.attach().await,
             PendingLaunch::Launch {
                 request,
                 preferred_node_id,
-            } => ((**request).clone(), preferred_node_id.clone()),
+                needs,
+            } => ((**request).clone(), preferred_node_id.clone(), *needs),
         };
 
         // A node that refuses the launch is excluded and placement is asked
@@ -535,11 +538,12 @@ impl SandboxBackend for RemoteSandboxStub {
         let (node, mut client, ack) = loop {
             let node = self
                 .placement
-                .place_new(
+                .place_new_with(
                     self.sandbox_id,
                     self.resources,
                     preferred_node_id.as_deref(),
                     &excluded_node_ids,
+                    needs,
                 )
                 .await
                 .with_context(|| format!("choose a node for sandbox {}", self.sandbox_id))?;

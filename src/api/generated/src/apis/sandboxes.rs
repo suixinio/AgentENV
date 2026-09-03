@@ -25,6 +25,8 @@ pub enum SandboxesColdPostResponse {
     Status400_BadRequest(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// No node can take a sandbox with these network rules right now
+    Status503_NoNodeCanTakeASandboxWithTheseNetworkRulesRightNow(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -58,6 +60,8 @@ pub enum SandboxesPostResponse {
     Status400_BadRequest(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// No node can take a sandbox with these network rules right now
+    Status503_NoNodeCanTakeASandboxWithTheseNetworkRulesRightNow(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -186,6 +190,8 @@ pub enum SandboxesSandboxIdNetworkPutResponse {
     Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// No secrets store is configured, so rules referencing secrets cannot be checked
+    Status503_NoSecretsStoreIsConfigured(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

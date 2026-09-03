@@ -1,7 +1,7 @@
 //! Filters real placement candidates using node-reported schedulability.
 
 use crate::node_registry::types::RichNode;
-use crate::proto::scheduler::NodeStatus;
+use crate::proto::scheduler::{EgressBrokerState, NodeStatus};
 
 /// Removes nodes whose latest heartbeat says they cannot accept new requests.
 ///
@@ -18,6 +18,26 @@ pub fn filter_unschedulable(nodes: Vec<RichNode>) -> Vec<RichNode> {
             !(status != NodeStatus::Unspecified && !status.can_accept_new_requests())
         })
         .collect()
+}
+
+/// Keeps only nodes whose latest heartbeat reports a usable egress broker.
+/// A node that has not reported yet is not kept: a sandbox with rules must
+/// land where the capability is known, not assumed.
+pub fn filter_without_egress_broker(nodes: Vec<RichNode>) -> Vec<RichNode> {
+    nodes
+        .into_iter()
+        .filter(|n| {
+            n.snapshot
+                .as_ref()
+                .is_some_and(|s| s.egress_broker().can_broker())
+        })
+        .collect()
+}
+
+impl EgressBrokerState {
+    pub fn can_broker(self) -> bool {
+        matches!(self, Self::Embedded | Self::RemoteOk)
+    }
 }
 
 #[cfg(test)]
@@ -137,5 +157,29 @@ mod tests {
         assert!(!NodeStatus::Unhealthy.can_accept_new_requests());
         assert!(!NodeStatus::Connecting.can_accept_new_requests());
         assert!(!NodeStatus::Unspecified.can_accept_new_requests());
+    }
+
+    #[test]
+    fn the_broker_filter_keeps_only_nodes_that_report_a_usable_broker() {
+        let with = |id: &str, state: EgressBrokerState| {
+            with_snapshot(
+                id,
+                NodeSnapshot {
+                    status: NodeStatus::Ready as i32,
+                    egress_broker: state as i32,
+                    ..Default::default()
+                },
+            )
+        };
+        let nodes = vec![
+            with("embedded", EgressBrokerState::Embedded),
+            with("remote-ok", EgressBrokerState::RemoteOk),
+            with("unreachable", EgressBrokerState::RemoteUnreachable),
+            with("disabled", EgressBrokerState::Disabled),
+            with("legacy", EgressBrokerState::Unspecified),
+            no_snapshot("silent"),
+        ];
+        let result = filter_without_egress_broker(nodes);
+        assert_eq!(ids(&result), vec!["embedded", "remote-ok"]);
     }
 }

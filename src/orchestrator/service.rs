@@ -21,6 +21,7 @@ use crate::sandbox::{
 use crate::snapshot::{SnapshotRuntimeVersions, SnapshotSource};
 use crate::types::{bytes_to_mib_ceil, ExecutionId, SandboxId, SandboxResources};
 
+use super::grants::{GrantIssuer, NoGrants};
 use super::launch_plan::{LaunchPlan, LaunchSource};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
@@ -111,6 +112,9 @@ pub struct Orchestrator<S: MetadataStore, F: SandboxBackendFactory> {
     /// Where a pause capture becomes durable. Without one a pause cannot
     /// succeed, because a paused sandbox exists only as what it published.
     pause_publisher: OnceCell<Arc<dyn PausePublisher>>,
+    /// Who records which secret names an incarnation may read; `NoGrants`
+    /// until the api half installs its store.
+    grants: OnceCell<Arc<dyn GrantIssuer>>,
 }
 
 /// Outcome when a process-local sandbox handle is absent.
@@ -193,6 +197,7 @@ where
             image_refs,
             access_tokens: SandboxAccessTokenGenerator::new(access_token_seed).unwrap(),
             pause_publisher: tokio::sync::OnceCell::new(),
+            grants: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -239,6 +244,7 @@ where
             image_refs,
             access_tokens,
             pause_publisher: OnceCell::new(),
+            grants: OnceCell::new(),
         });
 
         // Start the auto-evict task.
@@ -766,6 +772,38 @@ where
                     .then(|| self.access_tokens.generate(child.sandbox_id)),
             })
             .collect::<Vec<_>>();
+
+        // Children inherit the parent's policy, so each child's incarnation
+        // needs its own grant before it can open a brokered connection.
+        for spec in &children_spec {
+            if let Err(source) = self
+                .grant_secrets(
+                    spec.sandbox_id,
+                    spec.execution_id,
+                    &source_metadata.network_policy,
+                )
+                .await
+            {
+                for granted in &children_spec {
+                    self.revoke_secrets(granted.sandbox_id, granted.execution_id)
+                        .await;
+                }
+                self.counters.record_create_fail(u64::from(count));
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &source_sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Forking],
+                    )
+                    .await;
+                return Err(OrchestratorError::SandboxOperationFailed {
+                    sandbox_id: source_sandbox_id,
+                    operation: SandboxOperation::Fork,
+                    source,
+                });
+            }
+        }
 
         // Start to fork the sandbox.
         // This is a single operation that will return a list of results for each child sandbox.
@@ -1307,6 +1345,7 @@ where
 
         // Now the sandbox is successfully stopped, remove its metadata.
         let metadata = self.store.remove(&sandbox_id).await?;
+        self.revoke_secrets(sandbox_id, expected_execution_id).await;
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
@@ -1324,6 +1363,51 @@ where
     pub fn set_pause_publisher(&self, publisher: Arc<dyn PausePublisher>) {
         if self.pause_publisher.set(publisher).is_err() {
             warn!("pause publisher was already wired; ignoring");
+        }
+    }
+
+    /// Installs the grant issuer once; later calls are ignored.
+    pub fn set_grant_issuer(&self, issuer: Arc<dyn GrantIssuer>) {
+        if self.grants.set(issuer).is_err() {
+            warn!("grant issuer was already wired; ignoring");
+        }
+    }
+
+    fn grants(&self) -> Arc<dyn GrantIssuer> {
+        self.grants
+            .get()
+            .cloned()
+            .unwrap_or_else(|| NoGrants::shared())
+    }
+
+    /// Grants the names the policy references before the sandbox can open a
+    /// brokered connection. An empty set is a no-op for every issuer.
+    async fn grant_secrets(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        policy: &SandboxNetworkPolicy,
+    ) -> anyhow::Result<()> {
+        let names = policy.egress.referenced_secret_names();
+        if names.is_empty() {
+            return Ok(());
+        }
+        self.grants()
+            .grant(sandbox_id, execution_id, &names)
+            .await
+            .with_context(|| {
+                format!(
+                    "grant {} secret name(s) to sandbox {sandbox_id}",
+                    names.len()
+                )
+            })
+    }
+
+    /// Best effort: a grant that outlives its incarnation is unusable because
+    /// the execution id it names is gone; the warning is for the operator.
+    async fn revoke_secrets(&self, sandbox_id: SandboxId, execution_id: ExecutionId) {
+        if let Err(err) = self.grants().revoke(sandbox_id, execution_id).await {
+            warn!(%sandbox_id, %execution_id, error = %format_args!("{err:#}"), "failed to revoke secret grants");
         }
     }
 
@@ -1525,6 +1609,7 @@ where
                         if let Err(error) = self.store.remove(&sandbox_id).await {
                             warn!(error = ?error, "failed to remove sandbox after pause failure");
                         }
+                        self.revoke_secrets(sandbox_id, metadata.execution_id).await;
                         return Err(OrchestratorError::SandboxOperationFailed {
                             sandbox_id,
                             operation: SandboxOperation::Pause,
@@ -1547,6 +1632,7 @@ where
         if let Err(err) = self.store.remove(&sandbox_id).await {
             warn!(error = ?err, "failed to remove the record of a paused sandbox");
         }
+        self.revoke_secrets(sandbox_id, metadata.execution_id).await;
         self.publish_sandbox_event(
             SandboxLifecycleEventType::Pause,
             sandbox_id,
@@ -2333,8 +2419,29 @@ where
                 .await;
             return Err(err);
         }
+        if let Err(source) = self
+            .grant_secrets(
+                sandbox_id,
+                plan.execution_id(),
+                &plan.metadata.network_policy,
+            )
+            .await
+        {
+            warn!(error = %format_args!("{source:#}"), "failed to grant secrets before start");
+            if let Err(stop_err) = sandbox.stop().await {
+                warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after grant failure");
+            }
+            self.rollback_failed_launch_metadata(&plan, transitional_state)
+                .await;
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Start,
+                source,
+            });
+        }
         if let Err(source) = sandbox.start_nowait().await {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
+            self.revoke_secrets(sandbox_id, plan.execution_id()).await;
             if let Err(stop_err) = sandbox.stop().await {
                 warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
             }
@@ -2514,6 +2621,8 @@ where
         handle: SandboxHandle,
         stage: FailedLaunchStage,
     ) {
+        self.revoke_secrets(plan.sandbox_id, plan.execution_id())
+            .await;
         let should_rollback_shared_state = self
             .detach_launch_runtime_if_current(
                 &plan.sandbox_id,

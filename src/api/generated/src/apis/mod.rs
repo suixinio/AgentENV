@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod default;
 pub mod sandboxes;
+pub mod secrets;
 pub mod snapshots;
 pub mod templates;
 

@@ -602,3 +602,28 @@ A typical pattern:
 
 The guest must keep a long-running dispatcher (started during the initial
 boot) that watches for these per-instance files and executes them after resume.
+
+## Brokered egress (`network.rules`)
+
+A sandbox whose policy carries `rules` gets a listener in its network namespace, a
+DNAT of guest port 443 onto it, and a `caBundle` on every envd `init` (the
+egress CA when the node has one, an empty string otherwise). Two facts about
+the guest side:
+
+- envd must support `caBundle` on `/init`. e2b's envd installs the bundle from
+  0.7.0 (`internal/api/init.go`); the 0.5.15 pinned in `[envd].version` and the
+  `agentenv-tools` drive ignores the field. Until the tools drive ships a newer
+  envd, `wait_for_ready` fails the launch of a sandbox with rules whose guest
+  trust store does not contain the CA, so the gap is a create error rather than
+  a TLS failure inside the guest. Sandboxes without rules are unaffected.
+- envd treats an empty `caBundle` as "nothing to install", not as "remove".
+  Isolation of the CA from other sandboxes rests on the guest's trust store
+  living on a tmpfs mount that a snapshot does not carry, as in e2b's envd
+  service unit; verify that mount when upgrading the tools drive.
+
+`crates/aenv-node/tests/integration/egress.rs` exercises the intercept with the
+embedded broker and its `tcp` handler. It needs a node config with
+`[egress_broker].mode = "embedded"` and `[cluster].node_discovery_mode =
+"static"` (an `AENV_CONFIG_OVERLAY_PATH` file is enough) and fails, rather than
+skips, when the mode is anything else.
+

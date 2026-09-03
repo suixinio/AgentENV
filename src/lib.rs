@@ -19,6 +19,7 @@ mod redis_test_server;
 pub mod runtime_snapshot;
 pub mod sandbox;
 pub mod scheduler_endpoint;
+pub mod secrets;
 pub mod server_main;
 pub mod snapshot;
 pub mod template;

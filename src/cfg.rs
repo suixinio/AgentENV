@@ -1,10 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+pub mod egress_broker;
 pub mod image;
 pub mod network;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::Config;
+pub use egress_broker::{
+    EgressBrokerConfig, EgressBrokerMode, SecretsBackendKind, SecretsConfig, VaultConfig,
+};
 pub use image::{
     ImageCacheConfig, ImageConfig, ImageRemoteBlocksCacheConfig, ImageResolverConfig,
     ResolvedImageCacheConfig, ResolvedImageCacheGcConfig,
@@ -147,6 +151,12 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     #[config(nested)]
     pub custom_extension: CustomExtensionConfig,
+    /// How this node reaches the egress broker for sandboxes with `rules`.
+    #[config(nested)]
+    pub egress_broker: EgressBrokerConfig,
+    /// The api half's secrets store; a node leaves it disabled.
+    #[config(nested)]
+    pub secrets: SecretsConfig,
     #[config(nested)]
     pub api: ApiConfig,
     /// Routing/binding store configuration with an independent key space.
@@ -1297,6 +1307,8 @@ impl AppConfig {
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
+        self.egress_broker.validate(&self.cluster)?;
+        self.secrets.validate()?;
         if self.ublk.overlaybd.resize_timeout_secs == 0 {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }
@@ -2545,14 +2557,19 @@ endpoint = "http://second:9000"
     #[test]
     fn every_documented_server_variable_is_one_the_process_reads() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let sources = ["src/cfg.rs", "src/cfg/image.rs", "src/cfg/network.rs"]
-            .iter()
-            .map(|relative| {
-                std::fs::read_to_string(workspace.join(relative))
-                    .unwrap_or_else(|err| panic!("read {relative}: {err}"))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+        let sources = [
+            "src/cfg.rs",
+            "src/cfg/egress_broker.rs",
+            "src/cfg/image.rs",
+            "src/cfg/network.rs",
+        ]
+        .iter()
+        .map(|relative| {
+            std::fs::read_to_string(workspace.join(relative))
+                .unwrap_or_else(|err| panic!("read {relative}: {err}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
         let doc = std::fs::read_to_string(workspace.join("docs/src/configuration/env-vars.md"))
             .expect("read env-vars.md");
 

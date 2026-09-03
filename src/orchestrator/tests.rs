@@ -4925,3 +4925,98 @@ async fn capture_snapshot_reuses_a_matching_handle_without_rebuilding_it() -> an
     );
     Ok(())
 }
+
+fn policy_with_rules(name: &str) -> SandboxNetworkPolicy {
+    let mut rules = std::collections::BTreeMap::new();
+    rules.insert(
+        "api.example.com".to_string(),
+        vec![crate::sandbox::network::policy::DomainRule {
+            transform: crate::sandbox::network::policy::HeaderTransform {
+                headers: [(
+                    "Authorization".to_string(),
+                    format!("Bearer ${{aenv.secrets.{name}}}"),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        }],
+    );
+    SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Default,
+        SandboxNetworkEgressPolicy::with_rules(None, None, Some(rules)).unwrap(),
+    )
+}
+
+#[tokio::test]
+async fn a_create_with_rules_grants_before_start_and_a_delete_revokes() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+    let created = orchestrator.create_sandbox(request).await?;
+
+    let expected_names: std::collections::BTreeSet<String> =
+        ["openai".to_string()].into_iter().collect();
+    assert_eq!(
+        grants.events(),
+        vec![GrantEvent::Grant {
+            sandbox_id: created.id,
+            execution_id: created.execution_id,
+            names: expected_names,
+        }]
+    );
+
+    orchestrator.delete_sandbox(created.id).await?;
+    assert_eq!(
+        grants.events().last(),
+        Some(&GrantEvent::Revoke {
+            sandbox_id: created.id,
+            execution_id: created.execution_id,
+        })
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_create_without_rules_asks_for_no_grant() -> Result<()> {
+    use crate::orchestrator::grants::recording::RecordingGrantIssuer;
+
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    assert!(grants.events().is_empty());
+    orchestrator.delete_sandbox(created.id).await?;
+    assert_eq!(grants.events().len(), 1, "a delete always revokes, cheaply");
+    Ok(())
+}
+
+#[tokio::test]
+async fn without_a_grant_issuer_a_create_with_rules_fails_and_leaves_no_record() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+
+    let err = orchestrator.create_sandbox(request).await.err().unwrap();
+    let OrchestratorError::SandboxOperationFailed { source, .. } = &err else {
+        panic!("expected a start failure, got {err:#}");
+    };
+    assert!(
+        source
+            .chain()
+            .any(|cause| cause.to_string().contains("no secrets store")),
+        "the failure names the missing store: {source:#}"
+    );
+    assert!(orchestrator.list_sandboxes().await?.is_empty());
+    Ok(())
+}

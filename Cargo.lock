@@ -83,6 +83,7 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-util",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
  "sqlx",
@@ -95,6 +96,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -162,6 +164,7 @@ dependencies = [
  "url",
  "uuid",
  "warm-pool",
+ "zeroize",
 ]
 
 [[package]]
@@ -189,6 +192,7 @@ name = "aenv-node"
 version = "0.1.2"
 dependencies = [
  "aenv-core",
+ "aenv-egress",
  "agentenv-observability",
  "agentenv-test-support",
  "agentenv_http_server",

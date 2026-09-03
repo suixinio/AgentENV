@@ -11,6 +11,7 @@ pub use aenv_core::{
 
 pub mod orchestrator;
 pub mod pg;
+pub mod secrets;
 pub mod snapshot;
 
 #[cfg(test)]

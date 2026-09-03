@@ -95,6 +95,62 @@ func (NodeStatus) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{0}
 }
 
+// How a node reaches the egress broker, as the node itself reports it.
+type EgressBrokerState int32
+
+const (
+	EgressBrokerState_EGRESS_BROKER_STATE_UNSPECIFIED        EgressBrokerState = 0
+	EgressBrokerState_EGRESS_BROKER_STATE_DISABLED           EgressBrokerState = 1
+	EgressBrokerState_EGRESS_BROKER_STATE_EMBEDDED           EgressBrokerState = 2
+	EgressBrokerState_EGRESS_BROKER_STATE_REMOTE_OK          EgressBrokerState = 3
+	EgressBrokerState_EGRESS_BROKER_STATE_REMOTE_UNREACHABLE EgressBrokerState = 4
+)
+
+// Enum value maps for EgressBrokerState.
+var (
+	EgressBrokerState_name = map[int32]string{
+		0: "EGRESS_BROKER_STATE_UNSPECIFIED",
+		1: "EGRESS_BROKER_STATE_DISABLED",
+		2: "EGRESS_BROKER_STATE_EMBEDDED",
+		3: "EGRESS_BROKER_STATE_REMOTE_OK",
+		4: "EGRESS_BROKER_STATE_REMOTE_UNREACHABLE",
+	}
+	EgressBrokerState_value = map[string]int32{
+		"EGRESS_BROKER_STATE_UNSPECIFIED":        0,
+		"EGRESS_BROKER_STATE_DISABLED":           1,
+		"EGRESS_BROKER_STATE_EMBEDDED":           2,
+		"EGRESS_BROKER_STATE_REMOTE_OK":          3,
+		"EGRESS_BROKER_STATE_REMOTE_UNREACHABLE": 4,
+	}
+)
+
+func (x EgressBrokerState) Enum() *EgressBrokerState {
+	p := new(EgressBrokerState)
+	*p = x
+	return p
+}
+
+func (x EgressBrokerState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (EgressBrokerState) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_scheduler_proto_enumTypes[1].Descriptor()
+}
+
+func (EgressBrokerState) Type() protoreflect.EnumType {
+	return &file_api_proto_scheduler_proto_enumTypes[1]
+}
+
+func (x EgressBrokerState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use EgressBrokerState.Descriptor instead.
+func (EgressBrokerState) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{1}
+}
+
 type SandboxEventType int32
 
 const (
@@ -139,11 +195,11 @@ func (x SandboxEventType) String() string {
 }
 
 func (SandboxEventType) Descriptor() protoreflect.EnumDescriptor {
-	return file_api_proto_scheduler_proto_enumTypes[1].Descriptor()
+	return file_api_proto_scheduler_proto_enumTypes[2].Descriptor()
 }
 
 func (SandboxEventType) Type() protoreflect.EnumType {
-	return &file_api_proto_scheduler_proto_enumTypes[1]
+	return &file_api_proto_scheduler_proto_enumTypes[2]
 }
 
 func (x SandboxEventType) Number() protoreflect.EnumNumber {
@@ -152,7 +208,7 @@ func (x SandboxEventType) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SandboxEventType.Descriptor instead.
 func (SandboxEventType) EnumDescriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{1}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{2}
 }
 
 type Node struct {
@@ -396,8 +452,11 @@ type NewSandboxHint struct {
 	// Nodes that already refused this sandbox in this launch, so the retry is
 	// placed elsewhere. A preferred node listed here is not preferred.
 	ExcludedNodeIds []string `protobuf:"bytes,5,rep,name=excluded_node_ids,json=excludedNodeIds,proto3" json:"excluded_node_ids,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// The sandbox declares network rules, so only a node whose heartbeat reports
+	// a usable egress broker may take it.
+	RequiresEgressBroker bool `protobuf:"varint,6,opt,name=requires_egress_broker,json=requiresEgressBroker,proto3" json:"requires_egress_broker,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *NewSandboxHint) Reset() {
@@ -463,6 +522,13 @@ func (x *NewSandboxHint) GetExcludedNodeIds() []string {
 		return x.ExcludedNodeIds
 	}
 	return nil
+}
+
+func (x *NewSandboxHint) GetRequiresEgressBroker() bool {
+	if x != nil {
+		return x.RequiresEgressBroker
+	}
+	return false
 }
 
 type ScheduleRequest struct {
@@ -720,8 +786,11 @@ type NodeSnapshot struct {
 	CreateSuccesses      uint64                 `protobuf:"varint,11,opt,name=create_successes,json=createSuccesses,proto3" json:"create_successes,omitempty"`
 	CreateFails          uint64                 `protobuf:"varint,12,opt,name=create_fails,json=createFails,proto3" json:"create_fails,omitempty"`
 	ReportedAtUnixMs     int64                  `protobuf:"varint,13,opt,name=reported_at_unix_ms,json=reportedAtUnixMs,proto3" json:"reported_at_unix_ms,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Whether this node can run sandboxes that declare network rules. The api
+	// half places such sandboxes only on nodes reporting EMBEDDED or REMOTE_OK.
+	EgressBroker  EgressBrokerState `protobuf:"varint,17,opt,name=egress_broker,json=egressBroker,proto3,enum=scheduler.v1.EgressBrokerState" json:"egress_broker,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NodeSnapshot) Reset() {
@@ -843,6 +912,13 @@ func (x *NodeSnapshot) GetReportedAtUnixMs() int64 {
 		return x.ReportedAtUnixMs
 	}
 	return 0
+}
+
+func (x *NodeSnapshot) GetEgressBroker() EgressBrokerState {
+	if x != nil {
+		return x.EgressBroker
+	}
+	return EgressBrokerState_EGRESS_BROKER_STATE_UNSPECIFIED
 }
 
 type P2PEndpoint struct {
@@ -2113,14 +2189,15 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd0\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x86\x03\n" +
 	"\x0eNewSandboxHint\x12F\n" +
 	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x12 \n" +
 	"\tcpu_count\x18\x02 \x01(\rH\x00R\bcpuCount\x88\x01\x01\x12\"\n" +
 	"\n" +
 	"memory_mib\x18\x03 \x01(\x04H\x01R\tmemoryMib\x88\x01\x01\x12*\n" +
 	"\x11preferred_node_id\x18\x04 \x01(\tR\x0fpreferredNodeId\x12*\n" +
-	"\x11excluded_node_ids\x18\x05 \x03(\tR\x0fexcludedNodeIds\x1a;\n" +
+	"\x11excluded_node_ids\x18\x05 \x03(\tR\x0fexcludedNodeIds\x124\n" +
+	"\x16requires_egress_broker\x18\x06 \x01(\bR\x14requiresEgressBroker\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\f\n" +
@@ -2147,7 +2224,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\n" +
 	"used_bytes\x18\x04 \x01(\x04R\tusedBytes\x12\x1f\n" +
 	"\vtotal_bytes\x18\x05 \x01(\x04R\n" +
-	"totalBytes\"\x98\x05\n" +
+	"totalBytes\"\xde\x05\n" +
 	"\fNodeSnapshot\x120\n" +
 	"\x06status\x18\x01 \x01(\x0e2\x18.scheduler.v1.NodeStatusR\x06status\x12#\n" +
 	"\rallocated_cpu\x18\x02 \x01(\rR\fallocatedCpu\x124\n" +
@@ -2163,7 +2240,8 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	" \x01(\rR\x14sandboxStartingCount\x12)\n" +
 	"\x10create_successes\x18\v \x01(\x04R\x0fcreateSuccesses\x12!\n" +
 	"\fcreate_fails\x18\f \x01(\x04R\vcreateFails\x12-\n" +
-	"\x13reported_at_unix_ms\x18\r \x01(\x03R\x10reportedAtUnixMsJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10J\x04\b\x10\x10\x11R\x14paused_sandbox_countR\x14paused_allocated_cpuR\x1dpaused_allocated_memory_bytes\"A\n" +
+	"\x13reported_at_unix_ms\x18\r \x01(\x03R\x10reportedAtUnixMs\x12D\n" +
+	"\regress_broker\x18\x11 \x01(\x0e2\x1f.scheduler.v1.EgressBrokerStateR\fegressBrokerJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10J\x04\b\x10\x10\x11R\x14paused_sandbox_countR\x14paused_allocated_cpuR\x1dpaused_allocated_memory_bytes\"A\n" +
 	"\vP2pEndpoint\x12\x18\n" +
 	"\abackend\x18\x01 \x01(\tR\abackend\x12\x18\n" +
 	"\aaddress\x18\x02 \x01(\tR\aaddress\"\xe5\x02\n" +
@@ -2262,7 +2340,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x16NODE_STATUS_CONNECTING\x10\x02\x12\x19\n" +
 	"\x15NODE_STATUS_UNHEALTHY\x10\x03\x12\x19\n" +
 	"\x15NODE_STATUS_LINGERING\x10\x04\x12\x18\n" +
-	"\x14NODE_STATUS_DRAINING\x10\x05*\xce\x01\n" +
+	"\x14NODE_STATUS_DRAINING\x10\x05*\xcb\x01\n" +
+	"\x11EgressBrokerState\x12#\n" +
+	"\x1fEGRESS_BROKER_STATE_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cEGRESS_BROKER_STATE_DISABLED\x10\x01\x12 \n" +
+	"\x1cEGRESS_BROKER_STATE_EMBEDDED\x10\x02\x12!\n" +
+	"\x1dEGRESS_BROKER_STATE_REMOTE_OK\x10\x03\x12*\n" +
+	"&EGRESS_BROKER_STATE_REMOTE_UNREACHABLE\x10\x04*\xce\x01\n" +
 	"\x10SandboxEventType\x12\"\n" +
 	"\x1eSANDBOX_EVENT_TYPE_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_CREATE\x10\x01\x12\x1d\n" +
@@ -2293,88 +2377,90 @@ func file_api_proto_scheduler_proto_rawDescGZIP() []byte {
 	return file_api_proto_scheduler_proto_rawDescData
 }
 
-var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 32)
 var file_api_proto_scheduler_proto_goTypes = []any{
 	(NodeStatus)(0),                    // 0: scheduler.v1.NodeStatus
-	(SandboxEventType)(0),              // 1: scheduler.v1.SandboxEventType
-	(*Node)(nil),                       // 2: scheduler.v1.Node
-	(*ScheduleRequestHint)(nil),        // 3: scheduler.v1.ScheduleRequestHint
-	(*NewColdSandboxHint)(nil),         // 4: scheduler.v1.NewColdSandboxHint
-	(*NewSandboxHint)(nil),             // 5: scheduler.v1.NewSandboxHint
-	(*ScheduleRequest)(nil),            // 6: scheduler.v1.ScheduleRequest
-	(*ScheduleResponse)(nil),           // 7: scheduler.v1.ScheduleResponse
-	(*MachineInfo)(nil),                // 8: scheduler.v1.MachineInfo
-	(*DiskMetric)(nil),                 // 9: scheduler.v1.DiskMetric
-	(*NodeSnapshot)(nil),               // 10: scheduler.v1.NodeSnapshot
-	(*P2PEndpoint)(nil),                // 11: scheduler.v1.P2pEndpoint
-	(*ObservedNode)(nil),               // 12: scheduler.v1.ObservedNode
-	(*HeartbeatRequest)(nil),           // 13: scheduler.v1.HeartbeatRequest
-	(*SandboxRosterEntry)(nil),         // 14: scheduler.v1.SandboxRosterEntry
-	(*HeartbeatResponse)(nil),          // 15: scheduler.v1.HeartbeatResponse
-	(*SandboxEvent)(nil),               // 16: scheduler.v1.SandboxEvent
-	(*ReportSandboxEventRequest)(nil),  // 17: scheduler.v1.ReportSandboxEventRequest
-	(*ReportSandboxEventResponse)(nil), // 18: scheduler.v1.ReportSandboxEventResponse
-	(*P2PPeer)(nil),                    // 19: scheduler.v1.P2pPeer
-	(*ListP2PPeersRequest)(nil),        // 20: scheduler.v1.ListP2pPeersRequest
-	(*ListP2PPeersResponse)(nil),       // 21: scheduler.v1.ListP2pPeersResponse
-	(*RecordP2PArtifactRequest)(nil),   // 22: scheduler.v1.RecordP2pArtifactRequest
-	(*RecordP2PArtifactResponse)(nil),  // 23: scheduler.v1.RecordP2pArtifactResponse
-	(*ForgetP2PArtifactRequest)(nil),   // 24: scheduler.v1.ForgetP2pArtifactRequest
-	(*ForgetP2PArtifactResponse)(nil),  // 25: scheduler.v1.ForgetP2pArtifactResponse
-	(*LookupP2PArtifactRequest)(nil),   // 26: scheduler.v1.LookupP2pArtifactRequest
-	(*LookupP2PArtifactResponse)(nil),  // 27: scheduler.v1.LookupP2pArtifactResponse
-	(*GetNodeRequest)(nil),             // 28: scheduler.v1.GetNodeRequest
-	(*GetNodeResponse)(nil),            // 29: scheduler.v1.GetNodeResponse
-	(*UnregisterNodeRequest)(nil),      // 30: scheduler.v1.UnregisterNodeRequest
-	(*UnregisterNodeResponse)(nil),     // 31: scheduler.v1.UnregisterNodeResponse
-	nil,                                // 32: scheduler.v1.NewColdSandboxHint.MetadataEntry
-	nil,                                // 33: scheduler.v1.NewSandboxHint.MetadataEntry
+	(EgressBrokerState)(0),             // 1: scheduler.v1.EgressBrokerState
+	(SandboxEventType)(0),              // 2: scheduler.v1.SandboxEventType
+	(*Node)(nil),                       // 3: scheduler.v1.Node
+	(*ScheduleRequestHint)(nil),        // 4: scheduler.v1.ScheduleRequestHint
+	(*NewColdSandboxHint)(nil),         // 5: scheduler.v1.NewColdSandboxHint
+	(*NewSandboxHint)(nil),             // 6: scheduler.v1.NewSandboxHint
+	(*ScheduleRequest)(nil),            // 7: scheduler.v1.ScheduleRequest
+	(*ScheduleResponse)(nil),           // 8: scheduler.v1.ScheduleResponse
+	(*MachineInfo)(nil),                // 9: scheduler.v1.MachineInfo
+	(*DiskMetric)(nil),                 // 10: scheduler.v1.DiskMetric
+	(*NodeSnapshot)(nil),               // 11: scheduler.v1.NodeSnapshot
+	(*P2PEndpoint)(nil),                // 12: scheduler.v1.P2pEndpoint
+	(*ObservedNode)(nil),               // 13: scheduler.v1.ObservedNode
+	(*HeartbeatRequest)(nil),           // 14: scheduler.v1.HeartbeatRequest
+	(*SandboxRosterEntry)(nil),         // 15: scheduler.v1.SandboxRosterEntry
+	(*HeartbeatResponse)(nil),          // 16: scheduler.v1.HeartbeatResponse
+	(*SandboxEvent)(nil),               // 17: scheduler.v1.SandboxEvent
+	(*ReportSandboxEventRequest)(nil),  // 18: scheduler.v1.ReportSandboxEventRequest
+	(*ReportSandboxEventResponse)(nil), // 19: scheduler.v1.ReportSandboxEventResponse
+	(*P2PPeer)(nil),                    // 20: scheduler.v1.P2pPeer
+	(*ListP2PPeersRequest)(nil),        // 21: scheduler.v1.ListP2pPeersRequest
+	(*ListP2PPeersResponse)(nil),       // 22: scheduler.v1.ListP2pPeersResponse
+	(*RecordP2PArtifactRequest)(nil),   // 23: scheduler.v1.RecordP2pArtifactRequest
+	(*RecordP2PArtifactResponse)(nil),  // 24: scheduler.v1.RecordP2pArtifactResponse
+	(*ForgetP2PArtifactRequest)(nil),   // 25: scheduler.v1.ForgetP2pArtifactRequest
+	(*ForgetP2PArtifactResponse)(nil),  // 26: scheduler.v1.ForgetP2pArtifactResponse
+	(*LookupP2PArtifactRequest)(nil),   // 27: scheduler.v1.LookupP2pArtifactRequest
+	(*LookupP2PArtifactResponse)(nil),  // 28: scheduler.v1.LookupP2pArtifactResponse
+	(*GetNodeRequest)(nil),             // 29: scheduler.v1.GetNodeRequest
+	(*GetNodeResponse)(nil),            // 30: scheduler.v1.GetNodeResponse
+	(*UnregisterNodeRequest)(nil),      // 31: scheduler.v1.UnregisterNodeRequest
+	(*UnregisterNodeResponse)(nil),     // 32: scheduler.v1.UnregisterNodeResponse
+	nil,                                // 33: scheduler.v1.NewColdSandboxHint.MetadataEntry
+	nil,                                // 34: scheduler.v1.NewSandboxHint.MetadataEntry
 }
 var file_api_proto_scheduler_proto_depIdxs = []int32{
-	4,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
-	5,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
-	32, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
-	33, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
-	3,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
-	2,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
+	5,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
+	6,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
+	33, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
+	34, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
+	4,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
+	3,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
 	0,  // 6: scheduler.v1.NodeSnapshot.status:type_name -> scheduler.v1.NodeStatus
-	9,  // 7: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
-	8,  // 8: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
-	10, // 9: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	8,  // 10: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
-	10, // 11: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	11, // 12: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
-	14, // 13: scheduler.v1.HeartbeatRequest.roster:type_name -> scheduler.v1.SandboxRosterEntry
-	1,  // 14: scheduler.v1.SandboxEvent.event_type:type_name -> scheduler.v1.SandboxEventType
-	16, // 15: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
-	11, // 16: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
-	19, // 17: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
-	19, // 18: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
-	12, // 19: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
-	6,  // 20: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
-	13, // 21: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
-	17, // 22: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
-	20, // 23: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
-	22, // 24: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
-	24, // 25: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
-	26, // 26: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
-	28, // 27: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
-	30, // 28: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
-	7,  // 29: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
-	15, // 30: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
-	18, // 31: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
-	21, // 32: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
-	23, // 33: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
-	25, // 34: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
-	27, // 35: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
-	29, // 36: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
-	31, // 37: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
-	29, // [29:38] is the sub-list for method output_type
-	20, // [20:29] is the sub-list for method input_type
-	20, // [20:20] is the sub-list for extension type_name
-	20, // [20:20] is the sub-list for extension extendee
-	0,  // [0:20] is the sub-list for field type_name
+	10, // 7: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
+	1,  // 8: scheduler.v1.NodeSnapshot.egress_broker:type_name -> scheduler.v1.EgressBrokerState
+	9,  // 9: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
+	11, // 10: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	9,  // 11: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
+	11, // 12: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	12, // 13: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
+	15, // 14: scheduler.v1.HeartbeatRequest.roster:type_name -> scheduler.v1.SandboxRosterEntry
+	2,  // 15: scheduler.v1.SandboxEvent.event_type:type_name -> scheduler.v1.SandboxEventType
+	17, // 16: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
+	12, // 17: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
+	20, // 18: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
+	20, // 19: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
+	13, // 20: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
+	7,  // 21: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
+	14, // 22: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
+	18, // 23: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
+	21, // 24: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
+	23, // 25: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
+	25, // 26: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
+	27, // 27: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
+	29, // 28: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
+	31, // 29: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
+	8,  // 30: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
+	16, // 31: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
+	19, // 32: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
+	22, // 33: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
+	24, // 34: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
+	26, // 35: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
+	28, // 36: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
+	30, // 37: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
+	32, // 38: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
+	30, // [30:39] is the sub-list for method output_type
+	21, // [21:30] is the sub-list for method input_type
+	21, // [21:21] is the sub-list for extension type_name
+	21, // [21:21] is the sub-list for extension extendee
+	0,  // [0:21] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_scheduler_proto_init() }
@@ -2392,7 +2478,7 @@ func file_api_proto_scheduler_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_scheduler_proto_rawDesc), len(file_api_proto_scheduler_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   32,
 			NumExtensions: 0,
 			NumServices:   1,

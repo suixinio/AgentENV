@@ -744,7 +744,12 @@ impl Scheduler for NodeRegistryGrpcService {
                     }),
                 }))
             }
-            Err(_no_nodes) => Err(Status::unavailable("no nodes available")),
+            Err(lookup_logic::SelectNodeError::NoEgressBrokerNode) => Err(
+                Status::failed_precondition("no schedulable node reports a usable egress broker"),
+            ),
+            Err(lookup_logic::SelectNodeError::NoNodes(_)) => {
+                Err(Status::unavailable("no nodes available"))
+            }
         }
     }
 
@@ -2914,6 +2919,7 @@ mod tests {
                 hint: Some(scheduler::ScheduleRequestHint {
                     kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
                         scheduler::NewSandboxHint {
+                            requires_egress_broker: false,
                             metadata: Default::default(),
                             cpu_count: Some(1),
                             memory_mib: Some(1),
@@ -3065,6 +3071,7 @@ mod tests {
             hint: Some(scheduler::ScheduleRequestHint {
                 kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
                     scheduler::NewSandboxHint {
+                        requires_egress_broker: false,
                         metadata: Default::default(),
                         cpu_count,
                         memory_mib,

@@ -17,6 +17,7 @@ vendored-openssl = ["aenv-core/vendored-openssl"]
 
 [dependencies]
 aenv-core = { path = "../.." }
+aenv-egress = { path = "../aenv-egress" }
 agentenv-observability = { path = "../observability" }
 anyhow = "1.0.100"
 async-trait = "0.1"
@@ -36,7 +37,7 @@ ipnetwork = "0.21"
 libc = "0.2"
 metrics = "0.24"
 netlink-packet-route = "0.28"
-nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", "resource", "uio"] }
+nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", "resource", "uio", "socket"] }
 object-store-operator = { path = "../object-store-operator" }
 overlaybd = { path = "../../storage/overlaybd" }
 prost = "0.14.3"

@@ -124,6 +124,7 @@ semver = "1"
 iroh = { version = "=1.0.0-rc.0" }
 iroh-blobs = { version = "=0.101.0" }
 rand = "0.10"
+zeroize = "1"
 openssl-sys = { version = "0.9", optional = true }
 redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"] }
 # `src/node_registry/kubernetes_discovery.rs` runs the EndpointSlice/Pod

@@ -190,6 +190,7 @@ impl From<&ObservedNodeRecord> for StoredObservedRecord {
                 create_successes: s.create_successes,
                 create_fails: s.create_fails,
                 reported_at_unix_ms: s.reported_at_unix_ms,
+                egress_broker: s.egress_broker,
             }),
             last_seen_unix_ms: record.node.last_seen_unix_ms,
             p2p_endpoint: record.p2p_endpoint.as_ref().map(|p| StoredP2pEndpoint {
@@ -254,6 +255,7 @@ impl From<StoredObservedRecord> for ObservedNodeRecord {
                     create_successes: s.create_successes,
                     create_fails: s.create_fails,
                     reported_at_unix_ms: s.reported_at_unix_ms,
+                    egress_broker: s.egress_broker,
                 }),
                 last_seen_unix_ms,
             },
@@ -2398,6 +2400,7 @@ mod tests {
                     cpu_config_json: cpu_config_json(0xFF),
                 }),
                 snapshot: Some(NodeSnapshot {
+                    egress_broker: 0,
                     status: NodeStatus::Ready as i32,
                     allocated_cpu: 4,
                     allocated_memory_bytes: 1024,

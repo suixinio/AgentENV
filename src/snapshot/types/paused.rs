@@ -120,6 +120,40 @@ mod tests {
     }
 
     #[test]
+    fn network_rules_survive_the_paused_row() {
+        use crate::sandbox::network::policy::{DomainRule, HeaderTransform};
+        use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy};
+
+        let mut rules = std::collections::BTreeMap::new();
+        rules.insert(
+            "*.github.com".to_string(),
+            vec![DomainRule {
+                transform: HeaderTransform {
+                    headers: [(
+                        "Authorization".to_string(),
+                        "token ${e2b.secrets.gh}".to_string(),
+                    )]
+                    .into_iter()
+                    .collect(),
+                },
+            }],
+        );
+        let metadata = SandboxMetadata {
+            network_policy: SandboxNetworkPolicy::new(
+                BaseSandboxNetworkPolicy::Default,
+                SandboxNetworkEgressPolicy::with_rules(None, None, Some(rules)).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let config = PausedSandboxConfig::of(&metadata, SystemTime::now());
+        let json = serde_json::to_string(&config).unwrap();
+        let back: PausedSandboxConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.network_policy, metadata.network_policy);
+        assert_eq!(back.network_policy.egress.brokers.len(), 1);
+        assert!(back.network_policy.runtime_policy().is_some());
+    }
+
+    #[test]
     fn a_row_written_without_the_optional_fields_still_decodes() {
         let json = serde_json::json!({
             "template_id": "tpl",

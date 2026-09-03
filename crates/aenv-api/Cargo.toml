@@ -33,6 +33,7 @@ futures = "0.3"
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "openssl-tls"] }
 libc = "0.2"
 metrics = "0.24"
+reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Runtime-query API only (`sqlx::query`/`query_as`), never the `query!`
@@ -51,6 +52,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
 url = "2.5"
 uuid = { version = "1", features = ["serde", "v7"] }
+zeroize = "1"
 
 [dev-dependencies]
 aenv-core = { path = "../..", features = ["test-support"] }

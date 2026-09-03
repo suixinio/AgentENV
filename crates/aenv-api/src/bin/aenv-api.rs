@@ -199,23 +199,32 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         &snapshot_manager,
     ))));
 
-    let api_impl = Arc::new(
-        ApiImpl::new(
-            Arc::clone(&orchestration),
-            snapshot_manager,
-            observability,
-            config.sandbox_proxy.domains.clone(),
-            // Clone only after the binding and artifact builders.
-            ResumeWiring::cluster_in_process(node_registry_grpc_service.clone()),
-        )
-        .with_node_placement(placement)
-        // This half observes the cluster, so `/nodes` reports the fleet rather
-        // than the one replica answering the request.
-        .with_node_fleet(
-            Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>,
-            config.cluster.node_service_port,
-        ),
+    // Names and grants for network rules; values never pass through this process.
+    let secrets = aenv_api::secrets::build_secrets_service(config, &pg_pool)?;
+    if let Some(secrets) = &secrets {
+        orchestrator
+            .set_grant_issuer(Arc::clone(secrets) as Arc<dyn aenv_api::orchestrator::GrantIssuer>);
+    }
+
+    let mut api_impl = ApiImpl::new(
+        Arc::clone(&orchestration),
+        snapshot_manager,
+        observability,
+        config.sandbox_proxy.domains.clone(),
+        // Clone only after the binding and artifact builders.
+        ResumeWiring::cluster_in_process(node_registry_grpc_service.clone()),
+    )
+    .with_node_placement(placement)
+    // This half observes the cluster, so `/nodes` reports the fleet rather
+    // than the one replica answering the request.
+    .with_node_fleet(
+        Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>,
+        config.cluster.node_service_port,
     );
+    if let Some(secrets) = secrets {
+        api_impl = api_impl.with_secrets(secrets);
+    }
+    let api_impl = Arc::new(api_impl);
 
     let mut upkeep = node_registry_upkeep;
     if config.binding_store.sweep_enabled {

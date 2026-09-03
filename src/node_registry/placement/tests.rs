@@ -480,6 +480,7 @@ fn hint_shapes_map_onto_a_closed_request_table() {
 
     let new_sandbox = |cpu_count, memory_mib| ScheduleRequestHint {
         kind: Some(Kind::NewSandbox(NewSandboxHint {
+            requires_egress_broker: false,
             metadata: Default::default(),
             cpu_count,
             memory_mib,

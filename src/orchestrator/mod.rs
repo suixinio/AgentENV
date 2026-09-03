@@ -1,4 +1,5 @@
 mod facade;
+pub mod grants;
 mod launch_plan;
 
 mod metrics;
@@ -14,6 +15,7 @@ use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
 pub use facade::SandboxOrchestration;
+pub use grants::{GrantIssuer, NoGrants};
 pub use metrics::OrchestratorMetrics;
 #[cfg(any(test, feature = "test-support"))]
 pub use pause_publisher::DiscardingPausePublisher;

@@ -35,6 +35,7 @@ use crate::sandbox::backend::{
     CapturedSandboxSnapshot, RuntimeArtifactSet, SandboxBackend, SandboxCaptureError,
     SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
+use crate::sandbox::egress::{BrokeredEndpoints, EgressRuntime};
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{
     prepare_extra_drives, DriveMount, ExtraDrive, ExtraDrivePrepareMode, ROOTFS_DRIVE_ID,
@@ -172,6 +173,8 @@ pub struct FirecrackerSandbox {
     runtime_policy: FirecrackerRuntimePolicy,
     network_slot: Option<Slot>,
     current_network_policy: Option<SandboxNetworkPolicy>,
+    /// Listeners for the policy's brokers, alive while the slot is held.
+    brokered: Option<BrokeredEndpoints>,
     /// Current custom extension params. Initialized from the launch config and
     /// updated via `update_custom_extension_params`; persisted into snapshots
     /// on pause.
@@ -414,6 +417,7 @@ impl SandboxBackend for FirecrackerSandbox {
         if let Some(slot) = self.network_slot.as_ref() {
             slot.set_egress_policy(policy.as_ref())
                 .context("configure sandbox network policy")?;
+            self.reconcile_brokered_endpoints(policy.as_ref()).await?;
             self.current_network_policy = policy;
             Ok(())
         } else if policy.is_none() {
@@ -622,13 +626,176 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(device_key)
                 .await;
         }
+        let ca_bundle = self.guest_ca_bundle();
+        let mut env_vars = self.launch.common().env_vars.clone();
+        if ca_bundle.is_some() {
+            let env = env_vars.get_or_insert_with(Default::default);
+            for (name, value) in crate::sandbox::egress::DEFAULT_TRUST_ENV {
+                env.entry(name.to_string())
+                    .or_insert_with(|| value.to_string());
+            }
+        }
         envd_instance
             .init(
-                self.launch.common().env_vars.clone(),
+                env_vars,
                 self.launch.common().default_workdir.clone(),
                 self.launch.common().default_user.clone(),
+                Some(ca_bundle.clone().unwrap_or_default()),
             )
-            .await
+            .await?;
+        if let Some(pem) = ca_bundle {
+            self.assert_guest_trusts(&pem).await?;
+        }
+        Ok(())
+    }
+
+    /// The CA guests with brokers must trust, when this node has one; `None`
+    /// means init clears any extra trust and no probe runs.
+    fn guest_ca_bundle(&self) -> Option<String> {
+        let has_brokers = self
+            .current_network_policy
+            .as_ref()
+            .is_some_and(|policy| policy.has_brokers());
+        if !has_brokers {
+            return None;
+        }
+        EgressRuntime::global().and_then(|runtime| runtime.ca_bundle().map(str::to_string))
+    }
+
+    /// Fails the launch when the guest's trust store does not carry the CA:
+    /// an envd that ignores `caBundle` would otherwise leave every brokered
+    /// TLS connection failing inside the guest with no attributable cause.
+    async fn assert_guest_trusts(&self, pem: &str) -> Result<()> {
+        let Some(needle) = pem
+            .lines()
+            .map(str::trim)
+            .find(|line| line.len() >= 32 && !line.starts_with("-----"))
+        else {
+            bail!("egress_broker.ca_cert_path holds no certificate body");
+        };
+        if !needle
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+        {
+            bail!("egress_broker.ca_cert_path is not a PEM certificate");
+        }
+        let script = format!(
+            "grep -qF -- '{needle}' {}",
+            crate::sandbox::egress::GUEST_CA_BUNDLE_PATH
+        );
+        // The process client's futures are not Send, so the probe runs on its
+        // own thread and runtime, as the namespace helpers do.
+        let envd = self
+            .envd_instance
+            .clone()
+            .context("envd instance not initialized")?;
+        let output = tokio::task::spawn_blocking(move || -> Result<_> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build a runtime for the CA probe")?;
+            runtime.block_on(async move {
+                Executor::new(&envd)
+                    .run_command("sh", &["-c", &script])
+                    .await
+            })
+        })
+        .await
+        .context("join the CA probe")?
+        .context("probe the guest trust store for the egress CA")?;
+        if output.exit_code != 0 {
+            bail!(
+                "the guest trust store does not contain the egress CA after envd init; the guest's                  envd must support caBundle (exit {}, stderr {:?})",
+                output.exit_code,
+                output.stderr.trim()
+            );
+        }
+        Ok(())
+    }
+
+    fn sandbox_identity(&self) -> crate::sandbox::egress::SandboxIdentity {
+        crate::sandbox::egress::SandboxIdentity {
+            sandbox_id: self.id,
+            execution_id: self.execution_id,
+            template_id: self
+                .launch
+                .common()
+                .mmds_metadata
+                .as_ref()
+                .map(|mmds| mmds.snapshot_id.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Opens the brokered listeners a policy asks for on the held slot.
+    /// A policy with brokers on a node without a broker runtime is an error.
+    fn spawn_brokered_endpoints(&mut self, policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
+        let Some(policy) = policy.filter(|policy| policy.has_brokers()) else {
+            return Ok(());
+        };
+        let Some(runtime) = EgressRuntime::global() else {
+            bail!("the sandbox declares network rules but this node has no egress broker");
+        };
+        let slot = self
+            .network_slot
+            .as_ref()
+            .context("brokered endpoints need an allocated network slot")?;
+        let endpoints = BrokeredEndpoints::spawn(&runtime, slot, self.sandbox_identity(), policy)
+            .context("open brokered endpoints")?;
+        self.brokered = Some(endpoints);
+        Ok(())
+    }
+
+    async fn reconcile_brokered_endpoints(
+        &mut self,
+        policy: Option<&SandboxNetworkPolicy>,
+    ) -> Result<()> {
+        let wants_brokers = policy.is_some_and(|policy| policy.has_brokers());
+        match (self.brokered.take(), wants_brokers) {
+            (None, false) => Ok(()),
+            (None, true) => self.spawn_brokered_endpoints(policy),
+            (Some(mut previous), false) => {
+                previous.shutdown().await;
+                if let Some(slot) = self.network_slot.as_ref() {
+                    slot.remove_intercept().context("remove intercept")?;
+                }
+                Ok(())
+            }
+            (Some(previous), true) => {
+                let runtime = EgressRuntime::global().context(
+                    "the sandbox declares network rules but this node has no egress broker",
+                )?;
+                let slot = self
+                    .network_slot
+                    .as_ref()
+                    .context("brokered endpoints need an allocated network slot")?;
+                let policy = policy.expect("wants_brokers implies a policy");
+                let endpoints = BrokeredEndpoints::replace(
+                    previous,
+                    &runtime,
+                    slot,
+                    self.sandbox_identity(),
+                    policy,
+                )
+                .await
+                .context("replace brokered endpoints")?;
+                self.brokered = Some(endpoints);
+                Ok(())
+            }
+        }
+    }
+
+    /// Ends every brokered task before the slot goes back to the pool, so no
+    /// listener or relay socket pins the namespace for its next tenant.
+    async fn shutdown_brokered_endpoints(&mut self) {
+        if let Some(mut endpoints) = self.brokered.take() {
+            endpoints.shutdown().await;
+            if let Some(slot) = self.network_slot.as_ref() {
+                if let Err(err) = slot.remove_intercept() {
+                    warn!(error = %err, "failed to remove the namespace intercept during stop");
+                }
+            }
+        }
     }
 
     /// Pause the running sandbox and create a snapshot for later resume.
@@ -915,6 +1082,8 @@ impl FirecrackerSandbox {
             guard.stop().await;
         }
 
+        self.shutdown_brokered_endpoints().await;
+
         // Cleanup network resources
         if let Some(slot) = self.network_slot.take() {
             let idx = slot.idx;
@@ -1148,6 +1317,9 @@ impl Drop for FirecrackerSandbox {
         // explicitly deleted on the stop() path and otherwise cleaned up when
         // the daemon shuts down.
         self.extra_drive_runtimes.clear();
+        // Dropping the endpoints aborts their tasks; the release below flushes
+        // the intercept before the slot is pooled.
+        self.brokered.take();
         if let Some(slot) = self.network_slot.take() {
             if let Err(e) = NetworkManager::global().release(slot) {
                 warn!(error = %e, "failed to release network slot on drop");
@@ -1181,6 +1353,7 @@ impl FirecrackerSandbox {
             fc_instance,
             network_slot: None,
             current_network_policy,
+            brokered: None,
             current_custom_extension_params,
             envd_instance: None,
             rootfs_runtime: None,
@@ -1314,6 +1487,8 @@ impl FirecrackerSandbox {
             .expect("network slot was just assigned")
             .set_egress_policy(config.common.network_policy.as_ref())
             .context("Failed to configure sandbox egress policy")?;
+        self.spawn_brokered_endpoints(config.common.network_policy.as_ref())
+            .context("Failed to open brokered endpoints")?;
         boot_args = Some(match boot_args.take() {
             Some(existing) => format!("{existing} {ip_config}"),
             None => ip_config,
@@ -1518,6 +1693,8 @@ impl FirecrackerSandbox {
             slot.set_egress_policy(config.common.network_policy.as_ref())
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
+        self.spawn_brokered_endpoints(config.common.network_policy.as_ref())
+            .context("Failed to open brokered endpoints for resume")?;
 
         // ── Custom extension hook: start-resume ──
         if let Some(client) = CustomExtensionClient::global() {

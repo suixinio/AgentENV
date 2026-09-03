@@ -269,7 +269,12 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
                 config.resolved_cpu_template_helper(),
                 cluster_cpu_arc,
             )
-            .await,
+            .await
+            .with_egress_broker_probe(Arc::new(|| {
+                aenv_node::sandbox::egress::EgressRuntime::global()
+                    .map(|runtime| runtime.state())
+                    .unwrap_or(aenv_node::observability::EgressBrokerState::Disabled)
+            })),
         ))
     } else {
         None

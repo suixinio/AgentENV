@@ -37,6 +37,24 @@ pub enum NodeMembership {
     Gone,
 }
 
+/// Node capabilities a launch depends on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlacementNeeds {
+    /// The sandbox declares network rules and must land on a node whose
+    /// heartbeat reports a usable egress broker.
+    pub egress_broker: bool,
+}
+
+/// Placement found nodes but none with a capability the launch needs. The
+/// API answers 503 rather than 500 when this is in the error chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum PlacementRefused {
+    #[error(
+        "no node reports a usable egress broker; sandboxes with network rules cannot be placed"
+    )]
+    NoEgressBrokerNode,
+}
+
 #[async_trait]
 pub trait NodePlacement: Send + Sync + 'static {
     /// Selects a node for a new sandbox.
@@ -54,6 +72,22 @@ pub trait NodePlacement: Send + Sync + 'static {
         preferred_node_id: Option<&str>,
         excluded_node_ids: &[String],
     ) -> anyhow::Result<NodeEndpoint>;
+
+    /// `place_new` with what the sandbox needs from its node. The default
+    /// ignores `needs`; a placement source that knows node capabilities
+    /// overrides it and refuses with [`PlacementRefused`] when no node fits.
+    async fn place_new_with(
+        &self,
+        sandbox_id: SandboxId,
+        resources: SandboxResources,
+        preferred_node_id: Option<&str>,
+        excluded_node_ids: &[String],
+        needs: PlacementNeeds,
+    ) -> anyhow::Result<NodeEndpoint> {
+        let _ = needs;
+        self.place_new(sandbox_id, resources, preferred_node_id, excluded_node_ids)
+            .await
+    }
 
     /// Locates the node holding an existing sandbox.
     ///

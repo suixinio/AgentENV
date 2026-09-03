@@ -240,6 +240,23 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 }
 
 impl ApiImpl {
+    /// The sandbox's record once any pause in flight on it has settled.
+    ///
+    /// `None` means no record: the sandbox's newest catalog row speaks for
+    /// it, or it never existed. A pause that outlasts the orchestrator's wait
+    /// budget is `InvalidSandboxState { state: Pausing }`.
+    async fn record_after_any_pause(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<SandboxMetadata>, OrchestratorError> {
+        match self.orchestrator.get_sandbox(&sandbox_id).await? {
+            Some(metadata) if metadata.state == SandboxState::Pausing => {
+                self.orchestrator.wait_for_pause_to_settle(sandbox_id).await
+            }
+            recorded => Ok(recorded),
+        }
+    }
+
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
         let envd_access_token = self
             .orchestrator
@@ -684,7 +701,7 @@ impl Sandboxes<()> for ApiImpl {
             ));
         };
         let timeout = Duration::from_secs(body.timeout as u64);
-        match self.orchestrator.get_sandbox(&sandbox_id).await {
+        match self.record_after_any_pause(sandbox_id).await {
             Ok(Some(metadata)) => match metadata.state {
                 SandboxState::Creating
                 | SandboxState::Running
@@ -740,6 +757,14 @@ impl Sandboxes<()> for ApiImpl {
                 }
             },
             Ok(None) => {}
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                    Self::error(
+                        400,
+                        format!("sandbox is still {state} after waiting; connect again shortly"),
+                    ),
+                ));
+            }
             Err(err) => {
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
@@ -1333,9 +1358,10 @@ impl Sandboxes<()> for ApiImpl {
         };
         let timeout = duration_from_secs(body.timeout).unwrap_or(default_sandbox_timeout());
 
-        // A running sandbox is answered as it stands; one mid-transition is
-        // refused; only the absence of a record reads the snapshot row.
-        match self.orchestrator.get_sandbox(&sandbox_id).await {
+        // A running sandbox is answered as it stands; a pause in flight is
+        // waited out, since its end is what makes the row resumable; any other
+        // transition is refused; only the absence of a record reads the row.
+        match self.record_after_any_pause(sandbox_id).await {
             Ok(Some(metadata)) => match metadata.state {
                 SandboxState::Running => {
                     let metadata = match self
@@ -1373,6 +1399,14 @@ impl Sandboxes<()> for ApiImpl {
                 }
             },
             Ok(None) => {}
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                    Self::error(
+                        409,
+                        format!("sandbox is still {state} after waiting; resume it again shortly"),
+                    ),
+                ));
+            }
             Err(err) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
                     err.into(),
@@ -2518,6 +2552,111 @@ mod paused_sandbox_rest_tests {
             vec![still_paused.to_string()],
             "a running sandbox keeps the row it was resumed from; the row is not a \
              second, paused sandbox"
+        );
+    }
+
+    /// Puts a record mid-pause under `sandbox_id`, as a pause in flight leaves it.
+    async fn pause_in_flight(surface: &Surface, sandbox_id: SandboxId) {
+        surface
+            .api
+            .orchestrator()
+            .set_metadata_state_for_test(sandbox_id, SandboxState::Pausing)
+            .await
+            .expect("the store answers");
+    }
+
+    /// Ends the pause in flight shortly, the way a real one ends: the record
+    /// goes away and the row is all that is left.
+    fn finish_pause_later(surface: &Surface, sandbox_id: SandboxId) {
+        let orchestrator = surface.api.orchestrator();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            orchestrator
+                .remove_sandbox_for_test(&sandbox_id)
+                .await
+                .expect("the store answers");
+        });
+    }
+
+    /// Fails the pause in flight shortly: the VM is back and the record is running.
+    fn fail_pause_later(surface: &Surface, sandbox_id: SandboxId) {
+        let orchestrator = surface.api.orchestrator();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            orchestrator
+                .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+                .await
+                .expect("the store answers");
+        });
+    }
+
+    #[tokio::test]
+    async fn a_resume_during_a_pause_waits_for_it_and_rebuilds_from_the_row() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = surface.paused(mock_paused_sandbox_config());
+        pause_in_flight(&surface, sandbox_id).await;
+        finish_pause_later(&surface, sandbox_id);
+
+        let response = surface.resume(sandbox_id).await;
+
+        assert!(
+            matches!(
+                response,
+                SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully { .. }
+            ),
+            "the resume waited for the pause to finish and rebuilt from the row, got {response:?}"
+        );
+        assert_eq!(
+            surface.state_of(sandbox_id).await,
+            Some(SandboxState::Running)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_during_a_pause_waits_for_it_and_rebuilds_from_the_row() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = surface.paused(mock_paused_sandbox_config());
+        pause_in_flight(&surface, sandbox_id).await;
+        finish_pause_later(&surface, sandbox_id);
+
+        let response = surface.connect(sandbox_id).await;
+
+        assert!(
+            matches!(
+                response,
+                SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully { .. }
+            ),
+            "the connect waited for the pause to finish and rebuilt from the row, got {response:?}"
+        );
+        assert_eq!(
+            surface.state_of(sandbox_id).await,
+            Some(SandboxState::Running)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_during_a_pause_that_fails_answers_the_sandbox_that_kept_running() {
+        let surface = Surface::api_half().await;
+        let sandbox_id = surface.paused(mock_paused_sandbox_config());
+        pause_in_flight(&surface, sandbox_id).await;
+        fail_pause_later(&surface, sandbox_id);
+
+        let response = surface.resume(sandbox_id).await;
+
+        assert!(
+            matches!(
+                response,
+                SandboxesSandboxIdResumePostResponse::Status201_TheSandboxWasResumedSuccessfully { .. }
+            ),
+            "a pause that failed leaves the sandbox running, and the resume answers it as it \
+             stands, got {response:?}"
+        );
+        assert!(
+            matches!(
+                surface.connect(sandbox_id).await,
+                SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning { .. }
+            ),
+            "nothing was rebuilt over the sandbox that kept running"
         );
     }
 }

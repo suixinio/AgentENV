@@ -694,19 +694,53 @@ async fn the_node_half_answers_not_found_for_anything_it_is_not_running() {
 }
 
 #[tokio::test]
-async fn a_sandbox_mid_transition_is_refused_until_the_transition_settles() {
+async fn a_wake_up_during_a_pause_waits_for_it_and_rebuilds_from_the_row() {
     let api = serve_api(api_half(Ok(ResumePlacement::NotRunning))).await;
     let pausing = SandboxId::new();
+    api.catalog.seed(paused_sandbox_record(
+        pausing,
+        Some(OTHER_NODE),
+        mock_paused_sandbox_config(),
+        1_700_000_000_000,
+    ));
     api.api
         .orchestrator()
         .set_metadata_state_for_test(pausing, SandboxState::Pausing)
         .await
         .expect("seed a sandbox mid-pause");
+    let orchestrator = api.api.orchestrator();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        orchestrator
+            .remove_sandbox_for_test(&pausing)
+            .await
+            .expect("the pause finishes by forgetting the record");
+    });
+
+    api.resume(&pausing.to_string(), None, None)
+        .await
+        .expect("the wake-up waits for the pause and rebuilds from its row");
+    assert_eq!(
+        api.state_of(pausing).await,
+        Some(SandboxState::Running),
+        "the pause finished first; what answered was a rebuild, not the pausing VM"
+    );
+}
+
+#[tokio::test]
+async fn a_sandbox_mid_snapshot_is_refused_and_one_being_killed_is_gone() {
+    let api = serve_api(api_half(Ok(ResumePlacement::NotRunning))).await;
+    let snapshotting = SandboxId::new();
+    api.api
+        .orchestrator()
+        .set_metadata_state_for_test(snapshotting, SandboxState::Snapshotting)
+        .await
+        .expect("seed a sandbox mid-snapshot");
 
     let status = api
-        .resume(&pausing.to_string(), None, None)
+        .resume(&snapshotting.to_string(), None, None)
         .await
-        .expect_err("a sandbox mid-pause cannot be woken yet");
+        .expect_err("a sandbox mid-snapshot cannot be woken yet");
     assert_eq!(status.code(), Code::FailedPrecondition);
     assert_eq!(
         refusal_reason(&status),

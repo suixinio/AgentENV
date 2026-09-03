@@ -152,6 +152,9 @@ orchestration_surface! {
         /// One sandbox's metadata, or `None` when this orchestrator has no
         /// record of it.
         fn get_sandbox(sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
+        /// Waits for a pause in flight to settle: `None` once the record is
+        /// gone, the record itself if the pause did not finish.
+        fn wait_for_pause_to_settle(sandbox_id: SandboxId) -> Result<Option<SandboxMetadata>>;
         /// Every sandbox this orchestrator has a record of.
         fn list_sandboxes() -> Result<Vec<SandboxMetadata>>;
         /// The ids of every sandbox this orchestrator has a record of.
@@ -188,6 +191,8 @@ orchestration_surface! {
         );
         #[cfg(test)]
         fn set_metadata_state_for_test(sandbox_id: SandboxId, state: SandboxState) -> Result<()>;
+        #[cfg(test)]
+        fn remove_sandbox_for_test(sandbox_id: &SandboxId) -> Result<()>;
         #[cfg(test)]
         fn set_auto_resume_for_test(
             sandbox_id: &SandboxId,

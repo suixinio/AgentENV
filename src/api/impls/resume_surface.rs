@@ -309,7 +309,11 @@ impl ApiImpl {
 
         // The placement source can lag a record this process wrote itself.
         match self.orchestrator.get_sandbox(&sandbox_id).await {
-            Ok(Some(metadata)) => return self.answer_recorded(metadata).await,
+            Ok(Some(metadata)) => {
+                if let Some(answer) = self.answer_recorded(metadata).await {
+                    return answer;
+                }
+            }
             Ok(None) => {}
             Err(err) => return DataPlaneResume::Undecided(err.to_string()),
         }
@@ -346,10 +350,26 @@ impl ApiImpl {
     }
 
     /// Answers for a sandbox this process records but the placement source
-    /// did not name.
-    async fn answer_recorded(&self, metadata: SandboxMetadata) -> DataPlaneResume {
+    /// did not name. `None` is a pause that finished while this call waited:
+    /// the record is gone and the catalog row speaks for the sandbox.
+    async fn answer_recorded(&self, metadata: SandboxMetadata) -> Option<DataPlaneResume> {
         let sandbox_id = metadata.id;
-        match metadata.state {
+        let metadata = if metadata.state == SandboxState::Pausing {
+            // The pause ends in the row this call would wake from.
+            match self.orchestrator.wait_for_pause_to_settle(sandbox_id).await {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => return None,
+                Err(OrchestratorError::InvalidSandboxState { .. }) => {
+                    return Some(DataPlaneResume::TransitionInProgress {
+                        holder: SandboxState::Pausing.to_string(),
+                    })
+                }
+                Err(err) => return Some(DataPlaneResume::Undecided(err.to_string())),
+            }
+        } else {
+            metadata
+        };
+        Some(match metadata.state {
             SandboxState::Running => {
                 let node = self.node_running(sandbox_id).await;
                 self.project_running(
@@ -373,7 +393,7 @@ impl ApiImpl {
                     holder: state.to_string(),
                 }
             }
-        }
+        })
     }
 
     /// Rebuilds the sandbox from its row, bounded by the wake-up deadline.

@@ -126,7 +126,7 @@ where
             DataPlaneResume::TransitionInProgress { holder } => {
                 record("transition_in_progress");
                 Err(refusal(
-                    format!("sandbox is being resumed by node '{holder}'"),
+                    format!("another operation holds the sandbox: {holder}"),
                     REASON_TRANSITION_IN_PROGRESS,
                     &holder,
                 ))

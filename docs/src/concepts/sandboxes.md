@@ -79,7 +79,7 @@ Pausing a sandbox captures:
 - **Memory snapshot** of the running VM state
 - **Disk snapshot** of the writable filesystem layer
 
-Resuming creates a new VM under the same sandbox ID from the newest paused snapshot — on the node that paused it when that node is schedulable, otherwise wherever placement decides. The sandbox picks up exactly where it left off, including running processes; its lifetime budget and the running time already charged carry over. The paused snapshot is kept until the sandbox is deleted, and the next pause writes a new one. Pausing an already-paused sandbox is a `409`; deleting a sandbox removes every paused snapshot of it.
+Resuming creates a new VM under the same sandbox ID from the newest paused snapshot — on the node that paused it when that node is schedulable, otherwise wherever placement decides. The sandbox picks up exactly where it left off, including running processes; its lifetime budget and the running time already charged carry over. The paused snapshot is kept until the sandbox is deleted, and the next pause writes a new one. A resume, connect or data-plane wake-up that arrives while the sandbox is still pausing waits for the pause to finish and then resumes from the snapshot it wrote; if that pause fails, the sandbox that kept running is answered as it stands. Pausing an already-paused sandbox is a `409`; deleting a sandbox removes every paused snapshot of it.
 
 
 ```bash

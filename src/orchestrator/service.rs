@@ -2081,6 +2081,32 @@ where
         }
     }
 
+    /// Waits for a pause in flight on `sandbox_id` to settle.
+    ///
+    /// `None` is the pause having finished: the record is gone and the
+    /// sandbox's newest catalog row speaks for it from here. `Some` is the
+    /// record as it stands after a pause that did not finish. A pause still
+    /// in flight after [`WAIT_TRANSITION_TIMEOUT`] is
+    /// `InvalidSandboxState { state: Pausing }`.
+    pub async fn wait_for_pause_to_settle(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<Option<SandboxMetadata>> {
+        let wait = self
+            .store
+            .wait_while_in_states(&sandbox_id, &[SandboxState::Pausing]);
+        match tokio::time::timeout(WAIT_TRANSITION_TIMEOUT, wait).await {
+            Ok(settled) => settled.map_err(OrchestratorError::from),
+            Err(_elapsed) => {
+                warn!(%sandbox_id, "timed out waiting for a pause to settle");
+                Err(OrchestratorError::InvalidSandboxState {
+                    sandbox_id,
+                    state: SandboxState::Pausing,
+                })
+            }
+        }
+    }
+
     /// Joins a pause another caller is performing on the same sandbox.
     ///
     /// The record disappearing is the pause finishing: a delete cannot start
@@ -2984,6 +3010,12 @@ where
         } else {
             let _ = self.proxy_routes.write().await.remove(&sandbox_id);
         }
+    }
+
+    /// Forgets a record outright, the way a finished pause does.
+    pub async fn remove_sandbox_for_test(&self, sandbox_id: &SandboxId) -> Result<()> {
+        self.store.remove(sandbox_id).await?;
+        Ok(())
     }
 
     pub async fn set_metadata_state_for_test(

@@ -38,11 +38,13 @@ pub struct Placement {
 }
 
 /// Selects an eligible node, honoring preference before shared round-robin.
+/// Nodes named in `excluded_node_ids` are never chosen, preferred or not.
 /// Shadow scoring runs only after real selection using the same registry reads.
 pub fn select_node(
     deps: &ScheduleDeps<'_>,
     hint: Option<&ScheduleRequestHint>,
     prefer_node_id: &str,
+    excluded_node_ids: &[String],
     source: ShadowSource,
     now: SystemTime,
 ) -> Result<Placement, NoNodesAvailable> {
@@ -65,7 +67,19 @@ pub fn select_node(
             RichNode { node, snapshot }
         })
         .collect();
-    let eligible_nodes = filter_unschedulable(rich);
+    let excluded: Vec<String> = excluded_node_ids
+        .iter()
+        .map(|id| {
+            deps.node_registry
+                .resolve(id.trim())
+                .map(|n| n.id)
+                .unwrap_or_else(|| id.trim().to_string())
+        })
+        .collect();
+    let eligible_nodes: Vec<RichNode> = filter_unschedulable(rich)
+        .into_iter()
+        .filter(|rich| !excluded.contains(&rich.node.id))
+        .collect();
     let eligible = eligible_nodes.len();
 
     let prefer_node_id = prefer_node_id.trim();
@@ -445,7 +459,7 @@ mod tests {
             shadow: &shadow,
         };
 
-        let placement = select_node(&deps, None, "", ShadowSource::Schedule, now)
+        let placement = select_node(&deps, None, "", &[], ShadowSource::Schedule, now)
             .expect("three discovered nodes");
         assert_eq!(placement.candidates, 3);
         assert_eq!(placement.eligible, 3);
@@ -482,13 +496,14 @@ mod tests {
 
         // Repeated bare selections expose any cursor movement by preferred calls.
         for _ in 0..2 {
-            let placement = select_node(&deps, None, "node-b", ShadowSource::PausedLookup, now)
-                .expect("node-b is a candidate");
+            let placement =
+                select_node(&deps, None, "node-b", &[], ShadowSource::PausedLookup, now)
+                    .expect("node-b is a candidate");
             assert_eq!(placement.node.id, "node-b");
         }
         let rotation: Vec<String> = (0..3)
             .map(|_| {
-                select_node(&deps, None, "", ShadowSource::Schedule, now)
+                select_node(&deps, None, "", &[], ShadowSource::Schedule, now)
                     .expect("two discovered nodes")
                     .node
                     .id

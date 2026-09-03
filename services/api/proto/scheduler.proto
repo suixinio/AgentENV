@@ -78,6 +78,9 @@ message NewSandboxHint {
   // bytes were last warm. Honoured only while that node is schedulable;
   // empty means no preference.
   string preferred_node_id = 4;
+  // Nodes that already refused this sandbox in this launch, so the retry is
+  // placed elsewhere. A preferred node listed here is not preferred.
+  repeated string excluded_node_ids = 5;
 }
 
 message ScheduleRequest {

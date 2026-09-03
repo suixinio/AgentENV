@@ -393,6 +393,9 @@ type NewSandboxHint struct {
 	// bytes were last warm. Honoured only while that node is schedulable;
 	// empty means no preference.
 	PreferredNodeId string `protobuf:"bytes,4,opt,name=preferred_node_id,json=preferredNodeId,proto3" json:"preferred_node_id,omitempty"`
+	// Nodes that already refused this sandbox in this launch, so the retry is
+	// placed elsewhere. A preferred node listed here is not preferred.
+	ExcludedNodeIds []string `protobuf:"bytes,5,rep,name=excluded_node_ids,json=excludedNodeIds,proto3" json:"excluded_node_ids,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -453,6 +456,13 @@ func (x *NewSandboxHint) GetPreferredNodeId() string {
 		return x.PreferredNodeId
 	}
 	return ""
+}
+
+func (x *NewSandboxHint) GetExcludedNodeIds() []string {
+	if x != nil {
+		return x.ExcludedNodeIds
+	}
+	return nil
 }
 
 type ScheduleRequest struct {
@@ -2103,13 +2113,14 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xa4\x02\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xd0\x02\n" +
 	"\x0eNewSandboxHint\x12F\n" +
 	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x12 \n" +
 	"\tcpu_count\x18\x02 \x01(\rH\x00R\bcpuCount\x88\x01\x01\x12\"\n" +
 	"\n" +
 	"memory_mib\x18\x03 \x01(\x04H\x01R\tmemoryMib\x88\x01\x01\x12*\n" +
-	"\x11preferred_node_id\x18\x04 \x01(\tR\x0fpreferredNodeId\x1a;\n" +
+	"\x11preferred_node_id\x18\x04 \x01(\tR\x0fpreferredNodeId\x12*\n" +
+	"\x11excluded_node_ids\x18\x05 \x03(\tR\x0fexcludedNodeIds\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B\f\n" +

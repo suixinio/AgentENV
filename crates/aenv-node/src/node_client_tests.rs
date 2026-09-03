@@ -830,6 +830,7 @@ impl NodePlacement for ReplacementNodePlacement {
         _sandbox_id: crate::types::SandboxId,
         _resources: crate::types::SandboxResources,
         _preferred_node_id: Option<&str>,
+        _excluded_node_ids: &[String],
     ) -> anyhow::Result<NodeEndpoint> {
         Ok(self.initial.clone())
     }
@@ -1092,6 +1093,7 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
             _sandbox_id: crate::types::SandboxId,
             _resources: crate::types::SandboxResources,
             _preferred_node_id: Option<&str>,
+            _excluded_node_ids: &[String],
         ) -> anyhow::Result<NodeEndpoint> {
             Ok(self.initial.clone())
         }
@@ -2747,6 +2749,10 @@ struct ClusterPlacement {
     recorded: Mutex<Vec<(crate::types::SandboxId, ExecutionId, NodeEndpoint, u32)>>,
     /// The placement preference each launch arrived with, in order.
     preferred: Mutex<Vec<Option<String>>>,
+    /// The exclusions each placement call arrived with, in order.
+    excluded: Mutex<Vec<Vec<String>>>,
+    /// Nodes offered once `node` is excluded, in order.
+    spares: Vec<NodeEndpoint>,
     membership: Mutex<MembershipAnswer>,
 }
 
@@ -2768,9 +2774,20 @@ impl ClusterPlacement {
             reserves_at_all: true,
             recorded: Mutex::new(Vec::new()),
             preferred: Mutex::new(Vec::new()),
+            excluded: Mutex::new(Vec::new()),
+            spares: Vec::new(),
             membership: Mutex::new(MembershipAnswer::Present),
             node,
         })
+    }
+
+    // A cluster with a second node to offer once the first is excluded.
+    fn recording_with_spare(node: NodeEndpoint, spare: NodeEndpoint) -> Arc<Self> {
+        let mut placement = Arc::try_unwrap(Self::recording(node))
+            .ok()
+            .expect("sole owner");
+        placement.spares = vec![spare];
+        Arc::new(placement)
     }
 
     // A cluster whose binding store refuses the reservation write.
@@ -2838,6 +2855,10 @@ impl ClusterPlacement {
         self.preferred.lock().expect("lock").clone()
     }
 
+    fn exclusions_seen(&self) -> Vec<Vec<String>> {
+        self.excluded.lock().expect("lock").clone()
+    }
+
     fn set_membership(&self, answer: MembershipAnswer) {
         *self.membership.lock().expect("lock") = answer;
     }
@@ -2850,12 +2871,23 @@ impl NodePlacement for ClusterPlacement {
         _sandbox_id: crate::types::SandboxId,
         _resources: crate::types::SandboxResources,
         preferred_node_id: Option<&str>,
+        excluded_node_ids: &[String],
     ) -> anyhow::Result<NodeEndpoint> {
         self.preferred
             .lock()
             .expect("lock")
             .push(preferred_node_id.map(str::to_string));
-        Ok(self.node.clone())
+        self.excluded
+            .lock()
+            .expect("lock")
+            .push(excluded_node_ids.to_vec());
+        // The first node not excluded; with none left, the excluded first
+        // node again, which is what a placement source with nowhere else says.
+        Ok(std::iter::once(&self.node)
+            .chain(self.spares.iter())
+            .find(|node| !excluded_node_ids.contains(&node.node_id))
+            .unwrap_or(&self.node)
+            .clone())
     }
 
     async fn place_existing(
@@ -3029,6 +3061,122 @@ async fn a_create_the_node_refused_withdraws_its_reservation() {
          until the reservation expires"
     );
     assert!(!placement.is_bound(sandbox_id));
+}
+
+#[tokio::test]
+async fn a_create_a_draining_node_refused_is_placed_on_another_node() {
+    let (script, refusing) = scripted_node().await;
+    *script.create.lock().expect("lock") = Some(Err(Status::unavailable(
+        "node is isolated and is not taking new sandboxes",
+    )));
+    let refusing_endpoint =
+        NodeEndpoint::same_address("node-draining", refusing.endpoint.endpoint.clone());
+    let accepting = real_node().await;
+
+    let placement =
+        ClusterPlacement::recording_with_spare(refusing_endpoint, accepting.endpoint.clone());
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, ExecutionId::new())
+        .expect("building a stub does no I/O");
+
+    backend
+        .start()
+        .await
+        .expect("the refusal of one node is not the answer while another can take it");
+
+    assert_eq!(
+        backend.holding_node_id(),
+        Some(accepting.endpoint.node_id.as_str()),
+        "the sandbox is running where the second placement put it"
+    );
+    assert_eq!(
+        placement.exclusions_seen(),
+        vec![Vec::new(), vec!["node-draining".to_string()]],
+        "the second placement was asked to avoid the node that refused"
+    );
+    assert_eq!(
+        script.seen_create.lock().expect("lock").len(),
+        1,
+        "the refusing node was asked exactly once"
+    );
+    assert_eq!(running_on(&accepting).await, vec![sandbox_id]);
+    assert!(
+        placement.is_bound(sandbox_id),
+        "the placement that succeeded is the one recorded"
+    );
+}
+
+#[tokio::test]
+async fn a_create_refused_for_its_request_is_not_retried_elsewhere() {
+    let (script, refusing) = scripted_node().await;
+    *script.create.lock().expect("lock") =
+        Some(Err(Status::invalid_argument("source is required")));
+    let refusing_endpoint =
+        NodeEndpoint::same_address("node-strict", refusing.endpoint.endpoint.clone());
+    let accepting = real_node().await;
+
+    let placement =
+        ClusterPlacement::recording_with_spare(refusing_endpoint, accepting.endpoint.clone());
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, ExecutionId::new())
+        .expect("building a stub does no I/O");
+
+    let error = backend
+        .start()
+        .await
+        .expect_err("a request another node would refuse the same way fails here");
+
+    assert!(
+        format!("{error:#}").contains("source is required"),
+        "the node's own reason is the error: {error:#}"
+    );
+    assert_eq!(
+        placement.exclusions_seen().len(),
+        1,
+        "placement was not asked a second time"
+    );
+    assert!(running_on(&accepting).await.is_empty());
+    assert!(!placement.is_reserved(sandbox_id));
+}
+
+#[tokio::test]
+async fn a_refusal_with_nowhere_else_to_go_is_the_answer() {
+    let (script, refusing) = scripted_node().await;
+    *script.create.lock().expect("lock") = Some(Err(Status::unavailable(
+        "node is isolated and is not taking new sandboxes",
+    )));
+    let placement = ClusterPlacement::recording(NodeEndpoint::same_address(
+        "node-draining",
+        refusing.endpoint.endpoint.clone(),
+    ));
+    let factory =
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let config = launch_config();
+    let sandbox_id = config.sandbox_id;
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), config, ExecutionId::new())
+        .expect("building a stub does no I/O");
+
+    let error = backend.start().await.expect_err("the only node refused");
+
+    assert!(
+        format!("{error:#}").contains("not taking new sandboxes"),
+        "the refusal, not a placement error, is what the caller sees: {error:#}"
+    );
+    assert_eq!(
+        placement.exclusions_seen(),
+        vec![Vec::new(), vec!["node-draining".to_string()]],
+        "placement was asked once more, excluding the refuser, and offered it again"
+    );
+    assert!(!placement.is_reserved(sandbox_id));
 }
 
 async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger) -> ApiReplica {

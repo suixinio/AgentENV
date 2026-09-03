@@ -138,6 +138,7 @@ impl NodePlacement for NativeNodePlacement {
         _sandbox_id: SandboxId,
         resources: SandboxResources,
         preferred_node_id: Option<&str>,
+        excluded_node_ids: &[String],
     ) -> Result<NodeEndpoint> {
         let response = self
             .local
@@ -150,6 +151,7 @@ impl NodePlacement for NativeNodePlacement {
                             cpu_count: Some(resources.cpu_count),
                             memory_mib: Some(u64::from(resources.memory_mib)),
                             preferred_node_id: preferred_node_id.unwrap_or_default().to_string(),
+                            excluded_node_ids: excluded_node_ids.to_vec(),
                         },
                     )),
                 }),
@@ -365,7 +367,7 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..2 {
             let endpoint = placement
-                .place_new(SandboxId::new(), SandboxResources::default(), None)
+                .place_new(SandboxId::new(), SandboxResources::default(), None, &[])
                 .await
                 .expect("two discovered nodes, nothing else wired");
             seen.push(endpoint.node_id);
@@ -384,7 +386,7 @@ mod tests {
         let placement = placement(registry);
 
         let err = placement
-            .place_new(SandboxId::new(), SandboxResources::default(), None)
+            .place_new(SandboxId::new(), SandboxResources::default(), None, &[])
             .await
             .expect_err("nothing discovered");
         assert!(err.to_string().contains("no nodes available"), "{err}");

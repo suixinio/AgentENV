@@ -67,6 +67,7 @@ fn hint() -> ScheduleRequestHint {
             cpu_count: Some(2),
             memory_mib: Some(2048),
             preferred_node_id: String::new(),
+            excluded_node_ids: Vec::new(),
         })),
     }
 }
@@ -124,6 +125,7 @@ fn bench_placement_shadow(c: &mut Criterion) {
                             &deps,
                             Some(&hint),
                             "",
+                            &[],
                             ShadowSource::Schedule,
                             SystemTime::now(),
                         )

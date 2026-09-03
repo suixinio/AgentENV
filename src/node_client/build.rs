@@ -35,7 +35,7 @@ pub async fn build_template_on_a_node(
     // Builds have no sandbox ID; placement implementations ignore this synthetic one.
     let sandbox_id = SandboxId::new();
     let node = placement
-        .place_new(sandbox_id, resources, None)
+        .place_new(sandbox_id, resources, None, &[])
         .await
         .map_err(|err| {
             TemplateBuildErrorReason::new(format!("choose a node for a template build: {err:#}"))

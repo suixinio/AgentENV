@@ -707,20 +707,21 @@ impl Scheduler for NodeRegistryGrpcService {
             strategy: self.strategy.as_ref(),
             shadow: self.shadow.as_ref(),
         };
-        let preferred_node_id = req
-            .hint
-            .as_ref()
-            .and_then(|hint| match hint.kind.as_ref() {
-                Some(scheduler::schedule_request_hint::Kind::NewSandbox(hint)) => {
-                    Some(hint.preferred_node_id.as_str())
-                }
-                _ => None,
-            })
+        let new_sandbox = req.hint.as_ref().and_then(|hint| match hint.kind.as_ref() {
+            Some(scheduler::schedule_request_hint::Kind::NewSandbox(hint)) => Some(hint),
+            _ => None,
+        });
+        let preferred_node_id = new_sandbox
+            .map(|hint| hint.preferred_node_id.as_str())
+            .unwrap_or_default();
+        let excluded_node_ids: &[String] = new_sandbox
+            .map(|hint| hint.excluded_node_ids.as_slice())
             .unwrap_or_default();
         let result = lookup_logic::select_node(
             &deps,
             req.hint.as_ref(),
             preferred_node_id,
+            excluded_node_ids,
             ShadowSource::Schedule,
             SystemTime::now(),
         );
@@ -2339,6 +2340,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn schedule_never_chooses_an_excluded_node_even_the_preferred_one() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![
+                node("node-a", "http://10.0.0.1:8000"),
+                node("node-b", "http://10.0.0.2:8000"),
+            ],
+            Duration::from_secs(30),
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry));
+        let excluding_b = |preferred: &str| ScheduleRequest {
+            hint: Some(scheduler::ScheduleRequestHint {
+                kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
+                    scheduler::NewSandboxHint {
+                        preferred_node_id: preferred.to_string(),
+                        excluded_node_ids: vec!["node-b".to_string()],
+                        ..Default::default()
+                    },
+                )),
+            }),
+        };
+
+        for preferred in ["node-b", "", "node-b", ""] {
+            let resp = service
+                .schedule(Request::new(excluding_b(preferred)))
+                .await
+                .expect("node-a is still eligible")
+                .into_inner();
+            assert_eq!(
+                resp.node.expect("a node was chosen").node_id,
+                "node-a",
+                "an excluded node was chosen with preference {preferred:?}"
+            );
+        }
+
+        let nothing_left = ScheduleRequest {
+            hint: Some(scheduler::ScheduleRequestHint {
+                kind: Some(scheduler::schedule_request_hint::Kind::NewSandbox(
+                    scheduler::NewSandboxHint {
+                        excluded_node_ids: vec!["node-a".to_string(), "node-b".to_string()],
+                        ..Default::default()
+                    },
+                )),
+            }),
+        };
+        let status = service
+            .schedule(Request::new(nothing_left))
+            .await
+            .expect_err("every node is excluded");
+        assert_eq!(status.code(), tonic::Code::Unavailable);
+    }
+
+    #[tokio::test]
     async fn schedule_metrics_are_named_and_labelled_exactly() {
         use metrics_util::debugging::DebuggingRecorder;
 
@@ -2865,6 +2918,7 @@ mod tests {
                             cpu_count: Some(1),
                             memory_mib: Some(1),
                             preferred_node_id: String::new(),
+                            excluded_node_ids: Vec::new(),
                         },
                     )),
                 }),
@@ -2959,6 +3013,7 @@ mod tests {
                     disk_size_mib: 1024,
                 },
                 None,
+                &[],
             )
             .await
             .expect("two discovered nodes");
@@ -3014,6 +3069,7 @@ mod tests {
                         cpu_count,
                         memory_mib,
                         preferred_node_id: String::new(),
+                        excluded_node_ids: Vec::new(),
                     },
                 )),
             }),

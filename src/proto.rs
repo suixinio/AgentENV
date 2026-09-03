@@ -385,6 +385,7 @@ mod scheduler_wire_tests {
                         cpu_count,
                         memory_mib,
                         preferred_node_id: String::new(),
+                        excluded_node_ids: Vec::new(),
                     },
                 )),
             }),

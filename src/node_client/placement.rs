@@ -43,12 +43,16 @@ pub trait NodePlacement: Send + Sync + 'static {
     ///
     /// `preferred_node_id` is honoured when that node is schedulable and
     /// silently ignored otherwise: it is where a paused sandbox's bytes were
-    /// last warm, never where the sandbox must run.
+    /// last warm, never where the sandbox must run. `excluded_node_ids` are
+    /// nodes that refused this launch already; none of them is chosen, and
+    /// an implementation that cannot avoid them returns one anyway, which the
+    /// caller reads as the cluster having nowhere else.
     async fn place_new(
         &self,
         sandbox_id: SandboxId,
         resources: SandboxResources,
         preferred_node_id: Option<&str>,
+        excluded_node_ids: &[String],
     ) -> anyhow::Result<NodeEndpoint>;
 
     /// Locates the node holding an existing sandbox.
@@ -124,6 +128,7 @@ impl NodePlacement for FixedNodePlacement {
         _sandbox_id: SandboxId,
         _resources: SandboxResources,
         _preferred_node_id: Option<&str>,
+        _excluded_node_ids: &[String],
     ) -> anyhow::Result<NodeEndpoint> {
         Ok(self.node.clone())
     }

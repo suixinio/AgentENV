@@ -45,6 +45,9 @@ pub enum PendingLaunch {
 }
 
 /// One sandbox on another node.
+/// How many nodes one launch may try before its last refusal is the answer.
+const PLACEMENT_ATTEMPTS: usize = 3;
+
 pub struct RemoteSandboxStub {
     sandbox_id: SandboxId,
     execution_id: ExecutionId,
@@ -280,6 +283,18 @@ impl RemoteSandboxStub {
 
     // Best-effort: a reservation that outlives this call expires on its own, and
     // one the node meanwhile confirmed names a runtime that really is there.
+    /// Whether a node's answer to a create means "not here, not now" rather
+    /// than something wrong with the request: unavailable (isolated, shutting
+    /// down, or unreachable), busy with a conflicting state, or full.
+    fn refuses_the_launch(status: &tonic::Status) -> bool {
+        matches!(
+            status.code(),
+            tonic::Code::Unavailable
+                | tonic::Code::FailedPrecondition
+                | tonic::Code::ResourceExhausted
+        )
+    }
+
     async fn withdraw_reservation(&self) {
         if let Err(error) = self
             .placement
@@ -511,48 +526,66 @@ impl SandboxBackend for RemoteSandboxStub {
                 preferred_node_id,
             } => ((**request).clone(), preferred_node_id.clone()),
         };
-        let node = self
-            .placement
-            .place_new(
-                self.sandbox_id,
-                self.resources,
-                preferred_node_id.as_deref(),
-            )
-            .await
-            .with_context(|| format!("choose a node for sandbox {}", self.sandbox_id))?;
 
-        // Reserve before asking for the runtime, never after: a lookup that finds
-        // no record of a sandbox is read as a verdict that it is gone, so a runtime
-        // must not be able to exist before its record does.
-        self.placement
-            .reserve_placement(self.sandbox_id, self.execution_id, &node)
-            .await
-            .with_context(|| {
-                format!(
-                    "reserve a routing record for sandbox {} on node {} before starting it",
-                    self.sandbox_id, node.node_id
+        // A node that refuses the launch is excluded and placement is asked
+        // again, so a preference the placement source is stale about (a node
+        // just put into draining) costs one round trip, not the launch.
+        let mut excluded_node_ids: Vec<String> = Vec::new();
+        let mut last_refusal: Option<anyhow::Error> = None;
+        let (node, mut client, ack) = loop {
+            let node = self
+                .placement
+                .place_new(
+                    self.sandbox_id,
+                    self.resources,
+                    preferred_node_id.as_deref(),
+                    &excluded_node_ids,
                 )
-            })?;
-
-        let mut client = match Self::connect(&node.endpoint).await {
-            Ok(client) => client,
-            Err(error) => {
-                self.withdraw_reservation().await;
-                return Err(error);
+                .await
+                .with_context(|| format!("choose a node for sandbox {}", self.sandbox_id))?;
+            if excluded_node_ids.contains(&node.node_id) {
+                // Placement has nowhere else; the refusal stands.
+                return Err(last_refusal.expect("an excluded node was refused first"));
             }
-        };
 
-        let ack = match client.create(request).await {
-            Ok(ack) => ack.into_inner(),
-            Err(status) => {
-                self.withdraw_reservation().await;
-                return Err(wire::into_error(status)).with_context(|| {
+            // Reserve before asking for the runtime, never after: a lookup that finds
+            // no record of a sandbox is read as a verdict that it is gone, so a runtime
+            // must not be able to exist before its record does.
+            self.placement
+                .reserve_placement(self.sandbox_id, self.execution_id, &node)
+                .await
+                .with_context(|| {
                     format!(
-                        "create sandbox {} on node {}",
+                        "reserve a routing record for sandbox {} on node {} before starting it",
                         self.sandbox_id, node.node_id
                     )
-                });
+                })?;
+
+            let (retryable, error) = match Self::connect(&node.endpoint).await {
+                Ok(mut client) => match client.create(request.clone()).await {
+                    Ok(ack) => break (node, client, ack.into_inner()),
+                    Err(status) => (
+                        Self::refuses_the_launch(&status),
+                        wire::into_error(status).context(format!(
+                            "create sandbox {} on node {}",
+                            self.sandbox_id, node.node_id
+                        )),
+                    ),
+                },
+                Err(error) => (true, error),
+            };
+            self.withdraw_reservation().await;
+            if !retryable || excluded_node_ids.len() + 1 >= PLACEMENT_ATTEMPTS {
+                return Err(error);
             }
+            warn!(
+                sandbox_id = %self.sandbox_id,
+                node = %node.node_id,
+                error = %format_args!("{error:#}"),
+                "node refused the launch; placing the sandbox elsewhere"
+            );
+            excluded_node_ids.push(node.node_id);
+            last_refusal = Some(error);
         };
 
         // The node must start the incarnation already recorded by the caller.

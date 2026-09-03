@@ -188,8 +188,16 @@ test: test-agent test-envd test-ublk
 # executed on none. Among them: `aenv download` not overwriting an existing
 # file without `--force`, and `aenv upload`'s directory walk refusing to
 # follow symlinks out of the tree.
+#
+# The package list reaches `aenv-egress` with its default features (`core`),
+# which is what `aenv-node` links and deliberately carries no TLS stack, no
+# Vault client and no `http` handler. The broker binary's own code — the leaf
+# signer, the Vault grant check, the header injection — lives behind `bin`, so
+# it needs the second invocation to be executed at all rather than only
+# type-checked by `make clippy`'s `--all-features`.
 test-unit:
 	$(CARGO) test -p aenv-core -p aenv-api -p aenv-node -p aenv-egress -p envd -p linux-cap -p aenv -p adev --lib --bins
+	$(CARGO) test -p aenv-egress --features bin --lib --bins
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api -p aenv-node --lib --bins -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib --bins
 	bash scripts/tests/verify-capability-runner.sh
@@ -281,13 +289,28 @@ test-agent: prepare-agent-test-state
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api -p aenv-node; \
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api -p aenv-node --lib -- --ignored
 
+# Two cargo invocations over the same test binaries, because the egress tests
+# need a different node config than every other integration test and the
+# config is read from the process environment. `integration/egress.rs` refuses
+# any mode but `embedded` (a `Result::Err` out of a `#[tokio::test]` is a
+# failure, not a skip) while `config/default.toml` ships `disabled`; the
+# overlay below flips the mode for that invocation only. The `--skip egress::`
+# on the first one is what keeps the overlay from becoming the config the
+# other tests run under.
 test-agent-integration: prepare-agent-test-state
 	$(MAKE) build-ublk PROFILE=debug
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
 	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-node \
 		--test integration \
-		--test orchestrator_integration
+		--test orchestrator_integration \
+		-- --skip egress::
+	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
+	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
+	AENV_CONFIG_OVERLAY_PATH="$(CURDIR)/tests/fixtures/egress-embedded-overlay.toml" \
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-node \
+		--test integration \
+		egress::
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
 	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv-e2e-tests --test snapshot_oss_e2e_test -- --ignored
@@ -413,6 +436,7 @@ k8s-load-dev:
 	$(DOCKER) save $(K8S_RUNTIME_IMAGE) | $(K3S_CTR) images import -
 	$(DOCKER) save $(K8S_API_IMAGE) | $(K3S_CTR) images import -
 	$(DOCKER) save $(K8S_GATEWAY_IMAGE) | $(K3S_CTR) images import -
+	$(DOCKER) save $(K8S_EGRESS_IMAGE) | $(K3S_CTR) images import -
 
 k8s-refresh-dev: k8s-build k8s-load-dev k8s-redeploy
 

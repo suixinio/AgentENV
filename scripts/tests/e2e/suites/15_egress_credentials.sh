@@ -22,6 +22,19 @@ run_in_sandbox() {
     python3 "${EGRESS_PY}" run "${sandbox_id}" "${cmd}"
 }
 
+# The HTTP status of one guest request, with a connection failure reported as
+# `000`. Two shapes have to read the same: curl's own `-w '%{http_code}'`
+# prints `000` when it never connected, and the e2b SDK's blocking
+# `commands.run` raises on a non-zero exit, so today run_in_sandbox prints
+# nothing at all and only its exit status carries the failure. Take the first
+# line and default it rather than depending on which one arrives.
+guest_http_code() {
+  local sandbox_id="$1" url="$2" code
+  code=$(run_in_sandbox "$sandbox_id" \
+    "curl -sS -o /dev/null -w '%{http_code}' --max-time ${3:-20} ${url}" | head -n 1 || true)
+  printf '%s' "${code:-000}"
+}
+
 # -- Preconditions -------------------------------------------------------------
 if ! python3 -c 'import e2b' >/dev/null 2>&1; then
   warn "python e2b SDK not importable; the suite cannot run commands inside sandboxes"
@@ -138,7 +151,7 @@ closed_id=$(create_sandbox "$AENV_TEMPLATE_ID" 120 "$closed_json"); _sync_http
 assert_status "$HTTP_STATUS" "201" "create closed sandbox with rules"
 track_sandbox "$closed_id"
 wait_for_sandbox_state "$closed_id" "running" 60
-closed_code=$(run_in_sandbox "$closed_id" "curl -sS -o /dev/null -w '%{http_code}' --max-time 20 https://${EGRESS_UPSTREAM}/anything" || echo 000)
+closed_code=$(guest_http_code "$closed_id" "https://${EGRESS_UPSTREAM}/anything" 20)
 if [[ "$closed_code" == "403" || "$closed_code" == "000" ]]; then
   _pass "closed sandbox cannot reach the rule domain through the broker (HTTP ${closed_code})"
 else
@@ -170,10 +183,19 @@ if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
   assert_eq "$after_roll" "Bearer ${secret_value}" "brokered requests resume after the rollout"
 
   replicas=$(kubectl -n "$ns" get deploy/aenv-egress -o jsonpath='{.spec.replicas}')
+  # Registered before the scale-down, not after it: an interrupt or a runner
+  # timeout between the two would otherwise leave the broker at zero replicas
+  # for every tenant of a shared cluster. Chained onto the harness's own EXIT
+  # trap (`_cleanup_e2e`, scripts/tests/e2e/lib/helpers.sh) rather than
+  # replacing it.
+  _restore_egress_replicas() {
+    kubectl -n "$ns" scale deploy/aenv-egress --replicas="${replicas:-2}" >/dev/null 2>&1 || true
+  }
+  trap '_restore_egress_replicas; _cleanup_e2e' EXIT
   kubectl -n "$ns" scale deploy/aenv-egress --replicas=0 >/dev/null
   kubectl -n "$ns" rollout status deploy/aenv-egress --timeout=120s >/dev/null || true
   sleep 12
-  outage_code=$(run_in_sandbox "$sandbox_id" "curl -sS -o /dev/null -w '%{http_code}' --max-time 10 https://${EGRESS_UPSTREAM}/anything" || echo 000)
+  outage_code=$(guest_http_code "$sandbox_id" "https://${EGRESS_UPSTREAM}/anything" 10)
   if [[ "$outage_code" == "000" ]]; then
     _pass "guest connection fails fast while the broker is down"
   else

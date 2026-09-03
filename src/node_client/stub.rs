@@ -297,6 +297,94 @@ impl RemoteSandboxStub {
         )
     }
 
+    fn fork_child(
+        result: pb::ForkChildResult,
+        requested: &SandboxForkSpec,
+        resources: SandboxResources,
+        placement: &Arc<dyn NodePlacement>,
+        node: &NodeEndpoint,
+        client: &NodeSandboxServiceClient<Channel>,
+    ) -> Result<RemoteSandboxStub> {
+        if result.sandbox_id != requested.sandbox_id.to_string() {
+            bail!(
+                "node {} answered for sandbox {} where {} was asked for",
+                node.node_id,
+                result.sandbox_id,
+                requested.sandbox_id
+            );
+        }
+        match result.outcome {
+            Some(pb::fork_child_result::Outcome::Started(ack)) => {
+                let execution_id =
+                    ExecutionId::parse_str(&ack.execution_id).with_context(|| {
+                        format!("fork child {} returned no incarnation", result.sandbox_id)
+                    })?;
+                Ok(RemoteSandboxStub::already_running(
+                    requested.sandbox_id,
+                    execution_id,
+                    resources,
+                    Arc::clone(placement),
+                    node.clone(),
+                    client.clone(),
+                    &ack,
+                ))
+            }
+            Some(pb::fork_child_result::Outcome::Error(message)) => bail!(
+                "node {} failed to fork {}: {message}",
+                node.node_id,
+                requested.sandbox_id
+            ),
+            None => bail!(
+                "node {} returned neither an outcome nor an error for {}",
+                node.node_id,
+                requested.sandbox_id
+            ),
+        }
+    }
+
+    // Best-effort, as for a create: the node's next heartbeat repairs a gap.
+    async fn announce_child_placement(
+        placement: &Arc<dyn NodePlacement>,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        node: &NodeEndpoint,
+        projection_ttl_secs: u32,
+    ) {
+        if let Err(error) = placement
+            .record_placement(sandbox_id, execution_id, node, projection_ttl_secs)
+            .await
+        {
+            warn!(
+                %sandbox_id,
+                node_id = %node.node_id,
+                %execution_id,
+                error = %error,
+                "could not tell the cluster which machine this fork child is on; it stays \
+                 unroutable until the node's next heartbeat says so"
+            );
+        }
+    }
+
+    async fn withdraw_reservations(
+        placement: &Arc<dyn NodePlacement>,
+        reserved: &[(SandboxId, ExecutionId)],
+    ) {
+        for (sandbox_id, execution_id) in reserved {
+            if let Err(error) = placement
+                .release_placement_reservation(*sandbox_id, *execution_id)
+                .await
+            {
+                warn!(
+                    %sandbox_id,
+                    %execution_id,
+                    error = %error,
+                    "could not withdraw the routing reservation of a fork child that never \
+                     started; it expires on its own"
+                );
+            }
+        }
+    }
+
     async fn withdraw_reservation(&self) {
         if let Err(error) = self
             .placement
@@ -749,11 +837,35 @@ impl SandboxBackend for RemoteSandboxStub {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
         let resources = self.resources;
+        let projection_ttl_secs = self.projection_ttl_secs;
         let placement = Arc::clone(&self.placement);
-        self.placed().map_err(SandboxCaptureError::recoverable)?;
+        let node_before = self
+            .placed()
+            .map_err(SandboxCaptureError::recoverable)?
+            .node
+            .clone();
+
+        // Children get routing records before the node is asked for them, as a
+        // create does: a lookup that finds no record is read as a verdict that
+        // the sandbox is gone. A retry that re-resolves the parent's node
+        // confirms the children on the node it actually used, below.
+        let mut reserved: Vec<(SandboxId, ExecutionId)> = Vec::new();
+        for child in spec {
+            if let Err(error) = placement
+                .reserve_placement(child.sandbox_id, child.execution_id, &node_before)
+                .await
+            {
+                Self::withdraw_reservations(&placement, &reserved).await;
+                return Err(SandboxCaptureError::recoverable(error.context(format!(
+                    "reserve a routing record for fork child {} before starting it",
+                    child.sandbox_id
+                ))));
+            }
+            reserved.push((child.sandbox_id, child.execution_id));
+        }
 
         // Retry only when the fork call never reached the node.
-        let response = self
+        let response = match self
             .call_with_stale_placement_retry("fork", |client| {
                 Box::pin(
                     client.fork(pb::SandboxForkRequest {
@@ -774,8 +886,13 @@ impl SandboxBackend for RemoteSandboxStub {
                 )
             })
             .await
-            .map_err(wire::into_capture_error)?
-            .into_inner();
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                Self::withdraw_reservations(&placement, &reserved).await;
+                return Err(wire::into_capture_error(status));
+            }
+        };
 
         // A retry may have replaced the connection; use the current placement.
         let placed = self.placed().map_err(SandboxCaptureError::recoverable)?;
@@ -784,6 +901,7 @@ impl SandboxBackend for RemoteSandboxStub {
 
         // Results pair positionally with child specs.
         if response.children.len() != spec.len() {
+            Self::withdraw_reservations(&placement, &reserved).await;
             return Err(SandboxCaptureError::terminal(anyhow!(
                 "node {} answered a fork of {} children with {} results",
                 node.node_id,
@@ -792,48 +910,31 @@ impl SandboxBackend for RemoteSandboxStub {
             )));
         }
 
-        Ok(response
-            .children
-            .into_iter()
-            .zip(spec)
-            .map(|(result, requested)| {
-                if result.sandbox_id != requested.sandbox_id.to_string() {
-                    return Err(anyhow!(
-                        "node {} answered for sandbox {} where {} was asked for",
-                        node.node_id,
-                        result.sandbox_id,
-                        requested.sandbox_id
-                    ));
+        let mut children = Vec::with_capacity(spec.len());
+        for (result, requested) in response.children.into_iter().zip(spec) {
+            let child = Self::fork_child(result, requested, resources, &placement, &node, &client);
+            match &child {
+                Ok(child) => {
+                    Self::announce_child_placement(
+                        &placement,
+                        requested.sandbox_id,
+                        child.execution_id(),
+                        &node,
+                        projection_ttl_secs,
+                    )
+                    .await
                 }
-                match result.outcome {
-                    Some(pb::fork_child_result::Outcome::Started(ack)) => {
-                        let execution_id =
-                            ExecutionId::parse_str(&ack.execution_id).with_context(|| {
-                                format!("fork child {} returned no incarnation", result.sandbox_id)
-                            })?;
-                        Ok(Box::new(RemoteSandboxStub::already_running(
-                            requested.sandbox_id,
-                            execution_id,
-                            resources,
-                            Arc::clone(&placement),
-                            node.clone(),
-                            client.clone(),
-                            &ack,
-                        )) as Box<dyn SandboxBackend>)
-                    }
-                    Some(pb::fork_child_result::Outcome::Error(message)) => Err(anyhow!(
-                        "node {} failed to fork {}: {message}",
-                        node.node_id,
-                        requested.sandbox_id
-                    )),
-                    None => Err(anyhow!(
-                        "node {} returned neither an outcome nor an error for {}",
-                        node.node_id,
-                        requested.sandbox_id
-                    )),
+                Err(_) => {
+                    Self::withdraw_reservations(
+                        &placement,
+                        &[(requested.sandbox_id, requested.execution_id)],
+                    )
+                    .await
                 }
-            })
-            .collect())
+            }
+            children.push(child.map(|child| Box::new(child) as Box<dyn SandboxBackend>));
+        }
+        Ok(children)
     }
 
     /// Deletes the remote sandbox unless pause already stopped it and left a capture.

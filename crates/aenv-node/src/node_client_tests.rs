@@ -954,6 +954,102 @@ async fn a_stale_node_address_is_retried_once_against_a_freshly_resolved_one() {
     assert!(script_a.seen_delete.lock().expect("lock").is_empty());
 }
 
+fn scripted_fork_of(
+    child: &SandboxForkSpec,
+    outcome: pb::fork_child_result::Outcome,
+) -> pb::SandboxForkResponse {
+    pb::SandboxForkResponse {
+        children: vec![pb::ForkChildResult {
+            sandbox_id: child.sandbox_id.to_string(),
+            execution_id: child.execution_id.to_string(),
+            outcome: Some(outcome),
+        }],
+    }
+}
+
+async fn started_parent_on(
+    script: &ScriptedNode,
+    placement: Arc<ClusterPlacement>,
+) -> Box<dyn crate::sandbox::SandboxBackend> {
+    let execution_id = ExecutionId::new();
+    *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        ..Default::default()
+    }));
+    let factory = RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>);
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
+        .expect("build a stub");
+    backend.start().await.expect("start the parent");
+    backend
+}
+
+#[tokio::test]
+async fn a_fork_child_the_node_started_is_routable() {
+    let (script, node) = scripted_node().await;
+    let placement = ClusterPlacement::recording(node.endpoint.clone());
+    let mut parent = started_parent_on(&script, Arc::clone(&placement)).await;
+    let child_spec = SandboxForkSpec {
+        sandbox_id: crate::types::SandboxId::new(),
+        execution_id: ExecutionId::new(),
+        envd_access_token: None,
+    };
+    *script.fork.lock().expect("lock") = Some(Ok(scripted_fork_of(
+        &child_spec,
+        pb::fork_child_result::Outcome::Started(pb::SandboxCreateResponse {
+            sandbox_id: child_spec.sandbox_id.to_string(),
+            execution_id: child_spec.execution_id.to_string(),
+            ..Default::default()
+        }),
+    )));
+
+    let results = parent
+        .fork(std::slice::from_ref(&child_spec))
+        .await
+        .expect("fork");
+    assert!(results[0].is_ok(), "the child started");
+    assert!(
+        placement.is_bound(child_spec.sandbox_id),
+        "a started fork child is not routable"
+    );
+    assert!(!placement.is_reserved(child_spec.sandbox_id));
+    let recorded = placement.recorded();
+    let child_record = recorded
+        .iter()
+        .find(|(id, _, _, _)| *id == child_spec.sandbox_id)
+        .expect("the child's placement was confirmed");
+    assert_eq!(child_record.1, child_spec.execution_id);
+    assert_eq!(child_record.2.node_id, node.endpoint.node_id);
+}
+
+#[tokio::test]
+async fn a_fork_child_the_node_failed_to_start_leaves_no_routing_record() {
+    let (script, node) = scripted_node().await;
+    let placement = ClusterPlacement::recording(node.endpoint.clone());
+    let mut parent = started_parent_on(&script, Arc::clone(&placement)).await;
+    let child_spec = SandboxForkSpec {
+        sandbox_id: crate::types::SandboxId::new(),
+        execution_id: ExecutionId::new(),
+        envd_access_token: None,
+    };
+    *script.fork.lock().expect("lock") = Some(Ok(scripted_fork_of(
+        &child_spec,
+        pb::fork_child_result::Outcome::Error("no room".to_string()),
+    )));
+
+    let results = parent
+        .fork(std::slice::from_ref(&child_spec))
+        .await
+        .expect("fork answered");
+    assert!(results[0].is_err(), "the child did not start");
+    assert!(!placement.is_bound(child_spec.sandbox_id));
+    assert!(
+        !placement.is_reserved(child_spec.sandbox_id),
+        "a reservation for a child that never started must not linger"
+    );
+}
+
 #[tokio::test]
 async fn a_forks_children_carry_the_connection_the_retry_actually_used() {
     let (script_a, node_a) = scripted_node().await;

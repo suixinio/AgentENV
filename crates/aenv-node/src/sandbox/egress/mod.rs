@@ -16,7 +16,7 @@ use aenv_egress::{
     BrokerDenyList, BrokerTransport, Dispatcher, EgressPolicySummary, EmbeddedTransport,
     IdentityHeader, TransportError, UpstreamGuard,
 };
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -221,6 +221,41 @@ impl EgressRuntime {
     pub fn ca_bundle(&self) -> Option<&str> {
         self.ca_bundle.as_deref()
     }
+
+    /// The runtime a policy with brokers needs, or an error naming the
+    /// configuration a node must carry to serve one.
+    pub fn required() -> Result<Arc<Self>> {
+        Self::global().context(
+            "the sandbox declares network rules but this node has no egress broker; set [egress_broker].mode (AENV_EGRESS_BROKER_MODE) to \"remote\" and point endpoint, ca_cert_path and shared_secret at aenv-egress",
+        )
+    }
+
+    /// Refuses a policy whose brokers this node cannot dispatch, so no caller
+    /// is told a set of rules is in force that would fail on first use.
+    pub fn ensure_serves(&self, policy: &SandboxNetworkPolicy) -> Result<()> {
+        for broker in &policy.egress.brokers {
+            if !mode_serves_handler(self.mode, &broker.handler) {
+                bail!(
+                    "this node's {} egress broker does not serve the {:?} handler these rules need",
+                    self.mode.as_str(),
+                    broker.handler
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Which handlers a broker mode dispatches. The embedded transport carries
+/// only [`TcpEchoHandler`], which the node's own integration tests read the
+/// identity banner from; the `http` handler public rules name lives in the
+/// broker process.
+pub fn mode_serves_handler(mode: EgressBrokerMode, handler: &str) -> bool {
+    match mode {
+        EgressBrokerMode::Disabled => false,
+        EgressBrokerMode::Embedded => handler == TcpEchoHandler::NAME,
+        EgressBrokerMode::Remote => true,
+    }
 }
 
 /// Who a set of brokered endpoints speaks for.
@@ -252,15 +287,19 @@ struct AcceptContext {
     relays: Arc<Mutex<JoinSet<()>>>,
 }
 
-/// The listeners one sandbox's policy asked for, alive until `shutdown`.
-/// Accept loops and relays are separate tasks: replacing the policy stops
-/// accepting on the old listeners without cutting connections in flight.
+/// The listeners one sandbox's policy asked for, alive until `shutdown` or
+/// drop. Accept loops and relays are separate tasks: replacing the policy
+/// stops accepting on the old listeners without cutting connections in
+/// flight.
 pub struct BrokeredEndpoints {
     accept_tasks: Vec<JoinHandle<()>>,
     relays: Arc<Mutex<JoinSet<()>>>,
     ports: Vec<u16>,
     over_limit: Arc<AtomicU64>,
     sandbox_permits: Arc<Semaphore>,
+    /// Set once a successor owns the relay set, so this instance's drop
+    /// leaves the connections in flight to it.
+    relays_handed_over: bool,
 }
 
 impl BrokeredEndpoints {
@@ -283,7 +322,9 @@ impl BrokeredEndpoints {
     }
 
     /// Like `spawn`, but connections in flight on `previous` keep running
-    /// and keep counting against the sandbox's budget.
+    /// and keep counting against the sandbox's budget. The new listener and
+    /// its intercept are in place before the old loop stops accepting, so
+    /// nothing the guest sends in between escapes the intercept.
     pub async fn replace(
         mut previous: Self,
         runtime: &Arc<EgressRuntime>,
@@ -291,12 +332,12 @@ impl BrokeredEndpoints {
         identity: SandboxIdentity,
         policy: &SandboxNetworkPolicy,
     ) -> Result<Self> {
-        previous.stop_accepting().await;
-        slot.remove_intercept()
-            .context("remove the previous intercept")?;
         let relays = Arc::clone(&previous.relays);
         let permits = Arc::clone(&previous.sandbox_permits);
-        Self::spawn_with(runtime, slot, identity, policy, relays, permits)
+        let next = Self::spawn_with(runtime, slot, identity, policy, relays, permits)?;
+        previous.relays_handed_over = true;
+        previous.stop_accepting().await;
+        Ok(next)
     }
 
     fn spawn_with(
@@ -308,9 +349,16 @@ impl BrokeredEndpoints {
         sandbox_permits: Arc<Semaphore>,
     ) -> Result<Self> {
         let egress = egress_summary(policy);
-        let over_limit = Arc::new(AtomicU64::new(0));
-        let mut accept_tasks = Vec::new();
-        let mut ports = Vec::new();
+        // Every task is owned by `endpoints` from the moment it is spawned, so
+        // a broker that fails to come up takes the ones before it down.
+        let mut endpoints = Self {
+            accept_tasks: Vec::new(),
+            relays,
+            ports: Vec::new(),
+            over_limit: Arc::new(AtomicU64::new(0)),
+            sandbox_permits,
+            relays_handed_over: false,
+        };
         for broker in &policy.egress.brokers {
             let listener = slot.listen_in_namespace(broker.port).with_context(|| {
                 format!("open brokered listener for handler {}", broker.handler)
@@ -334,9 +382,9 @@ impl BrokeredEndpoints {
                 handler: broker.handler.clone(),
                 params: broker.params.clone(),
                 egress: egress.clone(),
-                sandbox_permits: Arc::clone(&sandbox_permits),
-                over_limit: Arc::clone(&over_limit),
-                relays: Arc::clone(&relays),
+                sandbox_permits: Arc::clone(&endpoints.sandbox_permits),
+                over_limit: Arc::clone(&endpoints.over_limit),
+                relays: Arc::clone(&endpoints.relays),
             });
             debug!(
                 sandbox_id = %identity.sandbox_id,
@@ -345,16 +393,12 @@ impl BrokeredEndpoints {
                 intercept = ?broker.intercept.as_ref().map(|i| &i.dports),
                 "brokered listener open"
             );
-            accept_tasks.push(tokio::spawn(accept_loop(listener, ctx)));
-            ports.push(port);
+            endpoints
+                .accept_tasks
+                .push(tokio::spawn(accept_loop(listener, ctx)));
+            endpoints.ports.push(port);
         }
-        Ok(Self {
-            accept_tasks,
-            relays,
-            ports,
-            over_limit,
-            sandbox_permits,
-        })
+        Ok(endpoints)
     }
 
     /// Listener ports inside the sandbox namespace, in policy order.
@@ -383,6 +427,23 @@ impl BrokeredEndpoints {
             std::mem::take(&mut *self.relays.lock().unwrap_or_else(|e| e.into_inner()));
         relays.abort_all();
         while relays.join_next().await.is_some() {}
+    }
+}
+
+/// A dropped instance must leave no socket bound in a namespace that goes
+/// back to the pool: an accept task holds its listener, and a relay task
+/// holds the relay set through its context, so neither ends on its own.
+impl Drop for BrokeredEndpoints {
+    fn drop(&mut self) {
+        for task in self.accept_tasks.drain(..) {
+            task.abort();
+        }
+        if !self.relays_handed_over {
+            self.relays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .abort_all();
+        }
     }
 }
 
@@ -505,7 +566,116 @@ pub fn original_destination(stream: &TcpStream) -> Option<SocketAddrV4> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sandbox::network::policy::SandboxNetworkEgressPolicy;
+    use crate::sandbox::network::policy::{
+        DomainRule, HeaderTransform, SandboxNetworkEgressPolicy,
+    };
+
+    struct DropMark(Arc<AtomicU64>);
+
+    impl Drop for DropMark {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // The mark is built by the caller, so it counts a future that is dropped
+    // before it is ever polled: an aborted accept loop.
+    async fn pending_holding(_mark: DropMark) {
+        std::future::pending::<()>().await
+    }
+
+    fn endpoints_holding(
+        accept_mark: &Arc<AtomicU64>,
+        relays: &Arc<Mutex<JoinSet<()>>>,
+    ) -> BrokeredEndpoints {
+        BrokeredEndpoints {
+            accept_tasks: vec![tokio::spawn(pending_holding(DropMark(Arc::clone(
+                accept_mark,
+            ))))],
+            relays: Arc::clone(relays),
+            ports: vec![40443],
+            over_limit: Arc::new(AtomicU64::new(0)),
+            sandbox_permits: Arc::new(Semaphore::new(1)),
+            relays_handed_over: false,
+        }
+    }
+
+    async fn settled(marks: &[&Arc<AtomicU64>]) {
+        for _ in 0..1000 {
+            if marks.iter().all(|mark| mark.load(Ordering::Relaxed) > 0) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn rules_policy() -> SandboxNetworkPolicy {
+        let rules = std::collections::BTreeMap::from([(
+            "api.example.com".to_string(),
+            vec![DomainRule {
+                transform: HeaderTransform {
+                    headers: std::collections::BTreeMap::from([(
+                        "authorization".to_string(),
+                        "Bearer ${aenv.secrets.k}".to_string(),
+                    )]),
+                },
+            }],
+        )]);
+        SandboxNetworkPolicy::new(
+            BaseSandboxNetworkPolicy::Default,
+            SandboxNetworkEgressPolicy::with_rules(None, None, Some(rules)).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn dropping_the_endpoints_aborts_the_accept_loops_and_the_relays() {
+        let accept_mark = Arc::new(AtomicU64::new(0));
+        let relay_mark = Arc::new(AtomicU64::new(0));
+        let relays = Arc::new(Mutex::new(JoinSet::new()));
+        relays
+            .lock()
+            .unwrap()
+            .spawn(pending_holding(DropMark(Arc::clone(&relay_mark))));
+
+        drop(endpoints_holding(&accept_mark, &relays));
+
+        settled(&[&accept_mark, &relay_mark]).await;
+        assert_eq!(accept_mark.load(Ordering::Relaxed), 1);
+        assert_eq!(relay_mark.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_successor_keeps_the_relays_the_dropped_endpoints_handed_it() {
+        let accept_mark = Arc::new(AtomicU64::new(0));
+        let relay_mark = Arc::new(AtomicU64::new(0));
+        let relays = Arc::new(Mutex::new(JoinSet::new()));
+        relays
+            .lock()
+            .unwrap()
+            .spawn(pending_holding(DropMark(Arc::clone(&relay_mark))));
+
+        let mut previous = endpoints_holding(&accept_mark, &relays);
+        previous.relays_handed_over = true;
+        drop(previous);
+
+        settled(&[&accept_mark]).await;
+        assert_eq!(accept_mark.load(Ordering::Relaxed), 1);
+        assert_eq!(relay_mark.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_embedded_broker_does_not_serve_the_handler_public_rules_name() {
+        let policy = rules_policy();
+        let handler = policy.egress.brokers[0].handler.as_str();
+
+        assert!(!mode_serves_handler(EgressBrokerMode::Embedded, handler));
+        assert!(mode_serves_handler(EgressBrokerMode::Remote, handler));
+        assert!(!mode_serves_handler(EgressBrokerMode::Disabled, handler));
+        assert!(mode_serves_handler(
+            EgressBrokerMode::Embedded,
+            TcpEchoHandler::NAME
+        ));
+    }
 
     #[test]
     fn the_summary_mirrors_base_policy_and_cidrs() {

@@ -1,9 +1,12 @@
 //! Brokered egress with the embedded broker: the guest's 443 traffic is
-//! intercepted in its namespace, reaches the `tcp` handler with the right
-//! identity and original destination, and the listeners follow the policy
-//! through updates, pause/resume and slot reuse.
+//! intercepted in its namespace, reaches the broker with the right identity
+//! and original destination, and the listeners follow the policy through
+//! updates, pause/resume and slot reuse.
 //!
-//! Requires root, `/dev/kvm`, and a node config with
+//! The embedded broker dispatches the `tcp` identity-echo handler only, so
+//! these policies name that handler where a public `rules` policy names
+//! `http`; everything between the guest and the broker is the production
+//! path. Requires root, `/dev/kvm`, and a node config with
 //! `[egress_broker].mode = "embedded"` and `[cluster].node_discovery_mode =
 //! "static"`. Passthrough of unmatched SNI and policy denial at the broker
 //! need the `http` handler and are covered when it lands.
@@ -50,10 +53,16 @@ fn policy_with_rules(
             },
         }],
     );
-    Ok(SandboxNetworkPolicy::new(
+    let mut policy = SandboxNetworkPolicy::new(
         base,
         SandboxNetworkEgressPolicy::with_rules(None, deny_out, Some(rules))?,
-    ))
+    );
+    // `with_rules` names the `http` handler, which lives in the broker
+    // process; the embedded dispatcher would answer `unknown_handler`.
+    for broker in &mut policy.egress.brokers {
+        broker.handler = "tcp".to_string();
+    }
+    Ok(policy)
 }
 
 /// Connects to `dest:443` from the guest, reads the identity banner the

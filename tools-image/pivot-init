@@ -138,7 +138,9 @@ generate_resolv_conf
 $BB cat > /run/sv/envd/run << 'RUNSV_EOF'
 #!/agentenv/bin/busybox sh
 exec 2>>/var/log/agentenv/envd.stderr.log  # append across restarts; unbounded but VM-ephemeral
-exec /agentenv/envd
+# -verbose is what puts envd's structured log on stdout, where the svlogd
+# service below records it.
+exec /agentenv/envd -verbose
 RUNSV_EOF
 $BB chmod 0755 /run/sv/envd/run
 

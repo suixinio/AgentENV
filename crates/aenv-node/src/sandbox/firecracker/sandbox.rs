@@ -56,6 +56,10 @@ const VM_STATE_FILE_NAME: &str = "vm_state.bin";
 const ROOTFS_DRIVE_PATH: &str = "rootfs.ext4";
 const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 
+// The tools drive mounts busybox here in every guest, whatever the user image
+// ships; `tools-image/pivot-init` is the other end.
+const GUEST_BUSYBOX_PATH: &str = "/agentenv/bin/busybox";
+
 /// Firecracker's `TokenBucket::size` is the number of tokens replenished every
 /// `refill_time`, not a per-second rate. Pinning the refill period to 1000 ms
 /// makes the configured `*_per_sec` values equal the sustained per-second rate.
@@ -417,7 +421,18 @@ impl SandboxBackend for FirecrackerSandbox {
         if let Some(slot) = self.network_slot.as_ref() {
             slot.set_egress_policy(policy.as_ref())
                 .context("configure sandbox network policy")?;
-            self.reconcile_brokered_endpoints(policy.as_ref()).await?;
+            if let Err(err) = self.reconcile_brokered_endpoints(policy.as_ref()).await {
+                // A refused update leaves the sandbox under the rules it is
+                // recorded with, not under half of the new ones.
+                if let Some(slot) = self.network_slot.as_ref() {
+                    if let Err(revert) =
+                        slot.set_egress_policy(self.current_network_policy.as_ref())
+                    {
+                        warn!(error = %revert, "failed to restore the namespace egress policy after a refused update");
+                    }
+                }
+                return Err(err);
+            }
             self.current_network_policy = policy;
             Ok(())
         } else if policy.is_none() {
@@ -626,7 +641,16 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(device_key)
                 .await;
         }
-        let ca_bundle = self.guest_ca_bundle();
+        self.init_envd(self.guest_ca_bundle().as_deref()).await
+    }
+
+    /// envd dedups an identical CA, so a sandbox that gains rules while
+    /// running can be initialised again.
+    async fn init_envd(&self, ca_bundle: Option<&str>) -> Result<()> {
+        let envd_instance = self
+            .envd_instance
+            .as_ref()
+            .context("envd instance not initialized")?;
         let mut env_vars = self.launch.common().env_vars.clone();
         if ca_bundle.is_some() {
             let env = env_vars.get_or_insert_with(Default::default);
@@ -640,11 +664,11 @@ impl FirecrackerSandbox {
                 env_vars,
                 self.launch.common().default_workdir.clone(),
                 self.launch.common().default_user.clone(),
-                Some(ca_bundle.clone().unwrap_or_default()),
+                Some(ca_bundle.unwrap_or_default().to_string()),
             )
             .await?;
         if let Some(pem) = ca_bundle {
-            self.assert_guest_trusts(&pem).await?;
+            self.assert_guest_trusts(pem).await?;
         }
         Ok(())
     }
@@ -652,11 +676,11 @@ impl FirecrackerSandbox {
     /// The CA guests with brokers must trust, when this node has one; `None`
     /// means init clears any extra trust and no probe runs.
     fn guest_ca_bundle(&self) -> Option<String> {
-        let has_brokers = self
-            .current_network_policy
-            .as_ref()
-            .is_some_and(|policy| policy.has_brokers());
-        if !has_brokers {
+        Self::guest_ca_bundle_for(self.current_network_policy.as_ref())
+    }
+
+    fn guest_ca_bundle_for(policy: Option<&SandboxNetworkPolicy>) -> Option<String> {
+        if !policy.is_some_and(|policy| policy.has_brokers()) {
             return None;
         }
         EgressRuntime::global().and_then(|runtime| runtime.ca_bundle().map(str::to_string))
@@ -679,10 +703,7 @@ impl FirecrackerSandbox {
         {
             bail!("egress_broker.ca_cert_path is not a PEM certificate");
         }
-        let script = format!(
-            "grep -qF -- '{needle}' {}",
-            crate::sandbox::egress::GUEST_CA_BUNDLE_PATH
-        );
+        let needle = needle.to_string();
         // The process client's futures are not Send, so the probe runs on its
         // own thread and runtime, as the namespace helpers do.
         let envd = self
@@ -695,8 +716,19 @@ impl FirecrackerSandbox {
                 .build()
                 .context("build a runtime for the CA probe")?;
             runtime.block_on(async move {
+                // The tools drive's busybox is mounted in every guest, so the
+                // probe does not need the user image to ship grep.
                 Executor::new(&envd)
-                    .run_command("sh", &["-c", &script])
+                    .run_command(
+                        GUEST_BUSYBOX_PATH,
+                        &[
+                            "grep",
+                            "-qF",
+                            "--",
+                            &needle,
+                            crate::sandbox::egress::GUEST_CA_BUNDLE_PATH,
+                        ],
+                    )
                     .await
             })
         })
@@ -705,7 +737,7 @@ impl FirecrackerSandbox {
         .context("probe the guest trust store for the egress CA")?;
         if output.exit_code != 0 {
             bail!(
-                "the guest trust store does not contain the egress CA after envd init; the guest's                  envd must support caBundle (exit {}, stderr {:?})",
+                "the guest trust store does not contain the egress CA after envd init; the guest's envd must support caBundle (exit {}, stderr {:?})",
                 output.exit_code,
                 output.stderr.trim()
             );
@@ -728,14 +760,14 @@ impl FirecrackerSandbox {
     }
 
     /// Opens the brokered listeners a policy asks for on the held slot.
-    /// A policy with brokers on a node without a broker runtime is an error.
+    /// A policy this node's broker cannot serve is an error, so the caller
+    /// never hears success for rules that would fail on first use.
     fn spawn_brokered_endpoints(&mut self, policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
         let Some(policy) = policy.filter(|policy| policy.has_brokers()) else {
             return Ok(());
         };
-        let Some(runtime) = EgressRuntime::global() else {
-            bail!("the sandbox declares network rules but this node has no egress broker");
-        };
+        let runtime = EgressRuntime::required()?;
+        runtime.ensure_serves(policy)?;
         let slot = self
             .network_slot
             .as_ref()
@@ -746,6 +778,10 @@ impl FirecrackerSandbox {
         Ok(())
     }
 
+    /// Brings the brokered listeners in line with `policy`. A sandbox that
+    /// gains rules while running has the broker CA installed and proved
+    /// before its traffic is intercepted; processes already running in the
+    /// guest keep the environment they started with.
     async fn reconcile_brokered_endpoints(
         &mut self,
         policy: Option<&SandboxNetworkPolicy>,
@@ -753,7 +789,16 @@ impl FirecrackerSandbox {
         let wants_brokers = policy.is_some_and(|policy| policy.has_brokers());
         match (self.brokered.take(), wants_brokers) {
             (None, false) => Ok(()),
-            (None, true) => self.spawn_brokered_endpoints(policy),
+            (None, true) => {
+                let wanted = policy.expect("wants_brokers implies a policy");
+                EgressRuntime::required()?.ensure_serves(wanted)?;
+                if let Some(pem) = Self::guest_ca_bundle_for(policy) {
+                    self.init_envd(Some(&pem))
+                        .await
+                        .context("install the egress CA in the running guest")?;
+                }
+                self.spawn_brokered_endpoints(policy)
+            }
             (Some(mut previous), false) => {
                 previous.shutdown().await;
                 if let Some(slot) = self.network_slot.as_ref() {
@@ -762,14 +807,13 @@ impl FirecrackerSandbox {
                 Ok(())
             }
             (Some(previous), true) => {
-                let runtime = EgressRuntime::global().context(
-                    "the sandbox declares network rules but this node has no egress broker",
-                )?;
+                let runtime = EgressRuntime::required()?;
+                let policy = policy.expect("wants_brokers implies a policy");
+                runtime.ensure_serves(policy)?;
                 let slot = self
                     .network_slot
                     .as_ref()
                     .context("brokered endpoints need an allocated network slot")?;
-                let policy = policy.expect("wants_brokers implies a policy");
                 let endpoints = BrokeredEndpoints::replace(
                     previous,
                     &runtime,
@@ -1317,8 +1361,9 @@ impl Drop for FirecrackerSandbox {
         // explicitly deleted on the stop() path and otherwise cleaned up when
         // the daemon shuts down.
         self.extra_drive_runtimes.clear();
-        // Dropping the endpoints aborts their tasks; the release below flushes
-        // the intercept before the slot is pooled.
+        // `BrokeredEndpoints::drop` aborts the accept loops and the relays, so
+        // no socket of this sandbox stays bound in the namespace; the release
+        // below flushes the intercept before the slot is pooled.
         self.brokered.take();
         if let Some(slot) = self.network_slot.take() {
             if let Err(e) = NetworkManager::global().release(slot) {

@@ -35,8 +35,11 @@ pub fn filter_without_egress_broker(nodes: Vec<RichNode>) -> Vec<RichNode> {
 }
 
 impl EgressBrokerState {
+    /// Whether a sandbox whose rules name the public `http` handler can run
+    /// on a node in this state. An embedded broker dispatches only the
+    /// identity-echo handler the node's own integration tests use.
     pub fn can_broker(self) -> bool {
-        matches!(self, Self::Embedded | Self::RemoteOk)
+        matches!(self, Self::RemoteOk)
     }
 }
 
@@ -160,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn the_broker_filter_keeps_only_nodes_that_report_a_usable_broker() {
+    fn the_broker_filter_keeps_only_nodes_that_report_a_reachable_remote_broker() {
         let with = |id: &str, state: EgressBrokerState| {
             with_snapshot(
                 id,
@@ -180,6 +183,6 @@ mod tests {
             no_snapshot("silent"),
         ];
         let result = filter_without_egress_broker(nodes);
-        assert_eq!(ids(&result), vec!["embedded", "remote-ok"]);
+        assert_eq!(ids(&result), vec!["remote-ok"]);
     }
 }

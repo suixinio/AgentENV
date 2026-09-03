@@ -16,9 +16,10 @@ x-agentenv-base: &agentenv-base
     AENV_SNAPSHOT_LOCAL_CACHE_PATH: /var/cache/agentenv/snapshot-local-cache
     AENV_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     # The broker core in-process, with the tcp identity handler only: enough
-    # to smoke the intercept and identity path, not to broker HTTPS. Embedded
-    # mode is validated against static discovery, which these nodes do not
-    # otherwise use.
+    # to smoke the intercept and identity path, not to broker HTTPS, so a
+    # sandbox declaring `network.rules` is never placed here and the create
+    # answers 503. Embedded mode is validated against static discovery, which
+    # these nodes do not otherwise use.
     AENV_EGRESS_BROKER_MODE: embedded
     AENV_CLUSTER_NODE_DISCOVERY_MODE: static
     # Keep in step with `aenv_core::logging::DEFAULT_FILTER`: these are target

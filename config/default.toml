@@ -154,9 +154,11 @@ peer_discovery_refresh_interval_secs = 5
 [egress_broker]
 # How this node reaches the egress broker that serves sandboxes declaring
 # `network.rules`: "disabled" (such sandboxes are never placed here),
-# "embedded" (the broker core runs inside aenv-node; single static node only)
-# or "remote" (TLS to the aenv-egress deployment; endpoint, ca_cert_path and
-# shared_secret are then required).
+# "embedded" (the broker core runs inside aenv-node with the tcp identity
+# handler only, for this crate's integration tests; single static node, and
+# sandboxes with rules are not placed here either) or "remote" (TLS to the
+# aenv-egress deployment; endpoint, ca_cert_path and shared_secret are then
+# required).
 mode = "disabled"
 # endpoint = "aenv-egress.aenv.svc:8443"
 # ca_cert_path = "/etc/aenv/egress-ca/ca.crt"

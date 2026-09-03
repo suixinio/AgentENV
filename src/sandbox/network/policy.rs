@@ -27,6 +27,11 @@ pub const SECRET_MARKER_PREFIXES: [&str; 2] = ["${aenv.secrets.", "${e2b.secrets
 pub const MAX_SECRET_NAMES_PER_DOMAIN: usize = 32;
 pub const MAX_HEADER_VALUE_BYTES: usize = 8 * 1024;
 pub const MAX_SECRET_NAME_LEN: usize = 128;
+/// Cap on the serialized `rules`, half of the 64 KiB identity frame the
+/// runtime sends the broker (`aenv_egress::framing::MAX_FRAME_LEN`, which
+/// `aenv-core` must not link); the rest carries the sandbox identity and its
+/// egress summary.
+pub const MAX_RULES_SERIALIZED_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BaseSandboxNetworkPolicy {
@@ -88,9 +93,9 @@ impl SandboxNetworkEgressPolicy {
         Self::with_rules(allow_out, deny_out, None)
     }
 
-    /// Validates every domain key, header name and marker, then derives
-    /// `brokers` from the rules. Any non-empty `rules` becomes one `http`
-    /// endpoint intercepting port 443.
+    /// Validates every domain key, header name and marker, canonicalizes
+    /// header names to lowercase, then derives `brokers` from the rules. Any
+    /// non-empty `rules` becomes one `http` endpoint intercepting port 443.
     pub fn with_rules(
         allow_out: Option<Vec<String>>,
         deny_out: Option<Vec<String>>,
@@ -101,12 +106,20 @@ impl SandboxNetworkEgressPolicy {
         for (domain, domain_rules) in rules.unwrap_or_default() {
             let key = normalize_domain_pattern(&domain)
                 .with_context(|| format!("invalid rules domain {domain:?}"))?;
-            validate_domain_rules(&key, &domain_rules)?;
+            let domain_rules = normalize_domain_rules(&key, &domain_rules)?;
             if normalized_rules.insert(key.clone(), domain_rules).is_some() {
                 bail!("rules domain {key:?} is declared more than once");
             }
         }
         if !normalized_rules.is_empty() {
+            let serialized = serde_json::to_vec(&normalized_rules)
+                .context("serialize the rules to size them")?
+                .len();
+            if serialized > MAX_RULES_SERIALIZED_BYTES {
+                bail!(
+                    "rules serialize to {serialized} bytes; at most {MAX_RULES_SERIALIZED_BYTES} are allowed, so declare fewer domains, rules or headers"
+                );
+            }
             policy.brokers = vec![BrokeredEndpoint {
                 port: 0,
                 handler: HTTP_BROKER_HANDLER.to_string(),
@@ -352,6 +365,14 @@ fn build_intercept_commands(
             chain: INTERCEPT_CHAIN,
             rule: format!("-i tap0 -o vpeer -p udp --dport {dport} -j REJECT"),
         });
+        // A DNATed packet is delivered locally and never forwarded, so TCP
+        // reaching this chain is TCP the DNAT below did not catch: the guest
+        // must not get to the destination unbrokered.
+        commands.push(IptablesRestoreCommand::Append {
+            table: "filter",
+            chain: INTERCEPT_CHAIN,
+            rule: format!("-i tap0 -o vpeer -p tcp --dport {dport} -j REJECT"),
+        });
     }
     for dport in dports {
         commands.push(IptablesRestoreCommand::Append {
@@ -547,9 +568,20 @@ fn is_valid_header_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
-fn validate_domain_rules(domain: &str, rules: &[DomainRule]) -> Result<()> {
+// A byte the broker could not put on the wire: CR, LF, NUL and the rest of
+// the C0 range apart from HTAB, plus DEL. Refusing them here keeps a template
+// that can never be sent out of the accepted policy.
+fn forbidden_header_value_byte(value: &str) -> Option<u8> {
+    value
+        .bytes()
+        .find(|byte| (*byte < 0x20 && *byte != b'\t') || *byte == 0x7f)
+}
+
+fn normalize_domain_rules(domain: &str, rules: &[DomainRule]) -> Result<Vec<DomainRule>> {
     let mut names = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(rules.len());
     for rule in rules {
+        let mut headers = BTreeMap::new();
         for (header, value) in &rule.transform.headers {
             if !is_valid_header_name(header) {
                 bail!("rules for {domain:?} name an invalid header {header:?}");
@@ -557,6 +589,11 @@ fn validate_domain_rules(domain: &str, rules: &[DomainRule]) -> Result<()> {
             if value.len() > MAX_HEADER_VALUE_BYTES {
                 bail!(
                     "rules for {domain:?} set header {header:?} to a value over {MAX_HEADER_VALUE_BYTES} bytes"
+                );
+            }
+            if let Some(byte) = forbidden_header_value_byte(value) {
+                bail!(
+                    "rules for {domain:?} set header {header:?} to a value holding the control byte {byte:#04x}; header values carry printable text and tabs only"
                 );
             }
             for marker in secret_markers(value) {
@@ -567,7 +604,19 @@ fn validate_domain_rules(domain: &str, rules: &[DomainRule]) -> Result<()> {
                     "rules for {domain:?} set header {header:?} with a secret marker whose name {malformed:?} is not [a-zA-Z0-9_-]{{1,{MAX_SECRET_NAME_LEN}}}"
                 );
             }
+            // Header names match case-insensitively at the broker, so the
+            // canonical form is what makes later-rule-wins hold across
+            // casings.
+            if headers
+                .insert(header.to_ascii_lowercase(), value.clone())
+                .is_some()
+            {
+                bail!("rules for {domain:?} set header {header:?} more than once, ignoring case");
+            }
         }
+        normalized.push(DomainRule {
+            transform: HeaderTransform { headers },
+        });
     }
     if names.len() > MAX_SECRET_NAMES_PER_DOMAIN {
         bail!(
@@ -575,7 +624,7 @@ fn validate_domain_rules(domain: &str, rules: &[DomainRule]) -> Result<()> {
             names.len()
         );
     }
-    Ok(())
+    Ok(normalized)
 }
 
 // A known prefix followed by a closing brace but an invalid name is a typo
@@ -891,7 +940,7 @@ mod tests {
         assert_eq!(broker.handler, "http");
         assert_eq!(broker.intercept, Some(Intercept { dports: vec![443] }));
         assert_eq!(
-            broker.params["rules"]["api.openai.com"][0]["transform"]["headers"]["Authorization"],
+            broker.params["rules"]["api.openai.com"][0]["transform"]["headers"]["authorization"],
             "Bearer ${aenv.secrets.openai}"
         );
         assert!(policy.has_explicit_rules());
@@ -1028,6 +1077,91 @@ mod tests {
     }
 
     #[test]
+    fn header_values_carrying_control_bytes_are_refused() {
+        for value in ["a\rb", "a\nb", "a\0b", "a\x1fb", "a\x7fb"] {
+            let refused = SandboxNetworkEgressPolicy::with_rules(
+                None,
+                None,
+                Some(rules("api.example.com", &[("X-Token", value)])),
+            );
+            let err = refused
+                .expect_err("a control byte must be refused")
+                .to_string();
+            assert!(err.contains("control byte"), "{value:?}: {err}");
+        }
+
+        let tab = SandboxNetworkEgressPolicy::with_rules(
+            None,
+            None,
+            Some(rules("api.example.com", &[("X-Token", "a\tb")])),
+        )
+        .expect("a tab is representable in a header value");
+        assert_eq!(
+            tab.rules["api.example.com"][0].transform.headers["x-token"],
+            "a\tb"
+        );
+    }
+
+    #[test]
+    fn header_names_are_canonicalized_to_lowercase_and_casing_duplicates_refused() {
+        let policy = SandboxNetworkEgressPolicy::with_rules(
+            None,
+            None,
+            Some(rules("api.example.com", &[("X-Api-Key", "k")])),
+        )
+        .unwrap();
+        let headers = &policy.rules["api.example.com"][0].transform.headers;
+        assert_eq!(headers.keys().collect::<Vec<_>>(), ["x-api-key"]);
+        assert_eq!(
+            policy.brokers[0].params["rules"]["api.example.com"][0]["transform"]["headers"]
+                ["x-api-key"],
+            "k"
+        );
+
+        let collision = SandboxNetworkEgressPolicy::with_rules(
+            None,
+            None,
+            Some(rules(
+                "api.example.com",
+                &[("X-Api-Key", "one"), ("x-api-key", "two")],
+            )),
+        );
+        assert!(collision
+            .unwrap_err()
+            .to_string()
+            .contains("more than once, ignoring case"));
+    }
+
+    #[test]
+    fn rules_over_the_serialized_cap_are_refused() {
+        let value = "v".repeat(MAX_HEADER_VALUE_BYTES);
+        let mut many = BTreeMap::new();
+        for index in 0..8 {
+            many.extend(rules(
+                &format!("api{index}.example.com"),
+                &[("X-Token", value.as_str())],
+            ));
+        }
+        let err = SandboxNetworkEgressPolicy::with_rules(None, None, Some(many))
+            .expect_err("8 KiB values over eight domains exceed the cap")
+            .to_string();
+        assert!(
+            err.contains(&MAX_RULES_SERIALIZED_BYTES.to_string()),
+            "{err}"
+        );
+
+        let mut few = BTreeMap::new();
+        for index in 0..3 {
+            few.extend(rules(
+                &format!("api{index}.example.com"),
+                &[("X-Token", value.as_str())],
+            ));
+        }
+        SandboxNetworkEgressPolicy::with_rules(None, None, Some(few))
+            .expect("three domains stay under the cap");
+    }
+
+    #[test]
     fn the_init_sequence_creates_both_intercept_chains_and_jumps_to_them_first() {
         let commands = build_namespace_egress_chain_commands(
             Ipv4Addr::new(10, 12, 0, 2),
@@ -1071,7 +1205,7 @@ mod tests {
     }
 
     #[test]
-    fn intercept_commands_flush_then_reject_udp_and_dnat_tcp_grouped_by_table() {
+    fn intercept_commands_flush_then_reject_unbrokered_traffic_and_dnat_tcp_grouped_by_table() {
         let listener = "169.254.0.22:40443".parse().unwrap();
         let commands = build_intercept_commands(listener, &[443]);
         assert!(commands.windows(2).all(|w| w[0].table() <= w[1].table()));
@@ -1093,6 +1227,7 @@ mod tests {
             [
                 "filter -F AGENTENV-INTERCEPT",
                 "filter -A AGENTENV-INTERCEPT -i tap0 -o vpeer -p udp --dport 443 -j REJECT",
+                "filter -A AGENTENV-INTERCEPT -i tap0 -o vpeer -p tcp --dport 443 -j REJECT",
                 "nat -F AGENTENV-INTERCEPT",
                 "nat -A AGENTENV-INTERCEPT -i tap0 -p tcp --dport 443 -j DNAT --to-destination 169.254.0.22:40443",
             ]

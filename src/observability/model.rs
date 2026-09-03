@@ -2,7 +2,7 @@ use super::DiskMetric;
 use crate::orchestrator::SandboxRosterEntry;
 
 /// How this node reaches the egress broker. The api half places a sandbox
-/// that declares network rules only on `Embedded` or `RemoteOk` nodes.
+/// that declares network rules only on a `RemoteOk` node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EgressBrokerState {
     #[default]
@@ -13,8 +13,12 @@ pub enum EgressBrokerState {
 }
 
 impl EgressBrokerState {
+    /// Whether a sandbox whose rules name the public `http` handler can run
+    /// here. The embedded transport dispatches the identity-echo handler the
+    /// node's own integration tests use and nothing else, so it is not a
+    /// placement target for public rules.
     pub fn can_broker(&self) -> bool {
-        matches!(self, Self::Embedded | Self::RemoteOk)
+        matches!(self, Self::RemoteOk)
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -86,4 +90,17 @@ pub struct NodeSnapshot {
     pub create_fails: u64,
     pub sandbox_starting_count: u32,
     pub egress_broker: EgressBrokerState,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EgressBrokerState;
+
+    #[test]
+    fn only_a_reachable_remote_broker_can_serve_public_rules() {
+        assert!(EgressBrokerState::RemoteOk.can_broker());
+        assert!(!EgressBrokerState::Embedded.can_broker());
+        assert!(!EgressBrokerState::RemoteUnreachable.can_broker());
+        assert!(!EgressBrokerState::Disabled.can_broker());
+    }
 }

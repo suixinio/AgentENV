@@ -145,6 +145,19 @@ else
   _fail "closed sandbox through the broker" "403 or connection failure" "$closed_code"
 fi
 
+# The Authorization header the upstream echoes back, retried until it appears or
+# the deadline passes: the nodes learn that the broker is back from a periodic
+# probe, so the first request after a rollout may land inside that window.
+brokered_auth_within() {
+  local deadline=$(( $(date +%s) + $1 )) auth=""
+  while (( $(date +%s) < deadline )); do
+    auth=$(run_in_sandbox "$sandbox_id" "curl -sS --max-time 20 https://${EGRESS_UPSTREAM}/anything" 2>/dev/null | jq -r '.headers.Authorization // .headers.authorization // empty' 2>/dev/null || true)
+    [[ -n "$auth" ]] && break
+    sleep 3
+  done
+  printf '%s' "$auth"
+}
+
 # -- 5 and 7. Broker restart and outage (Kubernetes only) --------------------------
 if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
    && kubectl -n "${K8S_NAMESPACE:-agentenv-system}" get deploy/aenv-egress >/dev/null 2>&1; then
@@ -153,7 +166,7 @@ if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
   kubectl -n "$ns" rollout status deploy/aenv-egress --timeout=180s >/dev/null
   state=$(get_sandbox_state "$sandbox_id")
   assert_eq "$state" "running" "sandbox survives a broker rollout"
-  after_roll=$(run_in_sandbox "$sandbox_id" "curl -sS --max-time 20 https://${EGRESS_UPSTREAM}/anything" | jq -r '.headers.Authorization // .headers.authorization // empty' 2>/dev/null || true)
+  after_roll=$(brokered_auth_within 60)
   assert_eq "$after_roll" "Bearer ${secret_value}" "brokered requests resume after the rollout"
 
   replicas=$(kubectl -n "$ns" get deploy/aenv-egress -o jsonpath='{.spec.replicas}')
@@ -168,8 +181,7 @@ if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
   fi
   kubectl -n "$ns" scale deploy/aenv-egress --replicas="${replicas:-2}" >/dev/null
   kubectl -n "$ns" rollout status deploy/aenv-egress --timeout=180s >/dev/null
-  sleep 12
-  recovered=$(run_in_sandbox "$sandbox_id" "curl -sS --max-time 20 https://${EGRESS_UPSTREAM}/anything" | jq -r '.headers.Authorization // .headers.authorization // empty' 2>/dev/null || true)
+  recovered=$(brokered_auth_within 60)
   assert_eq "$recovered" "Bearer ${secret_value}" "brokered requests recover after the broker returns"
 else
   warn "not a Kubernetes run with kubectl; skipping broker rollout and outage checks"

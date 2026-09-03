@@ -20,10 +20,9 @@ pub trait GrantIssuer: Send + Sync {
     async fn revoke(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> anyhow::Result<()>;
 }
 
-/// The issuer of a process that holds no store: the node half, and an api
-/// half with `[secrets].backend = "disabled"`. A grant for a non-empty name
-/// set is refused, so a sandbox that needs credentials never starts silently
-/// without them.
+/// The issuer of an api half with `[secrets].backend = "disabled"`. A grant
+/// for a non-empty name set is refused, so a sandbox that needs credentials
+/// never starts silently without them.
 pub struct NoGrants;
 
 impl NoGrants {
@@ -48,6 +47,37 @@ impl GrantIssuer for NoGrants {
                 names.len()
             )
         }
+    }
+
+    async fn revoke(
+        &self,
+        _sandbox_id: SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// The issuer of the node half. The api half that dispatched the create
+/// recorded the grant and revokes it; the node holds no store and records
+/// nothing, but must not refuse a policy the api half already granted.
+pub struct GrantsIssuedUpstream;
+
+impl GrantsIssuedUpstream {
+    pub fn shared() -> Arc<dyn GrantIssuer> {
+        Arc::new(Self)
+    }
+}
+
+#[async_trait]
+impl GrantIssuer for GrantsIssuedUpstream {
+    async fn grant(
+        &self,
+        _sandbox_id: SandboxId,
+        _execution_id: ExecutionId,
+        _names: &BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 
     async fn revoke(

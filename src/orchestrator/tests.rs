@@ -5001,6 +5001,20 @@ async fn a_create_without_rules_asks_for_no_grant() -> Result<()> {
 }
 
 #[tokio::test]
+async fn the_node_half_issuer_starts_a_create_with_rules_without_a_store() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    orchestrator.set_grant_issuer(crate::orchestrator::GrantsIssuedUpstream::shared());
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+
+    let created = orchestrator.create_sandbox(request).await?;
+    assert_eq!(orchestrator.list_sandboxes().await?.len(), 1);
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn without_a_grant_issuer_a_create_with_rules_fails_and_leaves_no_record() -> Result<()> {
     setup();
     let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;

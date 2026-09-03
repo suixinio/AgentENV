@@ -99,7 +99,8 @@ The api half writes secret values to the store and never reads them back. Before
 rules starts, it records a grant for `(sandbox, execution, names)`; the grant is revoked when the
 sandbox is deleted or paused, and a resume or fork gets a new grant for its new execution. The
 broker serves a value only under a matching grant, so a compromised broker can read the values
-granted to currently running sandboxes and nothing else.
+granted to currently running sandboxes and nothing else. The node records nothing: it starts
+what the api half dispatched and holds no store to refuse or consult.
 
 ## Deployment
 

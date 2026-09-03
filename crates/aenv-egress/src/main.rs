@@ -255,7 +255,13 @@ async fn main() -> Result<()> {
         "aenv-egress listening"
     );
     let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("install the SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
         info!("shutting down");
     };
     runtime::run(runtime, listener, acceptor, shutdown).await

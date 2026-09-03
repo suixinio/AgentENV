@@ -260,6 +260,7 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
     let factory = FirecrackerSandboxFactory::with_cpu_config(applied_cpu_arc);
     let image_refs = aenv_node::image::local_runtime_image_refs();
     let orchestrator = Orchestrator::with_in_memory_store_and_factory(factory, image_refs).await?;
+    orchestrator.set_grant_issuer(aenv_core::orchestrator::GrantsIssuedUpstream::shared());
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(

@@ -134,13 +134,23 @@ check-crate-boundaries:
 	  echo "aenv-node links a PostgreSQL driver; a node must never hold database credentials."; \
 	  fail=1; \
 	fi; \
+	egress_tree=$$($(CARGO) tree -p aenv-egress -e normal --all-features) || { echo "cargo tree -p aenv-egress failed"; exit 1; }; \
+	if printf '%s\n' "$$egress_tree" | grep -E 'sqlx|deadpool-postgres|overlaybd|uvm-ublk|storage-util|aenv-core|rustls|rcgen'; then \
+	  echo "aenv-egress links a database, the byte half, aenv-core or a second TLS stack; the broker contract is a leaf on openssl only."; \
+	  fail=1; \
+	fi; \
+	node_features=$$($(CARGO) tree -p aenv-node -e features --prefix none) || { echo "cargo tree -p aenv-node -e features failed"; exit 1; }; \
+	if printf '%s\n' "$$node_features" | grep -E '^aenv-egress feature "tls"'; then \
+	  echo "aenv-node enables aenv-egress's tls feature; the node relays bytes and terminates no TLS."; \
+	  fail=1; \
+	fi; \
 	workspace_tree=$$($(CARGO) tree --workspace -e normal,build,dev --prefix none) || { echo "cargo tree --workspace failed"; exit 1; }; \
 	if printf '%s\n' "$$workspace_tree" | sort -u | grep -E '^(rocksdb|librocksdb-sys) v[0-9]'; then \
 	  echo "the workspace links an embedded database; node-local metadata is derived from the"; \
 	  echo "cache layout or written as JSON records, and nothing here needs one."; \
 	  fail=1; \
 	fi; \
-	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, aenv-node has no database, the workspace has no embedded database"; fi; \
+	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, aenv-node has no database and no broker TLS, aenv-egress is a leaf, the workspace has no embedded database"; fi; \
 	exit $$fail
 
 mutants:
@@ -178,7 +188,7 @@ test: test-agent test-envd test-ublk
 # file without `--force`, and `aenv upload`'s directory walk refusing to
 # follow symlinks out of the tree.
 test-unit:
-	$(CARGO) test -p aenv-core -p aenv-api -p aenv-node -p envd -p linux-cap -p aenv -p adev --lib --bins
+	$(CARGO) test -p aenv-core -p aenv-api -p aenv-node -p aenv-egress -p envd -p linux-cap -p aenv -p adev --lib --bins
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-core -p aenv-api -p aenv-node --lib --bins -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib --bins
 	bash scripts/tests/verify-capability-runner.sh

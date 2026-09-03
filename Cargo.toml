@@ -11,6 +11,7 @@ members = [
     "adev",
     "crates/aenv",
     "crates/aenv-api",
+    "crates/aenv-egress",
     "crates/aenv-node",
     "crates/benchmarks",
     "crates/e2e-tests",
@@ -79,7 +80,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 tower = "0.5.2"
 anyhow = "1.0.100"
 tempfile = "3.22.0"
-nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", "resource", "uio"] }
+nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", "resource", "uio", "socket"] }
 libc = "0.2"
 ipnetwork = "0.21"
 futures = "0.3"

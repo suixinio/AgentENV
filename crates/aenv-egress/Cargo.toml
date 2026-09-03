@@ -1,0 +1,38 @@
+[package]
+name = "aenv-egress"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "aenv_egress"
+path = "src/lib.rs"
+
+[features]
+default = ["core"]
+# The contract, framing, dispatch and the embedded transport. This is all
+# `aenv-node` links; nothing under it terminates or originates TLS.
+core = []
+# Leaf certificate signing and the `http` handler, openssl only. The broker
+# binary enables it; `make check-crate-boundaries` fails if `aenv-node` does.
+tls = ["dep:openssl"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+hmac = "0.12"
+ipnetwork = "0.21"
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tracing = "0.1.41"
+zeroize = "1"
+openssl = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

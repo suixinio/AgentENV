@@ -165,6 +165,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "aenv-egress"
+version = "0.1.2"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "bytes",
+ "hmac",
+ "ipnetwork",
+ "openssl",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "aenv-node"
 version = "0.1.2"
 dependencies = [
@@ -4956,6 +4976,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "metrics"
 version = "0.24.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5339,6 +5368,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

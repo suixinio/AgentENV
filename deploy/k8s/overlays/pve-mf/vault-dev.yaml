@@ -1,0 +1,81 @@
+# A single-replica, in-memory Vault for this cluster's egress credential
+# tests. Dev mode: unsealed at start, storage lost on restart, the root token
+# read from the same `egress-vault` Secret the api half and the broker use.
+# The postStart hook mounts the KV v2 engine at the `aenv` path both halves
+# default to. Not a production Vault; a rollout of this Pod forgets every
+# secret and grant written through /secrets.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vault-dev
+  labels:
+    app.kubernetes.io/name: vault-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vault-dev
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vault-dev
+    spec:
+      containers:
+        - name: vault
+          image: hashicorp/vault:1.20
+          args: ["server", "-dev", "-dev-listen-address=0.0.0.0:8200"]
+          env:
+            - name: VAULT_DEV_ROOT_TOKEN_ID
+              valueFrom:
+                secretKeyRef:
+                  name: egress-vault
+                  key: token
+            - name: VAULT_ADDR
+              value: http://127.0.0.1:8200
+            - name: VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: egress-vault
+                  key: token
+          ports:
+            - name: http
+              containerPort: 8200
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - |
+                    for i in $(seq 1 60); do
+                      vault secrets enable -path=aenv kv-v2 && exit 0
+                      vault secrets list 2>/dev/null | grep -q '^aenv/' && exit 0
+                      sleep 1
+                    done
+                    exit 1
+          readinessProbe:
+            httpGet:
+              path: /v1/sys/health
+              port: http
+            periodSeconds: 5
+          securityContext:
+            capabilities:
+              add: ["IPC_LOCK"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vault-dev
+spec:
+  selector:
+    app.kubernetes.io/name: vault-dev
+  ports:
+    - name: http
+      port: 8200
+      targetPort: http

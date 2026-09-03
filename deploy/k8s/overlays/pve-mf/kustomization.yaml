@@ -3,7 +3,7 @@ kind: Kustomization
 
 # The pve-mf cluster (PVE host `pve-mf`, k3s on 10.1.0.200/10.1.0.201).
 #
-# It differs from `overlays/default` in exactly one respect: the registry this
+# It differs from `overlays/default` in two respects. First, the registry this
 # cluster's images and user images come from. `base` ships neutral,
 # do-nothing-safe defaults in two places that `deploy/k8s/run.sh`'s
 # IMAGE_REGISTRY rewrite deliberately does not touch — that rewrite only
@@ -20,6 +20,14 @@ kind: Kustomization
 #     HTTP. It is a configMapGenerator *file*, so an overlay replaces the
 #     whole generator rather than patching a field.
 #
+# Second, brokered egress is switched on here: the nodes boot guests from a
+# prerelease tools drive published to the same registry (`node-overlay.toml`,
+# layered onto AENV_CONFIG_OVERLAY_PATH), dial the broker in remote mode, and
+# the api half writes secrets and grants to the dev-mode Vault in
+# `vault-dev.yaml`. The four Secrets `aenv-egress-secrets.example.yaml`
+# documents must exist before the first apply; `egress-vault`'s token doubles
+# as that Vault's root token.
+#
 # Everything else, including the /var/lib/aenv hostPath, matches
 # `overlays/default`. The `agentenv-runtime-secrets` Secret is likewise NOT
 # generated here for the reason that overlay spells out at length: one
@@ -30,12 +38,30 @@ namespace: agentenv-system
 
 resources:
   - ../../base
+  - vault-dev.yaml
 
 configMapGenerator:
   - name: regctl-config
     behavior: replace
     files:
       - config.json=regctl.json
+  - name: agentenv-k8s-config
+    behavior: merge
+    files:
+      - node-overlay.toml
+  - name: snapshot-storage-config
+    behavior: merge
+    literals:
+      - AENV_CONFIG_OVERLAY_PATH=/workspace/config/oss-overlay.toml:/etc/agentenv/backend/backend-oss.toml:/workspace/config/node-overlay.toml
+  - name: egress-broker-config
+    behavior: merge
+    literals:
+      - AENV_EGRESS_BROKER_MODE=remote
+  - name: secrets-store-config
+    behavior: merge
+    literals:
+      - AENV_SECRETS_BACKEND=vault
+      - AENV_SECRETS_VAULT_ADDR=http://vault-dev:8200
 
 generatorOptions:
   disableNameSuffixHash: true
@@ -52,3 +78,37 @@ patches:
       - op: replace
         path: /spec/template/spec/volumes/0/hostPath/path
         value: /var/lib/aenv
+      # The node reads AENV_CONFIG_OVERLAY_PATH's files from /workspace/config,
+      # where base projects each ConfigMap key by subPath; a key merged in by
+      # this overlay needs its own projection.
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: agentenv-config
+          mountPath: /workspace/config/node-overlay.toml
+          subPath: node-overlay.toml
+  - target:
+      kind: Deployment
+      name: aenv-egress
+    patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: AENV_EGRESS_VAULT_ADDR
+          value: http://vault-dev:8200
+  # base lets the broker reach a Vault in the `vault` namespace; this cluster's
+  # dev Vault runs beside the broker.
+  - target:
+      kind: NetworkPolicy
+      name: aenv-egress
+    patch: |-
+      - op: add
+        path: /spec/egress/-
+        value:
+          to:
+            - podSelector:
+                matchLabels:
+                  app.kubernetes.io/name: vault-dev
+          ports:
+            - port: 8200
+              protocol: TCP

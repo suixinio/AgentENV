@@ -1,0 +1,12 @@
+# Node-only overlay for the pve-mf cluster, layered by AENV_CONFIG_OVERLAY_PATH.
+#
+# The tools drive this cluster's guests boot from. A prerelease published to
+# the cluster's own registry, ahead of the ghcr.io release the manifest names;
+# drop this section once config/deps_manifest.toml points at a release that
+# carries the same envd.
+[tools]
+version = "0.2.0-egress.2"
+url = "10.1.0.201:5000/agentenv-tools:{version}"
+
+[envd]
+version = "0.6.13"

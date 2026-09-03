@@ -29,7 +29,9 @@ pub trait PausePublisher: Send + Sync {
 }
 
 /// The node's half: stages the capture on this machine's repository and
-/// returns the value the api half commits.
+/// returns the value the api half commits. The `PausedSandboxConfig` it
+/// stages is a placeholder: the node's record lacks the sandbox's user-facing
+/// configuration, and the api half's commit replaces it with its own.
 pub struct StagingPausePublisher {
     snapshots: Arc<SnapshotManager>,
 }
@@ -139,5 +141,89 @@ impl PausePublisher for DiscardingPausePublisher {
         Ok(PublishedPause::Committed(
             crate::snapshot::SnapshotId::generate(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::orchestrator::SandboxTimeoutAction;
+    use crate::snapshot::mock::{in_memory_snapshot_manager, mock_paused_sandbox_config};
+    use crate::snapshot::repository::interfaces::SnapshotCatalog;
+    use crate::snapshot::repository::{SnapshotCommit, StagedSnapshot};
+    use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotPublishSource};
+    use crate::types::SandboxId;
+
+    /// What a node stages: its record knows nothing of the sandbox's
+    /// user-facing configuration, so the config it writes is the defaults.
+    fn staged_by_a_node(sandbox_id: SandboxId) -> StagedSnapshot {
+        let mut committed = CommittedSnapshot::mock();
+        committed.paused_sandbox = Some(PausedSandboxConfig {
+            auto_resume: false,
+            user_metadata: None,
+            timeout_action: SandboxTimeoutAction::Pause,
+            ..mock_paused_sandbox_config()
+        });
+        StagedSnapshot {
+            commit: SnapshotCommit {
+                id: SnapshotId::generate(),
+                alias: None,
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: sandbox_id.to_string(),
+                },
+                resources: Default::default(),
+                created_at_unix_ms: Some(1_700_000_000_000),
+                origin_node_id: Some("node-a".to_string()),
+                committed,
+            },
+            staged_at_unix_ms: 1_700_000_000_000,
+            origin_node_id: "node-a".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_committed_row_carries_the_api_halfs_configuration_not_the_nodes() {
+        let (manager, catalog) = in_memory_snapshot_manager();
+        let publisher = CommittingPausePublisher::new(Arc::new(manager));
+        let sandbox_id = SandboxId::new();
+        let user_metadata = Some([("owner".to_string(), "api".to_string())].into());
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            auto_resume: true,
+            user_metadata: user_metadata.clone(),
+            timeout_action: SandboxTimeoutAction::Delete,
+            ..Default::default()
+        };
+
+        let published = publisher
+            .publish(
+                &metadata,
+                CapturedSandboxSnapshot::staged(staged_by_a_node(sandbox_id)),
+            )
+            .await
+            .expect("the staged capture commits");
+
+        let PublishedPause::Committed(id) = published else {
+            panic!("the api half commits, it does not stage: {published:?}");
+        };
+        let row = catalog
+            .get(&id.to_string())
+            .await
+            .expect("the catalog answers")
+            .expect("the committed row");
+        let paused = row
+            .paused_sandbox()
+            .expect("a pause row carries its config");
+        assert!(
+            paused.auto_resume,
+            "the data-plane wake-up gate reads this flag; the node staged it as false"
+        );
+        assert_eq!(paused.user_metadata, user_metadata);
+        assert!(matches!(
+            paused.timeout_action,
+            SandboxTimeoutAction::Delete
+        ));
     }
 }

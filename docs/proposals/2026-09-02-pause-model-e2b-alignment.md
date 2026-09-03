@@ -221,7 +221,7 @@ binding 都不再需要。
 1. 暂停后 `paused_sandboxes` 不存在（表已删），catalog 出现 `source_sandbox_id` 行且 `status_group` 最终 `ready`；节点上 `records/` 不存在。
 2. 人为删除 origin 节点的 capture 缓存目录后 resume 成功（终态的金判据，沿用前篇）。
 3. 人为把 origin 置 draining 后 resume 落到另一节点，行的 `origin_node_id` 改写；再置 ready 后下一次 resume 回到暖节点。
-4. 上传完成前杀 origin Pod：resume 404，GET 报不可恢复，DELETE 204。
+4. 上传完成前杀 origin Pod：resume 404，GET 404，DELETE 404（该沙箱此前从未暂停过时，行、记录都不存在；e2b 的 DELETE 在两处都找不到时同样 404）。
 5. 暂停途中并发 resume：等 pausing 结束后成功；并发 pause：第二个拿到第一个的结果。
 6. `GET /sandboxes` 一个刚 resume 的沙箱只出现一次。
 7. autoResume:true 的暂停沙箱，直接打数据面地址被唤醒；autoResume:false 的得 404。
@@ -251,5 +251,7 @@ binding 都不再需要。
 - **节点关机是 kill，不是 drain。** §4.2 写「只 drain」；实际节点优雅关闭对每个沙箱执行 stop，节点重启丢失其上运行中的沙箱（§8 第 2 条已接受）。节点也不再在启动时恢复任何暂停沙箱：没有 `records/`，没有 `Paused`/`Resuming` 状态，心跳没有 `paused` roster 标志与 `paused_*` 指标（proto 字段 reserved），心跳应答不再点名 disowned 沙箱，`RuntimeImageOwner::PausedSandbox` 与镜像缓存的 paused-hold 对账一并删除。
 - **`/registry/sandboxes` 保留，改由 catalog 供数。** 列 catalog 的 paused 行，state 恒为 `paused`，lease 与 claim 字段为空。其余 REST 面：`GET /sandboxes/{id}` 在无活跃记录时把 paused 行渲染为 `paused`；对已暂停沙箱 `POST /pause` 得 409；`DELETE` 先 kill running（如有）再删该沙箱全部 paused 快照，任一发生即 204，都没有才 404；`GET /v2/sandboxes` 合并活跃记录与 paused 行，已恢复的沙箱只出现一次。
 - **pin 拒绝理由删除；gateway 指标标签未动。** 「只能在 origin 恢复」的状态没有了，`origin_not_reporting` 一类 pin 拒绝随之从 resume RPC 删除；节点半边对自己没在跑的沙箱一律答 `NotFound`；`Resume` RPC 从 `node.proto` 删除。数据面唤醒里 api 半边多了两道门：`secure` 行在请求指向控制面端口时要求 envd access token，行的 `auto_resume` 为 false 则以 `auto_resume_disabled` 拒绝。Go 侧 `agentenv_gateway_*` 的标签集合未改。
+- **暂停行的配置由 api 半边写。** 节点的记录没有 `auto_resume`、用户 metadata 与到期动作（node client 的 Create 请求不带它们），所以节点 stage 时写进 `PausedSandboxConfig` 的是默认值；api 半边采纳 staged 值提交时用自己记录构造的 `PausedSandboxConfig` 覆盖（`SnapshotManager::adopt_staged`）。pve-mf 首轮验收（2026-09-03）正是在这里失守：所有暂停沙箱的 `autoResume` 一律变成 false，`06_proxy` 两条断言失败。
+- **已知缺口：origin 置 draining 后的几秒内 resume 得 500。** api 半边的放置视图异步刷新，窗口内 `preferred_node_id` 仍命中该节点，节点以 `node is isolated` 拒绝，放置不换节点重试。pve-mf 实测 1 秒内 500、7 秒后 201 落别处。未修。
 - **暂停途中的 resume 按 §4.2 等待。** `POST /resume`、`POST /connect` 与数据面唤醒遇到 `Pausing` 记录时，等该 pause 收敛（`Orchestrator::wait_for_pause_to_settle`，沿用 `join_concurrent_pause` 的 60 秒预算）：记录消失即从新写的行 create；记录回到 `Running`（发布失败、沙箱原地继续跑）即按运行中应答；超预算才答 409 / 400 / `transition_in_progress`。§9.5 的前半句由此可验。
 - **接受的取舍（§8）如实落地。** origin 在 staged 字节提交前硬死，该次 pause 丢失；没有「只能在 origin 恢复」的状态；并发 resume 得 409 而不是等待。

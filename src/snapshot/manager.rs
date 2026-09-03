@@ -202,6 +202,11 @@ impl SnapshotManager {
         }
 
         staged.commit.alias = metadata.alias;
+        // The stager's record of the sandbox carries none of its user-facing
+        // configuration; the committing caller's does, so its answer wins.
+        if let Some(paused) = metadata.paused_sandbox {
+            staged.commit.committed.paused_sandbox = Some(paused);
+        }
         Ok(StagedSnapshotHandle::adopted(staged))
     }
 

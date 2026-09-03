@@ -3,8 +3,8 @@ SHELL := /usr/bin/env bash
 .DEFAULT_GOAL := build
 
 REPO_ROOT := ..
-TOOLS_VERSION ?= 0.1.0
-ENVD_REF ?= 2026.17
+TOOLS_VERSION ?= 0.2.0
+ENVD_REF ?= envd-v0.6.13
 ENVD_UPSTREAM_REPO ?= https://github.com/e2b-dev/infra.git
 HOST_MACHINE := $(shell uname -m)
 ifeq ($(HOST_MACHINE),x86_64)
@@ -29,6 +29,10 @@ OUTPUT_NAME ?= tools-$(TOOLS_VERSION)-$(ARCH).ext4
 OUTPUT_PATH := $(OUTPUT_DIR)/$(OUTPUT_NAME)
 IMAGE ?= agentenv-tools:$(TOOLS_VERSION)
 DOCKER ?= docker
+# The node extracts /tools.ext4 with umoci, which accepts only OCI image
+# manifests; the docker driver's plain --push would publish a Docker v2
+# manifest. Append `,registry.insecure=true` for a plain-HTTP registry.
+PUBLISH_OUTPUT ?= type=image,name=$(IMAGE),push=true,oci-mediatypes=true
 
 .PHONY: build publish push check-buildx check-tools-version check-publish-image
 
@@ -86,8 +90,7 @@ publish: check-buildx check-tools-version check-publish-image
 		--build-arg "TOOLS_VERSION=$(TOOLS_VERSION)" \
 		--build-arg "ENVD_REF=$(ENVD_REF)" \
 		--build-arg "ENVD_UPSTREAM_REPO=$(ENVD_UPSTREAM_REPO)" \
-		-t "$(IMAGE)" \
-		--push \
+		--output "$(PUBLISH_OUTPUT)" \
 		.
 push:
 	@echo "'make push' is no longer supported; use 'make publish' for a multi-platform release." >&2

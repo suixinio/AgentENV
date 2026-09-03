@@ -607,19 +607,29 @@ boot) that watches for these per-instance files and executes them after resume.
 
 A sandbox whose policy carries `rules` gets a listener in its network namespace, a
 DNAT of guest port 443 onto it, and a `caBundle` on every envd `init` (the
-egress CA when the node has one, an empty string otherwise). Two facts about
-the guest side:
+egress CA when the node has one, an empty string otherwise). On the guest side:
 
-- envd must support `caBundle` on `/init`. e2b's envd installs the bundle from
-  0.7.0 (`internal/api/init.go`); the 0.5.15 pinned in `[envd].version` and the
-  `agentenv-tools` drive ignores the field. Until the tools drive ships a newer
-  envd, `wait_for_ready` fails the launch of a sandbox with rules whose guest
-  trust store does not contain the CA, so the gap is a create error rather than
-  a TLS failure inside the guest. Sandboxes without rules are unaffected.
+- envd installs the bundle it is handed on `/init` (`internal/api/init.go`, in the
+  0.5.15 build the `agentenv-tools` 0.1.0 drive ships as well as in 0.6.13). It
+  appends to `/etc/ssl/certs/ca-certificates.crt` and keeps a copy under
+  `/usr/local/share/ca-certificates/e2b-ca.crt`; the latter lands on the user
+  rootfs by envd's design. `wait_for_ready` still probes the guest trust store
+  for the CA and fails the launch of a sandbox with rules when it is absent,
+  so a guest whose envd or image cannot take the bundle is a create error
+  rather than a TLS failure inside the guest. Sandboxes without rules are
+  unaffected.
+- The trust store itself must not persist: `tools-image/pivot-init` serves
+  `/etc/ssl/certs` from a tmpfs copy before envd starts, so a pause snapshot or
+  a published template carries no CA of the node that ran it. Drives before
+  0.2.0 have no such mount and let the append reach the rootfs upper layer. A
+  snapshot pins the tools drive version it was taken with, so sandboxes resumed
+  from older snapshots keep booting the older drive until they are rebuilt.
 - envd treats an empty `caBundle` as "nothing to install", not as "remove".
-  Isolation of the CA from other sandboxes rests on the guest's trust store
-  living on a tmpfs mount that a snapshot does not carry, as in e2b's envd
-  service unit; verify that mount when upgrading the tools drive.
+- Releasing a new drive is `make -C tools-image publish` to `ghcr.io`, then
+  bumping `[tools].version` in `config/deps_manifest.toml` and `[envd].version`
+  in `config/default.toml` together. A cluster that needs the drive before the
+  release pins a prerelease from its own registry through a node config overlay,
+  as `deploy/k8s/overlays/pve-mf/node-overlay.toml` does.
 
 `crates/aenv-node/tests/integration/egress.rs` exercises the intercept with the
 embedded broker and its `tcp` handler. It needs a node config with

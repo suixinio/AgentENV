@@ -86,31 +86,35 @@ The build accepts these Make variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TOOLS_VERSION` | `0.1.0` | Immutable SemVer release of the complete tools drive |
-| `ENVD_REF` | `2026.17` | Tag, branch, or fetchable commit to build from the envd upstream repository |
+| `TOOLS_VERSION` | `0.2.0` | Immutable SemVer release of the complete tools drive |
+| `ENVD_REF` | `envd-v0.6.13` | Tag, branch, or fetchable commit to build from the envd upstream repository |
 | `ENVD_UPSTREAM_REPO` | `https://github.com/e2b-dev/infra.git` | Repository containing `packages/envd` |
 | `ARCH` | host architecture, normalized to `amd64` or `arm64` | Target architecture |
 | `PUBLISH_PLATFORMS` | `linux/amd64,linux/arm64` | Platforms included in the published OCI image |
 | `OUTPUT_DIR` | `out` | Directory for exported tools drive images |
 | `OUTPUT_NAME` | `tools-${TOOLS_VERSION}-${ARCH}.ext4` | Versioned tools drive filename |
 | `IMAGE` | `agentenv-tools:${TOOLS_VERSION}` | Local or remote image tag |
+| `PUBLISH_OUTPUT` | `type=image,name=${IMAGE},push=true,oci-mediatypes=true` | Buildx image exporter options for `publish`; append `,registry.insecure=true` for a plain-HTTP registry |
 | `DOCKER` | `docker` | Docker CLI command |
 
 Examples:
 
 ```bash
-make TOOLS_VERSION=0.1.0 ENVD_REF=2026.17 ARCH=amd64
+make TOOLS_VERSION=0.2.0 ENVD_REF=envd-v0.6.13 ARCH=amd64
 
 make \
   ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git \
-  TOOLS_VERSION=0.1.0 \
-  ENVD_REF=2026.17 \
+  TOOLS_VERSION=0.2.0 \
+  ENVD_REF=envd-v0.6.13 \
   ARCH=amd64
 ```
 
 ## Publish
 
-The `publish` target builds a multi-platform artifact and pushes it to `IMAGE`.
+The `publish` target builds a multi-platform artifact and pushes it to `IMAGE`
+with OCI media types: the node unpacks the image with `umoci`, which rejects a
+Docker v2 manifest. Use a `docker-container` builder (`BUILDX_BUILDER=<name>`);
+the `docker` driver ignores the media type request on some engines.
 It accepts SemVer releases and prereleases without build metadata, requires the
 image tag to match that version, and refuses to overwrite a tag found by its
 preflight check. That check is not atomic: the registry must enforce immutable
@@ -118,14 +122,14 @@ tags to prevent concurrent or external publishers from replacing a release.
 
 ```bash
 make publish \
-  TOOLS_VERSION=0.1.0 \
-  ENVD_REF=2026.17 \
-  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.1.0
+  TOOLS_VERSION=0.2.0 \
+  ENVD_REF=envd-v0.6.13 \
+  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.2.0
 
 make publish \
-  TOOLS_VERSION=0.1.0-custom.1 \
-  ENVD_REF=2026.17 \
-  IMAGE=registry.example.com/custom/agentenv-tools:0.1.0-custom.1
+  TOOLS_VERSION=0.2.0-custom.1 \
+  ENVD_REF=envd-v0.6.13 \
+  IMAGE=registry.example.com/custom/agentenv-tools:0.2.0-custom.1
 ```
 
 After validation, update `[tools].version` in `config/deps_manifest.toml` to
@@ -138,8 +142,8 @@ To test a locally built tools drive, point AgentENV at the generated ext4:
 
 ```toml
 [tools]
-version = "0.1.0"
-drive_path = "tools-image/out/tools-0.1.0-amd64.ext4"
+version = "0.2.0"
+drive_path = "tools-image/out/tools-0.2.0-amd64.ext4"
 ```
 
 The path is resolved relative to the server process working directory, not

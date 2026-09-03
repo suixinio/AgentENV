@@ -95,12 +95,29 @@ fi
 # Expose envd as a stable guest command.
 $BB ln -sf /agentenv/envd /usr/local/bin/envd
 
-# envd 0.5.x starts guest processes through /usr/bin/nice. Minimal user images
-# do not always ship coreutils, so provide a BusyBox-backed fallback without
+# envd starts guest processes through nice(1). Minimal user images do not
+# always ship coreutils, so provide a BusyBox-backed fallback without
 # overriding an image that already has a real nice(1).
 $BB mkdir -p /usr/bin
 if [ ! -x /usr/bin/nice ]; then
     $BB ln -sf /agentenv/bin/busybox /usr/bin/nice
+fi
+
+# Serve /etc/ssl/certs from a tmpfs copy. envd installs a CA handed to it on
+# /init by appending to /etc/ssl/certs/ca-certificates.crt; on tmpfs that
+# append never reaches the user rootfs, so a pause snapshot or a published
+# template carries no CA of the node that ran it, and an image whose bundle
+# is a symlink into a read-only store still gets a real file to append to.
+# Every step fails open: the node probes the guest trust store before it
+# hands a sandbox with brokered egress to the user.
+if [ -d /etc/ssl/certs ] && ! $BB grep -qs ' /etc/ssl/certs ' /proc/mounts; then
+    $BB mkdir -p /run/agentenv/certs
+    if $BB cp -aL /etc/ssl/certs/. /run/agentenv/certs/ 2>/dev/null; then
+        $BB mount -n --bind /run/agentenv/certs /etc/ssl/certs 2>/dev/null \
+            || echo "AGENTENV PIVOT INIT WARN: bind-mounting the tmpfs trust store failed" >&2
+    else
+        echo "AGENTENV PIVOT INIT WARN: copying /etc/ssl/certs to tmpfs failed" >&2
+    fi
 fi
 
 # Prepare remaining runtime directories envd and the guest init commonly

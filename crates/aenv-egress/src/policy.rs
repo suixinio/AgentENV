@@ -37,6 +37,8 @@ const DEFAULT_DENIED_CIDRS: &[&str] = &[
     "fc00::/7",
     "fe80::/10",
     "ff00::/8",
+    "::ffff:0:0/96",
+    "64:ff9b::/96",
 ];
 
 impl BrokerDenyList {
@@ -184,8 +186,10 @@ impl UpstreamGuard {
     }
 
     /// Broker deny list, then the sandbox's allow list, deny list and base
-    /// policy: the same order as the namespace's FORWARD chains.
+    /// policy: the same order as the namespace's FORWARD chains. An
+    /// IPv4-mapped IPv6 address is checked as the IPv4 address it maps.
     pub fn check(&self, ip: IpAddr, policy: &EgressPolicySummary) -> Result<(), DenyReason> {
+        let ip = ip.to_canonical();
         if self.deny.matches(ip).is_some() {
             return Err(DenyReason::BrokerDenied);
         }
@@ -204,14 +208,20 @@ impl UpstreamGuard {
     }
 
     /// Resolves `host`, checks every address it resolved to (one denied
-    /// address denies the connection), then connects to one of them.
+    /// address denies the connection), then connects to one of them. The
+    /// address checked is the address dialled, in its canonical form.
     pub async fn connect_checked(
         &self,
         host: &str,
         port: u16,
         policy: &EgressPolicySummary,
     ) -> Result<(TcpStream, SocketAddr), UpstreamError> {
-        let ips = self.resolve(host).await?;
+        let ips: Vec<IpAddr> = self
+            .resolve(host)
+            .await?
+            .into_iter()
+            .map(|ip| ip.to_canonical())
+            .collect();
         for ip in &ips {
             self.check(*ip, policy).map_err(UpstreamError::Denied)?;
         }
@@ -233,6 +243,7 @@ impl UpstreamGuard {
         addr: SocketAddr,
         policy: &EgressPolicySummary,
     ) -> Result<TcpStream, UpstreamError> {
+        let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
         self.check(addr.ip(), policy)
             .map_err(UpstreamError::Denied)?;
         self.connect(addr).await
@@ -374,6 +385,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ipv4_mapped_ipv6_addresses_are_checked_as_the_ipv4_address_they_map() {
+        let guard = UpstreamGuard::new(BrokerDenyList::default());
+        let permissive = EgressPolicySummary {
+            allow_internet: true,
+            allowed_cidrs: vec!["0.0.0.0/0".into(), "::/0".into()],
+            denied_cidrs: vec![],
+        };
+        for denied in [
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert_eq!(
+                guard.check(ip(denied), &permissive),
+                Err(DenyReason::BrokerDenied),
+                "{denied}"
+            );
+        }
+        assert_eq!(guard.check(ip("2606:4700::1111"), &permissive), Ok(()));
+        assert_eq!(guard.check(ip("::ffff:93.184.216.34"), &permissive), Ok(()));
+
+        let unlisted = UpstreamGuard::new(BrokerDenyList::empty());
+        let sandbox = EgressPolicySummary {
+            allow_internet: true,
+            allowed_cidrs: vec![],
+            denied_cidrs: vec!["203.0.113.0/24".into()],
+        };
+        assert_eq!(
+            unlisted.check(ip("::ffff:203.0.113.5"), &sandbox),
+            Err(DenyReason::SandboxDenied)
+        );
+    }
+
+    #[test]
+    fn the_mapped_and_nat64_prefixes_are_in_the_built_in_deny_list() {
+        let deny = BrokerDenyList::default();
+        assert!(deny.matches(ip("::ffff:8.8.8.8")).is_some());
+        assert!(deny.matches(ip("64:ff9b::808:808")).is_some());
+        assert!(deny.matches(ip("2606:4700::1111")).is_none());
+        assert_eq!(
+            UpstreamGuard::new(deny).check(ip("64:ff9b::a00:1"), &open_internet()),
+            Err(DenyReason::BrokerDenied)
+        );
+    }
+
     struct FixedResolver(Vec<IpAddr>);
 
     #[async_trait]
@@ -381,6 +438,38 @@ mod tests {
         async fn resolve(&self, _: &str) -> std::io::Result<Vec<IpAddr>> {
             Ok(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn connect_checked_dials_the_canonical_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let guard = UpstreamGuard::new(BrokerDenyList::empty())
+            .with_resolver(Arc::new(FixedResolver(vec![ip("::ffff:127.0.0.1")])));
+
+        let (stream, addr) = guard
+            .connect_checked("mapped.example", bound.port(), &open_internet())
+            .await
+            .unwrap();
+        assert_eq!(addr, bound);
+        let (_accepted, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer, stream.local_addr().unwrap());
+    }
+
+    #[tokio::test]
+    async fn connect_checked_addr_dials_the_canonical_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        let guard = UpstreamGuard::new(BrokerDenyList::empty());
+        let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{}", bound.port())
+            .parse()
+            .unwrap();
+
+        let stream = guard
+            .connect_checked_addr(mapped, &open_internet())
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), bound);
     }
 
     #[tokio::test]

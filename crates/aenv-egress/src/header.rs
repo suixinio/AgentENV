@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -186,12 +186,12 @@ impl ReplayVerdict {
 
 /// Remembers every nonce accepted inside the skew window so a captured
 /// header cannot open a second stream. Size it for the connections expected
-/// within one window; entries leave when their window closes.
+/// within one window; entries leave in expiry order as their windows close.
 pub struct ReplayCache {
     window_ms: u64,
     capacity: usize,
-    seen: HashMap<[u8; NONCE_LEN], u64>,
-    order: VecDeque<([u8; NONCE_LEN], u64)>,
+    seen: HashSet<[u8; NONCE_LEN]>,
+    by_expiry: BTreeSet<(u64, [u8; NONCE_LEN])>,
 }
 
 impl ReplayCache {
@@ -199,8 +199,8 @@ impl ReplayCache {
         Self {
             window_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
             capacity,
-            seen: HashMap::new(),
-            order: VecDeque::new(),
+            seen: HashSet::new(),
+            by_expiry: BTreeSet::new(),
         }
     }
 
@@ -211,15 +211,15 @@ impl ReplayCache {
         now_unix_ms: u64,
     ) -> ReplayVerdict {
         self.expire(now_unix_ms);
-        if self.seen.contains_key(&nonce) {
+        if self.seen.contains(&nonce) {
             return ReplayVerdict::Replayed;
         }
         if self.seen.len() >= self.capacity {
             return ReplayVerdict::Full;
         }
         let expires_at = issued_at_unix_ms.saturating_add(self.window_ms);
-        self.seen.insert(nonce, expires_at);
-        self.order.push_back((nonce, expires_at));
+        self.seen.insert(nonce);
+        self.by_expiry.insert((expires_at, nonce));
         ReplayVerdict::Fresh
     }
 
@@ -232,14 +232,12 @@ impl ReplayCache {
     }
 
     fn expire(&mut self, now_unix_ms: u64) {
-        while let Some((nonce, expires_at)) = self.order.front().copied() {
+        while let Some(&(expires_at, nonce)) = self.by_expiry.first() {
             if expires_at >= now_unix_ms {
                 break;
             }
-            self.order.pop_front();
-            if self.seen.get(&nonce) == Some(&expires_at) {
-                self.seen.remove(&nonce);
-            }
+            self.by_expiry.pop_first();
+            self.seen.remove(&nonce);
         }
     }
 }
@@ -475,6 +473,32 @@ mod tests {
         assert_eq!(
             cache.check_and_insert([3; 16], 40_000, 40_000),
             ReplayVerdict::Fresh
+        );
+    }
+
+    #[test]
+    fn a_nonce_dated_ahead_of_the_clock_does_not_keep_expired_nonces_in_the_cache() {
+        let mut cache = ReplayCache::new(SKEW, 2);
+        assert_eq!(
+            cache.check_and_insert([1; 16], 26_000, 1_000),
+            ReplayVerdict::Fresh
+        );
+        assert_eq!(
+            cache.check_and_insert([2; 16], 1_000, 1_000),
+            ReplayVerdict::Fresh
+        );
+        assert_eq!(
+            cache.check_and_insert([3; 16], 31_001, 31_001),
+            ReplayVerdict::Fresh
+        );
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache.check_and_insert([1; 16], 26_000, 31_001),
+            ReplayVerdict::Replayed
+        );
+        assert_eq!(
+            cache.check_and_insert([2; 16], 31_001, 31_001),
+            ReplayVerdict::Full
         );
     }
 }

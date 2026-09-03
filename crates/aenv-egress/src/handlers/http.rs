@@ -17,7 +17,8 @@ use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderName, HeaderValue, HOST};
-use hyper::{Request, Response, StatusCode, Version};
+use hyper::http::uri::PathAndQuery;
+use hyper::{Method, Request, Response, StatusCode, Uri, Version};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -78,7 +79,8 @@ impl HttpHandler {
 
 /// Exact key first, then the longest `*.suffix` whose suffix the name is
 /// strictly below. Rule lists are not merged across keys; within the chosen
-/// list every rule's headers apply, later rules winning on the same name.
+/// list every rule's headers apply, later rules winning on the same name,
+/// which is the lowercase spelling a header name has on the wire.
 fn rule_headers(rules: &Rules, name: &str) -> Option<BTreeMap<String, String>> {
     let key = if let Some(list) = rules.get(name) {
         Some(list)
@@ -98,7 +100,7 @@ fn rule_headers(rules: &Rules, name: &str) -> Option<BTreeMap<String, String>> {
     let mut headers = BTreeMap::new();
     for rule in key {
         for (name, value) in &rule.transform.headers {
-            headers.insert(name.clone(), value.clone());
+            headers.insert(name.to_ascii_lowercase(), value.clone());
         }
     }
     Some(headers)
@@ -222,9 +224,44 @@ fn denied_reason(err: &UpstreamError) -> (StatusCode, &'static str) {
     }
 }
 
+/// The authority a guest names must be the one whose rules chose the credentials.
+fn refuse_foreign_authority<B>(req: &Request<B>, name: &str) -> Option<(StatusCode, &'static str)> {
+    if req.method() == Method::CONNECT {
+        return Some((StatusCode::METHOD_NOT_ALLOWED, "connect_unsupported"));
+    }
+    match req.uri().authority() {
+        Some(authority) if !authority.host().eq_ignore_ascii_case(name) => {
+            Some((StatusCode::BAD_REQUEST, "authority_mismatch"))
+        }
+        _ => None,
+    }
+}
+
+/// Runs after every transform, so nothing else can name another authority.
+fn bind_to_name<B>(req: &mut Request<B>, name: &str) -> Result<(), (StatusCode, &'static str)> {
+    let host = HeaderValue::from_str(name)
+        .map_err(|_| (StatusCode::BAD_GATEWAY, "host_not_representable"))?;
+    if req.uri().scheme().is_some() || req.uri().authority().is_some() {
+        let origin_form: Uri = req
+            .uri()
+            .path_and_query()
+            .map_or("/", PathAndQuery::as_str)
+            .parse()
+            .map_err(|_| (StatusCode::BAD_GATEWAY, "target_not_representable"))?;
+        *req.uri_mut() = origin_form;
+    }
+    req.headers_mut().insert(HOST, host);
+    Ok(())
+}
+
 async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> Response<Body> {
     if req.version() == Version::HTTP_2 {
         return synthesized(StatusCode::HTTP_VERSION_NOT_SUPPORTED, "http2_unsupported");
+    }
+    if let Some((status, reason)) = refuse_foreign_authority(&req, &rc.name) {
+        metrics::counter!("egress_policy_denied_total", "reason" => reason).increment(1);
+        debug!(name = %rc.name, reason, "request refused before any credential");
+        return synthesized(status, reason);
     }
 
     let mut resolved: BTreeMap<String, String> = BTreeMap::new();
@@ -269,10 +306,9 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
         };
         req.headers_mut().insert(header, value);
     }
-    if !req.headers().contains_key(HOST) {
-        if let Ok(host) = HeaderValue::from_str(&rc.name) {
-            req.headers_mut().insert(HOST, host);
-        }
+    if let Err((status, reason)) = bind_to_name(&mut req, &rc.name) {
+        warn!(name = %rc.name, reason, "the matched name does not fit a request");
+        return synthesized(status, reason);
     }
 
     let wants_upgrade = req.headers().contains_key(hyper::header::UPGRADE);
@@ -489,15 +525,15 @@ mod tests {
             ("*.deep.example.com", &[("Authorization", "deeper")]),
         ]);
         assert_eq!(
-            rule_headers(&rules, "api.example.com").unwrap()["Authorization"],
+            rule_headers(&rules, "api.example.com").unwrap()["authorization"],
             "exact"
         );
         assert_eq!(
-            rule_headers(&rules, "other.example.com").unwrap()["Authorization"],
+            rule_headers(&rules, "other.example.com").unwrap()["authorization"],
             "wild"
         );
         assert_eq!(
-            rule_headers(&rules, "a.deep.example.com").unwrap()["Authorization"],
+            rule_headers(&rules, "a.deep.example.com").unwrap()["authorization"],
             "deeper"
         );
         assert!(
@@ -517,6 +553,83 @@ mod tests {
         let mut out = Vec::new();
         stream.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, b"prerest");
+    }
+
+    #[test]
+    fn header_names_merge_case_insensitively_and_the_later_rule_wins() {
+        let rules: Rules = serde_json::from_value(serde_json::json!({
+            "api.test": [
+                { "transform": { "headers": { "Authorization": "first" } } },
+                { "transform": { "headers": { "authorization": "second" } } }
+            ]
+        }))
+        .unwrap();
+        let headers = rule_headers(&rules, "api.test").unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers["authorization"], "second");
+    }
+
+    fn request(method: &str, uri: &str, host: &str) -> Request<()> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(HOST, host)
+            .body(())
+            .unwrap()
+    }
+
+    #[test]
+    fn an_absolute_form_authority_other_than_the_matched_name_is_refused() {
+        assert_eq!(
+            refuse_foreign_authority(
+                &request("GET", "https://evil.test/v1/models", "api.test"),
+                "api.test"
+            ),
+            Some((StatusCode::BAD_REQUEST, "authority_mismatch"))
+        );
+        assert_eq!(
+            refuse_foreign_authority(
+                &request("GET", "https://API.test/v1/models", "api.test"),
+                "api.test"
+            ),
+            None
+        );
+        assert_eq!(
+            refuse_foreign_authority(&request("GET", "/v1/models", "evil.test"), "api.test"),
+            None
+        );
+    }
+
+    #[test]
+    fn connect_is_refused_whatever_authority_it_names() {
+        for target in ["api.test:443", "evil.test:443"] {
+            let req = Request::builder()
+                .method("CONNECT")
+                .uri(target)
+                .body(())
+                .unwrap();
+            assert_eq!(
+                refuse_foreign_authority(&req, "api.test"),
+                Some((StatusCode::METHOD_NOT_ALLOWED, "connect_unsupported"))
+            );
+        }
+    }
+
+    #[test]
+    fn binding_rewrites_the_target_to_origin_form_and_replaces_the_guest_host() {
+        let mut absolute = request("GET", "https://api.test:8443/v1/models?a=b", "evil.test");
+        bind_to_name(&mut absolute, "api.test").unwrap();
+        assert_eq!(absolute.uri().to_string(), "/v1/models?a=b");
+        assert_eq!(absolute.headers()[HOST], "api.test");
+
+        let mut rootless = request("GET", "https://api.test", "evil.test");
+        bind_to_name(&mut rootless, "api.test").unwrap();
+        assert_eq!(rootless.uri().to_string(), "/");
+
+        let mut origin = request("GET", "/v1/models", "evil.test");
+        bind_to_name(&mut origin, "api.test").unwrap();
+        assert_eq!(origin.uri().to_string(), "/v1/models");
+        assert_eq!(origin.headers()[HOST], "api.test");
     }
 
     #[test]
@@ -729,6 +842,93 @@ mod tests {
             let response = terminated_request(&broker, rules, policy).await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
             assert_eq!(response.headers()[REASON_HEADER], "credential_denied");
+        }
+
+        async fn raw_exchange(
+            broker: &Broker,
+            rules: serde_json::Value,
+            policy: EgressPolicySummary,
+            request: &str,
+        ) -> String {
+            let hdr = header(
+                "http",
+                serde_json::json!({ "rules": rules }),
+                policy,
+                Some("203.0.113.9:443".parse().unwrap()),
+            );
+            let stream = broker.transport.open(hdr).await.unwrap();
+            let mut connector = native_tls::TlsConnector::builder();
+            connector
+                .add_root_certificate(native_tls::Certificate::from_pem(&broker.ca_pem).unwrap());
+            let connector = tokio_native_tls::TlsConnector::from(connector.build().unwrap());
+            let mut tls = connector.connect("api.test", stream).await.unwrap();
+            tls.write_all(request.as_bytes()).await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if tls.read(&mut byte).await.unwrap() == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            String::from_utf8_lossy(&head).into_owned()
+        }
+
+        fn bearer_rules() -> serde_json::Value {
+            serde_json::json!({
+                "api.test": [{ "transform": { "headers": { "Authorization": "Bearer ${aenv.secrets.openai}" } } }]
+            })
+        }
+
+        #[tokio::test]
+        async fn an_absolute_form_target_naming_another_host_is_refused_with_400() {
+            let (broker, rules, policy) = start_broker(bearer_rules(), true).await;
+            let head = raw_exchange(
+                &broker,
+                rules,
+                policy,
+                "GET https://evil.test/v1/models HTTP/1.1\r\nHost: api.test\r\n\r\n",
+            )
+            .await;
+            assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
+            assert!(
+                head.contains(&format!("{REASON_HEADER}: authority_mismatch")),
+                "{head}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_absolute_form_target_naming_the_matched_host_reaches_the_upstream_step() {
+            let (broker, rules, policy) = start_broker(bearer_rules(), true).await;
+            let head = raw_exchange(
+                &broker,
+                rules,
+                policy,
+                "GET https://api.test/v1/models HTTP/1.1\r\nHost: evil.test\r\n\r\n",
+            )
+            .await;
+            assert!(head.starts_with("HTTP/1.1 403 "), "{head}");
+            assert!(
+                head.contains(&format!("{REASON_HEADER}: internet_disabled")),
+                "{head}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_connect_request_is_refused_with_405() {
+            let (broker, rules, policy) = start_broker(bearer_rules(), true).await;
+            let head = raw_exchange(
+                &broker,
+                rules,
+                policy,
+                "CONNECT api.test:443 HTTP/1.1\r\nHost: api.test\r\n\r\n",
+            )
+            .await;
+            assert!(head.starts_with("HTTP/1.1 405 "), "{head}");
+            assert!(
+                head.contains(&format!("{REASON_HEADER}: connect_unsupported")),
+                "{head}"
+            );
         }
 
         #[tokio::test]

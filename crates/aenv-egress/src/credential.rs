@@ -123,23 +123,49 @@ impl CredentialSource for StaticSource {
     }
 }
 
-/// Caches successful lookups for `ttl` (or until the secret's own expiry,
-/// whichever is sooner). Denials and outages are never cached, and an
-/// invalid name is denied before the inner source sees it.
+/// Caches successful lookups for `ttl`, or until the secret's own expiry if
+/// that is sooner, holding at most `capacity` entries and dropping expired
+/// ones on insert. Denials, outages and invalid names never reach the cache.
 pub struct CachingSource<S> {
     inner: S,
     ttl: Duration,
+    capacity: usize,
     cache: Mutex<HashMap<GrantKey, (Secret, Instant)>>,
 }
 
 type GrantKey = (String, String, String);
+
+/// Entries a broker holds when the operator names no capacity.
+pub const DEFAULT_CREDENTIAL_CACHE_CAPACITY: usize = 4096;
 
 impl<S: CredentialSource> CachingSource<S> {
     pub fn new(inner: S, ttl: Duration) -> Self {
         Self {
             inner,
             ttl,
+            capacity: DEFAULT_CREDENTIAL_CACHE_CAPACITY,
             cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A capacity of zero is raised to one: the map always admits the entry
+    /// it was asked to insert.
+    pub fn with_capacity(mut self, capacity: usize) -> Self {
+        self.capacity = capacity.max(1);
+        self
+    }
+
+    fn make_room(&self, cache: &mut HashMap<GrantKey, (Secret, Instant)>, now: Instant) {
+        cache.retain(|_, (_, expires_at)| *expires_at > now);
+        while cache.len() >= self.capacity {
+            let Some(soonest) = cache
+                .iter()
+                .min_by_key(|(_, (_, expires_at))| *expires_at)
+                .map(|(key, _)| key.clone())
+            else {
+                return;
+            };
+            cache.remove(&soonest);
         }
     }
 
@@ -186,10 +212,9 @@ impl<S: CredentialSource> CredentialSource for CachingSource<S> {
         }
         let secret = self.inner.get(sandbox_id, execution_id, name).await?;
         let expires_at = self.expiry_for(&secret, now);
-        self.cache
-            .lock()
-            .await
-            .insert(key, (secret.clone(), expires_at));
+        let mut cache = self.cache.lock().await;
+        self.make_room(&mut cache, Instant::now());
+        cache.insert(key, (secret.clone(), expires_at));
         Ok(secret)
     }
 }
@@ -308,6 +333,30 @@ mod tests {
             Some(CredentialError::Denied)
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_entry_leaves_the_cache_without_a_lookup_of_its_own_key() {
+        let (inner, _) = counting(Ok(b"v1".to_vec()));
+        let source = CachingSource::new(inner, Duration::from_secs(60));
+        source.get("s", "e", "n").await.unwrap();
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        source.get("s", "other-exec", "n").await.unwrap();
+
+        let cache = source.cache.lock().await;
+        assert_eq!(cache.len(), 1);
+        assert!(!cache.contains_key(&("s".into(), "e".into(), "n".into())));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_cache_holds_no_more_entries_than_its_capacity() {
+        let (inner, _) = counting(Ok(b"v1".to_vec()));
+        let source = CachingSource::new(inner, Duration::from_secs(60)).with_capacity(2);
+        for execution in ["e1", "e2", "e3"] {
+            source.get("s", execution, "n").await.unwrap();
+        }
+        assert_eq!(source.cache.lock().await.len(), 2);
     }
 
     #[tokio::test]

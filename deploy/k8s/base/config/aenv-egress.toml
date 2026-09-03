@@ -8,6 +8,15 @@ max_skew_ms = 30000
 # Nonces remembered inside the skew window; size it for the connections
 # expected in one window, a full cache refuses rather than forgets.
 replay_capacity = 100000
+# One deadline for the TLS handshake and the identity frame behind it. Nothing
+# on a connection is authenticated until both are done, so this bounds the work
+# an unauthenticated peer can hold open.
+admission_timeout_ms = 10000
+# Connections held at once; the excess is closed at accept, not queued.
+max_connections = 4096
+# How long SIGTERM lets live sessions finish before the process stops waiting.
+# Keep it under the pod's termination grace period, 30s by default.
+shutdown_drain_secs = 25
 
 [tls]
 cert_path = "/etc/aenv-egress/server/tls.crt"
@@ -38,6 +47,9 @@ token_file = "/etc/aenv-egress/vault/token"
 mount = "aenv"
 timeout_ms = 5000
 cache_ttl_secs = 30
+# Values held at once. Expired entries leave on every insert, so a finished
+# execution's secret is not kept past its ttl.
+cache_capacity = 4096
 
 [handlers]
 # The tcp identity-echo handler; leave off outside smoke tests.

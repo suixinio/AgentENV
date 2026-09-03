@@ -41,6 +41,17 @@ struct EgressConfig {
     max_skew_ms: u64,
     #[config(default = 100_000usize, env = "AENV_EGRESS_REPLAY_CAPACITY")]
     replay_capacity: usize,
+    /// One deadline for the TLS handshake and the identity frame behind it;
+    /// nothing on the connection is authenticated until both are done.
+    #[config(default = 10_000u64, env = "AENV_EGRESS_ADMISSION_TIMEOUT_MS")]
+    admission_timeout_ms: u64,
+    /// Connections held at once; the excess is closed, not queued.
+    #[config(default = 4_096u32, env = "AENV_EGRESS_MAX_CONNECTIONS")]
+    max_connections: u32,
+    /// How long a shutdown lets live sessions finish before it stops waiting.
+    /// Keep it under the pod's termination grace period.
+    #[config(default = 25u64, env = "AENV_EGRESS_SHUTDOWN_DRAIN_SECS")]
+    shutdown_drain_secs: u64,
     #[config(nested)]
     tls: TlsConfig,
     #[config(nested)]
@@ -113,6 +124,10 @@ struct VaultSourceConfig {
     /// How long a value is reused before Vault is asked again.
     #[config(default = 30u64)]
     cache_ttl_secs: u64,
+    /// Values held at once; expired entries leave on every insert and the
+    /// soonest to expire is dropped at capacity.
+    #[config(default = 4_096usize)]
+    cache_capacity: usize,
 }
 
 #[derive(Config)]
@@ -216,10 +231,10 @@ async fn main() -> Result<()> {
                 Duration::from_millis(config.vault.timeout_ms),
             )
             .context("configure the Vault credential source")?;
-            Arc::new(CachingSource::new(
-                source,
-                Duration::from_secs(config.vault.cache_ttl_secs),
-            ))
+            Arc::new(
+                CachingSource::new(source, Duration::from_secs(config.vault.cache_ttl_secs))
+                    .with_capacity(config.vault.cache_capacity),
+            )
         }
         None => {
             tracing::warn!("no vault.addr: every credential marker will answer 502");
@@ -238,11 +253,16 @@ async fn main() -> Result<()> {
         dispatcher = dispatcher.with_handler(Arc::new(TcpEchoHandler));
     }
     let runtime = Arc::new(Runtime::new(
-        Options::new(
-            keys,
-            Duration::from_millis(config.max_skew_ms),
-            config.replay_capacity,
-        ),
+        Options {
+            admission_timeout: Duration::from_millis(config.admission_timeout_ms),
+            max_connections: config.max_connections,
+            shutdown_drain: Duration::from_secs(config.shutdown_drain_secs),
+            ..Options::new(
+                keys,
+                Duration::from_millis(config.max_skew_ms),
+                config.replay_capacity,
+            )
+        },
         Arc::new(dispatcher),
     ));
 

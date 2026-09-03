@@ -1,0 +1,61 @@
+# The broker is the one process that connects to upstreams on a sandbox's
+# behalf from inside the cluster network, so its reach is pinned here: only
+# nodes may talk to it, and it may talk to Vault, DNS and public port 443.
+# The private ranges are excluded from the egress block for the same reason
+# `[upstream].denied_cidrs` in its config refuses them: a rule must not turn
+# the broker into a path to cluster-internal services.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aenv-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aenv-egress
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: agentenv-node
+      ports:
+        - protocol: TCP
+          port: 8443
+    # Scrapes from anything in the namespace.
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 9103
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Vault, wherever it runs; adjust the namespace label to the deployment.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+      ports:
+        - protocol: TCP
+          port: 8200
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

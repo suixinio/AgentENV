@@ -9,14 +9,46 @@ publish = false
 name = "aenv_egress"
 path = "src/lib.rs"
 
+[[bin]]
+name = "aenv-egress"
+path = "src/main.rs"
+required-features = ["bin"]
+
 [features]
 default = ["core"]
 # The contract, framing, dispatch and the embedded transport. This is all
-# `aenv-node` links; nothing under it terminates or originates TLS.
+# `aenv-node` needs to run the broker in-process; nothing under it terminates
+# or originates TLS.
 core = []
-# Leaf certificate signing and the `http` handler, openssl only. The broker
-# binary enables it; `make check-crate-boundaries` fails if `aenv-node` does.
-tls = ["dep:openssl"]
+# The runtime's TLS client to a remote broker. native-tls is openssl on Linux
+# and is already in `aenv-node`'s dependency tree, so enabling this adds no
+# TLS stack to the node.
+remote = ["dep:native-tls", "dep:tokio-native-tls"]
+# Leaf certificate signing, the TLS listener and the `http` handler, openssl
+# only. The broker binary enables it; `make check-crate-boundaries` fails if
+# `aenv-node` does.
+tls = [
+    "dep:openssl",
+    "dep:native-tls",
+    "dep:tokio-native-tls",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:http",
+    "dep:metrics",
+]
+# The Vault KV v2 credential source the broker binary reads grants and values from.
+vault = ["dep:reqwest"]
+# Everything the `aenv-egress` binary needs on top of the library features.
+bin = [
+    "tls",
+    "vault",
+    "remote",
+    "dep:clap",
+    "dep:confique",
+    "dep:tracing-subscriber",
+    "dep:metrics-exporter-prometheus",
+]
 
 [dependencies]
 async-trait = "0.1"
@@ -29,10 +61,25 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2.0.18"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.41"
 zeroize = "1"
+anyhow = "1.0.100"
 openssl = { version = "0.10", optional = true }
+native-tls = { version = "0.2", optional = true }
+tokio-native-tls = { version = "0.3", optional = true }
+hyper = { version = "1", features = ["http1", "server", "client"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+http = { version = "1", optional = true }
+metrics = { version = "0.24", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "native-tls", "charset", "http2"], optional = true }
+# The binary only.
+clap = { version = "4", features = ["derive"], optional = true }
+confique = { version = "0.4.0", features = ["toml"], optional = true }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"], optional = true }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"], optional = true }
 
 [dev-dependencies]
+axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

@@ -114,6 +114,62 @@ impl Runtime {
     }
 }
 
+/// Accepts TLS connections on `listener` and dispatches each on its own
+/// task until `shutdown` resolves. Every connection's outcome is counted.
+#[cfg(feature = "tls")]
+pub async fn run(
+    runtime: Arc<Runtime>,
+    listener: tokio::net::TcpListener,
+    acceptor: tokio_native_tls::TlsAcceptor,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
+    let active = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let mut shutdown = std::pin::pin!(shutdown);
+    loop {
+        let (tcp, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    tracing::warn!(error = %err, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+            },
+            _ = &mut shutdown => return Ok(()),
+        };
+        let runtime = Arc::clone(&runtime);
+        let acceptor = acceptor.clone();
+        let active = Arc::clone(&active);
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(tcp).await {
+                Ok(tls) => tls,
+                Err(err) => {
+                    tracing::debug!(%peer, error = %err, "tls accept failed");
+                    metrics::counter!("egress_conns_total", "handler" => "none", "outcome" => "tls_failed").increment(1);
+                    return;
+                }
+            };
+            active.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            metrics::gauge!("egress_active_conns").increment(1.0);
+            let outcome = match runtime.dispatch(Box::new(tls)).await {
+                Ok(()) => "ok",
+                Err(err) => {
+                    let outcome = err.outcome();
+                    if outcome == "replayed_nonce" {
+                        metrics::counter!("egress_replay_rejected_total").increment(1);
+                    }
+                    tracing::debug!(%peer, error = %err, "connection ended with an error");
+                    outcome
+                }
+            };
+            metrics::counter!("egress_conns_total", "handler" => "runtime", "outcome" => outcome)
+                .increment(1);
+            metrics::gauge!("egress_active_conns").decrement(1.0);
+            active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};

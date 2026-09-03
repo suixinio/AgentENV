@@ -18,9 +18,15 @@ pub mod framing;
 pub mod handler;
 pub mod handlers;
 pub mod header;
+pub mod marker;
 pub mod policy;
 pub mod runtime;
+pub mod sni;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod transport;
+#[cfg(feature = "vault")]
+pub mod vault;
 
 pub use credential::{CredentialError, CredentialSource, Secret};
 pub use dispatch::{Dispatcher, Reject};

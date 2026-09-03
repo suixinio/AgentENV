@@ -19,6 +19,7 @@ K8S_NAMESPACE ?= agentenv-system
 K8S_RUNTIME_IMAGE ?= agentenv-runtime:latest
 K8S_API_IMAGE ?= agentenv-api:latest
 K8S_GATEWAY_IMAGE ?= agentenv-gateway:latest
+K8S_EGRESS_IMAGE ?= agentenv-egress:latest
 K3S_CTR ?= sudo k3s ctr
 
 # aenv home path.
@@ -134,8 +135,8 @@ check-crate-boundaries:
 	  echo "aenv-node links a PostgreSQL driver; a node must never hold database credentials."; \
 	  fail=1; \
 	fi; \
-	egress_tree=$$($(CARGO) tree -p aenv-egress -e normal --all-features) || { echo "cargo tree -p aenv-egress failed"; exit 1; }; \
-	if printf '%s\n' "$$egress_tree" | grep -E 'sqlx|deadpool-postgres|overlaybd|uvm-ublk|storage-util|aenv-core|rustls|rcgen'; then \
+	egress_tree=$$($(CARGO) tree -p aenv-egress -e normal --all-features --prefix none) || { echo "cargo tree -p aenv-egress failed"; exit 1; }; \
+	if printf '%s\n' "$$egress_tree" | sort -u | grep -E '^(sqlx|deadpool-postgres|overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util|aenv-core|rustls|tokio-rustls|hyper-rustls|rcgen) v[0-9]'; then \
 	  echo "aenv-egress links a database, the byte half, aenv-core or a second TLS stack; the broker contract is a leaf on openssl only."; \
 	  fail=1; \
 	fi; \
@@ -396,14 +397,17 @@ k8s-build:
 	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) --build-arg AENV_GIT_COMMIT="$(AENV_GIT_COMMIT)" -f deploy/docker/Dockerfile.aenv-node -t $(K8S_RUNTIME_IMAGE) .
 	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) --build-arg AENV_GIT_COMMIT="$(AENV_GIT_COMMIT)" -f deploy/docker/Dockerfile.aenv-api -t $(K8S_API_IMAGE) .
 	$(DOCKER) build -f deploy/docker/Dockerfile.gateway -t $(K8S_GATEWAY_IMAGE) .
+	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) --build-arg AENV_GIT_COMMIT="$(AENV_GIT_COMMIT)" -f deploy/docker/Dockerfile.aenv-egress -t $(K8S_EGRESS_IMAGE) .
 
 k8s-redeploy:
 	$(KUBECTL) rollout restart deploy/agentenv-gateway -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart ds/agentenv-node -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart deploy/agentenv-api -n $(K8S_NAMESPACE)
+	$(KUBECTL) rollout restart deploy/aenv-egress -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status deploy/agentenv-gateway -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status ds/agentenv-node -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status deploy/agentenv-api -n $(K8S_NAMESPACE)
+	$(KUBECTL) rollout status deploy/aenv-egress -n $(K8S_NAMESPACE)
 
 k8s-load-dev:
 	$(DOCKER) save $(K8S_RUNTIME_IMAGE) | $(K3S_CTR) images import -

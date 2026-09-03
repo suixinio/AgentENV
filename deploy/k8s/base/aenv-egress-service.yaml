@@ -1,0 +1,18 @@
+# Where nodes dial the broker: `[egress_broker].endpoint = "aenv-egress:8443"`.
+# The server certificate in the `egress-server` Secret must carry this name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aenv-egress
+  labels:
+    app.kubernetes.io/name: aenv-egress
+spec:
+  selector:
+    app.kubernetes.io/name: aenv-egress
+  ports:
+    - name: broker
+      port: 8443
+      targetPort: broker
+    - name: metrics
+      port: 9103
+      targetPort: metrics

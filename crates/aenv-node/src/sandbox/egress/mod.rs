@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use aenv_egress::credential::NoCredentials;
 use aenv_egress::handlers::tcp::TcpEchoHandler;
+use aenv_egress::transport::RemoteTransport;
 use aenv_egress::{
     BrokerDenyList, BrokerTransport, Dispatcher, EgressPolicySummary, EmbeddedTransport,
     IdentityHeader, TransportError, UpstreamGuard,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
@@ -55,7 +56,13 @@ pub struct EgressRuntime {
     per_sandbox_conns: usize,
     open_timeout: Duration,
     ca_bundle: Option<String>,
+    /// Whether the last probe of a remote broker succeeded; always true for
+    /// the embedded transport.
+    reachable: Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// How often a remote broker is probed for the heartbeat.
+const REMOTE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 impl EgressRuntime {
     /// The process-wide runtime, or `None` when `[egress_broker].mode` is
@@ -90,7 +97,26 @@ impl EgressRuntime {
                 Arc::new(EmbeddedTransport::new(dispatcher))
             }
             EgressBrokerMode::Remote => {
-                bail!("egress_broker.mode = \"remote\" is not served by this build of aenv-node")
+                let endpoint = egress
+                    .endpoint
+                    .as_deref()
+                    .context("egress_broker.endpoint is required in remote mode")?;
+                let ca_path = egress
+                    .ca_cert_path
+                    .as_ref()
+                    .context("egress_broker.ca_cert_path is required in remote mode")?;
+                let ca_pem = std::fs::read(ca_path).with_context(|| {
+                    format!("read egress_broker.ca_cert_path {}", ca_path.display())
+                })?;
+                let secret = egress
+                    .shared_secret
+                    .as_deref()
+                    .context("egress_broker.shared_secret is required in remote mode")?;
+                Arc::new(
+                    RemoteTransport::new(endpoint, None, &ca_pem, secret.trim().as_bytes())
+                        .context("configure the remote broker transport")?
+                        .with_connect_timeout(Duration::from_millis(egress.open_timeout_ms)),
+                )
             }
         };
         let ca_bundle =
@@ -100,6 +126,12 @@ impl EgressRuntime {
                 })?),
                 None => None,
             };
+        let reachable = Arc::new(std::sync::atomic::AtomicBool::new(
+            egress.mode == EgressBrokerMode::Embedded,
+        ));
+        if egress.mode == EgressBrokerMode::Remote {
+            Self::spawn_remote_probe(Arc::clone(&reachable), egress);
+        }
         info!(mode = egress.mode.as_str(), "egress broker runtime ready");
         Ok(Some(Self {
             mode: egress.mode,
@@ -109,7 +141,59 @@ impl EgressRuntime {
             per_sandbox_conns: egress.per_sandbox_conns as usize,
             open_timeout: Duration::from_millis(egress.open_timeout_ms),
             ca_bundle,
+            reachable,
         }))
+    }
+
+    // Runs on its own thread and runtime so `global()` works from any thread.
+    fn spawn_remote_probe(
+        reachable: Arc<std::sync::atomic::AtomicBool>,
+        egress: &crate::cfg::EgressBrokerConfig,
+    ) {
+        let endpoint = egress.endpoint.clone().unwrap_or_default();
+        let ca_path = egress.ca_cert_path.clone();
+        let secret = egress.shared_secret.clone().unwrap_or_default();
+        let timeout = Duration::from_millis(egress.open_timeout_ms);
+        let spawned = std::thread::Builder::new()
+            .name("egress-broker-probe".into())
+            .spawn(move || {
+                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    warn!("could not start the egress broker probe runtime");
+                    return;
+                };
+                runtime.block_on(async move {
+                    let Some(ca_pem) = ca_path.and_then(|path| std::fs::read(path).ok()) else {
+                        return;
+                    };
+                    let Ok(probe) =
+                        RemoteTransport::new(&endpoint, None, &ca_pem, secret.trim().as_bytes())
+                    else {
+                        return;
+                    };
+                    let probe = probe.with_connect_timeout(timeout);
+                    loop {
+                        let ok = probe.probe().await.is_ok();
+                        let was = reachable.swap(ok, Ordering::Relaxed);
+                        if was != ok {
+                            if ok {
+                                info!(endpoint, "egress broker reachable");
+                            } else {
+                                warn!(
+                                    endpoint,
+                                    "egress broker unreachable; brokered connections fail fast"
+                                );
+                            }
+                        }
+                        tokio::time::sleep(REMOTE_PROBE_INTERVAL).await;
+                    }
+                });
+            });
+        if let Err(err) = spawned {
+            warn!(error = %err, "could not spawn the egress broker probe thread");
+        }
     }
 
     /// What the heartbeat reports.
@@ -117,8 +201,20 @@ impl EgressRuntime {
         match self.mode {
             EgressBrokerMode::Disabled => EgressBrokerState::Disabled,
             EgressBrokerMode::Embedded => EgressBrokerState::Embedded,
-            EgressBrokerMode::Remote => EgressBrokerState::RemoteUnreachable,
+            EgressBrokerMode::Remote => {
+                if self.reachable.load(Ordering::Relaxed) {
+                    EgressBrokerState::RemoteOk
+                } else {
+                    EgressBrokerState::RemoteUnreachable
+                }
+            }
         }
+    }
+
+    /// False while a remote broker fails its probe; the accept loop then
+    /// closes new connections at once instead of waiting on the open timeout.
+    pub fn is_reachable(&self) -> bool {
+        self.reachable.load(Ordering::Relaxed)
     }
 
     /// The PEM guests with rules must trust, when this node has one.
@@ -304,6 +400,11 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<AcceptContext>) {
             }
         };
         reap_finished(&ctx.relays);
+        if !ctx.runtime.is_reachable() {
+            debug!(sandbox_id = %ctx.identity.sandbox_id, "brokered connection closed: broker unreachable");
+            drop(stream);
+            continue;
+        }
         let Ok(sandbox_permit) = Arc::clone(&ctx.sandbox_permits).try_acquire_owned() else {
             ctx.over_limit.fetch_add(1, Ordering::Relaxed);
             debug!(sandbox_id = %ctx.identity.sandbox_id, "brokered connection refused: sandbox budget exhausted");

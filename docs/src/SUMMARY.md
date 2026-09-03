@@ -33,6 +33,7 @@
 - [Snapshots](./concepts/snapshots.md)
 - [Custom Extension](./concepts/custom-extension.md)
 - [Proxy](./concepts/proxy.md)
+- [Egress Credentials](./concepts/egress-credentials.md)
 
 # API Reference
 

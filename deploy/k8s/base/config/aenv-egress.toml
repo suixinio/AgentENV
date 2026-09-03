@@ -1,0 +1,44 @@
+# The egress broker's configuration, mounted from the `aenv-egress-config`
+# ConfigMap. Paths name the Secret volumes aenv-egress-deployment.yaml mounts.
+listen = "0.0.0.0:8443"
+metrics_listen = "0.0.0.0:9103"
+# Identity headers older or newer than this are refused; keep it equal to
+# [egress_broker].max_skew_ms on the nodes.
+max_skew_ms = 30000
+# Nonces remembered inside the skew window; size it for the connections
+# expected in one window, a full cache refuses rather than forgets.
+replay_capacity = 100000
+
+[tls]
+cert_path = "/etc/aenv-egress/server/tls.crt"
+key_path = "/etc/aenv-egress/server/tls.key"
+
+[hmac]
+# Several files carry a rotation; any of them verifies a header.
+key_files = ["/etc/aenv-egress/hmac/key"]
+
+[ca]
+cert_path = "/etc/aenv-egress/ca/ca.crt"
+key_path = "/etc/aenv-egress/ca/ca.key"
+leaf_ttl_secs = 86400
+cache_capacity = 4096
+mints_per_sandbox_per_minute = 60
+
+[upstream]
+# The cluster's Service and Pod CIDRs, on top of the built-in private ranges:
+# no sandbox reaches them through the broker whatever its own policy says.
+# k3s defaults; change them with the cluster.
+denied_cidrs = ["10.42.0.0/16", "10.43.0.0/16"]
+
+[vault]
+# Unset leaves the broker without a credential source: every marker answers
+# 502 credential_unavailable. Set it to the same server the api half writes.
+# addr = "http://vault.vault.svc:8200"
+token_file = "/etc/aenv-egress/vault/token"
+mount = "aenv"
+timeout_ms = 5000
+cache_ttl_secs = 30
+
+[handlers]
+# The tcp identity-echo handler; leave off outside smoke tests.
+tcp = false

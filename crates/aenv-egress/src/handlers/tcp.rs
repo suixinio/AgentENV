@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -51,8 +52,8 @@ impl Handler for TcpEchoHandler {
         &self,
         conn: Box<dyn AsyncStream>,
         ctx: ConnCtx,
-        _creds: &dyn CredentialSource,
-        _guard: &UpstreamGuard,
+        _creds: Arc<dyn CredentialSource>,
+        _guard: Arc<UpstreamGuard>,
     ) -> Result<(), HandlerError> {
         let (mut reader, mut writer) = tokio::io::split(conn);
         let mut banner = serde_json::to_vec(&IdentityBanner::from(&ctx))

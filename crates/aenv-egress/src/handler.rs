@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -58,8 +59,8 @@ pub trait Handler: Send + Sync {
         &self,
         conn: Box<dyn AsyncStream>,
         ctx: ConnCtx,
-        creds: &dyn CredentialSource,
-        guard: &UpstreamGuard,
+        creds: Arc<dyn CredentialSource>,
+        guard: Arc<UpstreamGuard>,
     ) -> Result<(), HandlerError>;
 }
 

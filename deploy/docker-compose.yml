@@ -15,6 +15,12 @@ x-agentenv-base: &agentenv-base
     AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://agentenv-api:8002
     AENV_SNAPSHOT_LOCAL_CACHE_PATH: /var/cache/agentenv/snapshot-local-cache
     AENV_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
+    # The broker core in-process, with the tcp identity handler only: enough
+    # to smoke the intercept and identity path, not to broker HTTPS. Embedded
+    # mode is validated against static discovery, which these nodes do not
+    # otherwise use.
+    AENV_EGRESS_BROKER_MODE: embedded
+    AENV_CLUSTER_NODE_DISCOVERY_MODE: static
     # Keep in step with `aenv_core::logging::DEFAULT_FILTER`: these are target
     # prefixes, and a target is `module_path!()`, so the crate names have to be
     # the post-split ones. `agentenv` stays for the explicit

@@ -17,7 +17,7 @@ vendored-openssl = ["aenv-core/vendored-openssl"]
 
 [dependencies]
 aenv-core = { path = "../.." }
-aenv-egress = { path = "../aenv-egress" }
+aenv-egress = { path = "../aenv-egress", features = ["remote"] }
 agentenv-observability = { path = "../observability" }
 anyhow = "1.0.100"
 async-trait = "0.1"

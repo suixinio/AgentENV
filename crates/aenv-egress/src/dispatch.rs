@@ -84,8 +84,8 @@ impl Dispatcher {
             .handle(
                 stream,
                 ConnCtx::from(header),
-                self.creds.as_ref(),
-                self.guard.as_ref(),
+                Arc::clone(&self.creds),
+                Arc::clone(&self.guard),
             )
             .await
     }

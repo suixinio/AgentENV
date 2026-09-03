@@ -462,6 +462,29 @@ spec:
                   name: sandbox-proxy-config
                   key: SANDBOX_PROXY_DOMAINS
                   optional: true
+            # The secrets store behind /secrets and network.rules. `disabled`
+            # ships; `vault` needs the address here and a token in the
+            # egress-vault Secret that can write <mount>/data/secrets/* and
+            # <mount>/data/grants/*. All optional: an api Pod applies and
+            # starts without any of it.
+            - name: AENV_SECRETS_BACKEND
+              valueFrom:
+                configMapKeyRef:
+                  name: secrets-store-config
+                  key: AENV_SECRETS_BACKEND
+                  optional: true
+            - name: AENV_SECRETS_VAULT_ADDR
+              valueFrom:
+                configMapKeyRef:
+                  name: secrets-store-config
+                  key: AENV_SECRETS_VAULT_ADDR
+                  optional: true
+            - name: AENV_SECRETS_VAULT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: egress-vault
+                  key: token
+                  optional: true
             # 🔴 AENV_STARTUP_RECLAIM_ENABLED is deliberately absent, here and
             # everywhere else in this tree. It makes a process sweep the host
             # for another process's leftover VMs, which is sound for

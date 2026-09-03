@@ -171,19 +171,33 @@ dependencies = [
 name = "aenv-egress"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bytes",
+ "clap",
+ "confique",
  "hmac",
+ "http 1.4.0",
+ "http-body-util",
+ "hyper 1.9.0",
+ "hyper-util",
  "ipnetwork",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "native-tls",
  "openssl",
  "rand 0.10.1",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-native-tls",
  "tracing",
+ "tracing-subscriber",
  "zeroize",
 ]
 

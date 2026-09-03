@@ -1,0 +1,55 @@
+# The egress broker image. Same build stages as Dockerfile.aenv-api; the
+# runtime stage carries only the binary, the system trust store the broker
+# verifies upstreams against, and no shell tooling beyond ca-certificates.
+FROM rust:1-bookworm AS chef
+WORKDIR /build
+ENV CARGO_TARGET_DIR=/build/target
+ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
+ARG APT_MIRROR_BASE
+COPY deploy/docker/apply_apt_mirror.sh /usr/local/bin/apply_apt_mirror.sh
+RUN sh /usr/local/bin/apply_apt_mirror.sh "${APT_MIRROR_BASE}" \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        clang \
+        libclang-dev \
+        libprotobuf-dev \
+        protobuf-compiler \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo install cargo-chef --locked
+
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build-deps
+COPY --from=planner /build/recipe.json recipe.json
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo chef cook --release --recipe-path recipe.json
+
+FROM build-deps AS builder
+COPY . .
+ARG AENV_GIT_COMMIT=unknown
+ENV AENV_GIT_COMMIT=${AENV_GIT_COMMIT}
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
+    cargo build --release -p aenv-egress --features bin --bin aenv-egress \
+    && cp /build/target/release/aenv-egress /out-aenv-egress
+
+FROM ubuntu:24.04
+ARG APT_MIRROR_BASE
+COPY deploy/docker/apply_apt_mirror.sh /usr/local/bin/apply_apt_mirror.sh
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && sh /usr/local/bin/apply_apt_mirror.sh "${APT_MIRROR_BASE}" \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=builder --chmod=0755 /out-aenv-egress /aenv-egress
+USER 65532:65532
+ENV AENV_EGRESS_CONFIG_PATH=/etc/aenv-egress/config.toml
+ENTRYPOINT ["/aenv-egress"]

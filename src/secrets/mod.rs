@@ -148,7 +148,7 @@ impl SecretsService {
             return Err(SecretsError::EmptyValue);
         }
         let secret_id = new_secret_id();
-        let created = self.refs.create(&secret_id, name, &metadata).await?;
+        self.refs.create(&secret_id, name, &metadata).await?;
         let version = match self.values.put(name, &value).await {
             Ok(version) => version,
             Err(err) => {
@@ -169,10 +169,10 @@ impl SecretsService {
             .await
         {
             Ok(secret) => Ok(secret),
-            Err(SecretsError::NotFound) => Ok(SecretRef {
-                current_version: version,
-                ..created
-            }),
+            Err(SecretsError::NotFound) => {
+                self.discard_orphaned_value(name).await;
+                Err(SecretsError::NotFound)
+            }
             Err(err) => Err(err),
         }
     }
@@ -196,9 +196,30 @@ impl SecretsService {
             .ok_or(SecretsError::NotFound)?;
         let version = self.values.put(&existing.name, &value).await?;
         drop(value);
-        self.refs
+        match self
+            .refs
             .set_current_version(&existing.secret_id, version, metadata.as_ref())
             .await
+        {
+            Err(SecretsError::NotFound) => {
+                self.discard_orphaned_value(&existing.name).await;
+                Err(SecretsError::NotFound)
+            }
+            other => other,
+        }
+    }
+
+    // Drops a value whose row is gone, so no value outlives the row that
+    // makes it reachable. Addressed by name, which is all the backend
+    // exposes, so a concurrent recreate of the same name is not fenced off.
+    async fn discard_orphaned_value(&self, name: &str) {
+        if let Err(err) = self.values.delete(name).await {
+            tracing::warn!(
+                secret = name,
+                error = %err,
+                "failed to delete the value of a secret whose row disappeared mid-write"
+            );
+        }
     }
 
     pub async fn delete(&self, id_or_name: &str) -> Result<(), SecretsError> {
@@ -511,6 +532,108 @@ mod tests {
 
     fn value(s: &str) -> SecretString {
         SecretString::new(s.to_string())
+    }
+
+    // Stands in for a row deleted by a concurrent request between the value
+    // write and the version update.
+    #[derive(Default)]
+    struct VanishingRowStore {
+        inner: InMemorySecretRefStore,
+        vanish: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl SecretRefStore for VanishingRowStore {
+        async fn create(
+            &self,
+            secret_id: &str,
+            name: &str,
+            metadata: &SecretMetadata,
+        ) -> Result<SecretRef, SecretsError> {
+            self.inner.create(secret_id, name, metadata).await
+        }
+
+        async fn set_current_version(
+            &self,
+            secret_id: &str,
+            version: i64,
+            metadata: Option<&SecretMetadata>,
+        ) -> Result<SecretRef, SecretsError> {
+            if self.vanish.load(Ordering::SeqCst) {
+                self.inner.delete(secret_id).await?;
+                return Err(SecretsError::NotFound);
+            }
+            self.inner
+                .set_current_version(secret_id, version, metadata)
+                .await
+        }
+
+        async fn delete(&self, secret_id: &str) -> Result<Option<SecretRef>, SecretsError> {
+            self.inner.delete(secret_id).await
+        }
+
+        async fn get(&self, id_or_name: &str) -> Result<Option<SecretRef>, SecretsError> {
+            self.inner.get(id_or_name).await
+        }
+
+        async fn list(
+            &self,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<(Vec<SecretRef>, Option<String>), SecretsError> {
+            self.inner.list(after, limit).await
+        }
+
+        async fn missing_names(&self, names: &[String]) -> Result<Vec<String>, SecretsError> {
+            self.inner.missing_names(names).await
+        }
+    }
+
+    fn vanishing_service() -> (
+        SecretsService,
+        Arc<VanishingRowStore>,
+        Arc<InMemorySecretsBackend>,
+    ) {
+        let refs = Arc::new(VanishingRowStore::default());
+        let backend = Arc::new(InMemorySecretsBackend::default());
+        let service = SecretsService::new(refs.clone(), backend.clone());
+        (service, refs, backend)
+    }
+
+    #[tokio::test]
+    async fn a_create_whose_row_vanished_reports_not_found_and_leaves_no_value() {
+        let (service, refs, backend) = vanishing_service();
+        refs.vanish.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            service
+                .create("openai", value("sk"), SecretMetadata::new())
+                .await,
+            Err(SecretsError::NotFound)
+        ));
+        assert!(
+            backend.value_of("openai").is_none(),
+            "a value with no row is unreachable and must not be left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_update_whose_row_vanished_reports_not_found_and_leaves_no_value() {
+        let (service, refs, backend) = vanishing_service();
+        service
+            .create("gh", value("v1"), SecretMetadata::new())
+            .await
+            .unwrap();
+        refs.vanish.store(true, Ordering::SeqCst);
+
+        assert!(matches!(
+            service.update("gh", value("v2"), None).await,
+            Err(SecretsError::NotFound)
+        ));
+        assert!(
+            backend.value_of("gh").is_none(),
+            "the version this call wrote must not outlive the row it belonged to"
+        );
     }
 
     #[test]

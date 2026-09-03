@@ -172,9 +172,76 @@ fn run_server(project_root: &std::path::Path) -> Result<()> {
     let mod_rs = server_dir.join("src/apis/mod.rs");
     fix_duplicate_auth_trait(&mod_rs)?;
 
+    // Anchored on formatted text, so format first and again afterwards.
+    util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
+    redact_secret_value_models(&server_dir.join("src/models.rs"))?;
     util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
     util::info("AENV server generated.");
     Ok(())
+}
+
+/// Request models carrying a secret value the generator treats as ordinary text.
+const SECRET_VALUE_MODELS: [&str; 2] = ["NewSecret", "SecretUpdate"];
+
+const GENERATED_DERIVE: &str = "#[derive(Debug, Clone, PartialEq, serde::Serialize, \
+                                serde::Deserialize, validator::Validate)]";
+const REDACTED_DERIVE: &str =
+    "#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]";
+
+/// A secret is opaque bytes: markup inside one is not an attack, and it must
+/// never reach a log line.
+fn redact_secret_value_models(models_rs: &std::path::Path) -> Result<()> {
+    let mut content = std::fs::read_to_string(models_rs)?;
+    for model in SECRET_VALUE_MODELS {
+        content = redact_secret_value_model(&content, model)?;
+    }
+    std::fs::write(models_rs, content)?;
+    Ok(())
+}
+
+fn redact_secret_value_model(content: &str, model: &str) -> Result<String> {
+    let header = format!(
+        "{GENERATED_DERIVE}\n\
+         #[cfg_attr(feature = \"conversion\", derive(frunk::LabelledGeneric))]\n\
+         pub struct {model} {{"
+    );
+    let start = content.find(&header).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{model} no longer starts with the derive this step rewrites; the generator's \
+             output changed and a secret value would ship with a printing Debug"
+        )
+    })?;
+    let body_end = content[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset + "\n}\n".len())
+        .ok_or_else(|| anyhow::anyhow!("{model} has no struct body to rewrite"))?;
+
+    let validated_value = "    #[serde(rename = \"value\")]\n    \
+                           #[validate(custom(function = \"check_xss_string\"))]\n    \
+                           pub value: String,";
+    let plain_value = "    #[serde(rename = \"value\")]\n    pub value: String,";
+    let body = &content[start..body_end];
+    if !body.contains(validated_value) {
+        anyhow::bail!(
+            "{model} has no XSS-validated value field to unvalidate; the generator's output \
+             changed and a secret containing markup would be rejected with a 400"
+        );
+    }
+    let rewritten =
+        body.replace(validated_value, plain_value)
+            .replacen(GENERATED_DERIVE, REDACTED_DERIVE, 1);
+
+    let redacted_debug = format!(
+        "\nimpl std::fmt::Debug for {model} {{\n    \
+         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {{\n        \
+         f.write_str(\"{model}([redacted])\")\n    }}\n}}\n"
+    );
+
+    Ok(format!(
+        "{}{rewritten}{redacted_debug}{}",
+        &content[..start],
+        &content[body_end..]
+    ))
 }
 
 /// Prepend #![allow(clippy::all)] and #![allow(warnings)] to a file if not already present.
@@ -239,4 +306,46 @@ fn fix_duplicate_auth_trait(path: &std::path::Path) -> Result<()> {
         path.display()
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn generated_model(model: &str) -> String {
+        format!(
+            "prelude\n\n{GENERATED_DERIVE}\n\
+             #[cfg_attr(feature = \"conversion\", derive(frunk::LabelledGeneric))]\n\
+             pub struct {model} {{\n    \
+             #[serde(rename = \"value\")]\n    \
+             #[validate(custom(function = \"check_xss_string\"))]\n    \
+             pub value: String,\n}}\n\ntail\n"
+        )
+    }
+
+    #[test]
+    fn the_secret_value_loses_its_validator_and_its_printing_debug() {
+        let rewritten = redact_secret_value_model(&generated_model("NewSecret"), "NewSecret")
+            .expect("the generated shape is the one this step rewrites");
+
+        assert!(!rewritten.contains("check_xss_string"));
+        assert!(!rewritten.contains(GENERATED_DERIVE));
+        assert!(rewritten.contains(REDACTED_DERIVE));
+        assert!(rewritten.contains("f.write_str(\"NewSecret([redacted])\")"));
+        assert!(rewritten.contains("pub value: String,"));
+        assert!(rewritten.starts_with("prelude\n"));
+        assert!(rewritten.ends_with("tail\n"));
+    }
+
+    #[test]
+    fn a_generator_that_stopped_writing_either_anchor_is_an_error() {
+        let no_struct = generated_model("NewSecret").replace("NewSecret", "SomethingElse");
+        assert!(redact_secret_value_model(&no_struct, "NewSecret").is_err());
+
+        let no_validator = generated_model("NewSecret").replace(
+            "    #[validate(custom(function = \"check_xss_string\"))]\n",
+            "",
+        );
+        assert!(redact_secret_value_model(&no_validator, "NewSecret").is_err());
+    }
 }

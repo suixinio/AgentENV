@@ -559,7 +559,11 @@ impl Sandboxes<()> for ApiImpl {
                 }
             };
         if let Err(err) = self.check_rule_secrets(&network_policy).await {
-            return Ok(SandboxesColdPostResponse::Status400_BadRequest(err));
+            return Ok(if err.code == 503 {
+                SandboxesColdPostResponse::Status503_NoNodeCanTakeASandboxWithTheseNetworkRulesRightNow(err)
+            } else {
+                SandboxesColdPostResponse::Status400_BadRequest(err)
+            });
         }
 
         let custom_params = body
@@ -736,7 +740,13 @@ impl Sandboxes<()> for ApiImpl {
                 }
             };
         if let Err(err) = self.check_rule_secrets(&network_policy).await {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(err));
+            return Ok(if err.code == 503 {
+                SandboxesPostResponse::Status503_NoNodeCanTakeASandboxWithTheseNetworkRulesRightNow(
+                    err,
+                )
+            } else {
+                SandboxesPostResponse::Status400_BadRequest(err)
+            });
         }
 
         let custom_params = body
@@ -2783,5 +2793,146 @@ mod paused_sandbox_rest_tests {
             ),
             "nothing was rebuilt over the sandbox that kept running"
         );
+    }
+}
+
+#[cfg(test)]
+mod rule_secret_check_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use axum_extra::extract::CookieJar;
+    use headers::Host;
+    use http::Method;
+
+    use agentenv_http_server::apis::sandboxes::*;
+    use agentenv_http_server::models;
+
+    use super::ApiImpl;
+    use crate::orchestrator::Orchestrator;
+    use crate::sandbox::mock::MockBackendFactory;
+    use crate::secrets::memory::{InMemorySecretRefStore, InMemorySecretsBackend};
+    use crate::secrets::{SecretMetadata, SecretString, SecretsService};
+    use crate::snapshot::mock::unresolvable_snapshot_manager;
+    use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
+
+    async fn surface(secrets: Option<Arc<SecretsService>>) -> Arc<ApiImpl> {
+        let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
+        let row = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let api = ApiImpl::new(
+            orchestrator,
+            Arc::new(unresolvable_snapshot_manager(row)),
+            None,
+            Vec::new(),
+            crate::api::ResumeWiring::api_half_for_test(),
+        );
+        Arc::new(match secrets {
+            Some(secrets) => api.with_secrets(secrets),
+            None => api,
+        })
+    }
+
+    async fn store_holding(names: &[&str]) -> Arc<SecretsService> {
+        let service = SecretsService::new(
+            Arc::new(InMemorySecretRefStore::default()),
+            Arc::new(InMemorySecretsBackend::default()),
+        );
+        for name in names {
+            service
+                .create(
+                    name,
+                    SecretString::new("v".to_string()),
+                    SecretMetadata::new(),
+                )
+                .await
+                .expect("seeding a secret");
+        }
+        Arc::new(service)
+    }
+
+    fn network_naming(secret: &str) -> models::SandboxNetworkConfig {
+        let mut transform = models::SandboxNetworkTransform::new();
+        transform.headers = Some(HashMap::from([(
+            "authorization".to_string(),
+            format!("Bearer ${{aenv.secrets.{secret}}}"),
+        )]));
+        let mut rule = models::SandboxNetworkRule::new();
+        rule.transform = Some(transform);
+        let mut network = models::SandboxNetworkConfig::new();
+        network.rules = Some(HashMap::from([("api.example.com".to_string(), vec![rule])]));
+        network
+    }
+
+    fn host() -> Host {
+        Host::from(http::uri::Authority::from_static("localhost"))
+    }
+
+    async fn warm_create(api: &ApiImpl, secret: &str) -> SandboxesPostResponse {
+        let mut body = models::NewSandbox::new("tpl-rules".to_string());
+        body.network = Some(network_naming(secret));
+        api.sandboxes_post(
+            &Method::POST,
+            &host(),
+            &CookieJar::new(),
+            &super::super::Claims,
+            &body,
+        )
+        .await
+        .expect("the handler answers")
+    }
+
+    async fn cold_create(api: &ApiImpl, secret: &str) -> SandboxesColdPostResponse {
+        let mut body = models::NewColdSandbox::new("debian:bookworm".to_string());
+        body.network = Some(network_naming(secret));
+        api.sandboxes_cold_post(
+            &Method::POST,
+            &host(),
+            &CookieJar::new(),
+            &super::super::Claims,
+            &body,
+        )
+        .await
+        .expect("the handler answers")
+    }
+
+    #[tokio::test]
+    async fn a_create_with_no_secrets_store_answers_503_not_a_400_carrying_503() {
+        let api = surface(None).await;
+
+        let warm = warm_create(&api, "openai").await;
+        let SandboxesPostResponse::Status503_NoNodeCanTakeASandboxWithTheseNetworkRulesRightNow(
+            error,
+        ) = warm
+        else {
+            panic!("a 503-coded body must travel in the 503 variant, got {warm:?}");
+        };
+        assert_eq!(error.code, 503);
+
+        let cold = cold_create(&api, "openai").await;
+        let SandboxesColdPostResponse::Status503_NoNodeCanTakeASandboxWithTheseNetworkRulesRightNow(
+            error,
+        ) = cold
+        else {
+            panic!("a 503-coded body must travel in the 503 variant, got {cold:?}");
+        };
+        assert_eq!(error.code, 503);
+    }
+
+    #[tokio::test]
+    async fn a_create_naming_an_unknown_secret_still_answers_400() {
+        let api = surface(Some(store_holding(&["other"]).await)).await;
+
+        let warm = warm_create(&api, "openai").await;
+        let SandboxesPostResponse::Status400_BadRequest(error) = warm else {
+            panic!("an unknown name is the caller's mistake, got {warm:?}");
+        };
+        assert_eq!(error.code, 400);
+        assert!(error.message.contains("openai"), "{}", error.message);
+
+        let cold = cold_create(&api, "openai").await;
+        let SandboxesColdPostResponse::Status400_BadRequest(error) = cold else {
+            panic!("an unknown name is the caller's mistake, got {cold:?}");
+        };
+        assert_eq!(error.code, 400);
     }
 }

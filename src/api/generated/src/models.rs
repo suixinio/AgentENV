@@ -3264,7 +3264,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NewSandbox> 
     }
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct NewSecret {
     /// Name of the secret, unique within the deployment and referenced from network rules as `${aenv.secrets.NAME}`. The sec_ prefix is reserved for secret identifiers.
@@ -3278,7 +3278,6 @@ pub struct NewSecret {
 
     /// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
     #[serde(rename = "value")]
-    #[validate(custom(function = "check_xss_string"))]
     pub value: String,
 
     /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
@@ -3286,6 +3285,12 @@ pub struct NewSecret {
     #[validate(length(max = 32), custom(function = "check_xss_map_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for NewSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NewSecret([redacted])")
+    }
 }
 
 lazy_static::lazy_static! {
@@ -8169,12 +8174,11 @@ impl std::ops::DerefMut for SecretString {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SecretUpdate {
     /// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
     #[serde(rename = "value")]
-    #[validate(custom(function = "check_xss_string"))]
     pub value: String,
 
     /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
@@ -8182,6 +8186,12 @@ pub struct SecretUpdate {
     #[validate(length(max = 32), custom(function = "check_xss_map_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for SecretUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretUpdate([redacted])")
+    }
 }
 
 impl SecretUpdate {

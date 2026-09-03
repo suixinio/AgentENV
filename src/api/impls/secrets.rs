@@ -229,3 +229,17 @@ impl Secrets<()> for ApiImpl {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use agentenv_http_server::models;
+
+    #[test]
+    fn a_secret_value_is_never_printed() {
+        let created = models::NewSecret::new("gh".to_string(), "sk-live-123".to_string());
+        assert_eq!(format!("{created:?}"), "NewSecret([redacted])");
+
+        let updated = models::SecretUpdate::new("sk-live-456".to_string());
+        assert_eq!(format!("{updated:?}"), "SecretUpdate([redacted])");
+    }
+}

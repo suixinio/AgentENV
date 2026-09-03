@@ -1,6 +1,6 @@
 //! Versioned catalog migrations serialized by a session-scoped schema lock.
-//! Preflight refuses owned relations under an empty ledger; verification
-//! refuses recorded versions whose relations disappeared.
+//! Preflight refuses relations of unrecorded versions; verification refuses
+//! recorded versions whose relations disappeared.
 //! Each migration and ledger write commit atomically.
 
 use anyhow::{Context, Result};
@@ -111,13 +111,6 @@ const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[
     (2, &["secret_refs"]),
 ];
 
-fn owned_relations() -> Vec<&'static str> {
-    RELATIONS_BY_VERSION
-        .iter()
-        .flat_map(|(_, relations)| relations.iter().copied())
-        .collect()
-}
-
 // `to_regclass` resolves against this connection's search path.
 async fn relation_exists(conn: &mut sqlx::PgConnection, relation: &str) -> Result<bool> {
     let found: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
@@ -128,16 +121,18 @@ async fn relation_exists(conn: &mut sqlx::PgConnection, relation: &str) -> Resul
     Ok(found.is_some())
 }
 
-// Refuses owned relations under an empty migration ledger.
+// Refuses relations belonging to a version the ledger has not recorded, so a
+// partially recorded ledger cannot adopt a table this build never created.
 async fn preflight(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Result<()> {
-    if !applied.is_empty() {
-        return Ok(());
-    }
-
     let mut existing = Vec::new();
-    for relation in owned_relations() {
-        if relation_exists(conn, relation).await? {
-            existing.push(relation);
+    for (version, relations) in RELATIONS_BY_VERSION {
+        if applied.contains(version) {
+            continue;
+        }
+        for relation in *relations {
+            if relation_exists(conn, relation).await? {
+                existing.push(*relation);
+            }
         }
     }
     if existing.is_empty() {
@@ -145,12 +140,12 @@ async fn preflight(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -> Res
     }
 
     anyhow::bail!(
-        "catalog table(s) {} already exist, but catalog_schema_migrations has no rows recorded — \
-         these tables were not created by this ledger. Refusing to continue: every migration \
-         statement is IF NOT EXISTS, so continuing would silently leave a schema that looks \
-         migrated but rejects every write on a column this ledger's migrations never added. \
-         Confirm what created these tables before proceeding; in dev/test, DROP them and \
-         restart this process.",
+        "catalog table(s) {} already exist, but catalog_schema_migrations has not recorded the \
+         migration that creates them — these tables were not created by this ledger. Refusing to \
+         continue: every migration statement is IF NOT EXISTS, so continuing would silently \
+         leave a schema that looks migrated but rejects every write on a column this ledger's \
+         migrations never added. Confirm what created these tables before proceeding; in \
+         dev/test, DROP them and restart this process.",
         existing.join(", ")
     )
 }
@@ -381,6 +376,39 @@ mod pg {
         assert_eq!(
             count, 0,
             "a refused preflight must leave the ledger untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn preflight_refuses_a_table_of_a_version_the_ledger_never_recorded() {
+        let pool = isolated_schema_pool_or_skip!(
+            "preflight_refuses_a_table_of_a_version_the_ledger_never_recorded"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+
+        sqlx::query("DELETE FROM catalog_schema_migrations WHERE version = 2")
+            .execute(&pool)
+            .await
+            .expect("forgetting one recorded version should succeed");
+
+        let error = migrate(&pool)
+            .await
+            .expect_err("migrate must refuse an unrecorded version's table under a live ledger");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("secret_refs") && message.contains("not created by this ledger"),
+            "got: {message}"
+        );
+
+        let recorded: Vec<i32> =
+            sqlx::query_scalar("SELECT version FROM catalog_schema_migrations ORDER BY version")
+                .fetch_all(&pool)
+                .await
+                .expect("reading the ledger should succeed");
+        assert_eq!(
+            recorded,
+            vec![1],
+            "a refused preflight must not record the version it refused"
         );
     }
 

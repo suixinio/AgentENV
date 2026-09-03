@@ -85,8 +85,11 @@ impl SecretRefStore for PgSecretRefStore {
         version: i64,
         metadata: Option<&SecretMetadata>,
     ) -> Result<SecretRef, SecretsError> {
+        // Concurrent backend writes can reach this row out of order; the
+        // column names the newest version the backend holds, so it never
+        // walks back. Metadata is last-writer-wins.
         let row = sqlx::query(&format!(
-            "UPDATE secret_refs SET current_version = $2, \
+            "UPDATE secret_refs SET current_version = GREATEST(current_version, $2), \
                     metadata = COALESCE($3, metadata), updated_at_ms = $4 \
               WHERE secret_id = $1 RETURNING {COLUMNS}"
         ))
@@ -211,6 +214,29 @@ mod tests {
             store.set_current_version("sec_1", 4, None).await,
             Err(SecretsError::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_late_write_cannot_walk_the_current_version_back() {
+        let store = store_or_skip!("secret_refs_version_monotonic");
+        store
+            .create("sec_1", "openai", &SecretMetadata::new())
+            .await
+            .unwrap();
+        store.set_current_version("sec_1", 7, None).await.unwrap();
+
+        let mut metadata = SecretMetadata::new();
+        metadata.insert("owner".into(), "team-a".into());
+        let late = store
+            .set_current_version("sec_1", 3, Some(&metadata))
+            .await
+            .unwrap();
+        assert_eq!(late.current_version, 7);
+        assert_eq!(late.metadata, metadata);
+        assert_eq!(
+            store.get("sec_1").await.unwrap().unwrap().current_version,
+            7
+        );
     }
 
     #[tokio::test]

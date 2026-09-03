@@ -143,6 +143,7 @@ type StoreHookSlot = StdMutex<Option<StoreHook>>;
 struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
+    remove_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
 }
 
@@ -158,6 +159,13 @@ impl ScriptedStoreControl {
         self.update_if_state_actions
             .lock()
             .expect("update_if_state actions mutex poisoned")
+            .push_back(action);
+    }
+
+    fn push_remove_action(&self, action: StoreAction) {
+        self.remove_actions
+            .lock()
+            .expect("remove actions mutex poisoned")
             .push_back(action);
     }
 
@@ -251,7 +259,10 @@ impl MetadataStore for ScriptedStore {
         &self,
         sandbox_id: &SandboxId,
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
-        self.inner.remove(sandbox_id).await
+        match ScriptedStoreControl::take_action(&self.control.remove_actions) {
+            StoreAction::Delegate => self.inner.remove(sandbox_id).await,
+            StoreAction::Fail(err) => Err(err),
+        }
     }
 
     async fn remove_if_execution(
@@ -5032,5 +5043,247 @@ async fn without_a_grant_issuer_a_create_with_rules_fails_and_leaves_no_record()
         "the failure names the missing store: {source:#}"
     );
     assert!(orchestrator.list_sandboxes().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_update_that_adds_a_rule_grants_its_secret_before_the_runtime_takes_it() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    assert!(grants.events().is_empty());
+
+    orchestrator
+        .replace_sandbox_network_policy(created.id, policy_with_rules("openai"))
+        .await?;
+
+    let expected: std::collections::BTreeSet<String> = ["openai".to_string()].into_iter().collect();
+    assert_eq!(
+        grants.events(),
+        vec![GrantEvent::Grant {
+            sandbox_id: created.id,
+            execution_id: created.execution_id,
+            names: expected,
+        }],
+        "a 204 with no grant is a policy the broker refuses on every request"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_update_replaces_the_grant_with_exactly_the_new_names() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+    let created = orchestrator.create_sandbox(request).await?;
+
+    orchestrator
+        .replace_sandbox_network_policy(created.id, policy_with_rules("anthropic"))
+        .await?;
+
+    let expected: std::collections::BTreeSet<String> =
+        ["anthropic".to_string()].into_iter().collect();
+    assert_eq!(
+        grants.events().last(),
+        Some(&GrantEvent::Grant {
+            sandbox_id: created.id,
+            execution_id: created.execution_id,
+            names: expected,
+        }),
+        "the replaced name must not stay granted alongside the new one"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_update_that_drops_every_rule_revokes_the_grant() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+    let created = orchestrator.create_sandbox(request).await?;
+
+    orchestrator
+        .replace_sandbox_network_policy(created.id, SandboxNetworkPolicy::default())
+        .await?;
+
+    assert_eq!(
+        grants.events().last(),
+        Some(&GrantEvent::Revoke {
+            sandbox_id: created.id,
+            execution_id: created.execution_id,
+        }),
+        "a rule the caller removed must not leave its secret readable"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_update_whose_grant_is_refused_fails_and_leaves_the_runtime_alone() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    // The default issuer has no store, so any non-empty name set is refused.
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    let err = orchestrator
+        .replace_sandbox_network_policy(created.id, policy_with_rules("openai"))
+        .await
+        .expect_err("a policy whose secrets cannot be granted must not answer 204");
+    assert!(
+        matches!(err, OrchestratorError::SandboxOperationFailed { .. }),
+        "got {err:#}"
+    );
+    assert_eq!(
+        behavior.update_network_calls(),
+        0,
+        "the runtime must not take rules whose credentials were refused"
+    );
+
+    let stored = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("the sandbox is still there");
+    assert!(stored.network_policy.egress.rules.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_update_the_runtime_refuses_puts_the_previous_grant_back() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+    use crate::sandbox::mock::{MockAction, MockOperation};
+
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+    let created = orchestrator.create_sandbox(request).await?;
+
+    behavior.push_action(
+        MockOperation::UpdateNetwork,
+        MockAction::Fail {
+            message: "the node cannot broker".to_string(),
+        },
+    );
+    assert!(orchestrator
+        .replace_sandbox_network_policy(created.id, policy_with_rules("anthropic"))
+        .await
+        .is_err());
+
+    let expected: std::collections::BTreeSet<String> = ["openai".to_string()].into_iter().collect();
+    assert_eq!(
+        grants.events().last(),
+        Some(&GrantEvent::Grant {
+            sandbox_id: created.id,
+            execution_id: created.execution_id,
+            names: expected,
+        }),
+        "the sandbox still runs the previous rules, so it keeps their grant"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_fork_child_that_never_started_does_not_keep_its_grant() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+    use crate::sandbox::mock::{MockAction, MockOperation};
+
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+    let created = orchestrator.create_sandbox(request).await?;
+
+    behavior.push_action(
+        MockOperation::Fork,
+        MockAction::Fail {
+            message: "no memory for a child".to_string(),
+        },
+    );
+    assert!(orchestrator
+        .fork_sandbox(created.id, ForkChildren::Fresh(1), NewTimeout::UseExisting)
+        .await
+        .is_err());
+
+    let child_revokes: Vec<_> = grants
+        .events()
+        .into_iter()
+        .filter(|event| match event {
+            GrantEvent::Revoke { sandbox_id, .. } => *sandbox_id != created.id,
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        child_revokes.len(),
+        1,
+        "the child's grant outlived a child that never existed: {:?}",
+        grants.events()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_delete_whose_record_removal_fails_still_revokes() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator =
+        make_orchestrator_without_background(ScriptedStore::new(Arc::clone(&control)));
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+    let created = orchestrator.create_sandbox(request).await?;
+
+    control.push_remove_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("the store is unreachable"),
+    }));
+    assert!(orchestrator.delete_sandbox(created.id).await.is_err());
+
+    assert_eq!(
+        grants.events().last(),
+        Some(&GrantEvent::Revoke {
+            sandbox_id: created.id,
+            execution_id: created.execution_id,
+        }),
+        "a record this process could not remove must not keep its grant alive"
+    );
     Ok(())
 }

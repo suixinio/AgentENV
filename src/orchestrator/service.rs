@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{
     atomic::{AtomicI64, AtomicU64, Ordering},
     Arc,
@@ -816,6 +816,11 @@ where
             Err(err) => {
                 warn!(error = ?err, "failed to fork sandbox");
                 self.counters.record_create_fail(u64::from(count));
+                // No child started, so every child grant issued above is dead.
+                for granted in &children_spec {
+                    self.revoke_secrets(granted.sandbox_id, granted.execution_id)
+                        .await;
+                }
                 if err.is_terminal() {
                     self.detach_sandbox_handle_and_route(&source_sandbox_id)
                         .await;
@@ -823,7 +828,8 @@ where
                         let mut sandbox = source_handle.lock().await;
                         sandbox.stop().await
                     };
-                    self.store.remove(&source_sandbox_id).await?;
+                    self.forget_sandbox(source_sandbox_id, source_metadata.execution_id)
+                        .await?;
                 } else {
                     let _ = self
                         .store
@@ -866,6 +872,7 @@ where
                 Ok(backend) => backend,
                 Err(err) => {
                     warn!(%sandbox_id, error = ?err, "failed to start forked sandbox");
+                    self.revoke_secrets(sandbox_id, spec.execution_id).await;
                     outcomes.push(Err(Self::fork_child_error(sandbox_id, err)));
                     continue;
                 }
@@ -887,6 +894,7 @@ where
                 Ok(proxy_target) => proxy_target,
                 Err(err) => {
                     Self::stop_failed_fork(backend, sandbox_id).await;
+                    self.revoke_secrets(sandbox_id, spec.execution_id).await;
                     outcomes.push(Err(Self::fork_child_error(
                         sandbox_id,
                         anyhow::Error::new(err),
@@ -897,6 +905,7 @@ where
             if let Err(err) = self.store.add(metadata.clone()).await {
                 warn!(%sandbox_id, error = ?err, "failed to register forked sandbox");
                 Self::stop_failed_fork(backend, sandbox_id).await;
+                self.revoke_secrets(sandbox_id, spec.execution_id).await;
                 outcomes.push(Err(Self::fork_child_error(
                     sandbox_id,
                     anyhow::Error::new(err),
@@ -1344,8 +1353,9 @@ where
         }
 
         // Now the sandbox is successfully stopped, remove its metadata.
-        let metadata = self.store.remove(&sandbox_id).await?;
-        self.revoke_secrets(sandbox_id, expected_execution_id).await;
+        let metadata = self
+            .forget_sandbox(sandbox_id, expected_execution_id)
+            .await?;
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
@@ -1409,6 +1419,44 @@ where
         if let Err(err) = self.grants().revoke(sandbox_id, execution_id).await {
             warn!(%sandbox_id, %execution_id, error = %format_args!("{err:#}"), "failed to revoke secret grants");
         }
+    }
+
+    /// One write supersedes the whole previous name set; an empty set revokes.
+    async fn regrant_secrets(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        names: &BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        if names.is_empty() {
+            return self
+                .grants()
+                .revoke(sandbox_id, execution_id)
+                .await
+                .with_context(|| format!("revoke the secret grants of sandbox {sandbox_id}"));
+        }
+        self.grants()
+            .grant(sandbox_id, execution_id, names)
+            .await
+            .with_context(|| {
+                format!(
+                    "grant {} secret name(s) to sandbox {sandbox_id}",
+                    names.len()
+                )
+            })
+    }
+
+    /// Drops a sandbox's record and its incarnation's grant together. The
+    /// grant goes even when the record removal fails, so no terminal teardown
+    /// can leave one behind.
+    async fn forget_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> Result<Option<SandboxMetadata>> {
+        let removed = self.store.remove(&sandbox_id).await;
+        self.revoke_secrets(sandbox_id, execution_id).await;
+        Ok(removed?)
     }
 
     /// Returns the real machine reported by the live backend, if remote.
@@ -1528,7 +1576,8 @@ where
                 // Confirmed runtime absence permits record cleanup.
                 Ok(AbsentHandle::RuntimeGone) => {
                     warn!("sandbox handle not found while pausing, removing from store");
-                    self.store.remove(&sandbox_id).await?;
+                    self.forget_sandbox(sandbox_id, expected_execution_id)
+                        .await?;
                     return Err(OrchestratorError::SandboxNotFound(sandbox_id));
                 }
                 Ok(AbsentHandle::NoRecord) => {
@@ -1563,7 +1612,8 @@ where
                     // keep serving as a running sandbox.
                     self.stop_detached(&handle, "after terminal pause failure")
                         .await;
-                    self.store.remove(&sandbox_id).await?;
+                    self.forget_sandbox(sandbox_id, expected_execution_id)
+                        .await?;
                 } else {
                     if handle_was_held_here {
                         self.sandboxes.write().await.insert(sandbox_id, handle);
@@ -1606,10 +1656,11 @@ where
                         warn!(error = ?resume_err, "failed to resume sandbox after a failed publication");
                         self.stop_detached(&handle, "after a failed publication")
                             .await;
-                        if let Err(error) = self.store.remove(&sandbox_id).await {
+                        if let Err(error) =
+                            self.forget_sandbox(sandbox_id, metadata.execution_id).await
+                        {
                             warn!(error = ?error, "failed to remove sandbox after pause failure");
                         }
-                        self.revoke_secrets(sandbox_id, metadata.execution_id).await;
                         return Err(OrchestratorError::SandboxOperationFailed {
                             sandbox_id,
                             operation: SandboxOperation::Pause,
@@ -1629,10 +1680,9 @@ where
 
         // The capture is durable: stop the VM and let the record go with it.
         self.stop_detached(&handle, "after pausing").await;
-        if let Err(err) = self.store.remove(&sandbox_id).await {
+        if let Err(err) = self.forget_sandbox(sandbox_id, metadata.execution_id).await {
             warn!(error = ?err, "failed to remove the record of a paused sandbox");
         }
-        self.revoke_secrets(sandbox_id, metadata.execution_id).await;
         self.publish_sandbox_event(
             SandboxLifecycleEventType::Pause,
             sandbox_id,
@@ -1743,7 +1793,8 @@ where
                 Ok(AbsentHandle::RuntimeGone) => {
                     warn!("sandbox handle not found while snapshotting, removing from store");
                     self.detach_sandbox_handle_and_route(&sandbox_id).await;
-                    self.store.remove(&sandbox_id).await?;
+                    self.forget_sandbox(sandbox_id, expected_execution_id)
+                        .await?;
                     return Err(OrchestratorError::SandboxNotFound(sandbox_id));
                 }
                 Ok(AbsentHandle::NoRecord) => {
@@ -1785,7 +1836,8 @@ where
                     if let Err(stop_err) = stop_result {
                         warn!(error = ?stop_err, "failed to stop sandbox after terminal snapshot failure");
                     }
-                    self.store.remove(&sandbox_id).await?;
+                    self.forget_sandbox(sandbox_id, expected_execution_id)
+                        .await?;
                 } else {
                     let _ = self
                         .store
@@ -1882,17 +1934,46 @@ where
             },
         };
 
+        // The grant is what the broker checks, so it has to name exactly the
+        // new policy's secrets before the new rules can serve a request.
+        let previous_names = metadata.network_policy.egress.referenced_secret_names();
+        let next_names = network_policy.egress.referenced_secret_names();
+        let grant_changed = next_names != previous_names;
+        if grant_changed {
+            self.regrant_secrets(sandbox_id, metadata.execution_id, &next_names)
+                .await
+                .map_err(|source| OrchestratorError::SandboxOperationFailed {
+                    sandbox_id,
+                    operation: SandboxOperation::UpdateNetwork,
+                    source,
+                })?;
+        }
+
         let runtime_policy = network_policy.runtime_policy();
 
         let update_result = {
             let mut sandbox = sandbox.lock().await;
             sandbox.update_network_policy(runtime_policy).await
         };
-        update_result.map_err(|source| OrchestratorError::SandboxOperationFailed {
-            sandbox_id,
-            operation: SandboxOperation::UpdateNetwork,
-            source,
-        })?;
+        if let Err(source) = update_result {
+            if grant_changed {
+                // The runtime kept the previous rules, so its grant goes back too.
+                if let Err(err) = self
+                    .regrant_secrets(sandbox_id, metadata.execution_id, &previous_names)
+                    .await
+                {
+                    warn!(
+                        error = %format_args!("{err:#}"),
+                        "failed to put the previous secret grant back after a refused network update"
+                    );
+                }
+            }
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::UpdateNetwork,
+                source,
+            });
+        }
 
         self.store
             .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
@@ -2720,7 +2801,10 @@ where
         // The launch's own record is the only state to take back; a
         // superseded one is handled by `reclaim_superseded_launch_record`.
         let _ = expected_state;
-        if let Err(err) = self.store.remove(&plan.sandbox_id).await {
+        if let Err(err) = self
+            .forget_sandbox(plan.sandbox_id, plan.execution_id())
+            .await
+        {
             warn!(error = %format_args!("{err:#}"), "failed to remove sandbox metadata during launch rollback");
         }
     }

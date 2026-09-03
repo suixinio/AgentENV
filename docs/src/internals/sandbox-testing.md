@@ -205,7 +205,7 @@ mem_size_mib = 128
 vcpu_count = 1
 
 [envd]
-version = "0.5.15"
+version = "0.6.13"
 init_timeout_secs = 30
 poll_ms = 10
 
@@ -628,8 +628,8 @@ egress CA when the node has one, an empty string otherwise). On the guest side:
 - Releasing a new drive is `make -C tools-image publish` to `ghcr.io`, then
   bumping `[tools].version` in `config/deps_manifest.toml` and `[envd].version`
   in `config/default.toml` together. A cluster that needs the drive before the
-  release pins a prerelease from its own registry through a node config overlay,
-  as `deploy/k8s/overlays/pve-mf/node-overlay.toml` does.
+  release pins a prerelease from its own registry through `[tools].version` and
+  `[tools].url` in a node config overlay.
 
 `crates/aenv-node/tests/integration/egress.rs` exercises the intercept with the
 embedded broker and its `tcp` handler. It needs a node config with

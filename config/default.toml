@@ -383,7 +383,7 @@ vcpu_count = 2
 
 [envd]
 # Expected envd version baked into the tools drive.
-version = "0.5.15"
+version = "0.6.13"
 # Maximum envd initialization wait in seconds (60 = 1 minute).
 init_timeout_secs = 60
 # envd readiness polling interval in milliseconds.

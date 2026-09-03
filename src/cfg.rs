@@ -314,7 +314,7 @@ pub struct SandboxProxyConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct EnvdConfig {
-    #[config(default = "0.5.15")]
+    #[config(default = "0.6.13")]
     pub version: String,
     #[config(default = 60u64)]
     pub init_timeout_secs: u64,

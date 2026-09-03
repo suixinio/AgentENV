@@ -20,11 +20,9 @@ kind: Kustomization
 #     HTTP. It is a configMapGenerator *file*, so an overlay replaces the
 #     whole generator rather than patching a field.
 #
-# Second, brokered egress is switched on here: the nodes boot guests from a
-# prerelease tools drive published to the same registry (`node-overlay.toml`,
-# layered onto AENV_CONFIG_OVERLAY_PATH), dial the broker in remote mode, and
-# the api half writes secrets and grants to the dev-mode Vault in
-# `vault-dev.yaml`. The four Secrets `aenv-egress-secrets.example.yaml`
+# Second, brokered egress is switched on here: the nodes dial the broker in
+# remote mode, and the api half writes secrets and grants to the dev-mode
+# Vault in `vault-dev.yaml`. The four Secrets `aenv-egress-secrets.example.yaml`
 # documents must exist before the first apply; `egress-vault`'s token doubles
 # as that Vault's root token.
 #
@@ -45,14 +43,6 @@ configMapGenerator:
     behavior: replace
     files:
       - config.json=regctl.json
-  - name: agentenv-k8s-config
-    behavior: merge
-    files:
-      - node-overlay.toml
-  - name: snapshot-storage-config
-    behavior: merge
-    literals:
-      - AENV_CONFIG_OVERLAY_PATH=/workspace/config/oss-overlay.toml:/etc/agentenv/backend/backend-oss.toml:/workspace/config/node-overlay.toml
   - name: egress-broker-config
     behavior: merge
     literals:
@@ -78,15 +68,6 @@ patches:
       - op: replace
         path: /spec/template/spec/volumes/0/hostPath/path
         value: /var/lib/aenv
-      # The node reads AENV_CONFIG_OVERLAY_PATH's files from /workspace/config,
-      # where base projects each ConfigMap key by subPath; a key merged in by
-      # this overlay needs its own projection.
-      - op: add
-        path: /spec/template/spec/containers/0/volumeMounts/-
-        value:
-          name: agentenv-config
-          mountPath: /workspace/config/node-overlay.toml
-          subPath: node-overlay.toml
   - target:
       kind: Deployment
       name: aenv-egress

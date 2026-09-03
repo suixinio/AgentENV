@@ -55,7 +55,7 @@ check-publish-image:
 		*/*) ;; \
 		*) \
 			echo "IMAGE must include a registry/repository for publish, got '$(IMAGE)'." >&2; \
-			echo "Example: make publish IMAGE=ghcr.io/kvcache-ai/agentenv-tools:$(TOOLS_VERSION)" >&2; \
+			echo "Example: make publish IMAGE=ghcr.io/suixinio/agentenv-tools:$(TOOLS_VERSION)" >&2; \
 			exit 1; \
 		;; \
 	esac

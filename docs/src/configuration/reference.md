@@ -309,7 +309,7 @@ In-guest `envd` daemon settings.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `version` | string | `"0.5.15"` | Expected envd version baked into the tools drive image |
+| `version` | string | `"0.6.13"` | Expected envd version baked into the tools drive image |
 | `init_timeout_secs` | integer | `60` | Max seconds to wait for envd to become ready after VM start |
 | `poll_ms` | integer | `3` | Poll interval (ms) for envd health check retries |
 

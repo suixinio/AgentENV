@@ -124,7 +124,7 @@ tags to prevent concurrent or external publishers from replacing a release.
 make publish \
   TOOLS_VERSION=0.2.0 \
   ENVD_REF=envd-v0.6.13 \
-  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.2.0
+  IMAGE=ghcr.io/suixinio/agentenv-tools:0.2.0
 
 make publish \
   TOOLS_VERSION=0.2.0-custom.1 \

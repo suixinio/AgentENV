@@ -469,7 +469,8 @@ impl Slot {
     /// Configures iptables rules inside the namespace for VM traffic routing.
     /// This includes:
     /// - Enabling IP forwarding so the namespace can route between tap0 and vpeer.
-    /// - FORWARD rules to permit traffic between the VM (tap0) and the host veth (vpeer).
+    /// - FORWARD rules to permit traffic between the VM (tap0) and the host veth (vpeer),
+    ///   dropping anything from tap0 that does not carry the VM's own source address.
     /// - SNAT/DNAT for host<->VM communication via host_interaction_ip.
     #[tracing::instrument(fields(vm_ip = %vm_ip, host_interaction_ip = %host_interaction_ip, veth_host_ip = %veth_host_ip))]
     fn configure_namespace_iptables_rules(
@@ -512,6 +513,7 @@ impl Slot {
         initialize_namespace_egress_chain(
             veth_host_ip,
             resolve_guest_dns_server(),
+            vm_ip,
             internal_egress_denied_cidrs,
         )
     }

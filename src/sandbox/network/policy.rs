@@ -126,11 +126,33 @@ fn configured_always_denied_cidrs() -> &'static [String] {
         .always_denied_cidrs
 }
 
+/// Installs the namespace FORWARD egress chains and the anti-spoofing DROP.
+/// The DROP is inserted last so it ends up ahead of the egress chain jump.
 pub fn initialize_namespace_egress_chain(
     veth_host_ip: Ipv4Addr,
     guest_dns_ip: Ipv4Addr,
+    vm_ip: Ipv4Addr,
     internal_egress_denied_cidrs: &[String],
 ) -> Result<()> {
+    let commands = build_namespace_egress_chain_commands(
+        veth_host_ip,
+        guest_dns_ip,
+        vm_ip,
+        internal_egress_denied_cidrs,
+        configured_always_denied_cidrs(),
+    );
+
+    apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
+        .context("initialize AgentENV namespace egress iptables chains")
+}
+
+fn build_namespace_egress_chain_commands(
+    veth_host_ip: Ipv4Addr,
+    guest_dns_ip: Ipv4Addr,
+    vm_ip: Ipv4Addr,
+    internal_egress_denied_cidrs: &[String],
+    node_always_denied_cidrs: &[String],
+) -> Vec<IptablesRestoreCommand> {
     let mut commands = vec![
         IptablesRestoreCommand::NewChain {
             table: "filter",
@@ -155,11 +177,23 @@ pub fn initialize_namespace_egress_chain(
         veth_host_ip,
         guest_dns_ip,
         internal_egress_denied_cidrs,
-        configured_always_denied_cidrs(),
+        node_always_denied_cidrs,
     ));
+    // Every FORWARD ACCEPT above matches on destination only; a guest packet
+    // carrying another source address must never reach them. Inserting at
+    // position 1 after the egress chain jump keeps the DROP ahead of it.
+    commands.push(anti_spoof_forward_command(vm_ip));
 
-    apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
-        .context("initialize AgentENV namespace egress iptables chains")
+    commands
+}
+
+fn anti_spoof_forward_command(vm_ip: Ipv4Addr) -> IptablesRestoreCommand {
+    IptablesRestoreCommand::Insert {
+        table: "filter",
+        chain: "FORWARD",
+        position: 1,
+        rule: format!("-i tap0 ! -s {vm_ip} -j DROP"),
+    }
 }
 
 fn build_static_egress_commands(
@@ -454,6 +488,39 @@ mod tests {
         assert!(hard_deny_pos < shared_deny_pos);
         assert!(hard_deny_pos < user_chain_pos);
         assert!(shared_deny_pos < user_chain_pos);
+    }
+
+    #[test]
+    fn anti_spoof_drop_is_inserted_at_position_one_after_the_egress_chain_jump() {
+        let commands = build_namespace_egress_chain_commands(
+            Ipv4Addr::new(10, 12, 0, 2),
+            Ipv4Addr::new(10, 1, 2, 1),
+            Ipv4Addr::new(10, 12, 0, 3),
+            &[],
+            &[],
+        );
+
+        let forward_inserts: Vec<(usize, i32, &str)> = commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| match command {
+                IptablesRestoreCommand::Insert {
+                    table: "filter",
+                    chain: "FORWARD",
+                    position,
+                    rule,
+                } => Some((index, *position, rule.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            forward_inserts,
+            [
+                (2, 1, "-i tap0 -o vpeer -j AGENTENV-EGRESS"),
+                (commands.len() - 1, 1, "-i tap0 ! -s 10.12.0.3 -j DROP"),
+            ]
+        );
     }
 
     #[test]

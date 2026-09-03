@@ -148,7 +148,6 @@ v1 唯一的公开面，字段级对齐 E2B（`spec/openapi.yml:457-528`）：
 
 ```json
 "network": {
-  "allowOut": ["api.openai.com", "github.com"],
   "rules": {
     "api.openai.com": [ { "transform": { "headers": { "Authorization": "Bearer ${aenv.secrets.openai}" } } } ],
     "*.github.com":   [ { "transform": { "headers": { "Authorization": "token ${aenv.secrets.gh}" } } } ]
@@ -156,7 +155,13 @@ v1 唯一的公开面，字段级对齐 E2B（`spec/openapi.yml:457-528`）：
 }
 ```
 
-- 键是精确域名或单个前导通配符；`rules` 不授予网络访问，`allowOut` 另配，与 E2B 相同。
+- 键是精确域名或单个前导通配符；`rules` 不授予网络访问，出口策略另配，与 E2B 相同。
+- 出口策略在本实现里是 IP/CIDR 粒度的：`allowOut` 的域名条目被 api 侧和 netns 装配双双拒绝
+  （"domain entries in allowOut require the TCP egress proxy"），两处拒绝都早于本方案。所以
+  规则域名的可达性由 `allow_internet_access` 决定：默认 `true` 时可达，`false` 时沙箱只剩
+  `allowOut` 的 CIDR，规则域名被 **broker 按 §4.5 的 G8 拒绝**（合成 403），而不是创建时报错。
+  `rules` 与 `allow_internet_access: false` 同时出现是合法的创建，这正是 §7 P3 那条 e2e 断言
+  的形状。
 - `headers` 是 `map<string,string>`，值里的 `${aenv.secrets.NAME}` 在出口替换；同时接受
   `${e2b.secrets.NAME}` 作别名。一个值里可以有多个标记（Basic 的 `user:pass`）。
   **沙箱自带的同名 header 一律被替换**，不追加，不透传。
@@ -165,8 +170,8 @@ v1 唯一的公开面，字段级对齐 E2B（`spec/openapi.yml:457-528`）：
 - `PUT /sandboxes/{id}/network` 整体替换 `rules`；在途连接不切断，新连接按新规则。
 - 名字语法 `^[a-zA-Z0-9_-]{1,128}$`，与 E2B `/secrets` 的 `name` 一致；引用侧与定义侧同一校验。
 
-创建时校验：标记语法、名字存在于 store（否则 400）、域名语法、`allowOut` 至少覆盖每个规则域名
-（否则 400，不静默）。
+创建时校验：标记语法、名字存在于 store（否则 400）、域名语法。不校验出口策略是否"覆盖"规则
+域名——按上一条，那个覆盖在本实现里无法表达，且拒绝发生在 broker。
 
 `rules` 归一化进 `SandboxNetworkEgressPolicy` 的内部形态 `brokers`（端口、handler、参数），
 `brokers` **不是公开字段**。v1.1 的显式端点与非 HTTP handler 通过 `x-aenv-` 前缀的扩展字段进
@@ -230,7 +235,12 @@ C5 说没有租户身份，所以"secret 归 tenant，tenant 的沙箱可读"没
 - aenv-api 在 create、resume、fork、`PUT /network` 时，对策略里引用的每个名字向 store 写一条
   授权记录 `grant(sandbox_id, execution_id, name)`；stop、pause、删除时撤销。
 - broker 的 `CredentialSource::get(sandbox_id, execution_id, name)` 只在 grant 存在时返回值。
-  broker 被攻陷时能读到的只是当前活跃 execution 的授权集合，不是全库。
+  这条约束的是**沙箱**：一个沙箱经由正常工作的 broker 能拿到的，恰好是它自己的 grant。
+  它约束不了 broker 进程本身——检查在 broker 的代码里，而它那张 Vault 令牌读得到 mount 下
+  的每一个值（KV v2 的 policy 表达不出"grants/E 里点名了才让读 secrets/X"）。被攻陷的
+  broker 进程由进程外的东西兜底：只有 `read` 能力、写不了 grant 的令牌，只放行节点入站、
+  只放行 Vault/DNS/443 出站的 NetworkPolicy，以及只读根文件系统的非 root Pod。把进程本身也
+  关进 grant 里需要签发时就限定范围的令牌（scoped 或 response-wrapped），列在 §7 v1.1。
 - fork 子沙箱得到父策略的副本，aenv-api 为子 execution 显式发新 grant：继承是 aenv-api 的
   决定，不是 store 的默认。W8 的"服务端自觉"变成结构。
 - 多租户到来时（`Claims` 携带身份），grant 的签发处加所有权检查，broker 与 store 不变。
@@ -329,13 +339,13 @@ broker 或 store 不可用是 `502 + reason`；CA 未到达是创建失败，不
 |---|---|---|---|
 | S1/F1/P5 | 阻断 | broker 从 Pod 网络连上游，绕过沙箱全部出口策略，成 SSRF 跳板 | 采纳：G8，§4.5 三层；`tcp` 与 `upstream` 移出 v1 |
 | S2/P2 | 阻断 | `tenant` 不存在，所有权授权为空 | 采纳：C5；§4.6 改为授权记录；多租户推 v2 |
-| S3 | 阻断 | broker 单一身份可 Resolve 全库；沙箱可把任意密钥注入到自选上游外送 | 采纳：grant 粒度到 (sandbox, execution, name)；上游由规则域名决定而非 `params.upstream` |
+| S3 | 阻断 | broker 单一身份可 Resolve 全库；沙箱可把任意密钥注入到自选上游外送 | 部分采纳：grant 粒度到 (sandbox, execution, name)，上游由规则域名决定而非 `params.upstream`；"broker 单一身份可读全库"这一半**未消除**——grant 是 broker 进程内的应用层检查，其令牌仍读得到 mount 下每个值（§4.6）。按 grant 限定范围的令牌推 v1.1 |
 | P1 | 阻断 | 公开面与 E2B 不兼容，`/secrets` 也非 E2B 形状 | 采纳：§4.3、§4.7 字段级对齐；`brokers` 降为内部形态 |
 | F2/S13 | 阻断 | "只拦截声明域名"与 DNAT 端口粒度矛盾，会 RST 其他 HTTPS | 采纳：§4.2 拦整端口按 SNI 分流；5.6 |
 | P3 | 阻断 | v1 范围不可评审 | 采纳：§7 三段裁剪 |
 | S4 | 重大 | 运行时↔broker 明文 TCP 横穿集群 | 采纳：§4.4 TLS，用 openssl 栈 |
 | S5 | 重大 | 身份头可重放 | 采纳：nonce + 去重 |
-| S6 | 重大 | 先签叶证书再匹配：DoS 与签名预言机 | 采纳：先匹配再签；Name Constraints；限速 |
+| S6 | 重大 | 先签叶证书再匹配：DoS 与签名预言机 | 部分采纳：先匹配再签、每沙箱每分钟限速已实现；**Name Constraints 未实现**——同一张 CA 还要签 broker 自己的 `CN=aenv-egress`（SAN `*.svc`），排除集会作废那张服务端证书，允许集又枚举不完规则可能点名的公网域名。给服务端证书单独一张 CA 后才能加约束，推 v1.1 |
 | S7 | 重大 | CA 随快照/模板扩散 | 采纳：每次 init 都传 caBundle，无规则传空 |
 | S8/S9 | 重大 | 透明 Postgres 可被中继；角色由沙箱自选 | 采纳：postgres 移到 v1.1，上游与 user 钉死，上游 TLS 校验 |
 | S10/F7 | 重大 | 无按沙箱连接上限；accept 循环内 await 卡死；fd 无预算 | 采纳：§4.4 spawn + Semaphore + 超时 |
@@ -376,7 +386,10 @@ fork 与 warm-pool 路径下 listener 早于 VM 运行，无窗口；`EnvdInstan
 **v1.1**：显式本地端点（`x-aenv-` 扩展字段，`AENV_EGRESS_HOST` 与 hosts 别名）、`tcp`
 （allowlist）与 `postgres` handler、外部解析器（同时承接 api 的 `grant/revoke` 与 broker 的
 `get`，见附录 A）与 `fallback`、`aenv-secrets` 自带 store、类型化的内联值转存、`allowedHosts`
-每 secret 限定上游。
+每 secret 限定上游、**按 grant 限定范围的 broker 令牌**（S3 的另一半：签发 grant 时同时签发
+只读得到该 grant 名字的 scoped/wrapped 令牌，把 §4.6 的应用层检查变成 store 层约束）、
+**给 broker 服务端证书单独一张 CA**（S6 的前置：两张 CA 分开后，签叶证书那张才能加
+Name Constraints）。
 
 **v2**：多租户所有权（待 `Claims` 有身份）、HTTP/2、ECH 与 DNS 层域名规则。
 
@@ -401,7 +414,7 @@ fork 与 warm-pool 路径下 listener 早于 VM 运行，无窗口；`EnvdInstan
 | 出口策略对代理流量 | orchestrator 内同一套 | CubeNet L3/L4 | 身份头带策略，broker 执行（G8） |
 | 解析进程 | ee，同进程 | 每节点独立 | 集群 Deployment；单机 embedded core |
 | 运行时↔解析器 | Go 接口 | admin HTTP + TPROXY | TLS + HMAC 身份头 + nonce |
-| 密钥在哪 | 外部 store | 代理内存明文 | Vault；broker 只在 grant 下读 |
+| 密钥在哪 | 外部 store | 代理内存明文 | Vault；沙箱侧按 grant 取值，broker 进程本身是可信组件（§4.6） |
 | 授权 | project 所有权 | 无 | 授权记录 (sandbox, execution, name) |
 | 节点上的额外进程 | 无 | 一个 | 无 |
 | 独立滚动 / 扩缩 | 是 / 否 | 是 / 否 | 是 / 是 |
@@ -479,8 +492,9 @@ uns-swe 侧的变化：agent-platform 实现解析器端点（grant/revoke/get�
 以 LLM key 为例，v1 两步，都不改 AgentENV 与 broker 代码：
 
 1. `POST /secrets {"name": "openai", "value": "sk-…"}`。
-2. 创建沙箱时 `network.allowOut` 加 `api.openai.com`，`network.rules["api.openai.com"]` 加
-   `{"transform": {"headers": {"Authorization": "Bearer ${aenv.secrets.openai}"}}}`。
+2. 创建沙箱时 `network.rules["api.openai.com"]` 加
+   `{"transform": {"headers": {"Authorization": "Bearer ${aenv.secrets.openai}"}}}`。出口策略
+   不用动：默认 `allow_internet_access: true` 已经放行，而 `allowOut` 按 §4.3 收不下域名。
 
 代码照常调 `api.openai.com`。再加一家是再来一次这两步。什么时候才要改 broker：凭据的用法
 不是"替换一个 header"时，query 参数是 `http` handler 的一个扩展点，SigV4 与 SCRAM 是新的

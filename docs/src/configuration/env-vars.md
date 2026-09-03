@@ -27,7 +27,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS` | `5` | Override heartbeat reporting interval in seconds |
 | `AENV_EGRESS_BROKER_MODE` | `disabled` | `[egress_broker].mode`: `disabled`, `embedded` or `remote`. See [`[egress_broker]`](reference.md#egress_broker). |
 | `AENV_EGRESS_BROKER_ENDPOINT` | unset | `[egress_broker].endpoint`, required in `remote` mode |
-| `AENV_EGRESS_BROKER_CA_CERT_PATH` | unset | `[egress_broker].ca_cert_path`, required in `remote` mode |
+| `AENV_EGRESS_BROKER_CA_CERT_PATH` | unset | `[egress_broker].ca_cert_path`, required in `remote` mode. A node's copy of the broker's CA certificate — never its key. Not to be confused with the broker's own `AENV_EGRESS_CA_CERT_PATH` under [Egress Broker](#egress-broker-aenv-egress). |
 | `AENV_EGRESS_BROKER_SHARED_SECRET` | unset | `[egress_broker].shared_secret`, required in `remote` mode; mount it from a Secret |
 | `AENV_EGRESS_BROKER_MAX_SKEW_MS` | `30000` | `[egress_broker].max_skew_ms` |
 | `AENV_EGRESS_BROKER_PER_SANDBOX_CONNS` | `256` | `[egress_broker].per_sandbox_conns` |
@@ -35,7 +35,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_EGRESS_BROKER_OPEN_TIMEOUT_MS` | `3000` | `[egress_broker].open_timeout_ms` |
 | `AENV_SECRETS_BACKEND` | `disabled` | `[secrets].backend`: `disabled` or `vault`. Read by `aenv-api` only. |
 | `AENV_SECRETS_VAULT_ADDR` | unset | `[secrets.vault].addr` |
-| `AENV_SECRETS_VAULT_TOKEN` | unset | `[secrets.vault].token`; mount it from a Secret |
+| `AENV_SECRETS_VAULT_TOKEN` | unset | `[secrets.vault].token`; mount it from a Secret (`secrets-vault-writer` in `deploy/k8s/base`). A write-only credential — this half never reads a value back — and deliberately not the broker's read-only token. |
 | `AENV_SECRETS_VAULT_MOUNT` | `aenv` | `[secrets.vault].mount` |
 | `AENV_SECRETS_VAULT_NAMESPACE` | unset | `[secrets.vault].namespace` |
 | `AENV_SECRETS_VAULT_TIMEOUT_MS` | `5000` | `[secrets.vault].timeout_ms` |
@@ -73,6 +73,43 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_PERSISTED_SANDBOX_STORE_PATH` | `$AENV_HOME/persisted-sandboxes` | Override the node-local scratch root for capture artifacts and node reclaim. Nothing under it survives a pause: a paused sandbox is a row in the snapshot catalog, not a file here. |
 | ~~`AENV_PAUSED_REGISTRY_BACKEND`~~ | — | **Removed.** It selected the backend of a cluster-wide paused-sandbox registry (`local`: resumable only on the node that paused it; `postgres`: a `paused_sandboxes` table with leases and reclaim, read over the `[pg]` pool). There is no registry to select any more: a paused sandbox is a sandbox-source row in the snapshot catalog whose committed payload carries its `PausedSandboxConfig`, and resume is a create from that row, so the `paused_sandboxes` and `paused_registry_grace` tables and the `[orchestrator.paused_registry]` section went with the switch. **Setting it today does nothing:** no field declares the name, so it is read by nothing and refused by nothing. |
 | ~~`AENV_PAUSED_REGISTRY_DSN`~~ | — | Removed; never existed. Paused-sandbox rows live in the snapshot catalog, which reads the process's own `[pg]` pool; no component ever took a DSN of its own for them (see `AENV_PAUSED_REGISTRY_BACKEND` above). **Setting it does nothing:** it is read by nothing and refused by nothing. The same is true of `AENV_PG_DSN`, another name that has never existed — `[pg]` is `Option<PgConfig>` and confique reaches a field from the environment only through `#[config(nested)]`, which may not be optional, so no key under `[pg]` can carry an `env =` binding at all. Supply `[pg].dsn` through the file `AENV_CONFIG_PATH` names or an `AENV_CONFIG_OVERLAY_PATH` overlay. |
+
+## Egress Broker (`aenv-egress`)
+
+These apply to the egress broker process (`crates/aenv-egress`), the third binary this repository
+ships. They override keys of its own configuration file — see
+[`aenv-egress.toml`](reference.md#aenv-egresstoml) — not of the server's, and nothing here is read
+by `aenv-node` or `aenv-api`.
+
+Two names sit one word apart and mean opposite ends of the same trust relation:
+`AENV_EGRESS_CA_CERT_PATH` is the certificate of the CA this process **signs** leaves with, read
+alongside its private key; `AENV_EGRESS_BROKER_CA_CERT_PATH` in the Server table above is a
+**node's** copy of that certificate, used to verify the broker and handed to guests as an extra
+trust anchor. A node never holds the key, and setting either name on the wrong process does
+nothing at all.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AENV_EGRESS_CONFIG_PATH` | `/etc/aenv-egress/config.toml` | Path to the broker's TOML configuration. `--config` wins over it. |
+| `AENV_EGRESS_LISTEN` | `0.0.0.0:8443` | `listen`: where runtimes connect. |
+| `AENV_EGRESS_METRICS_LISTEN` | unset | `metrics_listen`: Prometheus scrape address. Unset disables the exporter. |
+| `AENV_EGRESS_MAX_SKEW_MS` | `30000` | `max_skew_ms`: identity headers issued outside this window are refused. Keep equal to the nodes' `AENV_EGRESS_BROKER_MAX_SKEW_MS`. |
+| `AENV_EGRESS_REPLAY_CAPACITY` | `100000` | `replay_capacity`: nonces remembered inside the skew window. |
+| `AENV_EGRESS_ADMISSION_TIMEOUT_MS` | `10000` | `admission_timeout_ms`: one deadline over the TLS handshake and the identity frame behind it — what bounds a peer that has not authenticated yet. |
+| `AENV_EGRESS_MAX_CONNECTIONS` | `4096` | `max_connections`: connections held at once; the excess is closed, not queued. |
+| `AENV_EGRESS_SHUTDOWN_DRAIN_SECS` | `25` | `shutdown_drain_secs`: how long a shutdown lets live sessions finish. Keep it under the Pod's `terminationGracePeriodSeconds`. |
+| `AENV_EGRESS_TLS_CERT_PATH` | from file | `tls.cert_path`: the broker's server certificate. |
+| `AENV_EGRESS_TLS_KEY_PATH` | from file | `tls.key_path`: its PKCS#8 PEM private key. |
+| `AENV_EGRESS_CA_CERT_PATH` | from file | `ca.cert_path`: the CA this process signs intercepted-name leaves with. Not the node-side variable of the similar name — see above. |
+| `AENV_EGRESS_CA_KEY_PATH` | from file | `ca.key_path`: that CA's private key. Held by this process alone; it never reaches a node. |
+| `AENV_EGRESS_VAULT_ADDR` | unset | `vault.addr`. Unset leaves the broker with no credential source and every marker answers 502. |
+| `AENV_EGRESS_VAULT_TOKEN_FILE` | from file | `vault.token_file`: a file, not the token itself — unlike the api half's `AENV_SECRETS_VAULT_TOKEN`, which is the value. The two are different credentials: this one only reads, that one only writes. |
+| `AENV_EGRESS_VAULT_MOUNT` | `aenv` | `vault.mount`. Must match the api half's `AENV_SECRETS_VAULT_MOUNT`. |
+| `AENV_EGRESS_VAULT_NAMESPACE` | unset | `vault.namespace`: Vault Enterprise namespace header, when used. |
+
+`ca.leaf_ttl_secs`, `ca.cache_capacity`, `ca.mints_per_sandbox_per_minute`, `hmac.key_files`,
+`upstream.denied_cidrs`, `vault.timeout_ms`, `vault.cache_ttl_secs`, `vault.cache_capacity` and
+`handlers.tcp` have no environment binding; set them in the file.
 
 ## E2B SDK / CLI
 

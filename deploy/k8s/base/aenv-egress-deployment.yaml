@@ -1,12 +1,13 @@
 # The egress broker: sandboxes with `network.rules` reach their upstreams
 # through it. Stateless, multi-replica, unprivileged. It holds the leaf-signing
 # CA key, the HMAC key runtimes sign identity headers with, and a Vault token
-# scoped to reading secrets and grants; none of those ever reach a node.
+# whose policy grants `read` and nothing else; none of those ever reach a node,
+# and the token cannot write a grant — that is the api half's own credential.
 #
 # Every Secret volume is `optional: true` so the object applies on a cluster
 # that has not created the Secrets yet; the process then refuses to start
 # naming the missing file, which is the loud failure this wants. Creating the
-# three Secrets is the release step, and `aenv-egress-secrets.example.yaml`
+# four Secrets is the release step, and `aenv-egress-secrets.example.yaml`
 # says how.
 apiVersion: apps/v1
 kind: Deployment
@@ -99,8 +100,10 @@ spec:
           secret:
             secretName: egress-hmac
             optional: true
-        # A Vault token that can read <mount>/data/secrets/* and
-        # <mount>/data/grants/*. The api half writes with its own token.
+        # A Vault token whose policy is `read` on <mount>/data/secrets/* and
+        # <mount>/data/grants/* only. The api half writes with a different
+        # token, in the `secrets-vault-writer` Secret, which this Pod does not
+        # mount.
         - name: egress-vault
           secret:
             secretName: egress-vault

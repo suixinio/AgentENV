@@ -4,6 +4,12 @@
 
 - **Linux kernel 6.8+**
 - `/dev/kvm` access for Firecracker microVM execution
+- **An x86_64 server.** The tools drive pinned in `config/deps_manifest.toml`
+  (`ghcr.io/suixinio/agentenv-tools`) publishes a `linux/amd64` manifest only, so host setup
+  fails while resolving it on an arm64 host. An arm64 host needs its own multi-arch tools drive
+  — `make -C tools-image publish IMAGE=<registry>/agentenv-tools:<version>` builds both
+  platforms — and that pin repointed at it. This is about the server only; the `aenv` CLI below
+  ships for both architectures.
 
 > If your server does not support standard KVM, use the dedicated
 > [PVM Deployment](../deployment/pvm.md) guide instead.

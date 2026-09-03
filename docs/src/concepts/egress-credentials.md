@@ -98,9 +98,17 @@ values in the body:
 The api half writes secret values to the store and never reads them back. Before a sandbox with
 rules starts, it records a grant for `(sandbox, execution, names)`; the grant is revoked when the
 sandbox is deleted or paused, and a resume or fork gets a new grant for its new execution. The
-broker serves a value only under a matching grant, so a compromised broker can read the values
-granted to currently running sandboxes and nothing else. The node records nothing: it starts
-what the api half dispatched and holds no store to refuse or consult.
+broker serves a value only under a matching grant, so what a sandbox can obtain through a healthy
+broker is exactly its own grant and nothing else — that is the axis the grant bounds. The node
+records nothing: it starts what the api half dispatched and holds no store to refuse or consult.
+
+The broker process is trusted rather than confined by that check. It enforces the grant in its own
+code, and the Vault token it holds reads every value under the mount: KV v2 policy has no way to
+say "read `secrets/X` only when `grants/E` names it". What bounds a compromised broker is
+everything around the process — a token whose policy is `read` and cannot write itself a grant, a
+NetworkPolicy that admits only nodes and allows only Vault, DNS and port 443 out, and a non-root
+Pod with a read-only root filesystem. Confining the process itself needs a per-grant scoped or
+response-wrapped token issued at grant time; that is a later stage.
 
 ## Deployment
 
@@ -115,11 +123,17 @@ Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egr
   public addresses out.
 - Nodes: `[egress_broker].mode = "remote"`, `endpoint = "aenv-egress:8443"`, the CA certificate
   and the HMAC key. A node reports its broker state in every heartbeat, and the api half places a
-  sandbox with rules only on a node that reports `embedded` or `remote_ok`; when none does the
-  create answers `503`.
+  sandbox with rules only on a node that reports `remote_ok`; when none does the create answers
+  `503`.
 - The api half: `[secrets].backend = "vault"` with the Vault address and a token that can write
-  `<mount>/data/secrets/*` and `<mount>/data/grants/*`. PostgreSQL gets a `secret_refs` table
-  holding names and versions only.
+  `<mount>/data/secrets/*` and `<mount>/data/grants/*` and delete the matching `<mount>/metadata/*`
+  paths — the `secrets-vault-writer` Secret, a different credential from the broker's read-only
+  `egress-vault`. PostgreSQL gets a `secret_refs` table holding names and versions only.
+
+`AENV_EGRESS_BROKER_MODE` and `AENV_SECRETS_BACKEND` are both read once at process startup, so
+editing either ConfigMap changes nothing until the process that reads it restarts:
+`kubectl rollout restart ds/agentenv-node deploy/agentenv-api`, or `make k8s-redeploy` for all
+four workloads.
 
 `mode = "embedded"` runs the broker core inside `aenv-node` for a single static node: it has the
 `tcp` identity-echo handler and no TLS, so it proves the intercept and identity path
@@ -132,7 +146,7 @@ Metrics on the broker's `:9103`: `egress_conns_total{handler,outcome}`, `egress_
 ## Not covered
 
 Explicit local endpoints, non-HTTP protocols, external credential resolvers, per-secret upstream
-restrictions and multi-tenant ownership are later stages. ECH hides the server name and leaves
+restrictions, per-grant scoped broker tokens and multi-tenant ownership are later stages. ECH hides the server name and leaves
 only the passthrough path; the `egress_intercept_no_sni_total` counter shows how often that
 happens. See `docs/proposals/2026-09-03-sandbox-egress-credential-brokering.md` for the design
 and its review record.

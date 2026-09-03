@@ -627,13 +627,31 @@ egress CA when the node has one, an empty string otherwise). On the guest side:
 - envd treats an empty `caBundle` as "nothing to install", not as "remove".
 - Releasing a new drive is `make -C tools-image publish` to `ghcr.io`, then
   bumping `[tools].version` in `config/deps_manifest.toml` and `[envd].version`
-  in `config/default.toml` together. A cluster that needs the drive before the
-  release pins a prerelease from its own registry through `[tools].version` and
+  in `config/default.toml` together. `publish` builds `PUBLISH_PLATFORMS`
+  (`linux/amd64,linux/arm64`) and refuses a tag that already exists, so a tag
+  published with a narrower platform list is corrected by publishing a new
+  version, not by overwriting. The pinned `0.2.0` is amd64-only; an arm64 host
+  cannot resolve it, because the drive is pulled with `regctl image copy
+  --platform local`. A cluster that needs the drive before the release, or on
+  arm64, pins its own tag from its own registry through `[tools].version` and
   `[tools].url` in a node config overlay.
 
 `crates/aenv-node/tests/integration/egress.rs` exercises the intercept with the
 embedded broker and its `tcp` handler. It needs a node config with
 `[egress_broker].mode = "embedded"` and `[cluster].node_discovery_mode =
-"static"` (an `AENV_CONFIG_OVERLAY_PATH` file is enough) and fails, rather than
-skips, when the mode is anything else.
+"static"` and fails, rather than skips, when the mode is anything else.
+`tests/fixtures/egress-embedded-overlay.toml` is that overlay, and
+`make test-agent-integration` runs these tests as a second cargo invocation
+with `AENV_CONFIG_OVERLAY_PATH` pointing at it while the first invocation
+passes `--skip egress::` — one process environment cannot hold both configs, so
+the target splits rather than changing the config every other integration test
+reads.
+
+`scripts/tests/e2e/suites/15_egress_credentials.sh` is the API-level pass. Like
+suites 04, 07 and 09-12 it records an unmet prerequisite (no SDK, no secrets
+store, no node with a broker) as a passing skip; a run that skipped everything
+is therefore green. Turning that into a hard failure is a decision for the
+whole harness — an `E2E_STRICT=1` that makes `_pass "skipped: ..."` fatal in
+`scripts/tests/e2e/lib/helpers.sh` — and not for one suite, which would only
+make the convention inconsistent. It is not implemented.
 

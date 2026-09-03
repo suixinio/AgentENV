@@ -24,9 +24,10 @@ resources:
   - agentenv-api-service.yaml
   - agentenv-api-pdb.yaml
   # The egress broker for sandboxes with network.rules. Its four Secrets are
-  # not generated here: aenv-egress-secrets.example.yaml says how to mint
-  # them, and the Deployment applies without them (its volumes are optional)
-  # so the process, not the apply, is what fails until they exist.
+  # not generated here, nor is the api half's fifth:
+  # aenv-egress-secrets.example.yaml says how to mint all of them, and the
+  # Deployment applies without them (its volumes are optional) so the process,
+  # not the apply, is what fails until they exist.
   - aenv-egress-deployment.yaml
   - aenv-egress-service.yaml
   - aenv-egress-networkpolicy.yaml
@@ -449,9 +450,10 @@ configMapGenerator:
       - AENV_EGRESS_BROKER_MODE=disabled
       - AENV_EGRESS_BROKER_ENDPOINT=aenv-egress:8443
   # Where the api half stores secret values and grants. `disabled` ships:
-  # /secrets answers 503 and rules naming secrets are refused. The token
-  # comes from the `egress-vault` Secret, read by the api Deployment as an
-  # environment variable.
+  # /secrets answers 503 and rules naming secrets are refused. The token comes
+  # from the `secrets-vault-writer` Secret, read by the api Deployment as an
+  # environment variable — a write-only credential, distinct from the broker's
+  # read-only `egress-vault`.
   - name: secrets-store-config
     literals:
       - AENV_SECRETS_BACKEND=disabled

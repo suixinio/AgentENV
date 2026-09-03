@@ -36,6 +36,11 @@ AgentENV (AENV) is a platform for running agent environments at scale, powering 
 
 - **Linux kernel 6.8+** 
 - `/dev/kvm` access for Firecracker microVM execution
+- **An x86_64 server.** The tools drive the server pins by default
+  (`ghcr.io/suixinio/agentenv-tools`, in `config/deps_manifest.toml`) publishes a `linux/amd64`
+  manifest only, and host setup fails while resolving it on an arm64 host. Building and
+  publishing your own multi-arch tools drive (`make -C tools-image publish`, which builds both
+  platforms) and repointing that pin is what an arm64 host needs.
 
 If your server does not support standard KVM, see the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/dev/deployment/pvm.html) before installing.
 

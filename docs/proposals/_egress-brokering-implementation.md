@@ -104,7 +104,8 @@ pub struct SandboxNetworkEgressPolicy { allowed_cidrs, allowed_domains, denied_c
 `src/api/impls/sandbox.rs::network_policy_from_create` / `_from_update`（`:400-432`）传 `rules`；
 校验失败 400，文案不含标记值以外的任何东西。创建前：`secret_refs` 里名字必须存在（否则 400）；
 向 store 写 grant（P2.4）；`node_registry` 只把带 `brokers` 的沙箱放到 `egress_broker` 上报为
-`remote_ok`/`embedded` 的节点，一个都没有 → 503。
+`remote_ok` 的节点，一个都没有 → 503。`embedded` 只装 tcp 身份处理器，公开规则一律命名 `http`
+处理器，所以它不算可放置。
 
 `PUT /sandboxes/{id}/network`（`:1017-1050` → `replace_sandbox_network_policy` `:1744-1813`）：
 重写 grant，再下发。

@@ -22,9 +22,24 @@ kind: Kustomization
 #
 # Second, brokered egress is switched on here: the nodes dial the broker in
 # remote mode, and the api half writes secrets and grants to the dev-mode
-# Vault in `vault-dev.yaml`. The four Secrets `aenv-egress-secrets.example.yaml`
-# documents must exist before the first apply; `egress-vault`'s token doubles
-# as that Vault's root token.
+# Vault in `vault-dev.yaml`. All five Secrets
+# `aenv-egress-secrets.example.yaml` documents must exist before the first
+# apply. `secrets-vault-writer`'s token doubles as that Vault's root token, so
+# the api half needs no policy of its own here; `egress-vault` must hold a
+# different value, and a reader token with that id has to be issued against
+# the dev Vault once it is up:
+#
+#   NS=agentenv-system
+#   READER=$(kubectl -n $NS get secret egress-vault -o jsonpath='{.data.token}' | base64 -d)
+#   kubectl -n $NS exec -i deploy/vault-dev -- vault policy write aenv-egress-reader - <<'HCL'
+#   path "aenv/data/secrets/*" { capabilities = ["read"] }
+#   path "aenv/data/grants/*"  { capabilities = ["read"] }
+#   HCL
+#   kubectl -n $NS exec deploy/vault-dev -- \
+#     vault token create -id="$READER" -policy=aenv-egress-reader -period=768h
+#
+# A rollout of vault-dev forgets the policy and the token along with every
+# secret, so those two commands are re-run then.
 #
 # Everything else, including the /var/lib/aenv hostPath, matches
 # `overlays/default`. The `agentenv-runtime-secrets` Secret is likewise NOT

@@ -481,6 +481,44 @@ HashiCorp Vault KV v2. Values live at `<mount>/secrets/<name>`, grants at `<moun
 | `namespace` | string | unset | Vault Enterprise namespace header, when used. |
 | `timeout_ms` | integer | `5000` | Timeout for each Vault call. |
 
+## `aenv-egress.toml`
+
+The egress broker is a separate process with its own configuration file, not a section of the
+file above: `aenv-egress --config <path>`, defaulting to `$AENV_EGRESS_CONFIG_PATH` and then
+`/etc/aenv-egress/config.toml`. `deploy/k8s/base/config/aenv-egress.toml` is the shipped one, and
+every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.yaml` mounts. See
+[Egress Credentials](../concepts/egress-credentials.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `listen` | address | `0.0.0.0:8443` | Where runtimes connect. |
+| `metrics_listen` | address | unset | Prometheus scrape address; unset disables the exporter. |
+| `max_skew_ms` | integer | `30000` | Identity headers issued outside this window are refused. Keep equal to the nodes' `[egress_broker].max_skew_ms`. |
+| `replay_capacity` | integer | `100000` | Nonces remembered inside the skew window. A full cache refuses rather than forgets. |
+| `admission_timeout_ms` | integer | `10000` | One deadline covering the TLS handshake and the identity frame behind it. Nothing on a connection is authenticated until both are done, so this is what bounds an unauthenticated peer. |
+| `max_connections` | integer | `4096` | Connections held at once. The excess is closed, not queued. |
+| `shutdown_drain_secs` | integer | `25` | How long a shutdown lets live sessions finish before it stops waiting. Keep it under the Pod's `terminationGracePeriodSeconds`. |
+| `tls.cert_path` | path | required | The broker's server certificate, the one nodes verify against `[egress_broker].ca_cert_path`. |
+| `tls.key_path` | path | required | Its PKCS#8 PEM private key. |
+| `hmac.key_files` | array of paths | `[]` | Files holding the shared secrets identity headers are signed with. Several files carry a rotation; any of them verifies. |
+| `ca.cert_path` | path | required | The CA that signs leaf certificates for intercepted names. Also what nodes hand guests as `caBundle`. |
+| `ca.key_path` | path | required | Its private key — the one credential that makes the broker Pod worth attacking. |
+| `ca.leaf_ttl_secs` | integer | `86400` | Lifetime of a minted leaf certificate. |
+| `ca.cache_capacity` | integer | `4096` | How many minted leaves are kept before the oldest name is evicted. |
+| `ca.mints_per_sandbox_per_minute` | integer | `60` | Per-sandbox signing budget. With match-before-sign this is what bounds the leaves an unconstrained CA can be made to issue. |
+| `upstream.denied_cidrs` | array of CIDR strings | `[]` | Destinations no sandbox reaches through the broker, on top of the built-in private ranges. The cluster's Service and Pod CIDRs belong here. |
+| `vault.addr` | string | unset | Vault base URL. Unset runs the broker with no credential source and every marker answers 502. |
+| `vault.token_file` | path | unset | File holding the broker's Vault token. A read-only policy: the api half writes with a different token (`secrets-vault-writer`), which this Pod does not mount. |
+| `vault.mount` | string | `"aenv"` | KV v2 mount. Must match the api half's `[secrets.vault].mount`. |
+| `vault.namespace` | string | unset | Vault Enterprise namespace header, when used. |
+| `vault.timeout_ms` | integer | `5000` | Timeout for each Vault call. |
+| `vault.cache_ttl_secs` | integer | `30` | How long a resolved value is reused before Vault is asked again. |
+| `vault.cache_capacity` | integer | `4096` | Values held at once. Expired entries leave on every insert and the soonest to expire is dropped at capacity, so secret bytes are not retained past the TTL. |
+| `handlers.tcp` | boolean | `false` | The `tcp` identity-echo handler, for smoke tests. Off in production. |
+
+Environment variable overrides for this file are listed under
+[Egress Broker](env-vars.md#egress-broker-aenv-egress).
+
 ## `[snapshot]`
 
 Snapshot storage/build configuration.

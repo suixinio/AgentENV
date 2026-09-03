@@ -14,6 +14,13 @@ url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{ve
 version = "6.12.33-pvm"
 url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/vmlinux-guest-6.12.33-pvm"
 
+# amd64 only: this tag's OCI index carries `linux/amd64` plus an attestation and
+# no arm64 manifest, and the tools drive is pulled with `regctl image copy
+# --platform local` (setup/deps.rs), so an aarch64 host fails here rather than
+# falling back. `tools-image/Makefile`'s `publish` builds both platforms
+# (PUBLISH_PLATFORMS) — an arm64 deployment publishes its own tag and repoints
+# the two keys below at it. Version changes here are not overwrites: `publish`
+# refuses to replace a tag that already exists.
 [tools]
 version = "0.2.0"
 url = "ghcr.io/suixinio/agentenv-tools:{version}"

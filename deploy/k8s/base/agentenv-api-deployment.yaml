@@ -464,9 +464,14 @@ spec:
                   optional: true
             # The secrets store behind /secrets and network.rules. `disabled`
             # ships; `vault` needs the address here and a token in the
-            # egress-vault Secret that can write <mount>/data/secrets/* and
-            # <mount>/data/grants/*. All optional: an api Pod applies and
-            # starts without any of it.
+            # secrets-vault-writer Secret that can create/update
+            # <mount>/data/{secrets,grants}/* and delete the matching
+            # <mount>/metadata/* paths. That is a strictly different capability
+            # set from the read-only token the broker mounts as `egress-vault`,
+            # and the two are separate Secrets so neither process holds the
+            # other's: this half writes values and grants and never reads one
+            # back, the broker reads and never writes.
+            # All optional: an api Pod applies and starts without any of it.
             - name: AENV_SECRETS_BACKEND
               valueFrom:
                 configMapKeyRef:
@@ -482,7 +487,7 @@ spec:
             - name: AENV_SECRETS_VAULT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: egress-vault
+                  name: secrets-vault-writer
                   key: token
                   optional: true
             # 🔴 AENV_STARTUP_RECLAIM_ENABLED is deliberately absent, here and

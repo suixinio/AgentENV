@@ -537,6 +537,26 @@ G8 的闸门已满足。
 集群上还留着 4 条 Vault 时代的 `secret_refs` 行（`e2e-egress-…`、`verify_tenant_db`、
 `t7_db`、`t8_db`）：名字在、值不在新后端。引用它们的策略会被 400 挡下，不影响其它路径。
 
+### P5 回执（2026-09-04，pve-mf）
+
+删除批的清单跑完之后，仓库与集群两侧都不再有 Vault。
+
+- `cargo check -p aenv-egress --no-default-features --features resolver` 通过，
+  `make check-crate-boundaries` 逐 feature 单独构建（`core` / `resolver` / `remote` / `tls`）全过。
+- 门禁：fmt / boundaries / workspace-check / clippy / `--features bin` / `make test-with-postgres`
+  （73 passed，无跳过）/ `make -C services test -count=1` 全绿。`unit-1` 有一条失败，是
+  `node_client_tests::the_node_service_answers_through_the_entry_point_a_binary_uses`
+  的端口复用 flaky（"the port is still bound after the surface was told to stop"），
+  单独重跑 5/5 通过，且本分支未触碰 `crates/aenv-node/`。
+- 集群：`vault-dev` 的 Deployment 与 Service、`egress-vault` 与 `secrets-vault-writer`
+  两个 Secret 全部删除；broker 只剩 `AENV_EGRESS_RESOLVER_URL` 一个凭据源、不再挂
+  `egress-vault`；api 半边只剩 `AENV_SECRETS_BACKEND` 与两个 `_PG_` 路径。
+- **删除之后两套 e2e 逐字不变**：`15_egress_credentials` = All 23 tests passed (2 skipped)，
+  `16_egress_postgres` = All 9 tests passed，零跳过。这是"删掉的东西确实没有被谁用着"的证据。
+
+文档里那句"`AENV_SECRETS_BACKEND=vault` 现在会被拒"用一条测试钉住了（翻转断言变红、复原变绿），
+因为它是这批唯一一处**行为**承诺 —— 其余被删的变量都是"读它的人没了"，而这一个是主动拒绝。
+
 ---
 
 ## 8. 不做的事

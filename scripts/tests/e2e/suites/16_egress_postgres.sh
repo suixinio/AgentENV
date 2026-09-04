@@ -66,7 +66,17 @@ if ! python3 -c 'import e2b' >/dev/null 2>&1; then
   exit 0
 fi
 
+# A 503 is "no node reports a usable broker", which is also what the seconds
+# after a broker rollout look like -- and the suite before this one rolls the
+# broker on purpose. Give it a bounded chance to come back before believing it.
 sandbox_id=$(create_sandbox "$AENV_TEMPLATE_ID" 180 "$(endpoint_json)"); _sync_http
+broker_wait=0
+while [[ "$HTTP_STATUS" == "503" && "$broker_wait" -lt 90 ]]; do
+  sleep 10
+  broker_wait=$((broker_wait + 10))
+  log "no node reported a broker yet; retrying after ${broker_wait}s"
+  sandbox_id=$(create_sandbox "$AENV_TEMPLATE_ID" 180 "$(endpoint_json)"); _sync_http
+done
 case "$HTTP_STATUS" in
   201) ;;
   400)
@@ -76,7 +86,7 @@ case "$HTTP_STATUS" in
     exit 0
     ;;
   503)
-    warn "no node reports a usable egress broker"
+    warn "no node reported a usable egress broker within ${broker_wait}s"
     _skip "brokered postgres, no egress broker on any node"
     suite_summary "16_egress_postgres"
     exit 0

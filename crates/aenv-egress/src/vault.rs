@@ -8,7 +8,8 @@ use reqwest::{StatusCode, Url};
 use zeroize::Zeroizing;
 
 use crate::credential::{
-    is_valid_secret_name, CredentialError, CredentialFields, CredentialSource, Secret,
+    allowed_hosts, is_valid_secret_name, CredentialError, CredentialFields, CredentialSource,
+    Secret,
 };
 
 pub struct VaultSource {
@@ -144,27 +145,6 @@ impl CredentialSource for VaultSource {
             ));
         }
         Ok(fields)
-    }
-}
-
-/// A `allowed_hosts` written as a JSON array or as one comma-separated
-/// string, which is what a `vault kv put` on the command line produces.
-pub(crate) fn allowed_hosts(value: Option<&serde_json::Value>) -> Vec<String> {
-    match value {
-        Some(serde_json::Value::Array(entries)) => entries
-            .iter()
-            .filter_map(|entry| entry.as_str())
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .map(str::to_string)
-            .collect(),
-        Some(serde_json::Value::String(entries)) => entries
-            .split(',')
-            .map(str::trim)
-            .filter(|entry| !entry.is_empty())
-            .map(str::to_string)
-            .collect(),
-        _ => Vec::new(),
     }
 }
 

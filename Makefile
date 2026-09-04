@@ -140,6 +140,11 @@ check-crate-boundaries:
 	  echo "aenv-egress links a database, the byte half, aenv-core or a second TLS stack; the broker contract is a leaf on openssl only."; \
 	  fail=1; \
 	fi; \
+	for feature in core vault resolver remote tls; do \
+	  $(CARGO) check -q -p aenv-egress --no-default-features --features $$feature >/dev/null 2>&1 || { \
+	    echo "aenv-egress does not build with only its \"$$feature\" feature. Every build in the tree turns on either one feature or all of them, so a reference from one optional module into another compiles everywhere and fails for whoever enables just the one."; \
+	    fail=1; }; \
+	done; \
 	node_features=$$($(CARGO) tree -p aenv-node -e features --prefix none) || { echo "cargo tree -p aenv-node -e features failed"; exit 1; }; \
 	if printf '%s\n' "$$node_features" | grep -E '^aenv-egress feature "tls"'; then \
 	  echo "aenv-node enables aenv-egress's tls feature; the node relays bytes and terminates no TLS."; \
@@ -151,7 +156,7 @@ check-crate-boundaries:
 	  echo "cache layout or written as JSON records, and nothing here needs one."; \
 	  fail=1; \
 	fi; \
-	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, aenv-node has no database and no broker TLS, aenv-egress is a leaf, the workspace has no embedded database"; fi; \
+	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, aenv-node has no database and no broker TLS, aenv-egress is a leaf whose features each stand alone, the workspace has no embedded database"; fi; \
 	exit $$fail
 
 mutants:

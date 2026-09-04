@@ -11,7 +11,8 @@ use serde::Serialize;
 use zeroize::Zeroizing;
 
 use crate::credential::{
-    is_valid_secret_name, CredentialError, CredentialFields, CredentialSource, Secret,
+    allowed_hosts, is_valid_secret_name, CredentialError, CredentialFields, CredentialSource,
+    Secret,
 };
 
 /// Path the broker resolves a grant at, appended to the configured base.
@@ -106,7 +107,7 @@ impl CredentialSource for ResolverSource {
         let answer = self.resolve(sandbox_id, execution_id, name).await?;
         match answer.get("value").and_then(|value| value.as_str()) {
             Some(value) => Ok(Secret::new(value.as_bytes().to_vec(), expiry_of(&answer))
-                .with_allowed_hosts(crate::vault::allowed_hosts(answer.get("allowedHosts")))),
+                .with_allowed_hosts(allowed_hosts(answer.get("allowedHosts")))),
             None => Err(CredentialError::Unavailable(
                 "the resolver returned no opaque value for this name".into(),
             )),

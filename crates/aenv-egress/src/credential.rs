@@ -16,6 +16,32 @@ pub fn is_valid_secret_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
+/// An `allowed_hosts` field written as a JSON array or as one comma-separated
+/// string, which is what a `vault kv put` on the command line produces.
+///
+/// Every credential source that reads a JSON answer needs it, so it is gated
+/// on all of them together: behind a single source's feature, the others do
+/// not build on their own.
+#[cfg(any(feature = "vault", feature = "resolver"))]
+pub(crate) fn allowed_hosts(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(entries)) => entries
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(serde_json::Value::String(entries)) => entries
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// A credential value that is wiped on drop and never printed.
 #[derive(Clone)]
 pub struct Secret {

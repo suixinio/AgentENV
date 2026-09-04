@@ -16,11 +16,18 @@ log "Suite: Brokered Postgres (explicit endpoints + a credential the sandbox nev
 # write, such as an external resolver. Otherwise, give the connection itself
 # in E2E_PG_HOST / E2E_PG_USER / E2E_PG_PASSWORD and the suite writes a
 # structured credential through `/secrets` and removes it afterwards.
+#
+# E2E_PG_SSLMODE goes into that credential when set. Unset leaves it out, and
+# the handler then requires TLS to the upstream, which is the right default
+# for a real tenant database and wrong for a plaintext one stood up to verify
+# this path -- that upstream needs `disable` here or every query comes back
+# `ERR:28000:the upstream refused TLS and this endpoint requires it`.
 PG_SECRET="${E2E_PG_SECRET:-}"
 PG_HOST="${E2E_PG_HOST:-}"
 PG_PORT="${E2E_PG_PORT:-5432}"
 PG_USER="${E2E_PG_USER:-}"
 PG_PASSWORD="${E2E_PG_PASSWORD:-}"
+PG_SSLMODE="${E2E_PG_SSLMODE:-}"
 PG_DATABASE="${E2E_PG_DATABASE:-postgres}"
 # The probe sets application_name to "probe"; a resolver that overrides it is
 # a legitimate deployment and the assertion below says which case it saw.
@@ -76,8 +83,9 @@ trap cleanup EXIT
 if [[ -z "$PG_SECRET" && -n "$PG_HOST" && -n "$PG_USER" ]]; then
   PG_SECRET="e2e-pg-$(date +%s)-$RANDOM"
   api_post "/secrets" "$(jq -nc --arg n "$PG_SECRET" --arg h "$PG_HOST" --arg p "$PG_PORT" \
-    --arg u "$PG_USER" --arg w "$PG_PASSWORD" \
-    '{name: $n, fields: {host: $h, port: $p, user: $u, password: $w}}')"
+    --arg u "$PG_USER" --arg w "$PG_PASSWORD" --arg s "$PG_SSLMODE" \
+    '{name: $n, fields: ({host: $h, port: $p, user: $u, password: $w}
+                         + (if $s == "" then {} else {sslmode: $s} end))}')"
   case "$HTTP_STATUS" in
     201)
       created_secret="$PG_SECRET"
@@ -166,6 +174,9 @@ _pass "the guest can speak the protocol with ${PROBE_RUNNER}"
 answer=$(brokered_query "$sandbox_id" placeholder placeholder "$PG_DATABASE" "select 1")
 if [[ "$answer" != "1" ]]; then
   warn "the brokered connection did not answer: ${answer}"
+  if [[ "$answer" == *"refused TLS"* ]]; then
+    warn "the credential names no sslmode and this upstream speaks no TLS; set E2E_PG_SSLMODE=disable"
+  fi
   _skip "brokered postgres, the upstream did not answer through the broker"
   suite_summary "16_egress_postgres"
   exit 0

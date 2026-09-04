@@ -450,14 +450,21 @@ configMapGenerator:
       - AENV_EGRESS_BROKER_MODE=disabled
       - AENV_EGRESS_BROKER_ENDPOINT=aenv-egress:8443
   # Where the api half stores secret values and grants. `disabled` ships:
-  # /secrets answers 503 and rules naming secrets are refused. The token comes
-  # from the `secrets-vault-writer` Secret, read by the api Deployment as an
+  # /secrets answers 503 and rules naming secrets are refused.
+  #
+  # `vault` reads its token from the `secrets-vault-writer` Secret, as an
   # environment variable — a write-only credential, distinct from the broker's
-  # read-only `egress-vault`.
+  # read-only `egress-vault`. `postgres` keeps the values in the database this
+  # half already holds; the two paths below are where the api Deployment
+  # mounts the master key and the broker's bearer, so an overlay choosing that
+  # backend flips one literal and mints two Secrets. Both files are absent
+  # until it does, and unread while the backend is anything else.
   - name: secrets-store-config
     literals:
       - AENV_SECRETS_BACKEND=disabled
       - AENV_SECRETS_VAULT_ADDR=
+      - AENV_SECRETS_PG_KEY_FILE=/etc/agentenv/secrets/master-key
+      - AENV_SECRETS_PG_RESOLVER_TOKEN_FILE=/etc/agentenv/secrets/resolver-token
 
 images:
   - name: agentenv-gateway

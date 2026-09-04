@@ -490,6 +490,25 @@ spec:
                   name: secrets-vault-writer
                   key: token
                   optional: true
+            # `postgres` instead: the values live in the database this
+            # process already holds, and these two name files rather than
+            # values, because an environment variable holding a master key is
+            # readable from /proc, a crash dump and `kubectl describe`. Both
+            # come from the projected `credential-store` volume below, whose
+            # sources are optional — a Pod without them starts and only fails
+            # if the backend is actually set to postgres.
+            - name: AENV_SECRETS_PG_KEY_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: secrets-store-config
+                  key: AENV_SECRETS_PG_KEY_FILE
+                  optional: true
+            - name: AENV_SECRETS_PG_RESOLVER_TOKEN_FILE
+              valueFrom:
+                configMapKeyRef:
+                  name: secrets-store-config
+                  key: AENV_SECRETS_PG_RESOLVER_TOKEN_FILE
+                  optional: true
             # 🔴 AENV_STARTUP_RECLAIM_ENABLED is deliberately absent, here and
             # everywhere else in this tree. It makes a process sweep the host
             # for another process's leftover VMs, which is sound for
@@ -584,6 +603,11 @@ spec:
             - name: pg-credentials
               mountPath: /etc/agentenv/pg
               readOnly: true
+            # The master key values are encrypted under and the bearer the
+            # broker presents, for [secrets].backend = "postgres".
+            - name: credential-store
+              mountPath: /etc/agentenv/secrets
+              readOnly: true
             - name: scratch
               mountPath: /workspace/env
       volumes:
@@ -665,6 +689,27 @@ spec:
             items:
               - key: pg-dsn.toml
                 path: pg-dsn.toml
+        # 🔴 Two Secrets, one directory, and both halves optional: the master
+        # key and the resolver bearer are minted by the operator
+        # (`aenv-egress-secrets.example.yaml` says how) and neither exists on
+        # a fresh cluster. The key is deliberately *not* in the same Secret as
+        # anything the database side reads: whoever holds a dump of
+        # `secret_values` must not find the key beside it.
+        - name: credential-store
+          projected:
+            sources:
+              - secret:
+                  name: agentenv-secrets-key
+                  optional: true
+                  items:
+                    - key: key
+                      path: master-key
+              - secret:
+                  name: egress-resolver
+                  optional: true
+                  items:
+                    - key: token
+                      path: resolver-token
         # The image sets AENV_HOME_PATH=/workspace/env, and the process creates
         # caches under it. On the node that path is the machine's hostPath; here
         # it is scratch with the Pod's own lifetime. If anything this half writes

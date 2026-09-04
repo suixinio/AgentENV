@@ -53,11 +53,18 @@ cache_ttl_secs = 30
 cache_capacity = 4096
 
 [resolver]
-# An operator-run service that owns the credentials themselves. Set at most
-# one of this and [vault]; with both, the resolver wins and [vault] is ignored.
-# The api half posts grants to the same base URL, so keep the two in step.
-# url = "http://agent-platform.apps.svc/internal/aenv"
-# token_file = "/etc/aenv-egress/resolver/token"
+# Where the broker resolves credentials. Set at most one of this and [vault];
+# with both, the resolver wins and [vault] is ignored.
+#
+# Two things it can point at. With [secrets].backend = "postgres" it is the
+# api half itself, which serves the same contract:
+#   url = "http://agentenv-api:8000/internal"
+# With backend = "external_resolver" it is the operator's own service, which
+# the api half also posts grants to:
+#   url = "http://agent-platform.apps.svc/internal/aenv"
+# Either way the two halves must name the same base, and the NetworkPolicy
+# has to admit it.
+token_file = "/etc/aenv-egress/resolver/token"
 timeout_ms = 5000
 # How long a resolved credential is reused. It bounds how long a revocation
 # takes to bite, because a revoked grant is only noticed on the next lookup.

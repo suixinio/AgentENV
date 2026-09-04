@@ -78,6 +78,9 @@ spec:
             - name: egress-vault
               mountPath: /etc/aenv-egress/vault
               readOnly: true
+            - name: egress-resolver
+              mountPath: /etc/aenv-egress/resolver
+              readOnly: true
       volumes:
         - name: config
           configMap:
@@ -107,4 +110,12 @@ spec:
         - name: egress-vault
           secret:
             secretName: egress-vault
+            optional: true
+        # The bearer the broker presents at the resolve endpoint, whether
+        # that is the api half's own (backend = "postgres") or an operator's
+        # service. Mounted here and named by [resolver].token_file; unset
+        # [resolver].url leaves it unread.
+        - name: egress-resolver
+          secret:
+            secretName: egress-resolver
             optional: true

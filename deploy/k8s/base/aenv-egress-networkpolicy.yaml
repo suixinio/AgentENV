@@ -1,6 +1,7 @@
 # The broker is the one process that connects to upstreams on a sandbox's
 # behalf from inside the cluster network, so its reach is pinned here: only
-# nodes may talk to it, and it may talk to Vault, DNS and public port 443.
+# nodes may talk to it, and it may talk to its credential source, DNS and
+# public port 443.
 # The private ranges are excluded from the public egress block for the same
 # reason `[upstream].denied_cidrs` in its config refuses them: a rule must not
 # turn the broker into a path to cluster-internal services.
@@ -58,6 +59,17 @@ spec:
       ports:
         - protocol: TCP
           port: 8200
+    # The credential source, when it is the api half itself
+    # ([secrets].backend = "postgres"). Without this the broker's every
+    # lookup times out and nothing says why. Harmless with any other backend:
+    # a broker that never calls the api half does not use this rule.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: agentenv-api
+      ports:
+        - protocol: TCP
+          port: 8000
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

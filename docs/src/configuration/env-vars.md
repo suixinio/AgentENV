@@ -35,7 +35,9 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_EGRESS_BROKER_NODE_CONNS` | `20000` | `[egress_broker].node_conns` |
 | `AENV_EGRESS_BROKER_OPEN_TIMEOUT_MS` | `3000` | `[egress_broker].open_timeout_ms` |
 | — | `[]` | `[egress_broker].embedded_tcp_allowed_cidrs` is a list, so confique cannot bind it from the environment; set it in the config file or an overlay. |
-| `AENV_SECRETS_BACKEND` | `disabled` | `[secrets].backend`: `disabled`, `vault` or `external_resolver`. Read by `aenv-api` only. |
+| `AENV_SECRETS_BACKEND` | `disabled` | `[secrets].backend`: `disabled`, `postgres`, `vault` or `external_resolver`. Read by `aenv-api` only. |
+| `AENV_SECRETS_PG_KEY_FILE` | unset | `[secrets.pg].key_file`: the file holding the base64 32-byte master key values are encrypted under. A path, not the key — an environment variable holding one is readable from `/proc` and `kubectl describe`. |
+| `AENV_SECRETS_PG_RESOLVER_TOKEN_FILE` | unset | `[secrets.pg].resolver_token_file`: the file holding the bearer the broker presents at the internal resolve endpoint. Read once at startup; the broker's `AENV_EGRESS_RESOLVER_TOKEN_FILE` names a file with the same value. |
 | `AENV_SECRETS_VAULT_ADDR` | unset | `[secrets.vault].addr` |
 | `AENV_SECRETS_VAULT_TOKEN` | unset | `[secrets.vault].token`; mount it from a Secret (`secrets-vault-writer` in `deploy/k8s/base`). A write-only credential — this half never reads a value back — and deliberately not the broker's read-only token. |
 | `AENV_SECRETS_VAULT_MOUNT` | `aenv` | `[secrets.vault].mount` |

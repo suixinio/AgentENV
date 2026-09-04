@@ -179,12 +179,24 @@ open_timeout_ms = 3000
 embedded_tcp_allowed_cidrs = []
 
 [secrets]
-# Where aenv-api stores secret values and grants: "disabled", "vault", or
+# Where aenv-api stores secret values and grants: "disabled", "postgres" (its
+# own database, encrypted under a master key it reads from a file, and it
+# serves the broker's resolve endpoint itself), "vault", or
 # "external_resolver" (an operator-run service that owns the credentials; this
 # half records grants there and the broker resolves values against the same
-# base, so /secrets refuses to store a value). aenv-api's PostgreSQL holds
-# names and versions only; a node reads none of this.
+# base, so /secrets refuses to store a value). aenv-api's PostgreSQL always
+# holds names and versions; a node reads none of this.
 backend = "disabled"
+
+[secrets.pg]
+# Both are paths, never the values: an environment variable holding a master
+# key is readable from /proc, a crash dump and `kubectl describe`. Required
+# when backend = "postgres". The key is base64 of 32 bytes and lives nowhere
+# near the database that holds the ciphertexts; losing it loses every value.
+# key_file = "/etc/aenv/secrets/master-key"
+# The bearer the broker presents at POST /internal/credentials/resolve. The
+# broker's own [resolver].token_file holds the same value.
+# resolver_token_file = "/etc/aenv/secrets/resolver-token"
 
 [secrets.vault]
 # addr = "https://vault.vault.svc:8200"

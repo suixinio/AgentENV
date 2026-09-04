@@ -1,3 +1,10 @@
+//! The two PostgreSQL tables behind `/secrets`: `secret_refs` here, and
+//! `secret_values`/`secret_grants` in [`values`]; [`resolve_route`] is the
+//! endpoint the broker reads the latter through.
+
+pub mod resolve_route;
+pub mod values;
+
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

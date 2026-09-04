@@ -143,6 +143,9 @@ pub enum SecretsBackendKind {
     /// An operator-run service that owns the credentials themselves. This
     /// half records grants there; the broker resolves values there.
     ExternalResolver,
+    /// aenv-api's own PostgreSQL, values encrypted under a master key this
+    /// half holds. It also serves the broker's resolve endpoint.
+    Postgres,
 }
 
 impl SecretsBackendKind {
@@ -151,6 +154,7 @@ impl SecretsBackendKind {
             Self::Disabled => "disabled",
             Self::Vault => "vault",
             Self::ExternalResolver => "external_resolver",
+            Self::Postgres => "postgres",
         }
     }
 }
@@ -165,6 +169,8 @@ pub struct SecretsConfig {
     pub vault: VaultConfig,
     #[config(nested)]
     pub resolver: SecretsResolverConfig,
+    #[config(nested)]
+    pub pg: SecretsPgConfig,
 }
 
 impl fmt::Debug for SecretsConfig {
@@ -173,6 +179,7 @@ impl fmt::Debug for SecretsConfig {
             .field("backend", &self.backend)
             .field("vault", &self.vault)
             .field("resolver", &self.resolver)
+            .field("pg", &self.pg)
             .finish()
     }
 }
@@ -234,6 +241,31 @@ impl fmt::Debug for SecretsResolverConfig {
     }
 }
 
+/// Values in aenv-api's own PostgreSQL. Both credentials are files, never
+/// inline values: an environment variable holding a master key is readable
+/// from `/proc`, a crash dump and `kubectl describe`.
+#[derive(Config, Clone)]
+pub struct SecretsPgConfig {
+    /// File holding the base64 32-byte key values are encrypted under. It is
+    /// mounted from a Kubernetes Secret and never written to the database
+    /// that holds the ciphertexts.
+    #[config(env = "AENV_SECRETS_PG_KEY_FILE")]
+    pub key_file: Option<PathBuf>,
+    /// File holding the bearer the broker presents at the internal resolve
+    /// endpoint. The broker's own `resolver.token_file` holds the same value.
+    #[config(env = "AENV_SECRETS_PG_RESOLVER_TOKEN_FILE")]
+    pub resolver_token_file: Option<PathBuf>,
+}
+
+impl fmt::Debug for SecretsPgConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretsPgConfig")
+            .field("key_file", &self.key_file)
+            .field("resolver_token_file", &self.resolver_token_file)
+            .finish()
+    }
+}
+
 impl SecretsConfig {
     pub fn validate(&self) -> Result<()> {
         match self.backend {
@@ -244,6 +276,17 @@ impl SecretsConfig {
                 }
                 if self.resolver.timeout_ms == 0 {
                     bail!("secrets.resolver.timeout_ms must be > 0");
+                }
+                Ok(())
+            }
+            SecretsBackendKind::Postgres => {
+                for (name, path) in [
+                    ("key_file", &self.pg.key_file),
+                    ("resolver_token_file", &self.pg.resolver_token_file),
+                ] {
+                    if path.as_ref().is_none_or(|p| p.as_os_str().is_empty()) {
+                        bail!("secrets.backend = \"postgres\" requires secrets.pg.{name}");
+                    }
                 }
                 Ok(())
             }

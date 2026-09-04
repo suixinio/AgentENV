@@ -23,9 +23,15 @@ path = "src/bin/aenv-snapshot-image.rs"
 
 [dependencies]
 aenv-core = { path = "../.." }
+# 🔴 The only cipher in the workspace, and deliberately not the ambient
+# openssl: a typed nonce and an AAD that the API refuses to let you forget
+# are what keep `[secrets.pg]`'s envelope from being wrong in the two ways
+# that matter. See `src/secrets/envelope.rs`.
+aes-gcm = "0.10"
 agentenv-observability = { path = "../observability" }
 anyhow = "1.0.100"
 async-trait = "0.1"
+base64 = "0.22"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }

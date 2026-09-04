@@ -199,11 +199,13 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         &snapshot_manager,
     ))));
 
-    // Names and grants for network rules; values never pass through this process.
+    // Names and grants for network rules. Whether a value passes through this
+    // process depends on the backend: `postgres` holds them, the other two do not.
     let secrets = aenv_api::secrets::build_secrets_service(config, &pg_pool)?;
     if let Some(secrets) = &secrets {
-        orchestrator
-            .set_grant_issuer(Arc::clone(secrets) as Arc<dyn aenv_api::orchestrator::GrantIssuer>);
+        orchestrator.set_grant_issuer(
+            Arc::clone(&secrets.service) as Arc<dyn aenv_api::orchestrator::GrantIssuer>
+        );
     }
 
     let mut api_impl = ApiImpl::new(
@@ -221,8 +223,8 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         Arc::clone(&native_registry_handle) as Arc<dyn NodeRegistry>,
         config.cluster.node_service_port,
     );
-    if let Some(secrets) = secrets {
-        api_impl = api_impl.with_secrets(secrets);
+    if let Some(secrets) = &secrets {
+        api_impl = api_impl.with_secrets(Arc::clone(&secrets.service));
     }
     let api_impl = Arc::new(api_impl);
 
@@ -265,8 +267,19 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         Duration::from_secs(config.cluster.native_warmup_timeout_secs),
     );
 
+    // The broker's resolve endpoint, for the one backend whose values this
+    // process can open. Every other backend mounts nothing.
+    let credential_routes = match secrets.as_ref() {
+        Some(aenv_api::secrets::SecretsAssembly {
+            values: Some(values),
+            resolver_token: Some(token),
+            ..
+        }) => aenv_api::secrets::pg::resolve_route::router(Arc::clone(values), token.clone()),
+        _ => axum::Router::new(),
+    };
+
     Ok(Assembly {
-        app: server::new_control_plane_only(api_impl),
+        app: server::new_control_plane_only(api_impl, credential_routes),
         orchestration,
         upkeep,
         pg_singleton_tasks,

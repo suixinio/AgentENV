@@ -27,7 +27,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_secret_refs.sql",
         body: include_str!("migrations/0002_secret_refs.sql"),
     },
+    Migration {
+        version: 3,
+        name: "0003_secret_values.sql",
+        body: include_str!("migrations/0003_secret_values.sql"),
+    },
 ];
+
+// Every table these migrations create, in the order the rollback drops
+// them. The verification error prints this list and the test that claims to
+// run the documented command runs this list: a table left out of it survives
+// the rollback and blocks the next start as an unrecorded relation.
+const CATALOG_TABLES: &str =
+    "aliases, builds, templates, snapshots, secret_values, secret_grants, secret_refs";
 
 const VERSION_TABLE_DDL: &str = "
 CREATE TABLE IF NOT EXISTS catalog_schema_migrations (
@@ -109,6 +121,7 @@ const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[
         ],
     ),
     (2, &["secret_refs"]),
+    (3, &["secret_values", "secret_grants"]),
 ];
 
 // `to_regclass` resolves against this connection's search path.
@@ -184,7 +197,7 @@ async fn verify_applied(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -
          catalog_schema_migrations itself: the next start is then told every version is applied, \
          creates nothing, and every catalog query then fails on a missing relation, permanently. \
          Refusing to continue in this state. Finish the rollback, then restart:\n\
-         \x20   DROP TABLE IF EXISTS aliases, builds, templates, snapshots CASCADE;\n\
+         \x20   DROP TABLE IF EXISTS {CATALOG_TABLES} CASCADE;\n\
          \x20   DROP TABLE IF EXISTS catalog_schema_migrations;",
         claimed.join(", "),
         missing.join(", ")
@@ -261,12 +274,14 @@ mod pg {
         .expect("querying information_schema should succeed")
     }
 
-    const OWNED_TABLES: [&str; 6] = [
+    const OWNED_TABLES: [&str; 8] = [
         "snapshots",
         "templates",
         "builds",
         "aliases",
         "secret_refs",
+        "secret_values",
+        "secret_grants",
         "catalog_schema_migrations",
     ];
 
@@ -287,7 +302,7 @@ mod pg {
                 .fetch_all(&pool)
                 .await
                 .expect("reading the ledger should succeed");
-        assert_eq!(recorded, vec![1, 2]);
+        assert_eq!(recorded, vec![1, 2, 3]);
     }
 
     #[tokio::test]
@@ -313,10 +328,10 @@ mod pg {
             isolated_schema_pool_or_skip!("the_documented_rollback_command_actually_rolls_back");
         migrate(&pool).await.expect("migration should succeed");
 
-        sqlx::raw_sql(
-            "DROP TABLE IF EXISTS aliases, builds, templates, snapshots, secret_refs CASCADE;\
-             DROP TABLE IF EXISTS catalog_schema_migrations;",
-        )
+        sqlx::raw_sql(&format!(
+            "DROP TABLE IF EXISTS {CATALOG_TABLES} CASCADE;\
+             DROP TABLE IF EXISTS catalog_schema_migrations;"
+        ))
         .execute(&pool)
         .await
         .expect("the documented rollback command should succeed");
@@ -347,7 +362,11 @@ mod pg {
                 .fetch_all(&pool)
                 .await
                 .expect("reading the ledger should succeed");
-        assert_eq!(recorded, vec![1, 2], "no duplicate or missing ledger rows");
+        assert_eq!(
+            recorded,
+            vec![1, 2, 3],
+            "no duplicate or missing ledger rows"
+        );
     }
 
     #[tokio::test]
@@ -407,7 +426,7 @@ mod pg {
                 .expect("reading the ledger should succeed");
         assert_eq!(
             recorded,
-            vec![1],
+            vec![1, 3],
             "a refused preflight must not record the version it refused"
         );
     }
@@ -481,7 +500,9 @@ mod pg {
                 "aliases (r)",
                 "builds (r)",
                 "catalog_schema_migrations (r)",
+                "secret_grants (r)",
                 "secret_refs (r)",
+                "secret_values (r)",
                 "snapshots (r)",
                 "templates (r)",
             ],
@@ -518,9 +539,14 @@ mod pg {
                 "builds.builds_status_group_check (c)",
                 "builds.builds_template_fk (f)",
                 "catalog_schema_migrations.catalog_schema_migrations_pkey (p)",
+                "secret_grants.secret_grants_pkey (p)",
                 "secret_refs.secret_refs_name_unique (u)",
                 "secret_refs.secret_refs_pkey (p)",
                 "secret_refs.secret_refs_version_nonnegative (c)",
+                "secret_values.secret_values_kind (c)",
+                "secret_values.secret_values_name_fk (f)",
+                "secret_values.secret_values_pkey (p)",
+                "secret_values.secret_values_version_positive (c)",
                 "snapshots.snapshots_committed_axis (c)",
                 "snapshots.snapshots_cpu_count_check (c)",
                 "snapshots.snapshots_disk_size_floor (c)",
@@ -568,8 +594,10 @@ mod pg {
                 "builds_one_active_per_template unique=true partial=true",
                 "builds_pkey unique=true partial=false",
                 "catalog_schema_migrations_pkey unique=true partial=false",
+                "secret_grants_pkey unique=true partial=false",
                 "secret_refs_name_unique unique=true partial=false",
                 "secret_refs_pkey unique=true partial=false",
+                "secret_values_pkey unique=true partial=false",
                 "snapshots_list_idx unique=false partial=true",
                 "snapshots_pkey unique=true partial=false",
                 "snapshots_source_sandbox_idx unique=false partial=true",

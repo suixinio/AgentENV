@@ -8,7 +8,9 @@ use headers::Host;
 use tracing::warn;
 
 use super::ApiImpl;
-use crate::secrets::{SecretMetadata, SecretRef, SecretString, SecretsError, SecretsService};
+use crate::secrets::{
+    SecretMetadata, SecretRef, SecretString, SecretValue, SecretsError, SecretsService,
+};
 use agentenv_http_server::apis::secrets::{
     Secrets, SecretsGetResponse, SecretsPostResponse, SecretsSecretIdDeleteResponse,
     SecretsSecretIdGetResponse, SecretsSecretIdPostResponse,
@@ -115,7 +117,7 @@ impl Secrets<()> for ApiImpl {
                 ))
             }
         };
-        let value = SecretString::new(body.value.to_string());
+        let value = SecretValue::Opaque(SecretString::new(body.value.to_string()));
         match service
             .create(
                 &body.name,
@@ -210,7 +212,7 @@ impl Secrets<()> for ApiImpl {
                 return Ok(SecretsSecretIdPostResponse::Status503_NoSecretsStoreIsConfigured(err))
             }
         };
-        let value = SecretString::new(body.value.to_string());
+        let value = SecretValue::Opaque(SecretString::new(body.value.to_string()));
         let metadata = body.metadata.as_ref().map(|m| metadata_from(Some(m)));
         match service
             .update(

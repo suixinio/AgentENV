@@ -299,6 +299,105 @@ mod tests {
         assert!(fake.seen.lock().unwrap().is_empty());
     }
 
+    /// Both sources against servers holding the same grant, so that removing
+    /// one of them cannot quietly move the line between served and denied.
+    ///
+    /// This half proves the two clients agree given equivalent servers; that
+    /// the api half's own endpoint implements this rule is
+    /// `secrets::pg::values::tests::only_the_granted_triple_resolves` in
+    /// `aenv-api`. Deleted along with the Vault source.
+    #[cfg(feature = "vault")]
+    #[tokio::test]
+    async fn the_two_credential_sources_reach_the_same_verdict_on_the_same_grant() {
+        use axum::extract::Path;
+        use axum::routing::get;
+
+        const GRANTED_SANDBOX: &str = "sbx-1";
+        const GRANTED_EXECUTION: &str = "exec-1";
+        const GRANTED_NAME: &str = "openai";
+
+        fn is_granted(sandbox: &str, execution: &str, name: &str) -> bool {
+            sandbox == GRANTED_SANDBOX && execution == GRANTED_EXECUTION && name == GRANTED_NAME
+        }
+
+        async fn vault_read(Path(path): Path<String>) -> (StatusCode, Json<Value>) {
+            let data = match path.as_str() {
+                "aenv/data/grants/exec-1" => json!({
+                    "sandbox_id": GRANTED_SANDBOX,
+                    "execution_id": GRANTED_EXECUTION,
+                    "names": [GRANTED_NAME],
+                }),
+                "aenv/data/secrets/openai" => json!({"value": "sk"}),
+                _ => return (StatusCode::NOT_FOUND, Json(json!({}))),
+            };
+            (StatusCode::OK, Json(json!({"data": {"data": data}})))
+        }
+
+        async fn resolve_like_the_api_half(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+            let field = |key: &str| {
+                body.get(key)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            if is_granted(&field("sandboxId"), &field("executionId"), &field("name")) {
+                (StatusCode::OK, Json(json!({"value": "sk"})))
+            } else {
+                (StatusCode::NOT_FOUND, Json(json!({"error": "not found"})))
+            }
+        }
+
+        let app = Router::new()
+            .route("/v1/{*path}", get(vault_read))
+            .route("/credentials/resolve", post(resolve_like_the_api_half));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let resolver =
+            ResolverSource::new(&format!("http://{addr}"), None, Duration::from_secs(2)).unwrap();
+        let vault = crate::vault::VaultSource::new(
+            &format!("http://{addr}"),
+            "token",
+            "aenv",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+
+        for (sandbox, execution, name, served) in [
+            (GRANTED_SANDBOX, GRANTED_EXECUTION, GRANTED_NAME, true),
+            ("sbx-2", GRANTED_EXECUTION, GRANTED_NAME, false),
+            (GRANTED_SANDBOX, "exec-2", GRANTED_NAME, false),
+            (GRANTED_SANDBOX, GRANTED_EXECUTION, "gh", false),
+        ] {
+            let from_resolver = resolver.get(sandbox, execution, name).await;
+            let from_vault = vault.get(sandbox, execution, name).await;
+            assert_eq!(
+                from_resolver.is_ok(),
+                served,
+                "resolver on ({sandbox}, {execution}, {name})"
+            );
+            assert_eq!(
+                from_vault.is_ok(),
+                served,
+                "vault on ({sandbox}, {execution}, {name})"
+            );
+            if served {
+                assert_eq!(
+                    from_resolver.unwrap().expose(),
+                    from_vault.unwrap().expose(),
+                    "the same grant must yield the same value"
+                );
+            } else {
+                assert_eq!(from_resolver.err(), Some(CredentialError::Denied));
+                assert_eq!(from_vault.err(), Some(CredentialError::Denied));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_pin_the_resolver_states_reaches_the_handler() {
         let fake = Fake::default();

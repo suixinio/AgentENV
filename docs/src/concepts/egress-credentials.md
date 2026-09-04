@@ -222,6 +222,17 @@ Vault token would need a policy minted per grant, which means giving the api hal
 `sys/policies/acl/*` — the ability to write itself a policy for anything in Vault. That trades a
 larger exposure for a smaller one and is why it is not the fix.
 
+With `postgres` the check is this half's own. Values live in `secret_values` in the same
+PostgreSQL that holds `secret_refs`, encrypted with AES-256-GCM under a master key `aenv-api`
+reads from a file and the database never sees; grants are rows in `secret_grants`. The broker
+holds a bearer for `POST /internal/credentials/resolve` and asks about one
+`(sandbox, execution, name)` at a time, exactly as it does for an external resolver — a
+compromised broker reads nothing that is not granted to some live sandbox. What this backend
+costs is on the other side: `aenv-api` can open every stored value, where the other two backends
+leave it able only to write. That is the price of needing no credential store beside AgentENV,
+and it is the reason the master key is a mounted file rather than a column, an environment
+variable or a `pgcrypto` argument that would reach the query log.
+
 With `external_resolver` the check is the store's. The broker holds a token that lets it *ask*
 about one `(sandbox, execution, name)` at a time, not one that reads values; a resolver that has
 no grant for the triple answers `403`, and a compromised broker reads nothing that is not
@@ -250,6 +261,13 @@ Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egr
   `<mount>/data/secrets/*` and `<mount>/data/grants/*` and delete the matching `<mount>/metadata/*`
   paths — the `secrets-vault-writer` Secret, a different credential from the broker's read-only
   `egress-vault`. PostgreSQL gets a `secret_refs` table holding names and versions only.
+
+  Or `[secrets].backend = "postgres"`, which needs no store beside AgentENV: two mounted files,
+  `[secrets.pg].key_file` (base64 of 32 bytes) and `[secrets.pg].resolver_token_file`, and the
+  same PostgreSQL gains `secret_values` and `secret_grants`. The broker then points its
+  `[resolver].url` at `http://agentenv-api:8000/internal` with a `token_file` holding that same
+  bearer, and its NetworkPolicy has to admit the api half's 8000. Losing the master key loses
+  every stored value; it is not recoverable from a database backup, which is the point.
 
 `AENV_EGRESS_BROKER_MODE` and `AENV_SECRETS_BACKEND` are both read once at process startup, so
 editing either ConfigMap changes nothing until the process that reads it restarts:

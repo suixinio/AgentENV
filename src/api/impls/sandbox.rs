@@ -2877,7 +2877,7 @@ mod rule_secret_check_tests {
     use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::secrets::memory::{InMemorySecretRefStore, InMemorySecretsBackend};
-    use crate::secrets::{SecretMetadata, SecretString, SecretsService};
+    use crate::secrets::{SecretMetadata, SecretString, SecretValue, SecretsService};
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
 
@@ -2906,7 +2906,7 @@ mod rule_secret_check_tests {
             service
                 .create(
                     name,
-                    SecretString::new("v".to_string()),
+                    SecretValue::Opaque(SecretString::new("v".to_string())),
                     SecretMetadata::new(),
                     Vec::new(),
                 )

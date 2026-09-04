@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use aenv_core::cfg::VaultConfig;
-use aenv_core::secrets::{SecretString, SecretsBackend, SecretsError};
+use aenv_core::secrets::{SecretValue, SecretsBackend, SecretsError};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use reqwest::{Method, StatusCode};
@@ -127,15 +127,35 @@ impl SecretsBackend for VaultKv2Backend {
     async fn put(
         &self,
         name: &str,
-        value: &SecretString,
+        value: &SecretValue,
         allowed_hosts: &[String],
     ) -> Result<i64, SecretsError> {
         let url = self.url("data", &format!("secrets/{name}"))?;
         // The pin lives with the value because the broker reads it from the
-        // same document; a version written without one is unpinned.
-        let body = serde_json::json!({
-            "data": { "value": value.expose(), "allowed_hosts": allowed_hosts }
-        });
+        // same document; a version written without one is unpinned. Fields
+        // are top-level keys of the same document, which is what the
+        // broker's structured read takes everything but these two to be.
+        let mut data = serde_json::Map::new();
+        match value {
+            SecretValue::Opaque(value) => {
+                data.insert("value".into(), value.expose().into());
+            }
+            SecretValue::Fields(fields) => {
+                for key in ["value", "allowed_hosts"] {
+                    if fields.contains_key(key) {
+                        return Err(SecretsError::InvalidMetadata(format!(
+                            "this store keeps fields beside the value in one document, so it \
+                             cannot hold a field named {key:?}"
+                        )));
+                    }
+                }
+                for (key, field) in fields {
+                    data.insert(key.clone(), field.expose().into());
+                }
+            }
+        }
+        data.insert("allowed_hosts".into(), allowed_hosts.into());
+        let body = serde_json::json!({ "data": data });
         let (status, json) = self.send(Method::POST, url.clone(), Some(body)).await?;
         Self::expect_success(&Method::POST, &url, status, false)?;
         json.as_ref()
@@ -247,6 +267,19 @@ mod tests {
         }
     }
 
+    fn opaque(value: &str) -> SecretValue {
+        SecretValue::Opaque(value.to_string().into())
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> SecretValue {
+        SecretValue::Fields(
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string().into()))
+                .collect(),
+        )
+    }
+
     fn header(headers: &HeaderMap, name: &str) -> Option<String> {
         headers
             .get(name)
@@ -282,7 +315,7 @@ mod tests {
         let fake = Fake::default();
         let backend = backend(&serve(fake.clone()).await);
         let version = backend
-            .put("openai", &SecretString::new("sk-live".into()), &[])
+            .put("openai", &opaque("sk-live"), &[])
             .await
             .unwrap();
         assert_eq!(version, 7);
@@ -308,7 +341,7 @@ mod tests {
         backend
             .put(
                 "openai",
-                &SecretString::new("sk-live".into()),
+                &opaque("sk-live"),
                 &["api.openai.com".to_string(), "*.github.com".to_string()],
             )
             .await
@@ -325,6 +358,39 @@ mod tests {
             })),
             "the broker reads the pin from the value document, not from a ref row"
         );
+    }
+
+    #[tokio::test]
+    async fn a_structured_credential_becomes_the_document_the_broker_takes_apart() {
+        let fake = Fake::default();
+        let backend = backend(&serve(fake.clone()).await);
+        backend
+            .put(
+                "tenant_db",
+                &fields(&[("host", "pg.internal"), ("port", "5432"), ("password", "p")]),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fake.seen.lock().unwrap()[0].body,
+            Some(serde_json::json!({
+                "data": {
+                    "host": "pg.internal", "port": "5432", "password": "p",
+                    "allowed_hosts": []
+                }
+            })),
+            "the broker reads every key but value and allowed_hosts as a field"
+        );
+
+        // The two reserved keys of that shape have nowhere to go here.
+        for reserved in ["value", "allowed_hosts"] {
+            assert!(matches!(
+                backend.put("tenant_db", &fields(&[(reserved, "x")]), &[]).await,
+                Err(SecretsError::InvalidMetadata(message)) if message.contains(reserved)
+            ));
+        }
     }
 
     #[tokio::test]
@@ -365,7 +431,7 @@ mod tests {
         };
         let backend = backend(&serve(fake).await);
         let err = backend
-            .put("openai", &SecretString::new("sk-live".into()), &[])
+            .put("openai", &opaque("sk-live"), &[])
             .await
             .err()
             .unwrap();

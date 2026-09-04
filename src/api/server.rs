@@ -46,8 +46,14 @@ where
     )
 }
 
-/// Builds the API router without a local sandbox data plane or host classifier.
-pub fn new_control_plane_only<I, A, E, C>(api_impl: I) -> Router
+/// Builds the API router without a local sandbox data plane or host
+/// classifier, merging `extra_control_plane_routes` beside the generated
+/// ones.
+///
+/// Those extra routes are how a process serves something the OpenAPI document
+/// does not describe. They are not counted as part of the user-facing surface
+/// and no generated authentication reaches them, so each one carries its own.
+pub fn new_control_plane_only<I, A, E, C>(api_impl: I, extra_control_plane_routes: Router) -> Router
 where
     I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
     A: apis::admin::Admin<E, Claims = C>
@@ -67,7 +73,7 @@ where
     compose::<I, A, E, C>(
         api_impl,
         DataPlane::Absent,
-        Router::new(),
+        extra_control_plane_routes,
         Arc::new(ControlPlaneGate::from_global_config()),
     )
 }
@@ -542,7 +548,7 @@ mod tests {
         );
         assert_ne!(
             status(
-                new_control_plane_only(Arc::clone(&api_impl)),
+                new_control_plane_only(Arc::clone(&api_impl), Router::new()),
                 Method::GET,
                 "/proxy/hello",
                 None

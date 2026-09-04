@@ -465,13 +465,24 @@ How a node reaches the egress broker that serves sandboxes declaring `network.ru
 
 ## `[secrets]`
 
-Where `aenv-api` stores secret values and grants for `/secrets`, `network.rules` and endpoint credentials. Only the api half reads this section; its PostgreSQL holds names and versions in `secret_refs`, never a value. With `backend = "disabled"`, `/secrets` answers 503 and rules that reference secrets are refused.
+Where `aenv-api` stores secret values and grants for `/secrets`, `network.rules` and endpoint credentials. Only the api half reads this section; its PostgreSQL always holds names and versions in `secret_refs`. With `backend = "disabled"`, `/secrets` answers 503 and rules that reference secrets are refused.
+
+With `backend = "postgres"` the values live in that same database, encrypted under a master key this process reads from a file, and `aenv-api` also serves the broker's resolve endpoint. It is the one backend that can open a stored value, and the one that needs no store beside AgentENV.
 
 With `backend = "external_resolver"` the credentials never enter AgentENV at all: this half posts grants and revocations to the operator's service, the broker resolves values against the same base, and the resolver is also the authority on which names exist. `/secrets` then refuses to store or delete a value, because it owns neither.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `backend` | string | `"disabled"` | `disabled`, `vault`, or `external_resolver`. |
+| `backend` | string | `"disabled"` | `disabled`, `postgres`, `vault`, or `external_resolver`. |
+
+## `[secrets.pg]`
+
+Values in `aenv-api`'s own PostgreSQL, AES-256-GCM under one master key. Both keys are paths, never inline values: an environment variable holding a master key is readable from `/proc`, a crash dump and `kubectl describe`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `key_file` | path | unset | File holding the base64 32-byte master key. Required when `backend = "postgres"`. Mount it from a Secret; it is never written to the database holding the ciphertexts, and losing it loses every stored value. |
+| `resolver_token_file` | path | unset | File holding the bearer the broker presents at `POST /internal/credentials/resolve`. Required when `backend = "postgres"`; the broker's own `resolver.token_file` holds the same value. Read once at startup. |
 
 ## `[secrets.vault]`
 
@@ -516,14 +527,10 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 | `vault.mount` | string | `"aenv"` | KV v2 mount. Must match the api half's `[secrets.vault].mount`. |
 | `vault.namespace` | string | unset | Vault Enterprise namespace header, when used. |
 | `vault.timeout_ms` | integer | `5000` | Timeout for each Vault call. |
-| `resolver.url` | string | unset | Base URL of the external credential resolver. Call paths (`grants`, `grants/revoke`, `credentials/exists`) are joined onto it, so a path prefix is kept. Required with `backend = "external_resolver"`; point the broker's `[resolver].url` at the same base. |
-| `resolver.token` | string | unset | Bearer token for those calls. `resolver.token_file` wins when both are set. |
-| `resolver.token_file` | path | unset | File holding that token, for injecting it from a Secret. |
-| `resolver.timeout_ms` | integer | `5000` | Timeout for each resolver call. |
 | `vault.cache_ttl_secs` | integer | `30` | How long a resolved value is reused before Vault is asked again. |
 | `vault.cache_capacity` | integer | `4096` | Values held at once. Expired entries leave on every insert and the soonest to expire is dropped at capacity, so secret bytes are not retained past the TTL. |
-| `resolver.url` | string | unset | Base URL of the external credential resolver, the same base the api half posts grants to. Set at most one of this and `vault.addr`; with both, the resolver is used and `[vault]` is ignored. |
-| `resolver.token_file` | path | unset | File holding the bearer token for resolver calls. |
+| `resolver.url` | string | unset | Base URL the broker resolves credentials against, the same base the api half posts grants to. With `[secrets].backend = "postgres"` that base is `aenv-api` itself — `http://agentenv-api:8000/internal` — and the NetworkPolicy has to admit it. Set at most one of this and `vault.addr`; with both, the resolver is used and `[vault]` is ignored. |
+| `resolver.token_file` | path | unset | File holding the bearer token for resolver calls. Against the `postgres` backend it holds the same value as the api half's `[secrets.pg].resolver_token_file`. |
 | `resolver.timeout_ms` | integer | `5000` | Timeout for each resolver call. |
 | `resolver.cache_ttl_secs` | integer | `30` | How long a resolved credential is reused. It bounds how long a revocation takes to bite: a revoked grant is only noticed on the next lookup. |
 | `resolver.cache_capacity` | integer | `4096` | Credentials held at once, with the same expiry-ordered eviction as the Vault cache. |

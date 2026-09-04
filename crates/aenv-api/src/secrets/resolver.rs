@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use aenv_core::cfg::SecretsResolverConfig;
-use aenv_core::secrets::{SecretString, SecretsBackend, SecretsError};
+use aenv_core::secrets::{SecretValue, SecretsBackend, SecretsError};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -125,7 +125,7 @@ impl SecretsBackend for ExternalResolverBackend {
     async fn put(
         &self,
         _name: &str,
-        _value: &SecretString,
+        _value: &SecretValue,
         _allowed_hosts: &[String],
     ) -> Result<i64, SecretsError> {
         Err(SecretsError::Unavailable(anyhow::anyhow!(
@@ -342,7 +342,9 @@ mod tests {
             Err(SecretsError::Unavailable(_))
         ));
         assert!(matches!(
-            backend.put("db", &SecretString::new("v".into()), &[]).await,
+            backend
+                .put("db", &SecretValue::Opaque("v".to_string().into()), &[])
+                .await,
             Err(SecretsError::Unavailable(_))
         ));
         assert!(matches!(

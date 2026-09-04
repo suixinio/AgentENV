@@ -49,6 +49,45 @@ impl fmt::Debug for SecretString {
     }
 }
 
+/// The set of named scalars a handler that authenticates to the upstream
+/// itself is given. Keys are field names, not secrets.
+pub type SecretFields = BTreeMap<String, SecretString>;
+
+pub const MAX_SECRET_FIELDS: usize = 32;
+pub const MAX_SECRET_FIELD_KEY_LEN: usize = 64;
+
+/// What a `/secrets` write carries. `Opaque` is one value substituted into a
+/// header; `Fields` is a credential a protocol handler takes apart itself,
+/// which is the only form a `postgres` endpoint can use.
+#[derive(Clone, Debug)]
+pub enum SecretValue {
+    Opaque(SecretString),
+    Fields(SecretFields),
+}
+
+impl SecretValue {
+    /// The `kind` a store records alongside the ciphertext.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Opaque(_) => "opaque",
+            Self::Fields(_) => "fields",
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Opaque(value) => value.is_empty(),
+            Self::Fields(fields) => fields.is_empty(),
+        }
+    }
+}
+
+impl From<SecretString> for SecretValue {
+    fn from(value: SecretString) -> Self {
+        Self::Opaque(value)
+    }
+}
+
 pub type SecretMetadata = BTreeMap<String, String>;
 
 /// What the API returns about a secret. It carries no value.
@@ -119,7 +158,7 @@ pub trait SecretsBackend: Send + Sync {
     async fn put(
         &self,
         name: &str,
-        value: &SecretString,
+        value: &SecretValue,
         allowed_hosts: &[String],
     ) -> Result<i64, SecretsError>;
     async fn delete(&self, name: &str) -> Result<(), SecretsError>;
@@ -154,16 +193,14 @@ impl SecretsService {
     pub async fn create(
         &self,
         name: &str,
-        value: SecretString,
+        value: SecretValue,
         metadata: SecretMetadata,
         allowed_hosts: Vec<String>,
     ) -> Result<SecretRef, SecretsError> {
         validate_name(name)?;
         validate_metadata(&metadata)?;
         let allowed_hosts = validate_allowed_hosts(allowed_hosts)?;
-        if value.is_empty() {
-            return Err(SecretsError::EmptyValue);
-        }
+        validate_value(&value)?;
         let secret_id = new_secret_id();
         self.refs.create(&secret_id, name, &metadata).await?;
         let version = match self.values.put(name, &value, &allowed_hosts).await {
@@ -199,7 +236,7 @@ impl SecretsService {
     pub async fn update(
         &self,
         id_or_name: &str,
-        value: SecretString,
+        value: SecretValue,
         metadata: Option<SecretMetadata>,
         allowed_hosts: Vec<String>,
     ) -> Result<SecretRef, SecretsError> {
@@ -207,9 +244,7 @@ impl SecretsService {
             validate_metadata(metadata)?;
         }
         let allowed_hosts = validate_allowed_hosts(allowed_hosts)?;
-        if value.is_empty() {
-            return Err(SecretsError::EmptyValue);
-        }
+        validate_value(&value)?;
         let existing = self
             .refs
             .get(id_or_name)
@@ -343,6 +378,37 @@ impl GrantIssuer for SecretsService {
     }
 }
 
+/// A `fields` credential is rejected on the shape of its keys, never on
+/// its values: an empty password is a real configuration, an unnamed field
+/// is not.
+pub fn validate_value(value: &SecretValue) -> Result<(), SecretsError> {
+    if value.is_empty() {
+        return Err(SecretsError::EmptyValue);
+    }
+    let SecretValue::Fields(fields) = value else {
+        return Ok(());
+    };
+    if fields.len() > MAX_SECRET_FIELDS {
+        return Err(SecretsError::InvalidMetadata(format!(
+            "the credential has {} fields; at most {MAX_SECRET_FIELDS} are allowed",
+            fields.len()
+        )));
+    }
+    for key in fields.keys() {
+        let shaped = (1..=MAX_SECRET_FIELD_KEY_LEN).contains(&key.len())
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        if !shaped {
+            return Err(SecretsError::InvalidMetadata(format!(
+                "credential field name {key:?} must match \
+                 [a-zA-Z0-9_-]{{1,{MAX_SECRET_FIELD_KEY_LEN}}}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_name(name: &str) -> Result<(), SecretsError> {
     if is_valid_secret_name(name) && !name.starts_with(SECRET_ID_PREFIX) {
         Ok(())
@@ -420,7 +486,7 @@ pub mod memory {
     use async_trait::async_trait;
 
     use super::{
-        SecretMetadata, SecretRef, SecretRefStore, SecretString, SecretsBackend, SecretsError,
+        SecretMetadata, SecretRef, SecretRefStore, SecretValue, SecretsBackend, SecretsError,
     };
 
     #[derive(Default)]
@@ -518,7 +584,7 @@ pub mod memory {
     /// assert on; never used outside tests and embedded smoke runs.
     #[derive(Default)]
     pub struct InMemorySecretsBackend {
-        values: Mutex<HashMap<String, (i64, SecretString)>>,
+        values: Mutex<HashMap<String, (i64, SecretValue)>>,
         pins: Mutex<HashMap<String, Vec<String>>>,
         grants: Mutex<HashMap<(String, String), Vec<String>>>,
         pub fail_puts: std::sync::atomic::AtomicBool,
@@ -541,12 +607,21 @@ pub mod memory {
                 .cloned()
         }
 
-        pub fn value_of(&self, name: &str) -> Option<SecretString> {
+        pub fn value_of(&self, name: &str) -> Option<SecretValue> {
             self.values
                 .lock()
                 .unwrap()
                 .get(name)
                 .map(|(_, value)| value.clone())
+        }
+
+        /// The opaque value under `name`, or `None` when it is absent or
+        /// stored as fields.
+        pub fn opaque_value_of(&self, name: &str) -> Option<String> {
+            match self.value_of(name) {
+                Some(SecretValue::Opaque(value)) => Some(value.expose().to_string()),
+                _ => None,
+            }
         }
     }
 
@@ -555,7 +630,7 @@ pub mod memory {
         async fn put(
             &self,
             name: &str,
-            value: &SecretString,
+            value: &SecretValue,
             allowed_hosts: &[String],
         ) -> Result<i64, SecretsError> {
             if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
@@ -616,8 +691,17 @@ mod tests {
         (service, backend)
     }
 
-    fn value(s: &str) -> SecretString {
-        SecretString::new(s.to_string())
+    fn value(s: &str) -> SecretValue {
+        SecretValue::Opaque(SecretString::new(s.to_string()))
+    }
+
+    fn fields(pairs: &[(&str, &str)]) -> SecretValue {
+        SecretValue::Fields(
+            pairs
+                .iter()
+                .map(|(key, value)| (key.to_string(), SecretString::new(value.to_string())))
+                .collect(),
+        )
     }
 
     // Stands in for a row deleted by a concurrent request between the value
@@ -723,10 +807,14 @@ mod tests {
     }
 
     #[test]
-    fn secret_string_debug_is_redacted() {
-        let secret = value("sk-live-123");
+    fn a_value_is_redacted_in_both_of_its_shapes() {
+        let secret = SecretString::new("sk-live-123".to_string());
         assert_eq!(format!("{secret:?}"), "SecretString([redacted])");
         assert_eq!(secret.expose(), "sk-live-123");
+
+        for shaped in [value("sk-live-123"), fields(&[("password", "sk-live-123")])] {
+            assert!(!format!("{shaped:?}").contains("sk-live-123"), "{shaped:?}");
+        }
     }
 
     #[tokio::test]
@@ -810,7 +898,7 @@ mod tests {
             .unwrap();
         assert_eq!(updated.current_version, 2);
         assert_eq!(updated.metadata, metadata);
-        assert_eq!(backend.value_of("gh").unwrap().expose(), "v2");
+        assert_eq!(backend.opaque_value_of("gh").as_deref(), Some("v2"));
 
         service.delete("gh").await.unwrap();
         assert!(backend.value_of("gh").is_none());
@@ -854,7 +942,7 @@ mod tests {
 
     #[async_trait]
     impl SecretsBackend for NameOwningBackend {
-        async fn put(&self, _: &str, _: &SecretString, _: &[String]) -> Result<i64, SecretsError> {
+        async fn put(&self, _: &str, _: &SecretValue, _: &[String]) -> Result<i64, SecretsError> {
             Err(SecretsError::Unavailable(anyhow::anyhow!(
                 "owned elsewhere"
             )))
@@ -1056,7 +1144,7 @@ mod tests {
 
     #[async_trait]
     impl SecretsBackend for UnavailableBackend {
-        async fn put(&self, _: &str, _: &SecretString, _: &[String]) -> Result<i64, SecretsError> {
+        async fn put(&self, _: &str, _: &SecretValue, _: &[String]) -> Result<i64, SecretsError> {
             Err(SecretsError::Unavailable(anyhow::anyhow!("down")))
         }
         async fn delete(&self, _: &str) -> Result<(), SecretsError> {

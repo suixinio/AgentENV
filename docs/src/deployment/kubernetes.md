@@ -192,6 +192,24 @@ either comes back. What the switch was supposed to buy — a node serving the gR
 surface the API half drives it through — is simply what `aenv-node` does: it
 binds that listener unconditionally.
 
+🔴 **The two halves carry a wire version, and any skew fails every create.**
+`aenv-api` and `aenv-node` exchange payloads stamped with
+`proto::node::SERIALIZED_VALUE_VERSION`, and each half refuses a version that is
+not exactly its own — in both directions. A node built after a bump answers an
+older api with
+`resolved_record was encoded with schema version N, and this build only reads
+version N+1`, and an older node answers a newer api the same way. So there is no
+order that avoids the window: rolling either half first breaks creates until the
+other follows, and what a rollout controls is how long that lasts, not whether it
+happens. Roll them back to back, and read the version in the error rather than
+guessing at the cause. Reads and deletes are unaffected; it is the create path
+that carries these payloads.
+
+Two bumps have shipped so far: brokered egress added the network fields (1 → 2),
+and the explicit endpoints and structured credentials of v1.1 added their own
+(2 → 3). Each is a one-way door for the api half, whose Redis records are refused
+by any earlier build.
+
 🔴 **Rolling back is an image tag, not a flag.** There is no `--role` flag and
 no `AENV_ROLE`; a manifest that still passes one is refused by argument parsing
 before the process starts, which is deliberate — an un-migrated manifest fails

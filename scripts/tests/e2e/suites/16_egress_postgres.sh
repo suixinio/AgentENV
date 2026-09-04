@@ -15,11 +15,17 @@ log "Suite: Brokered Postgres (explicit endpoints + a credential the sandbox nev
 # answered by the resolver), because `/secrets` stores one opaque value.
 PG_SECRET="${E2E_PG_SECRET:-}"
 PG_DATABASE="${E2E_PG_DATABASE:-postgres}"
+# The probe sets application_name to "probe"; a resolver that overrides it is
+# a legitimate deployment and the assertion below says which case it saw.
 ENDPOINT_PORT="${E2E_PG_ENDPOINT_PORT:-5432}"
 # Where a brokered listener binds inside every sandbox: the tap side of the VM
 # link, from network.internal's fixed VM link CIDR.
 LISTENER_IP="169.254.0.22"
 EGRESS_PY="${SUITE_DIR}/../egress_credentials_e2e.py"
+# A stock template has python3 and no psql, so the guest speaks the protocol
+# with this instead of a client it does not have.
+PROBE_PY="${SUITE_DIR}/../postgres_broker_probe.py"
+PROBE_B64="$(base64 -w0 < "${PROBE_PY}")"
 
 run_in_sandbox() {
   local sandbox_id="$1" cmd="$2"
@@ -27,19 +33,15 @@ run_in_sandbox() {
     python3 "${EGRESS_PY}" run "${sandbox_id}" "${cmd}"
 }
 
-# A psql query through the brokered endpoint, with a DSN whose user and
-# password are placeholders. Prints the first line of output, or `ERR:<text>`.
+# One query through the brokered endpoint, with a user and password that are
+# placeholders. Prints the first row, or `ERR:<sqlstate>:<message>`.
 brokered_query() {
-  local sandbox_id="$1" dsn="$2" sql="$3" out
+  local sandbox_id="$1" user="$2" password="$3" database="$4" sql="$5" out
   out=$(run_in_sandbox "$sandbox_id" \
-    "PGCONNECT_TIMEOUT=10 psql '${dsn}' -tAc \"${sql}\" 2>&1" | head -n 1 || true)
+    "printf %s '${PROBE_B64}' | base64 -d > /tmp/pgprobe.py && \
+     python3 /tmp/pgprobe.py '${LISTENER_IP}' '${ENDPOINT_PORT}' \
+       '${user}' '${password}' '${database}' \"${sql}\" 2>&1" | tail -n 1 || true)
   printf '%s' "${out:-ERR:no output}"
-}
-
-dsn_for() {
-  local user="$1" password="$2" database="$3"
-  printf 'postgresql://%s:%s@%s:%s/%s?sslmode=disable' \
-    "$user" "$password" "$LISTENER_IP" "$ENDPOINT_PORT" "$database"
 }
 
 endpoint_json() {
@@ -90,15 +92,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! run_in_sandbox "$sandbox_id" "command -v psql" >/dev/null 2>&1; then
-  warn "the template has no psql; the guest cannot speak the protocol under test"
-  _skip "brokered postgres, no psql in the template"
+if ! run_in_sandbox "$sandbox_id" "command -v python3" >/dev/null 2>&1; then
+  warn "the template has no python3; the guest cannot speak the protocol under test"
+  _skip "brokered postgres, no python3 in the template"
   suite_summary "16_egress_postgres"
   exit 0
 fi
 
 # -- The credential is the broker's, whatever the sandbox writes ---------------
-answer=$(brokered_query "$sandbox_id" "$(dsn_for placeholder placeholder "$PG_DATABASE")" "select 1")
+answer=$(brokered_query "$sandbox_id" placeholder placeholder "$PG_DATABASE" "select 1")
 if [[ "$answer" != "1" ]]; then
   warn "the brokered connection did not answer: ${answer}"
   _skip "brokered postgres, the upstream did not answer through the broker"
@@ -107,25 +109,24 @@ if [[ "$answer" != "1" ]]; then
 fi
 _pass "a placeholder DSN reaches the upstream through the broker"
 
-as_operator=$(brokered_query "$sandbox_id" \
-  "$(dsn_for placeholder placeholder "$PG_DATABASE")" "select current_user")
-assert_not_eq "$as_operator" "placeholder" "the connection is not the DSN's user"
+as_operator=$(brokered_query "$sandbox_id" placeholder placeholder "$PG_DATABASE" \
+  "select current_user")
+assert_not_eq "$as_operator" "placeholder" "the connection is not the user the guest wrote"
 
 # A different placeholder must land on the same account: nothing the sandbox
-# writes in the DSN selects a credential.
-as_other=$(brokered_query "$sandbox_id" \
-  "$(dsn_for someone-else hunter2 "$PG_DATABASE")" "select current_user")
-assert_eq "$as_other" "$as_operator" "any DSN user and password reach the same account"
+# writes selects a credential.
+as_other=$(brokered_query "$sandbox_id" someone-else hunter2 "$PG_DATABASE" \
+  "select current_user")
+assert_eq "$as_other" "$as_operator" "any user and password reach the same account"
 
 # -- The guest's own trust store is untouched ----------------------------------
 trust_env=$(run_in_sandbox "$sandbox_id" "env | grep -c '^SSL_CERT_FILE=' || true" | head -n 1)
 assert_eq "${trust_env:-0}" "0" "an endpoint reached in the clear adds no CA to the guest"
 
 # -- Fields the credential does not name are the guest's -----------------------
-guest_app=$(brokered_query "$sandbox_id" \
-  "$(dsn_for placeholder placeholder "$PG_DATABASE")?application_name=agent-probe" \
+guest_app=$(brokered_query "$sandbox_id" placeholder placeholder "$PG_DATABASE" \
   "select current_setting('application_name')")
-if [[ "$guest_app" == "agent-probe" ]]; then
+if [[ "$guest_app" == "probe" ]]; then
   _pass "a parameter the credential does not name reaches the upstream as the guest wrote it"
 else
   # A resolver that overrides application_name is a legitimate deployment; say

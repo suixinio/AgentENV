@@ -120,6 +120,12 @@ Whatever the handler, an upstream must fall inside the operator's per-handler al
 reaches nothing: the endpoint declaration names the upstream, so the operator names where
 declarations may point.
 
+Two lists have to agree, and they live in different files. `[handlers.<name>].allowed_cidrs`
+is what the broker's own code enforces; `aenv-egress-networkpolicy.yaml` is what the cluster
+enforces, and it ships permitting only public port 443. A handler enabled without a matching
+egress rule there fails every connection with `upstream_unreachable`, and the policy is the one
+that holds when the config is wrong.
+
 That allowlist reaches a private range when it names one, and it has to — the databases this
 exists for sit on private addresses inside a VPC. The upstream is the operator's choice and the
 guest never addressed it, so neither the broker's built-in private ranges nor the sandbox's own

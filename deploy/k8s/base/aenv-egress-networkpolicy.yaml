@@ -1,9 +1,20 @@
 # The broker is the one process that connects to upstreams on a sandbox's
 # behalf from inside the cluster network, so its reach is pinned here: only
 # nodes may talk to it, and it may talk to Vault, DNS and public port 443.
-# The private ranges are excluded from the egress block for the same reason
-# `[upstream].denied_cidrs` in its config refuses them: a rule must not turn
-# the broker into a path to cluster-internal services.
+# The private ranges are excluded from the public egress block for the same
+# reason `[upstream].denied_cidrs` in its config refuses them: a rule must not
+# turn the broker into a path to cluster-internal services.
+#
+# 🔴 That covers `rules`, whose upstream is a public HTTPS host the guest
+# named. A handler whose upstream the *operator* names — `postgres`, `tcp` —
+# reaches neither a non-443 port nor a private address through this policy, so
+# enabling one in `[handlers]` without the matching rule below leaves every
+# connection failing with `upstream_unreachable` and nothing here to say why.
+# Two lists have to agree, and they are in different files: whatever
+# `[handlers.<name>].allowed_cidrs` permits in aenv-egress.toml needs an egress
+# rule here for the same ranges and the port those upstreams listen on. This
+# policy is the narrower of the two and stays that way: it is what holds when
+# the broker's own config is wrong.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -59,3 +70,13 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    # Brokered upstreams an operator named. Uncomment and narrow to the ranges
+    # and ports `[handlers.<name>].allowed_cidrs` permits; a tenant database on
+    # a private address is what this is for. Left out entirely by default,
+    # because a broker that reaches nothing extra is the safe shape.
+    # - to:
+    #     - ipBlock:
+    #         cidr: 10.20.0.0/16
+    #   ports:
+    #     - protocol: TCP
+    #       port: 5432

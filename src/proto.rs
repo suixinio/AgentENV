@@ -18,7 +18,7 @@ pub mod node {
     tonic::include_proto!("agentenv.node.v1");
 
     /// Schema version written and accepted for serialized values.
-    pub const SERIALIZED_VALUE_VERSION: u32 = 2;
+    pub const SERIALIZED_VALUE_VERSION: u32 = 3;
 
     /// Encodes a serde value with this build's schema version.
     pub fn encode_value<T: serde::Serialize>(
@@ -217,13 +217,19 @@ mod serialized_value_golden {
         )]);
         // Derive `brokers` the way the api half does, so the golden pins the
         // shape the node actually receives.
-        let egress = SandboxNetworkEgressPolicy::with_rules(
+        let egress = SandboxNetworkEgressPolicy::with_rules_and_endpoints(
             Some(vec![
                 "10.0.0.0/8".to_string(),
                 "example.invalid".to_string(),
             ]),
             Some(vec!["192.168.0.0/16".to_string()]),
             Some(rules),
+            Some(vec![crate::sandbox::network::policy::EndpointDeclaration {
+                port: 5432,
+                handler: "postgres".to_string(),
+                params: json!({"credential": "tenant_db"}),
+                intercept_port: true,
+            }]),
         )
         .expect("the golden policy is valid");
         let policy = SandboxNetworkPolicy {
@@ -243,12 +249,26 @@ mod serialized_value_golden {
                     "allowed_domains": ["example.invalid"],
                     "denied_cidrs": ["192.168.0.0/16"],
                     "rules": {"api.openai.com": [transform]},
-                    "brokers": [{
-                        "port": 0,
-                        "handler": "http",
-                        "params": {"rules": {"api.openai.com": [transform]}},
-                        "intercept": {"dports": [443]},
+                    "endpoints": [{
+                        "port": 5432,
+                        "handler": "postgres",
+                        "params": {"credential": "tenant_db"},
+                        "intercept_port": true,
                     }],
+                    "brokers": [
+                        {
+                            "port": 0,
+                            "handler": "http",
+                            "params": {"rules": {"api.openai.com": [transform]}},
+                            "intercept": {"dports": [443]},
+                        },
+                        {
+                            "port": 5432,
+                            "handler": "postgres",
+                            "params": {"credential": "tenant_db"},
+                            "intercept": {"dports": [5432]},
+                        },
+                    ],
                 }
             }),
             "{BUMP}"

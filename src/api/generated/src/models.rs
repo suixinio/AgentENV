@@ -5814,6 +5814,180 @@ impl std::ops::DerefMut for SandboxAutoResumeEnabled {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxBrokeredEndpoint {
+    /// The port the listener binds inside the sandbox. 443 is reserved for the rules intercept and no two endpoints may claim the same port.
+    #[serde(rename = "port")]
+    #[validate(range(min = 1u32, max = 65535u32))]
+    pub port: u32,
+
+    /// Which protocol the broker speaks behind the listener. `tcp` relays bytes to the upstream its params name; `postgres` terminates the Postgres startup exchange and authenticates upstream with the brokered credential.
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "handler")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub handler: String,
+
+    /// Handler-specific settings, validated against the handler rather than accepted as free JSON. `tcp` requires `upstream` (\"host:port\"); `postgres` requires `credential` (a secret name) and accepts `upstream_tls` (boolean, default true). An unknown key is rejected.
+    #[serde(rename = "params")]
+    #[validate(custom(function = "check_xss_map"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<std::collections::HashMap<String, crate::types::Object>>,
+
+    /// Redirect every guest connection to this port onto the listener, so any resolvable host name reaches the broker. The sandbox then cannot reach any other service on that port; leave it false to require the sandbox to address the listener directly.
+    #[serde(rename = "interceptPort")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intercept_port: Option<bool>,
+}
+
+impl SandboxBrokeredEndpoint {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(port: u32, handler: String) -> SandboxBrokeredEndpoint {
+        SandboxBrokeredEndpoint {
+            port,
+            handler,
+            params: None,
+            intercept_port: Some(false),
+        }
+    }
+}
+
+/// Converts the SandboxBrokeredEndpoint value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxBrokeredEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("port".to_string()),
+            Some(self.port.to_string()),
+            Some("handler".to_string()),
+            Some(self.handler.to_string()),
+            // Skipping params in query parameter serialization
+            // Skipping params in query parameter serialization
+            self.intercept_port.as_ref().map(|intercept_port| {
+                ["interceptPort".to_string(), intercept_port.to_string()].join(",")
+            }),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxBrokeredEndpoint value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxBrokeredEndpoint {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub port: Vec<u32>,
+            pub handler: Vec<String>,
+            pub params: Vec<std::collections::HashMap<String, crate::types::Object>>,
+            pub intercept_port: Vec<bool>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxBrokeredEndpoint".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "port" => intermediate_rep.port.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "handler" => intermediate_rep.handler.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "params" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxBrokeredEndpoint".to_string()),
+                    #[allow(clippy::redundant_clone)]
+                    "interceptPort" => intermediate_rep.intercept_port.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    _ => return std::result::Result::Err("Unexpected key while parsing SandboxBrokeredEndpoint".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxBrokeredEndpoint {
+            port: intermediate_rep
+                .port
+                .into_iter()
+                .next()
+                .ok_or_else(|| "port missing in SandboxBrokeredEndpoint".to_string())?,
+            handler: intermediate_rep
+                .handler
+                .into_iter()
+                .next()
+                .ok_or_else(|| "handler missing in SandboxBrokeredEndpoint".to_string())?,
+            params: intermediate_rep.params.into_iter().next(),
+            intercept_port: intermediate_rep.intercept_port.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxBrokeredEndpoint> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxBrokeredEndpoint>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxBrokeredEndpoint>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxBrokeredEndpoint - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxBrokeredEndpoint> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxBrokeredEndpoint as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxBrokeredEndpoint - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxDetail {
     /// Identifier of the template from which is the sandbox created
     #[serde(rename = "templateID")]
@@ -6771,6 +6945,12 @@ pub struct SandboxNetworkConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<std::collections::HashMap<String, Vec<models::SandboxNetworkRule>>>,
 
+    /// Explicit local endpoints, an AgentENV extension with no E2B equivalent. Each entry opens a listener inside the sandbox on the port it names, backed by the broker handler it names; the sandbox reaches it by connecting to that port on 169.254.0.22, or under any resolvable host name when interceptPort is set. Credentials named here never enter the sandbox.
+    #[serde(rename = "x-aenv-endpoints")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_aenv_endpoints: Option<Vec<models::SandboxBrokeredEndpoint>>,
+
     /// Specify host mask which will be used for all sandbox requests
     #[serde(rename = "maskRequestHost")]
     #[validate(custom(function = "check_xss_string"))]
@@ -6786,6 +6966,7 @@ impl SandboxNetworkConfig {
             allow_out: None,
             deny_out: None,
             rules: None,
+            x_aenv_endpoints: None,
             mask_request_host: None,
         }
     }
@@ -6830,6 +7011,8 @@ impl std::fmt::Display for SandboxNetworkConfig {
             }),
             // Skipping rules in query parameter serialization
             // Skipping rules in query parameter serialization
+
+            // Skipping x-aenv-endpoints in query parameter serialization
             self.mask_request_host.as_ref().map(|mask_request_host| {
                 ["maskRequestHost".to_string(), mask_request_host.to_string()].join(",")
             }),
@@ -6858,6 +7041,7 @@ impl std::str::FromStr for SandboxNetworkConfig {
             pub allow_out: Vec<Vec<String>>,
             pub deny_out: Vec<Vec<String>>,
             pub rules: Vec<std::collections::HashMap<String, Vec<models::SandboxNetworkRule>>>,
+            pub x_aenv_endpoints: Vec<Vec<models::SandboxBrokeredEndpoint>>,
             pub mask_request_host: Vec<String>,
         }
 
@@ -6885,6 +7069,7 @@ impl std::str::FromStr for SandboxNetworkConfig {
                     "allowOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkConfig".to_string()),
                     "denyOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkConfig".to_string()),
                     "rules" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkConfig".to_string()),
+                    "x-aenv-endpoints" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkConfig".to_string()),
                     #[allow(clippy::redundant_clone)]
                     "maskRequestHost" => intermediate_rep.mask_request_host.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     _ => return std::result::Result::Err("Unexpected key while parsing SandboxNetworkConfig".to_string())
@@ -6901,6 +7086,7 @@ impl std::str::FromStr for SandboxNetworkConfig {
             allow_out: intermediate_rep.allow_out.into_iter().next(),
             deny_out: intermediate_rep.deny_out.into_iter().next(),
             rules: intermediate_rep.rules.into_iter().next(),
+            x_aenv_endpoints: intermediate_rep.x_aenv_endpoints.into_iter().next(),
             mask_request_host: intermediate_rep.mask_request_host.into_iter().next(),
         })
     }
@@ -7231,6 +7417,12 @@ pub struct SandboxNetworkUpdateConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules: Option<std::collections::HashMap<String, Vec<models::SandboxNetworkRule>>>,
 
+    /// Explicit local endpoints, an AgentENV extension with no E2B equivalent. Each entry opens a listener inside the sandbox on the port it names, backed by the broker handler it names; the sandbox reaches it by connecting to that port on 169.254.0.22, or under any resolvable host name when interceptPort is set. Credentials named here never enter the sandbox.
+    #[serde(rename = "x-aenv-endpoints")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_aenv_endpoints: Option<Vec<models::SandboxBrokeredEndpoint>>,
+
     /// Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut to 0.0.0.0/0 in the network config.
     #[serde(rename = "allow_internet_access")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7244,6 +7436,7 @@ impl SandboxNetworkUpdateConfig {
             allow_out: None,
             deny_out: None,
             rules: None,
+            x_aenv_endpoints: None,
             allow_internet_access: None,
         }
     }
@@ -7279,6 +7472,8 @@ impl std::fmt::Display for SandboxNetworkUpdateConfig {
             }),
             // Skipping rules in query parameter serialization
             // Skipping rules in query parameter serialization
+
+            // Skipping x-aenv-endpoints in query parameter serialization
             self.allow_internet_access
                 .as_ref()
                 .map(|allow_internet_access| {
@@ -7312,6 +7507,7 @@ impl std::str::FromStr for SandboxNetworkUpdateConfig {
             pub allow_out: Vec<Vec<String>>,
             pub deny_out: Vec<Vec<String>>,
             pub rules: Vec<std::collections::HashMap<String, Vec<models::SandboxNetworkRule>>>,
+            pub x_aenv_endpoints: Vec<Vec<models::SandboxBrokeredEndpoint>>,
             pub allow_internet_access: Vec<bool>,
         }
 
@@ -7337,6 +7533,7 @@ impl std::str::FromStr for SandboxNetworkUpdateConfig {
                     "allowOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
                     "denyOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
                     "rules" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
+                    "x-aenv-endpoints" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
                     #[allow(clippy::redundant_clone)]
                     "allow_internet_access" => intermediate_rep.allow_internet_access.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     _ => return std::result::Result::Err("Unexpected key while parsing SandboxNetworkUpdateConfig".to_string())
@@ -7352,6 +7549,7 @@ impl std::str::FromStr for SandboxNetworkUpdateConfig {
             allow_out: intermediate_rep.allow_out.into_iter().next(),
             deny_out: intermediate_rep.deny_out.into_iter().next(),
             rules: intermediate_rep.rules.into_iter().next(),
+            x_aenv_endpoints: intermediate_rep.x_aenv_endpoints.into_iter().next(),
             allow_internet_access: intermediate_rep.allow_internet_access.into_iter().next(),
         })
     }

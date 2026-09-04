@@ -448,7 +448,7 @@ Custom extension service configuration. When `url` is unset, the integration is 
 
 ## `[egress_broker]`
 
-How a node reaches the egress broker that serves sandboxes declaring `network.rules`. A sandbox with rules is placed only on nodes whose heartbeat reports a usable broker; with `mode = "disabled"` this node reports none. See the proposal in `docs/proposals/2026-09-03-sandbox-egress-credential-brokering.md`.
+How a node reaches the egress broker that serves sandboxes declaring `network.rules` or `network["x-aenv-endpoints"]`. A sandbox with rules is placed only on nodes whose heartbeat reports a usable broker; with `mode = "disabled"` this node reports none. See the proposal in `docs/proposals/2026-09-03-sandbox-egress-credential-brokering.md`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -460,6 +460,7 @@ How a node reaches the egress broker that serves sandboxes declaring `network.ru
 | `per_sandbox_conns` | integer | `256` | Concurrent brokered connections one sandbox may hold; excess connections are closed. |
 | `node_conns` | integer | `20000` | Concurrent brokered connections across the node. |
 | `open_timeout_ms` | integer | `3000` | How long the runtime waits for the broker to accept one connection. |
+| `embedded_tcp_allowed_cidrs` | array of CIDR strings | `[]` | Where the embedded broker's `tcp` handler may connect. Empty leaves that handler reaching nothing. `remote` mode reads the broker's own `[handlers.tcp].allowed_cidrs` instead. **TOML-file-only — no `env =` binding.** |
 
 ## `[secrets]`
 
@@ -514,7 +515,10 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 | `vault.timeout_ms` | integer | `5000` | Timeout for each Vault call. |
 | `vault.cache_ttl_secs` | integer | `30` | How long a resolved value is reused before Vault is asked again. |
 | `vault.cache_capacity` | integer | `4096` | Values held at once. Expired entries leave on every insert and the soonest to expire is dropped at capacity, so secret bytes are not retained past the TTL. |
-| `handlers.tcp` | boolean | `false` | The `tcp` identity-echo handler, for smoke tests. Off in production. |
+| `handlers.echo` | boolean | `false` | The `echo` identity handler, for smoke tests. Off in production. |
+| `handlers.tcp.enabled` | boolean | `false` | The `tcp` byte relay, which endpoint declarations name. |
+| `handlers.tcp.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations `tcp` reaches. An enabled handler with an empty list reaches nothing: a declaration names the upstream, so the operator names where declarations may point. Checked after the broker deny list and before the sandbox's own policy, so no sandbox input widens it. **TOML-file-only — no `env =` binding.** |
+| `handlers.http.allowed_cidrs` | array of CIDR strings | `[]` | Pins the `rules` handler further. Empty leaves it bounded by each sandbox's own egress policy, which is what already bounds an intercepted connection. **TOML-file-only — no `env =` binding.** |
 
 Environment variable overrides for this file are listed under
 [Egress Broker](env-vars.md#egress-broker-aenv-egress).

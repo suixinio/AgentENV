@@ -366,6 +366,10 @@ impl BrokeredEndpoints {
             sandbox_permits,
             relays_handed_over: false,
         };
+        // Every listener opens before any intercept is installed: the
+        // namespace holds one intercept, so the DNATs go in as one set.
+        let mut listeners = Vec::with_capacity(policy.egress.brokers.len());
+        let mut intercepts = Vec::new();
         for broker in &policy.egress.brokers {
             let listener = slot.listen_in_namespace(broker.port).with_context(|| {
                 format!("open brokered listener for handler {}", broker.handler)
@@ -375,11 +379,15 @@ impl BrokeredEndpoints {
                 .context("read brokered listener address")?
                 .port();
             if let Some(intercept) = &broker.intercept {
-                slot.install_intercept(port, &intercept.dports)
-                    .with_context(|| {
-                        format!("install intercept for ports {:?}", intercept.dports)
-                    })?;
+                intercepts.push((port, intercept.dports.clone()));
             }
+            listeners.push((broker, port, listener));
+        }
+        if !intercepts.is_empty() {
+            slot.install_intercepts(&intercepts)
+                .with_context(|| format!("install intercepts {intercepts:?}"))?;
+        }
+        for (broker, port, listener) in listeners {
             let listener = TcpListener::from_std(listener)
                 .context("register brokered listener with the runtime")?;
             let ctx = Arc::new(AcceptContext {

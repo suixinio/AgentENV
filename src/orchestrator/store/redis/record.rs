@@ -8,7 +8,7 @@ use super::super::{Result, SandboxMetadata, StoreError};
 use crate::types::{ExecutionId, SandboxId};
 
 /// Current stored-record schema version.
-pub const RECORD_VERSION: u32 = 2;
+pub const RECORD_VERSION: u32 = 3;
 
 /// Versioned JSON stored under a sandbox record key.
 #[derive(Clone, Debug, Serialize, Deserialize)]

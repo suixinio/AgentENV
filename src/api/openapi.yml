@@ -334,6 +334,17 @@ components:
             type: array
             items:
               $ref: "#/components/schemas/SandboxNetworkRule"
+        x-aenv-endpoints:
+          type: array
+          description: >
+            Explicit local endpoints, an AgentENV extension with no E2B equivalent.
+            Each entry opens a listener inside the sandbox on the port it names,
+            backed by the broker handler it names; the sandbox reaches it by
+            connecting to that port on 169.254.0.22, or under any resolvable host
+            name when interceptPort is set. Credentials named here never enter the
+            sandbox.
+          items:
+            $ref: "#/components/schemas/SandboxBrokeredEndpoint"
         maskRequestHost:
           type: string
           description: Specify host mask which will be used for all sandbox requests
@@ -366,11 +377,60 @@ components:
             type: array
             items:
               $ref: "#/components/schemas/SandboxNetworkRule"
+        x-aenv-endpoints:
+          type: array
+          description: >
+            Explicit local endpoints, an AgentENV extension with no E2B equivalent.
+            Each entry opens a listener inside the sandbox on the port it names,
+            backed by the broker handler it names; the sandbox reaches it by
+            connecting to that port on 169.254.0.22, or under any resolvable host
+            name when interceptPort is set. Credentials named here never enter the
+            sandbox.
+          items:
+            $ref: "#/components/schemas/SandboxBrokeredEndpoint"
         allow_internet_access:
           type: boolean
           description:
             Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
             to 0.0.0.0/0 in the network config.
+
+    SandboxBrokeredEndpoint:
+      type: object
+      required:
+        - port
+        - handler
+      properties:
+        port:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 65535
+          description: >
+            The port the listener binds inside the sandbox. 443 is reserved for the
+            rules intercept and no two endpoints may claim the same port.
+        handler:
+          type: string
+          enum: [tcp, postgres]
+          description: >
+            Which protocol the broker speaks behind the listener. `tcp` relays bytes
+            to the upstream its params name; `postgres` terminates the Postgres
+            startup exchange and authenticates upstream with the brokered credential.
+        params:
+          type: object
+          additionalProperties: true
+          description: >
+            Handler-specific settings, validated against the handler rather than
+            accepted as free JSON. `tcp` requires `upstream` ("host:port"); `postgres`
+            requires `credential` (a secret name) and accepts `upstream_tls`
+            (boolean, default true). An unknown key is rejected.
+        interceptPort:
+          type: boolean
+          default: false
+          description: >
+            Redirect every guest connection to this port onto the listener, so any
+            resolvable host name reaches the broker. The sandbox then cannot reach
+            any other service on that port; leave it false to require the sandbox to
+            address the listener directly.
 
     SandboxNetworkRule:
       type: object

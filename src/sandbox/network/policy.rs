@@ -22,6 +22,21 @@ pub const HTTP_BROKER_HANDLER: &str = "http";
 /// The destination port the `rules` intercept captures.
 pub const HTTPS_PORT: u16 = 443;
 
+/// A byte relay to the upstream its params name.
+pub const TCP_BROKER_HANDLER: &str = "tcp";
+/// A Postgres front end that authenticates upstream with brokered credentials.
+pub const POSTGRES_BROKER_HANDLER: &str = "postgres";
+
+/// Handlers an endpoint declaration may name. `http` is derived from `rules`
+/// and carries their shape in its params, so it is never declared directly.
+pub const DECLARABLE_BROKER_HANDLERS: [&str; 2] = [TCP_BROKER_HANDLER, POSTGRES_BROKER_HANDLER];
+
+/// Ports no endpoint may claim: 443 is the port the `rules` intercept
+/// captures, and one listener per port is the whole addressing scheme.
+pub const RESERVED_ENDPOINT_PORTS: [u16; 1] = [HTTPS_PORT];
+
+pub const MAX_ENDPOINTS_PER_SANDBOX: usize = 16;
+
 /// Marker prefixes accepted inside a transform header value.
 pub const SECRET_MARKER_PREFIXES: [&str; 2] = ["${aenv.secrets.", "${e2b.secrets."];
 pub const MAX_SECRET_NAMES_PER_DOMAIN: usize = 32;
@@ -32,6 +47,10 @@ pub const MAX_SECRET_NAME_LEN: usize = 128;
 /// `aenv-core` must not link); the rest carries the sandbox identity and its
 /// egress summary.
 pub const MAX_RULES_SERIALIZED_BYTES: usize = 32 * 1024;
+/// Cap on the serialized `brokers`, which is what actually travels in the
+/// identity frame: `rules` reach the broker inside an endpoint's params, and
+/// endpoint declarations share the frame with them.
+pub const MAX_BROKERS_SERIALIZED_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BaseSandboxNetworkPolicy {
@@ -75,6 +94,20 @@ pub struct BrokeredEndpoint {
     pub intercept: Option<Intercept>,
 }
 
+/// The public shape of an explicit endpoint: a port the runtime listens on
+/// inside the sandbox namespace and the handler the broker runs behind it.
+/// Nothing is redirected unless `intercept_port` asks for it; a guest reaches
+/// the listener by connecting to its address.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EndpointDeclaration {
+    pub port: u16,
+    pub handler: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+    #[serde(default)]
+    pub intercept_port: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxNetworkEgressPolicy {
     pub allowed_cidrs: Vec<String>,
@@ -83,7 +116,12 @@ pub struct SandboxNetworkEgressPolicy {
     /// The public shape: per-domain transform rules as the API received them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rules: BTreeMap<String, Vec<DomainRule>>,
-    /// The internal shape derived from `rules`; never accepted from the API.
+    /// The public shape: explicit endpoint declarations as the API received
+    /// them, normalized.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoints: Vec<EndpointDeclaration>,
+    /// The internal shape derived from `rules` and `endpoints`; never accepted
+    /// from the API.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub brokers: Vec<BrokeredEndpoint>,
 }
@@ -93,13 +131,24 @@ impl SandboxNetworkEgressPolicy {
         Self::with_rules(allow_out, deny_out, None)
     }
 
-    /// Validates every domain key, header name and marker, canonicalizes
-    /// header names to lowercase, then derives `brokers` from the rules. Any
-    /// non-empty `rules` becomes one `http` endpoint intercepting port 443.
     pub fn with_rules(
         allow_out: Option<Vec<String>>,
         deny_out: Option<Vec<String>>,
         rules: Option<BTreeMap<String, Vec<DomainRule>>>,
+    ) -> Result<Self> {
+        Self::with_rules_and_endpoints(allow_out, deny_out, rules, None)
+    }
+
+    /// Validates every domain key, header name and marker, canonicalizes
+    /// header names to lowercase, validates each endpoint declaration against
+    /// its handler, then derives `brokers` from both. Any non-empty `rules`
+    /// becomes one `http` endpoint intercepting port 443; each declaration
+    /// becomes one endpoint on the port it names.
+    pub fn with_rules_and_endpoints(
+        allow_out: Option<Vec<String>>,
+        deny_out: Option<Vec<String>>,
+        rules: Option<BTreeMap<String, Vec<DomainRule>>>,
+        endpoints: Option<Vec<EndpointDeclaration>>,
     ) -> Result<Self> {
         let mut policy = Self::base(allow_out, deny_out)?;
         let mut normalized_rules = BTreeMap::new();
@@ -130,18 +179,47 @@ impl SandboxNetworkEgressPolicy {
             }];
             policy.rules = normalized_rules;
         }
+        for declaration in normalize_endpoints(endpoints.unwrap_or_default())? {
+            policy.brokers.push(BrokeredEndpoint {
+                port: declaration.port,
+                handler: declaration.handler.clone(),
+                params: declaration.params.clone(),
+                intercept: declaration.intercept_port.then(|| Intercept {
+                    dports: vec![declaration.port],
+                }),
+            });
+            policy.endpoints.push(declaration);
+        }
+        if !policy.brokers.is_empty() {
+            let serialized = serde_json::to_vec(&policy.brokers)
+                .context("serialize the brokers to size them")?
+                .len();
+            if serialized > MAX_BROKERS_SERIALIZED_BYTES {
+                bail!(
+                    "rules and endpoints serialize to {serialized} bytes; at most {MAX_BROKERS_SERIALIZED_BYTES} are allowed, so declare fewer domains, rules, headers or endpoints"
+                );
+            }
+        }
         Ok(policy)
     }
 
-    /// Every secret name any rule refers to, for grant issuance.
+    /// Every secret name the rules and the endpoints refer to, for grant
+    /// issuance.
     pub fn referenced_secret_names(&self) -> BTreeSet<String> {
-        self.rules
+        let from_rules = self
+            .rules
             .values()
             .flatten()
             .flat_map(|rule| rule.transform.headers.values())
             .flat_map(|value| secret_markers(value))
-            .map(|marker| marker.name.to_string())
-            .collect()
+            .map(|marker| marker.name.to_string());
+        let from_endpoints = self
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.params.get("credential"))
+            .filter_map(|credential| credential.as_str())
+            .map(str::to_string);
+        from_rules.chain(from_endpoints).collect()
     }
 
     fn base(allow_out: Option<Vec<String>>, deny_out: Option<Vec<String>>) -> Result<Self> {
@@ -181,10 +259,20 @@ impl SandboxNetworkEgressPolicy {
             || !self.allowed_domains.is_empty()
             || !self.denied_cidrs.is_empty()
             || !self.rules.is_empty()
+            || !self.endpoints.is_empty()
     }
 
     pub fn has_brokers(&self) -> bool {
         !self.brokers.is_empty()
+    }
+
+    /// Whether any broker terminates TLS the guest opened, so the guest has
+    /// to trust the broker's CA. Only `http` does; an explicit endpoint is
+    /// reached in the clear inside the namespace.
+    pub fn needs_guest_ca(&self) -> bool {
+        self.brokers
+            .iter()
+            .any(|broker| broker.handler == HTTP_BROKER_HANDLER)
     }
 
     pub fn has_domain_allow_rules(&self) -> bool {
@@ -222,6 +310,10 @@ impl SandboxNetworkPolicy {
 
     pub fn has_brokers(&self) -> bool {
         self.egress.has_brokers()
+    }
+
+    pub fn needs_guest_ca(&self) -> bool {
+        self.egress.needs_guest_ca()
     }
 
     pub fn has_domain_allow_rules(&self) -> bool {
@@ -338,8 +430,18 @@ fn build_namespace_egress_chain_commands(
 /// Routes the guest's traffic to `dports` onto the brokered listener at
 /// `listener` and rejects UDP to the same ports so HTTP/3 falls back to TCP.
 /// Replaces whatever intercept was installed before.
-pub fn install_namespace_intercept(listener: std::net::SocketAddrV4, dports: &[u16]) -> Result<()> {
-    let commands = build_intercept_commands(listener, dports);
+/// One brokered listener and the guest destination ports DNATed onto it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InterceptTarget {
+    pub listener: std::net::SocketAddrV4,
+    pub dports: Vec<u16>,
+}
+
+/// Replaces the namespace's intercept with exactly `targets`. Every target
+/// is installed in one pass because the chains are flushed first: installing
+/// them one at a time would leave only the last one in place.
+pub fn install_namespace_intercept(targets: &[InterceptTarget]) -> Result<()> {
+    let commands = build_intercept_commands(targets);
     apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
         .context("install AgentENV namespace intercept")
 }
@@ -354,36 +456,37 @@ pub fn remove_namespace_intercept() -> Result<()> {
     .context("remove AgentENV namespace intercept")
 }
 
-fn build_intercept_commands(
-    listener: std::net::SocketAddrV4,
-    dports: &[u16],
-) -> Vec<IptablesRestoreCommand> {
+fn build_intercept_commands(targets: &[InterceptTarget]) -> Vec<IptablesRestoreCommand> {
     let mut commands = build_remove_intercept_commands();
-    for dport in dports {
-        commands.push(IptablesRestoreCommand::Append {
-            table: "filter",
-            chain: INTERCEPT_CHAIN,
-            rule: format!("-i tap0 -o vpeer -p udp --dport {dport} -j REJECT"),
-        });
-        // A DNATed packet is delivered locally and never forwarded, so TCP
-        // reaching this chain is TCP the DNAT below did not catch: the guest
-        // must not get to the destination unbrokered.
-        commands.push(IptablesRestoreCommand::Append {
-            table: "filter",
-            chain: INTERCEPT_CHAIN,
-            rule: format!("-i tap0 -o vpeer -p tcp --dport {dport} -j REJECT"),
-        });
+    for target in targets {
+        for dport in &target.dports {
+            commands.push(IptablesRestoreCommand::Append {
+                table: "filter",
+                chain: INTERCEPT_CHAIN,
+                rule: format!("-i tap0 -o vpeer -p udp --dport {dport} -j REJECT"),
+            });
+            // A DNATed packet is delivered locally and never forwarded, so TCP
+            // reaching this chain is TCP the DNAT below did not catch: the guest
+            // must not get to the destination unbrokered.
+            commands.push(IptablesRestoreCommand::Append {
+                table: "filter",
+                chain: INTERCEPT_CHAIN,
+                rule: format!("-i tap0 -o vpeer -p tcp --dport {dport} -j REJECT"),
+            });
+        }
     }
-    for dport in dports {
-        commands.push(IptablesRestoreCommand::Append {
-            table: "nat",
-            chain: INTERCEPT_CHAIN,
-            rule: format!(
-                "-i tap0 -p tcp --dport {dport} -j DNAT --to-destination {}:{}",
-                listener.ip(),
-                listener.port()
-            ),
-        });
+    for target in targets {
+        for dport in &target.dports {
+            commands.push(IptablesRestoreCommand::Append {
+                table: "nat",
+                chain: INTERCEPT_CHAIN,
+                rule: format!(
+                    "-i tap0 -p tcp --dport {dport} -j DNAT --to-destination {}:{}",
+                    target.listener.ip(),
+                    target.listener.port()
+                ),
+            });
+        }
     }
     commands.sort_by_key(|command| command.table());
     commands
@@ -650,6 +753,134 @@ fn malformed_marker_name(value: &str) -> Option<&str> {
         cursor = name_start + close + 1;
     }
     None
+}
+
+/// Refuses a declaration whose handler is unknown, whose port collides with
+/// the `rules` intercept or with another declaration, or whose params do not
+/// fit the handler. Returned params carry only keys the handler knows.
+fn normalize_endpoints(declared: Vec<EndpointDeclaration>) -> Result<Vec<EndpointDeclaration>> {
+    if declared.len() > MAX_ENDPOINTS_PER_SANDBOX {
+        bail!(
+            "{} endpoints are declared; at most {MAX_ENDPOINTS_PER_SANDBOX} are allowed",
+            declared.len()
+        );
+    }
+    let mut claimed = BTreeSet::new();
+    let mut normalized = Vec::with_capacity(declared.len());
+    for endpoint in declared {
+        if !DECLARABLE_BROKER_HANDLERS.contains(&endpoint.handler.as_str()) {
+            bail!(
+                "endpoint handler {:?} is not one of {DECLARABLE_BROKER_HANDLERS:?}",
+                endpoint.handler
+            );
+        }
+        if endpoint.port == 0 {
+            bail!("an endpoint must name a port between 1 and 65535");
+        }
+        if RESERVED_ENDPOINT_PORTS.contains(&endpoint.port) {
+            bail!(
+                "endpoint port {} is reserved for the rules intercept",
+                endpoint.port
+            );
+        }
+        if !claimed.insert(endpoint.port) {
+            bail!("endpoint port {} is declared more than once", endpoint.port);
+        }
+        let params = normalize_endpoint_params(&endpoint.handler, &endpoint.params)
+            .with_context(|| format!("endpoint on port {}", endpoint.port))?;
+        normalized.push(EndpointDeclaration { params, ..endpoint });
+    }
+    Ok(normalized)
+}
+
+/// Which params each handler requires and which it merely accepts. A key
+/// outside both lists is refused rather than dropped: a misspelled
+/// `credential` would otherwise read as an endpoint that needs none.
+fn endpoint_param_keys(
+    handler: &str,
+) -> Result<(&'static [&'static str], &'static [&'static str])> {
+    match handler {
+        TCP_BROKER_HANDLER => Ok((&["upstream"], &[])),
+        POSTGRES_BROKER_HANDLER => Ok((&["credential"], &["upstream_tls"])),
+        other => bail!("no endpoint params are defined for handler {other:?}"),
+    }
+}
+
+fn normalize_endpoint_params(
+    handler: &str,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let mut object = match params {
+        serde_json::Value::Null => serde_json::Map::new(),
+        serde_json::Value::Object(object) => object.clone(),
+        _ => bail!("params must be a JSON object"),
+    };
+    let (required, optional) = endpoint_param_keys(handler)?;
+    for key in object.keys() {
+        if !required.contains(&key.as_str()) && !optional.contains(&key.as_str()) {
+            bail!(
+                "params carry unknown key {key:?}; handler {handler:?} takes {required:?} and optionally {optional:?}"
+            );
+        }
+    }
+    for key in required {
+        if !object.contains_key(*key) {
+            bail!("params must carry {key:?} for handler {handler:?}");
+        }
+    }
+    if let Some(upstream) = object.get("upstream") {
+        let upstream = upstream
+            .as_str()
+            .context("params upstream must be a \"host:port\" string")?;
+        let canonical = normalize_upstream_authority(upstream)?;
+        object.insert("upstream".into(), serde_json::Value::String(canonical));
+    }
+    if let Some(credential) = object.get("credential") {
+        let name = credential
+            .as_str()
+            .context("params credential must be a secret name")?;
+        if !is_valid_secret_name(name) {
+            bail!("params credential {name:?} is not a valid secret name");
+        }
+    }
+    if let Some(upstream_tls) = object.get("upstream_tls") {
+        if !upstream_tls.is_boolean() {
+            bail!("params upstream_tls must be a boolean");
+        }
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+/// `host:port`, where the host is a DNS name or an IP literal and an IPv6
+/// literal is bracketed. The canonical form is what the broker dials.
+fn normalize_upstream_authority(authority: &str) -> Result<String> {
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        bail!("upstream {authority:?} must be host:port");
+    };
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("upstream {authority:?} carries an invalid port"))?;
+    if port == 0 {
+        bail!("upstream {authority:?} must name a port between 1 and 65535");
+    }
+    let bracketed = host.starts_with('[') && host.ends_with(']');
+    let host = if bracketed {
+        &host[1..host.len() - 1]
+    } else {
+        host
+    };
+    if host.is_empty() {
+        bail!("upstream {authority:?} names no host");
+    }
+    let canonical = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) if !bracketed => v4.to_string(),
+        Ok(IpAddr::V6(v6)) => format!("[{v6}]"),
+        Ok(IpAddr::V4(_)) => bail!("upstream {authority:?} brackets an IPv4 address"),
+        Err(_) if bracketed => bail!("upstream {authority:?} brackets a host that is not IPv6"),
+        Err(_) => normalize_dns_name(host)
+            .with_context(|| format!("upstream {authority:?} names an invalid host"))?,
+    };
+    Ok(format!("{canonical}:{port}"))
 }
 
 fn normalize_domain_pattern(pattern: &str) -> Result<String> {
@@ -1161,6 +1392,323 @@ mod tests {
             .expect("three domains stay under the cap");
     }
 
+    fn endpoint(port: u16, handler: &str, params: serde_json::Value) -> EndpointDeclaration {
+        EndpointDeclaration {
+            port,
+            handler: handler.to_string(),
+            params,
+            intercept_port: false,
+        }
+    }
+
+    fn with_endpoints(endpoints: Vec<EndpointDeclaration>) -> Result<SandboxNetworkEgressPolicy> {
+        SandboxNetworkEgressPolicy::with_rules_and_endpoints(None, None, None, Some(endpoints))
+    }
+
+    #[test]
+    fn a_declared_endpoint_becomes_one_broker_on_the_port_it_names() {
+        let policy = with_endpoints(vec![endpoint(
+            5432,
+            "postgres",
+            serde_json::json!({"credential": "db"}),
+        )])
+        .unwrap();
+
+        assert_eq!(
+            policy.brokers,
+            vec![BrokeredEndpoint {
+                port: 5432,
+                handler: "postgres".into(),
+                params: serde_json::json!({"credential": "db"}),
+                intercept: None,
+            }]
+        );
+        assert_eq!(policy.endpoints.len(), 1);
+        assert!(policy.has_brokers());
+        assert!(!policy.needs_guest_ca());
+    }
+
+    #[test]
+    fn intercept_port_is_the_only_thing_that_redirects_a_declared_endpoint() {
+        let mut declared = endpoint(5432, "postgres", serde_json::json!({"credential": "db"}));
+        assert_eq!(
+            with_endpoints(vec![declared.clone()]).unwrap().brokers[0].intercept,
+            None
+        );
+
+        declared.intercept_port = true;
+        assert_eq!(
+            with_endpoints(vec![declared]).unwrap().brokers[0].intercept,
+            Some(Intercept { dports: vec![5432] })
+        );
+    }
+
+    #[test]
+    fn rules_and_endpoints_coexist_and_only_the_rules_endpoint_needs_the_guest_ca() {
+        let policy = SandboxNetworkEgressPolicy::with_rules_and_endpoints(
+            None,
+            None,
+            Some(rules("api.example.com", &[("authorization", "Bearer x")])),
+            Some(vec![endpoint(
+                5432,
+                "postgres",
+                serde_json::json!({"credential": "db"}),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(policy.brokers.len(), 2);
+        assert_eq!(policy.brokers[0].handler, HTTP_BROKER_HANDLER);
+        assert_eq!(policy.brokers[1].handler, "postgres");
+        assert!(policy.needs_guest_ca());
+    }
+
+    #[test]
+    fn an_endpoint_credential_joins_the_names_a_grant_must_cover() {
+        let policy = SandboxNetworkEgressPolicy::with_rules_and_endpoints(
+            None,
+            None,
+            Some(rules(
+                "api.example.com",
+                &[("authorization", "Bearer ${aenv.secrets.openai}")],
+            )),
+            Some(vec![endpoint(
+                5432,
+                "postgres",
+                serde_json::json!({"credential": "tenant_db"}),
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.referenced_secret_names(),
+            BTreeSet::from(["openai".to_string(), "tenant_db".to_string()])
+        );
+    }
+
+    #[test]
+    fn invalid_endpoints_are_refused() {
+        for (endpoints, expected) in [
+            (
+                vec![endpoint(5432, "http", serde_json::json!({}))],
+                "is not one of",
+            ),
+            (
+                vec![endpoint(5432, "psql", serde_json::json!({}))],
+                "is not one of",
+            ),
+            (
+                vec![endpoint(
+                    443,
+                    "tcp",
+                    serde_json::json!({"upstream": "a.test:5432"}),
+                )],
+                "reserved for the rules intercept",
+            ),
+            (
+                vec![endpoint(
+                    0,
+                    "tcp",
+                    serde_json::json!({"upstream": "a.test:5432"}),
+                )],
+                "between 1 and 65535",
+            ),
+            (
+                vec![
+                    endpoint(5432, "tcp", serde_json::json!({"upstream": "a.test:5432"})),
+                    endpoint(5432, "postgres", serde_json::json!({"credential": "db"})),
+                ],
+                "declared more than once",
+            ),
+            (
+                vec![endpoint(5432, "postgres", serde_json::json!({}))],
+                "must carry \"credential\"",
+            ),
+            (
+                vec![endpoint(5432, "tcp", serde_json::json!({}))],
+                "must carry \"upstream\"",
+            ),
+            (
+                vec![endpoint(
+                    5432,
+                    "postgres",
+                    serde_json::json!({"credentials": "db"}),
+                )],
+                "unknown key",
+            ),
+            (
+                vec![endpoint(
+                    5432,
+                    "postgres",
+                    serde_json::json!({"credential": "db", "upstream": "elsewhere:5432"}),
+                )],
+                "unknown key",
+            ),
+            (
+                vec![endpoint(
+                    5432,
+                    "postgres",
+                    serde_json::json!({"credential": "../escape"}),
+                )],
+                "not a valid secret name",
+            ),
+            (
+                vec![endpoint(
+                    5432,
+                    "postgres",
+                    serde_json::json!({"credential": "db", "upstream_tls": "yes"}),
+                )],
+                "must be a boolean",
+            ),
+            (
+                vec![endpoint(
+                    5432,
+                    "tcp",
+                    serde_json::json!({"upstream": "a.test"}),
+                )],
+                "must be host:port",
+            ),
+            (
+                vec![endpoint(
+                    5432,
+                    "tcp",
+                    serde_json::json!({"upstream": "a.test:0"}),
+                )],
+                "between 1 and 65535",
+            ),
+            (
+                vec![endpoint(
+                    5432,
+                    "tcp",
+                    serde_json::json!({"upstream": ":5432"}),
+                )],
+                "names no host",
+            ),
+            (
+                vec![endpoint(
+                    5432,
+                    "tcp",
+                    serde_json::json!({"upstream": "not a host:5432"}),
+                )],
+                "invalid host",
+            ),
+            (
+                vec![endpoint(5432, "tcp", serde_json::json!("upstream"))],
+                "must be a JSON object",
+            ),
+        ] {
+            let err = with_endpoints(endpoints).unwrap_err();
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_upstream_authority_is_canonicalized_before_it_reaches_the_broker() {
+        for (declared, canonical) in [
+            ("DB.Example.COM:5432", "db.example.com:5432"),
+            ("10.0.0.1:5432", "10.0.0.1:5432"),
+            ("[2001:DB8::1]:5432", "[2001:db8::1]:5432"),
+        ] {
+            let policy = with_endpoints(vec![endpoint(
+                5432,
+                "tcp",
+                serde_json::json!({"upstream": declared}),
+            )])
+            .unwrap();
+            assert_eq!(policy.brokers[0].params["upstream"], canonical);
+        }
+        assert!(with_endpoints(vec![endpoint(
+            5432,
+            "tcp",
+            serde_json::json!({"upstream": "[10.0.0.1]:5432"}),
+        )])
+        .is_err());
+    }
+
+    #[test]
+    fn more_endpoints_than_the_cap_are_refused() {
+        let endpoints: Vec<_> = (1..=MAX_ENDPOINTS_PER_SANDBOX as u16 + 1)
+            .map(|i| {
+                endpoint(
+                    5000 + i,
+                    "postgres",
+                    serde_json::json!({"credential": "db"}),
+                )
+            })
+            .collect();
+        let message = format!("{:#}", with_endpoints(endpoints).unwrap_err());
+        assert!(message.contains("at most"), "{message}");
+    }
+
+    #[test]
+    fn rules_and_endpoints_share_one_serialized_cap() {
+        let headers: Vec<(String, String)> = (0..15)
+            .map(|i| (format!("x-pad-{i}"), "v".repeat(2000)))
+            .collect();
+        let borrowed: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let under_the_rules_cap = rules("api.example.com", &borrowed);
+        assert!(SandboxNetworkEgressPolicy::with_rules(
+            None,
+            None,
+            Some(under_the_rules_cap.clone())
+        )
+        .is_ok());
+
+        let long_host = [&"d".repeat(60)[..]; 4].join(".");
+        let endpoints: Vec<_> = (0..MAX_ENDPOINTS_PER_SANDBOX as u16)
+            .map(|i| {
+                endpoint(
+                    5000 + i,
+                    "tcp",
+                    serde_json::json!({"upstream": format!("{long_host}:5432")}),
+                )
+            })
+            .collect();
+        let message = format!(
+            "{:#}",
+            SandboxNetworkEgressPolicy::with_rules_and_endpoints(
+                None,
+                None,
+                Some(under_the_rules_cap),
+                Some(endpoints),
+            )
+            .unwrap_err()
+        );
+        assert!(
+            message.contains("rules and endpoints serialize to"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn endpoints_round_trip_through_json_with_their_brokers() {
+        let policy = with_endpoints(vec![EndpointDeclaration {
+            port: 5432,
+            handler: "postgres".into(),
+            params: serde_json::json!({"credential": "db", "upstream_tls": false}),
+            intercept_port: true,
+        }])
+        .unwrap();
+        let encoded = serde_json::to_string(&policy).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SandboxNetworkEgressPolicy>(&encoded).unwrap(),
+            policy
+        );
+        assert!(encoded.contains("\"endpoints\""));
+
+        let without = SandboxNetworkEgressPolicy::new(None, None).unwrap();
+        assert!(!serde_json::to_string(&without)
+            .unwrap()
+            .contains("endpoints"));
+    }
+
     #[test]
     fn the_init_sequence_creates_both_intercept_chains_and_jumps_to_them_first() {
         let commands = build_namespace_egress_chain_commands(
@@ -1206,8 +1754,10 @@ mod tests {
 
     #[test]
     fn intercept_commands_flush_then_reject_unbrokered_traffic_and_dnat_tcp_grouped_by_table() {
-        let listener = "169.254.0.22:40443".parse().unwrap();
-        let commands = build_intercept_commands(listener, &[443]);
+        let commands = build_intercept_commands(&[InterceptTarget {
+            listener: "169.254.0.22:40443".parse().unwrap(),
+            dports: vec![443],
+        }]);
         assert!(commands.windows(2).all(|w| w[0].table() <= w[1].table()));
 
         let rendered: Vec<String> = commands
@@ -1236,6 +1786,57 @@ mod tests {
         let removal = build_remove_intercept_commands();
         assert_eq!(removal.len(), 2);
         assert!(removal.iter().all(|c| matches!(
+            c,
+            IptablesRestoreCommand::FlushChain {
+                chain: INTERCEPT_CHAIN,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn every_target_keeps_its_own_dnat_because_the_chains_are_flushed_once() {
+        let commands = build_intercept_commands(&[
+            InterceptTarget {
+                listener: "169.254.0.22:40443".parse().unwrap(),
+                dports: vec![443],
+            },
+            InterceptTarget {
+                listener: "169.254.0.22:5432".parse().unwrap(),
+                dports: vec![5432],
+            },
+        ]);
+        let dnats: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| match c {
+                IptablesRestoreCommand::Append {
+                    table: "nat", rule, ..
+                } => Some(rule.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dnats,
+            [
+                "-i tap0 -p tcp --dport 443 -j DNAT --to-destination 169.254.0.22:40443",
+                "-i tap0 -p tcp --dport 5432 -j DNAT --to-destination 169.254.0.22:5432",
+            ]
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|c| matches!(c, IptablesRestoreCommand::FlushChain { .. }))
+                .count(),
+            2,
+            "each chain is flushed once for the whole set, never once per target"
+        );
+    }
+
+    #[test]
+    fn an_empty_target_set_leaves_only_the_flush() {
+        let commands = build_intercept_commands(&[]);
+        assert_eq!(commands.len(), 2);
+        assert!(commands.iter().all(|c| matches!(
             c,
             IptablesRestoreCommand::FlushChain {
                 chain: INTERCEPT_CHAIN,

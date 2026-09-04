@@ -17,7 +17,7 @@ use crate::orchestrator::{
     SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
     StoreError,
 };
-use crate::sandbox::network::policy::{DomainRule, HeaderTransform};
+use crate::sandbox::network::policy::{DomainRule, EndpointDeclaration, HeaderTransform};
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::secrets::MissingSecrets;
@@ -184,6 +184,8 @@ impl From<&SandboxNetworkPolicy> for models::SandboxNetworkConfig {
                 }),
             deny_out: (!egress.denied_cidrs.is_empty()).then(|| egress.denied_cidrs.clone()),
             rules: (!egress.rules.is_empty()).then(|| rules_model(&egress.rules)),
+            x_aenv_endpoints: (!egress.endpoints.is_empty())
+                .then(|| endpoints_model(&egress.endpoints)),
             mask_request_host: None,
         }
     }
@@ -208,6 +210,63 @@ fn rules_model(
             )
         })
         .collect()
+}
+
+fn endpoints_model(endpoints: &[EndpointDeclaration]) -> Vec<models::SandboxBrokeredEndpoint> {
+    endpoints
+        .iter()
+        .map(|endpoint| models::SandboxBrokeredEndpoint {
+            port: u32::from(endpoint.port),
+            handler: endpoint.handler.clone(),
+            params: endpoint.params.as_object().map(|params| {
+                params
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            agentenv_http_server::types::Object(value.clone()),
+                        )
+                    })
+                    .collect()
+            }),
+            intercept_port: Some(endpoint.intercept_port),
+        })
+        .collect()
+}
+
+fn endpoints_from_model(
+    endpoints: Option<&Vec<models::SandboxBrokeredEndpoint>>,
+) -> anyhow::Result<Option<Vec<EndpointDeclaration>>> {
+    let Some(endpoints) = endpoints else {
+        return Ok(None);
+    };
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let port = u16::try_from(endpoint.port).map_err(|_| {
+                anyhow::anyhow!("endpoint port {} is not between 1 and 65535", endpoint.port)
+            })?;
+            let params = endpoint
+                .params
+                .as_ref()
+                .map(|params| {
+                    serde_json::Value::Object(
+                        params
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.0.clone()))
+                            .collect(),
+                    )
+                })
+                .unwrap_or(serde_json::Value::Null);
+            Ok(EndpointDeclaration {
+                port,
+                handler: endpoint.handler.clone(),
+                params,
+                intercept_port: endpoint.intercept_port.unwrap_or(false),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map(Some)
 }
 
 fn rules_from_model(
@@ -501,7 +560,11 @@ fn network_policy_from_create(
     let allow_out = network.and_then(|network| network.allow_out.clone());
     let deny_out = network.and_then(|network| network.deny_out.clone());
     let rules = rules_from_model(network.and_then(|network| network.rules.as_ref()));
-    let egress = SandboxNetworkEgressPolicy::with_rules(allow_out, deny_out, rules)?;
+    let endpoints =
+        endpoints_from_model(network.and_then(|network| network.x_aenv_endpoints.as_ref()))?;
+    let egress = SandboxNetworkEgressPolicy::with_rules_and_endpoints(
+        allow_out, deny_out, rules, endpoints,
+    )?;
     let policy = SandboxNetworkPolicy::new(base_policy, egress);
     if policy.has_domain_allow_rules() {
         anyhow::bail!(
@@ -514,10 +577,11 @@ fn network_policy_from_create(
 fn network_policy_from_update(
     body: &models::SandboxNetworkUpdateConfig,
 ) -> anyhow::Result<SandboxNetworkPolicy> {
-    let policy = SandboxNetworkEgressPolicy::with_rules(
+    let policy = SandboxNetworkEgressPolicy::with_rules_and_endpoints(
         body.allow_out.clone(),
         body.deny_out.clone(),
         rules_from_model(body.rules.as_ref()),
+        endpoints_from_model(body.x_aenv_endpoints.as_ref())?,
     )?;
     if policy.has_domain_allow_rules() {
         anyhow::bail!(
@@ -1858,6 +1922,7 @@ mod tests {
     fn network_update_replaces_base_policy_and_egress() {
         let body = models::SandboxNetworkUpdateConfig {
             rules: None,
+            x_aenv_endpoints: None,
             allow_out: Some(vec!["8.8.8.8".to_string()]),
             deny_out: Some(vec!["203.0.113.0/24".to_string()]),
             allow_internet_access: Some(false),

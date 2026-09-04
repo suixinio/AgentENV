@@ -26,7 +26,7 @@ use tracing::{debug, info, warn};
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::policy::{
     initialize_namespace_egress_chain, install_namespace_intercept, remove_namespace_intercept,
-    set_namespace_egress_policy, SandboxNetworkPolicy,
+    set_namespace_egress_policy, InterceptTarget, SandboxNetworkPolicy,
 };
 use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS_PREFIX};
 
@@ -478,13 +478,19 @@ impl Slot {
         })
     }
 
-    /// DNATs the guest's TCP traffic to `dports` onto the listener at
-    /// `listener_port` and rejects UDP to the same ports.
-    pub fn install_intercept(&self, listener_port: u16, dports: &[u16]) -> Result<()> {
-        let listener = std::net::SocketAddrV4::new(self.tap_ip(), listener_port);
-        let dports = dports.to_vec();
+    /// Replaces the namespace's intercept: each entry DNATs the guest's TCP
+    /// traffic to its `dports` onto the listener port it names and rejects UDP
+    /// to the same ports. An empty slice leaves the chains empty.
+    pub fn install_intercepts(&self, intercepts: &[(u16, Vec<u16>)]) -> Result<()> {
+        let targets: Vec<InterceptTarget> = intercepts
+            .iter()
+            .map(|(listener_port, dports)| InterceptTarget {
+                listener: std::net::SocketAddrV4::new(self.tap_ip(), *listener_port),
+                dports: dports.clone(),
+            })
+            .collect();
         self.in_namespace("intercept setup", move || {
-            install_namespace_intercept(listener, &dports)
+            install_namespace_intercept(&targets)
         })
     }
 

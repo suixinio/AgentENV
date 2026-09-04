@@ -673,14 +673,15 @@ impl FirecrackerSandbox {
         Ok(())
     }
 
-    /// The CA guests with brokers must trust, when this node has one; `None`
-    /// means init clears any extra trust and no probe runs.
+    /// The CA guests whose broker terminates their TLS must trust, when this
+    /// node has one; `None` means init clears any extra trust and no probe
+    /// runs.
     fn guest_ca_bundle(&self) -> Option<String> {
         Self::guest_ca_bundle_for(self.current_network_policy.as_ref())
     }
 
     fn guest_ca_bundle_for(policy: Option<&SandboxNetworkPolicy>) -> Option<String> {
-        if !policy.is_some_and(|policy| policy.has_brokers()) {
+        if !policy.is_some_and(|policy| policy.needs_guest_ca()) {
             return None;
         }
         EgressRuntime::global().and_then(|runtime| runtime.ca_bundle().map(str::to_string))

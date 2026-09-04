@@ -2908,6 +2908,7 @@ mod rule_secret_check_tests {
                     name,
                     SecretString::new("v".to_string()),
                     SecretMetadata::new(),
+                    Vec::new(),
                 )
                 .await
                 .expect("seeding a secret");

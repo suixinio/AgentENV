@@ -117,7 +117,12 @@ impl Secrets<()> for ApiImpl {
         };
         let value = SecretString::new(body.value.clone());
         match service
-            .create(&body.name, value, metadata_from(body.metadata.as_ref()))
+            .create(
+                &body.name,
+                value,
+                metadata_from(body.metadata.as_ref()),
+                body.allowed_hosts.clone().unwrap_or_default(),
+            )
             .await
         {
             Ok(secret) => Ok(SecretsPostResponse::Status201_SuccessfullyCreatedTheSecret(
@@ -208,7 +213,12 @@ impl Secrets<()> for ApiImpl {
         let value = SecretString::new(body.value.clone());
         let metadata = body.metadata.as_ref().map(|m| metadata_from(Some(m)));
         match service
-            .update(&path_params.secret_id, value, metadata)
+            .update(
+                &path_params.secret_id,
+                value,
+                metadata,
+                body.allowed_hosts.clone().unwrap_or_default(),
+            )
             .await
         {
             Ok(secret) => Ok(

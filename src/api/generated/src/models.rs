@@ -3285,6 +3285,12 @@ pub struct NewSecret {
     #[validate(length(max = 32), custom(function = "check_xss_map_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+
+    /// Hosts this value may ever be sent to, an AgentENV extension. Each entry is an exact DNS name or one leading wildcard (\"*.example.com\"), the same grammar network rules keys use. An empty or absent list leaves the rule that names the secret as the only bound; a non-empty one refuses the value for any other host even when a rule asks for it.
+    #[serde(rename = "allowedHosts")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for NewSecret {
@@ -3304,6 +3310,7 @@ impl NewSecret {
             name,
             value,
             metadata: None,
+            allowed_hosts: None,
         }
     }
 }
@@ -3319,6 +3326,17 @@ impl std::fmt::Display for NewSecret {
             Some("value".to_string()),
             Some(self.value.to_string()),
             // Skipping metadata in query parameter serialization
+            self.allowed_hosts.as_ref().map(|allowed_hosts| {
+                [
+                    "allowedHosts".to_string(),
+                    allowed_hosts
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
         ];
 
         write!(
@@ -3343,6 +3361,7 @@ impl std::str::FromStr for NewSecret {
             pub name: Vec<String>,
             pub value: Vec<String>,
             pub metadata: Vec<std::collections::HashMap<String, String>>,
+            pub allowed_hosts: Vec<Vec<String>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -3378,6 +3397,12 @@ impl std::str::FromStr for NewSecret {
                                 .to_string(),
                         );
                     }
+                    "allowedHosts" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSecret"
+                                .to_string(),
+                        );
+                    }
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSecret".to_string(),
@@ -3403,6 +3428,7 @@ impl std::str::FromStr for NewSecret {
                 .next()
                 .ok_or_else(|| "value missing in NewSecret".to_string())?,
             metadata: intermediate_rep.metadata.into_iter().next(),
+            allowed_hosts: intermediate_rep.allowed_hosts.into_iter().next(),
         })
     }
 }
@@ -8384,6 +8410,12 @@ pub struct SecretUpdate {
     #[validate(length(max = 32), custom(function = "check_xss_map_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
+
+    /// Hosts this value may ever be sent to, an AgentENV extension. Each entry is an exact DNS name or one leading wildcard (\"*.example.com\"), the same grammar network rules keys use. An empty or absent list leaves the rule that names the secret as the only bound; a non-empty one refuses the value for any other host even when a rule asks for it.
+    #[serde(rename = "allowedHosts")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for SecretUpdate {
@@ -8398,6 +8430,7 @@ impl SecretUpdate {
         SecretUpdate {
             value,
             metadata: None,
+            allowed_hosts: None,
         }
     }
 }
@@ -8411,6 +8444,17 @@ impl std::fmt::Display for SecretUpdate {
             Some("value".to_string()),
             Some(self.value.to_string()),
             // Skipping metadata in query parameter serialization
+            self.allowed_hosts.as_ref().map(|allowed_hosts| {
+                [
+                    "allowedHosts".to_string(),
+                    allowed_hosts
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
         ];
 
         write!(
@@ -8434,6 +8478,7 @@ impl std::str::FromStr for SecretUpdate {
         struct IntermediateRep {
             pub value: Vec<String>,
             pub metadata: Vec<std::collections::HashMap<String, String>>,
+            pub allowed_hosts: Vec<Vec<String>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -8465,6 +8510,12 @@ impl std::str::FromStr for SecretUpdate {
                                 .to_string(),
                         );
                     }
+                    "allowedHosts" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in SecretUpdate"
+                                .to_string(),
+                        );
+                    }
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SecretUpdate".to_string(),
@@ -8485,6 +8536,7 @@ impl std::str::FromStr for SecretUpdate {
                 .next()
                 .ok_or_else(|| "value missing in SecretUpdate".to_string())?,
             metadata: intermediate_rep.metadata.into_iter().next(),
+            allowed_hosts: intermediate_rep.allowed_hosts.into_iter().next(),
         })
     }
 }

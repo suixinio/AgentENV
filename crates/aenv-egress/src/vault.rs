@@ -112,7 +112,8 @@ impl CredentialSource for VaultSource {
     ) -> Result<Secret, CredentialError> {
         let data = self.granted_secret(sandbox_id, execution_id, name).await?;
         match data.get("value").and_then(|v| v.as_str()) {
-            Some(value) => Ok(Secret::new(value.as_bytes().to_vec(), None)),
+            Some(value) => Ok(Secret::new(value.as_bytes().to_vec(), None)
+                .with_allowed_hosts(allowed_hosts(data.get("allowed_hosts")))),
             None => Err(CredentialError::Unavailable(
                 "the secret carries no string value".into(),
             )),
@@ -135,6 +136,7 @@ impl CredentialSource for VaultSource {
         };
         let mut object = object.clone();
         object.remove("value");
+        object.remove("allowed_hosts");
         let fields = CredentialFields::from_json(&object, None)?;
         if fields.is_empty() {
             return Err(CredentialError::Unavailable(
@@ -142,6 +144,27 @@ impl CredentialSource for VaultSource {
             ));
         }
         Ok(fields)
+    }
+}
+
+/// A `allowed_hosts` written as a JSON array or as one comma-separated
+/// string, which is what a `vault kv put` on the command line produces.
+pub(crate) fn allowed_hosts(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(entries)) => entries
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect(),
+        Some(serde_json::Value::String(entries)) => entries
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -300,6 +323,42 @@ mod tests {
                 .unwrap(),
             CredentialError::Denied
         );
+    }
+
+    #[tokio::test]
+    async fn a_secret_pinned_to_hosts_carries_that_pin_to_the_handler() {
+        let fake = Fake::default();
+        with(
+            &fake,
+            "grants/exec-1",
+            json!({ "sandbox_id": "sbx-1", "names": ["openai", "gh"] }),
+        );
+        with(
+            &fake,
+            "secrets/openai",
+            json!({ "value": "sk", "allowed_hosts": ["api.openai.com"] }),
+        );
+        with(
+            &fake,
+            "secrets/gh",
+            json!({ "value": "ghp", "allowed_hosts": " *.github.com , codeload.github.com " }),
+        );
+        let source = serve(fake).await;
+
+        let openai = source.get("sbx-1", "exec-1", "openai").await.unwrap();
+        assert_eq!(openai.allowed_hosts(), ["api.openai.com"]);
+        assert!(openai.may_reach("api.openai.com"));
+        assert!(!openai.may_reach("evil.example"));
+
+        let gh = source.get("sbx-1", "exec-1", "gh").await.unwrap();
+        assert_eq!(gh.allowed_hosts(), ["*.github.com", "codeload.github.com"]);
+
+        // The pin is not a credential field: it configures the value, it is
+        // not part of it.
+        assert!(matches!(
+            source.get_fields("sbx-1", "exec-1", "openai").await,
+            Err(CredentialError::Unavailable(_))
+        ));
     }
 
     #[tokio::test]

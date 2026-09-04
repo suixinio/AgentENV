@@ -124,13 +124,20 @@ impl EgressRuntime {
                 )
             }
         };
-        let ca_bundle =
-            match egress.ca_cert_path.as_ref() {
-                Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
-                    format!("read egress_broker.ca_cert_path {}", path.display())
-                })?),
-                None => None,
-            };
+        // Guests trust the CA that signs intercepted-name leaves, which is the
+        // same CA that verifies the broker's server certificate only when the
+        // operator has not split them.
+        let (guest_ca_key, guest_ca_path) = match egress.guest_ca_cert_path.as_ref() {
+            Some(path) => ("egress_broker.guest_ca_cert_path", Some(path)),
+            None => ("egress_broker.ca_cert_path", egress.ca_cert_path.as_ref()),
+        };
+        let ca_bundle = match guest_ca_path {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .with_context(|| format!("read {guest_ca_key} {}", path.display()))?,
+            ),
+            None => None,
+        };
         let reachable = Arc::new(std::sync::atomic::AtomicBool::new(
             egress.mode == EgressBrokerMode::Embedded,
         ));

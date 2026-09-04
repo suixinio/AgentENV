@@ -161,7 +161,10 @@ peer_discovery_refresh_interval_secs = 5
 # ca_cert_path and shared_secret are then required).
 mode = "disabled"
 # endpoint = "aenv-egress.aenv.svc:8443"
-# ca_cert_path = "/etc/aenv/egress-ca/ca.crt"
+# ca_cert_path = "/etc/aenv/egress-transport-ca/ca.crt"
+# The CA guests trust for intercepted names, when the operator has split it
+# from the one above. Unset means the two are one CA.
+# guest_ca_cert_path = "/etc/aenv/egress-ca/ca.crt"
 # shared_secret = "replace-with-the-hmac-key-from-the-egress-hmac secret"
 # Identity headers older or newer than this are refused by the broker.
 max_skew_ms = 30000

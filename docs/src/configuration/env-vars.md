@@ -28,6 +28,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_EGRESS_BROKER_MODE` | `disabled` | `[egress_broker].mode`: `disabled`, `embedded` or `remote`. See [`[egress_broker]`](reference.md#egress_broker). |
 | `AENV_EGRESS_BROKER_ENDPOINT` | unset | `[egress_broker].endpoint`, required in `remote` mode |
 | `AENV_EGRESS_BROKER_CA_CERT_PATH` | unset | `[egress_broker].ca_cert_path`, required in `remote` mode. A node's copy of the broker's CA certificate — never its key. Not to be confused with the broker's own `AENV_EGRESS_CA_CERT_PATH` under [Egress Broker](#egress-broker-aenv-egress). |
+| `AENV_EGRESS_BROKER_GUEST_CA_CERT_PATH` | unset | `[egress_broker].guest_ca_cert_path`: the CA guests trust for intercepted names, when it is not the same one that verifies the broker. |
 | `AENV_EGRESS_BROKER_SHARED_SECRET` | unset | `[egress_broker].shared_secret`, required in `remote` mode; mount it from a Secret |
 | `AENV_EGRESS_BROKER_MAX_SKEW_MS` | `30000` | `[egress_broker].max_skew_ms` |
 | `AENV_EGRESS_BROKER_PER_SANDBOX_CONNS` | `256` | `[egress_broker].per_sandbox_conns` |

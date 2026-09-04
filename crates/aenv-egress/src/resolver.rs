@@ -105,7 +105,8 @@ impl CredentialSource for ResolverSource {
     ) -> Result<Secret, CredentialError> {
         let answer = self.resolve(sandbox_id, execution_id, name).await?;
         match answer.get("value").and_then(|value| value.as_str()) {
-            Some(value) => Ok(Secret::new(value.as_bytes().to_vec(), expiry_of(&answer))),
+            Some(value) => Ok(Secret::new(value.as_bytes().to_vec(), expiry_of(&answer))
+                .with_allowed_hosts(crate::vault::allowed_hosts(answer.get("allowedHosts")))),
             None => Err(CredentialError::Unavailable(
                 "the resolver returned no opaque value for this name".into(),
             )),
@@ -295,6 +296,20 @@ mod tests {
             );
         }
         assert!(fake.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pin_the_resolver_states_reaches_the_handler() {
+        let fake = Fake::default();
+        answering(
+            &fake,
+            StatusCode::OK,
+            json!({"value": "sk", "allowedHosts": ["api.openai.com", "*.github.com"]}),
+        );
+        let source = serve(fake, "").await;
+        let secret = source.get("sbx-1", "exec-1", "openai").await.unwrap();
+        assert_eq!(secret.allowed_hosts(), ["api.openai.com", "*.github.com"]);
+        assert!(!secret.may_reach("evil.example"));
     }
 
     #[tokio::test]

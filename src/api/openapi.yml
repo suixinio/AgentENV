@@ -520,6 +520,16 @@ components:
           $ref: "#/components/schemas/SecretString"
         metadata:
           $ref: "#/components/schemas/SecretMetadata"
+        allowedHosts:
+          type: array
+          description: >
+            Hosts this value may ever be sent to, an AgentENV extension. Each entry
+            is an exact DNS name or one leading wildcard ("*.example.com"), the same
+            grammar network rules keys use. An empty or absent list leaves the rule
+            that names the secret as the only bound; a non-empty one refuses the
+            value for any other host even when a rule asks for it.
+          items:
+            type: string
 
     SecretUpdate:
       type: object
@@ -530,6 +540,16 @@ components:
           $ref: "#/components/schemas/SecretString"
         metadata:
           $ref: "#/components/schemas/SecretMetadata"
+        allowedHosts:
+          type: array
+          description: >
+            Hosts this value may ever be sent to, an AgentENV extension. Each entry
+            is an exact DNS name or one leading wildcard ("*.example.com"), the same
+            grammar network rules keys use. An empty or absent list leaves the rule
+            that names the secret as the only bound; a non-empty one refuses the
+            value for any other host even when a rule asks for it.
+          items:
+            type: string
 
     SandboxAutoResumeEnabled:
       type: boolean

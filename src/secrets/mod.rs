@@ -113,7 +113,15 @@ pub trait SecretRefStore: Send + Sync {
 /// (sandbox, execution) able to read the named values.
 #[async_trait]
 pub trait SecretsBackend: Send + Sync {
-    async fn put(&self, name: &str, value: &SecretString) -> Result<i64, SecretsError>;
+    /// `allowed_hosts` pins the value to the hosts it may be sent to; empty
+    /// leaves the rule that names it as the only bound. It is stored with the
+    /// value because the broker reads it there, not from the ref row.
+    async fn put(
+        &self,
+        name: &str,
+        value: &SecretString,
+        allowed_hosts: &[String],
+    ) -> Result<i64, SecretsError>;
     async fn delete(&self, name: &str) -> Result<(), SecretsError>;
     async fn grant(
         &self,
@@ -148,15 +156,17 @@ impl SecretsService {
         name: &str,
         value: SecretString,
         metadata: SecretMetadata,
+        allowed_hosts: Vec<String>,
     ) -> Result<SecretRef, SecretsError> {
         validate_name(name)?;
         validate_metadata(&metadata)?;
+        let allowed_hosts = validate_allowed_hosts(allowed_hosts)?;
         if value.is_empty() {
             return Err(SecretsError::EmptyValue);
         }
         let secret_id = new_secret_id();
         self.refs.create(&secret_id, name, &metadata).await?;
-        let version = match self.values.put(name, &value).await {
+        let version = match self.values.put(name, &value, &allowed_hosts).await {
             Ok(version) => version,
             Err(err) => {
                 if let Err(rollback) = self.refs.delete(&secret_id).await {
@@ -184,15 +194,19 @@ impl SecretsService {
         }
     }
 
+    /// A new version replaces the pin as well as the value: the pin lives
+    /// with the value, so a version written without one is unpinned.
     pub async fn update(
         &self,
         id_or_name: &str,
         value: SecretString,
         metadata: Option<SecretMetadata>,
+        allowed_hosts: Vec<String>,
     ) -> Result<SecretRef, SecretsError> {
         if let Some(metadata) = &metadata {
             validate_metadata(metadata)?;
         }
+        let allowed_hosts = validate_allowed_hosts(allowed_hosts)?;
         if value.is_empty() {
             return Err(SecretsError::EmptyValue);
         }
@@ -201,7 +215,10 @@ impl SecretsService {
             .get(id_or_name)
             .await?
             .ok_or(SecretsError::NotFound)?;
-        let version = self.values.put(&existing.name, &value).await?;
+        let version = self
+            .values
+            .put(&existing.name, &value, &allowed_hosts)
+            .await?;
         drop(value);
         match self
             .refs
@@ -319,6 +336,32 @@ pub fn validate_name(name: &str) -> Result<(), SecretsError> {
     } else {
         Err(SecretsError::InvalidName)
     }
+}
+
+pub const MAX_ALLOWED_HOSTS: usize = 32;
+
+/// Normalizes each pattern the way `rules` keys are normalized, so a pin and
+/// a rule that name the same host agree on what that host is.
+pub fn validate_allowed_hosts(allowed_hosts: Vec<String>) -> Result<Vec<String>, SecretsError> {
+    if allowed_hosts.len() > MAX_ALLOWED_HOSTS {
+        return Err(SecretsError::InvalidMetadata(format!(
+            "allowedHosts carries {} entries; at most {MAX_ALLOWED_HOSTS} are allowed",
+            allowed_hosts.len()
+        )));
+    }
+    let mut normalized = Vec::with_capacity(allowed_hosts.len());
+    for host in allowed_hosts {
+        let pattern =
+            crate::sandbox::network::policy::normalize_host_pattern(&host).ok_or_else(|| {
+                SecretsError::InvalidMetadata(format!(
+                    "allowedHosts entry {host:?} is not a DNS name or a single leading wildcard"
+                ))
+            })?;
+        if !normalized.contains(&pattern) {
+            normalized.push(pattern);
+        }
+    }
+    Ok(normalized)
 }
 
 pub fn validate_metadata(metadata: &SecretMetadata) -> Result<(), SecretsError> {
@@ -463,6 +506,7 @@ pub mod memory {
     #[derive(Default)]
     pub struct InMemorySecretsBackend {
         values: Mutex<HashMap<String, (i64, SecretString)>>,
+        pins: Mutex<HashMap<String, Vec<String>>>,
         grants: Mutex<HashMap<(String, String), Vec<String>>>,
         pub fail_puts: std::sync::atomic::AtomicBool,
     }
@@ -470,6 +514,10 @@ pub mod memory {
     impl InMemorySecretsBackend {
         pub fn version_of(&self, name: &str) -> Option<i64> {
             self.values.lock().unwrap().get(name).map(|(v, _)| *v)
+        }
+
+        pub fn pin_of(&self, name: &str) -> Option<Vec<String>> {
+            self.pins.lock().unwrap().get(name).cloned()
         }
 
         pub fn grants_for(&self, sandbox_id: &str, execution_id: &str) -> Option<Vec<String>> {
@@ -491,7 +539,12 @@ pub mod memory {
 
     #[async_trait]
     impl SecretsBackend for InMemorySecretsBackend {
-        async fn put(&self, name: &str, value: &SecretString) -> Result<i64, SecretsError> {
+        async fn put(
+            &self,
+            name: &str,
+            value: &SecretString,
+            allowed_hosts: &[String],
+        ) -> Result<i64, SecretsError> {
             if self.fail_puts.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(SecretsError::Unavailable(anyhow::anyhow!(
                     "store refused the write"
@@ -500,11 +553,16 @@ pub mod memory {
             let mut values = self.values.lock().unwrap();
             let version = values.get(name).map(|(v, _)| *v).unwrap_or(0) + 1;
             values.insert(name.to_string(), (version, value.clone()));
+            self.pins
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), allowed_hosts.to_vec());
             Ok(version)
         }
 
         async fn delete(&self, name: &str) -> Result<(), SecretsError> {
             self.values.lock().unwrap().remove(name);
+            self.pins.lock().unwrap().remove(name);
             Ok(())
         }
 
@@ -622,7 +680,7 @@ mod tests {
 
         assert!(matches!(
             service
-                .create("openai", value("sk"), SecretMetadata::new())
+                .create("openai", value("sk"), SecretMetadata::new(), Vec::new())
                 .await,
             Err(SecretsError::NotFound)
         ));
@@ -636,13 +694,13 @@ mod tests {
     async fn an_update_whose_row_vanished_reports_not_found_and_leaves_no_value() {
         let (service, refs, backend) = vanishing_service();
         service
-            .create("gh", value("v1"), SecretMetadata::new())
+            .create("gh", value("v1"), SecretMetadata::new(), Vec::new())
             .await
             .unwrap();
         refs.vanish.store(true, Ordering::SeqCst);
 
         assert!(matches!(
-            service.update("gh", value("v2"), None).await,
+            service.update("gh", value("v2"), None, Vec::new()).await,
             Err(SecretsError::NotFound)
         ));
         assert!(
@@ -662,7 +720,7 @@ mod tests {
     async fn create_stores_the_value_in_the_backend_and_the_row_without_it() {
         let (service, backend) = service();
         let created = service
-            .create("openai", value("sk"), SecretMetadata::new())
+            .create("openai", value("sk"), SecretMetadata::new(), Vec::new())
             .await
             .unwrap();
         assert!(created.secret_id.starts_with("sec_"));
@@ -681,7 +739,7 @@ mod tests {
         let (service, backend) = service();
         backend.fail_puts.store(true, Ordering::SeqCst);
         let err = service
-            .create("openai", value("sk"), SecretMetadata::new())
+            .create("openai", value("sk"), SecretMetadata::new(), Vec::new())
             .await
             .err()
             .unwrap();
@@ -697,22 +755,24 @@ mod tests {
         let (service, _) = service();
         for bad in ["", "with/slash", "sec_reserved", &"a".repeat(129)] {
             assert!(matches!(
-                service.create(bad, value("v"), SecretMetadata::new()).await,
+                service
+                    .create(bad, value("v"), SecretMetadata::new(), Vec::new())
+                    .await,
                 Err(SecretsError::InvalidName)
             ));
         }
         assert!(matches!(
             service
-                .create("empty", value(""), SecretMetadata::new())
+                .create("empty", value(""), SecretMetadata::new(), Vec::new())
                 .await,
             Err(SecretsError::EmptyValue)
         ));
         service
-            .create("gh", value("v"), SecretMetadata::new())
+            .create("gh", value("v"), SecretMetadata::new(), Vec::new())
             .await
             .unwrap();
         assert!(matches!(
-            service.create("gh", value("v2"), SecretMetadata::new()).await,
+            service.create("gh", value("v2"), SecretMetadata::new(), Vec::new()).await,
             Err(SecretsError::AlreadyExists(name)) if name == "gh"
         ));
     }
@@ -721,13 +781,18 @@ mod tests {
     async fn update_appends_a_version_and_delete_removes_value_and_row() {
         let (service, backend) = service();
         let created = service
-            .create("gh", value("v1"), SecretMetadata::new())
+            .create("gh", value("v1"), SecretMetadata::new(), Vec::new())
             .await
             .unwrap();
         let mut metadata = SecretMetadata::new();
         metadata.insert("owner".into(), "team-a".into());
         let updated = service
-            .update(&created.secret_id, value("v2"), Some(metadata.clone()))
+            .update(
+                &created.secret_id,
+                value("v2"),
+                Some(metadata.clone()),
+                Vec::new(),
+            )
             .await
             .unwrap();
         assert_eq!(updated.current_version, 2);
@@ -751,7 +816,7 @@ mod tests {
         let (service, _) = service();
         for name in ["a", "b", "c"] {
             service
-                .create(name, value("v"), SecretMetadata::new())
+                .create(name, value("v"), SecretMetadata::new(), Vec::new())
                 .await
                 .unwrap();
         }
@@ -776,7 +841,7 @@ mod tests {
 
     #[async_trait]
     impl SecretsBackend for NameOwningBackend {
-        async fn put(&self, _: &str, _: &SecretString) -> Result<i64, SecretsError> {
+        async fn put(&self, _: &str, _: &SecretString, _: &[String]) -> Result<i64, SecretsError> {
             Err(SecretsError::Unavailable(anyhow::anyhow!(
                 "owned elsewhere"
             )))
@@ -804,6 +869,70 @@ mod tests {
                     .collect(),
             ))
         }
+    }
+
+    #[tokio::test]
+    async fn a_pin_is_normalized_the_way_a_rules_key_is_and_travels_with_the_value() {
+        let (service, backend) = service();
+        service
+            .create(
+                "openai",
+                value("sk"),
+                SecretMetadata::new(),
+                vec![
+                    "API.OpenAI.com".into(),
+                    "*.GitHub.com".into(),
+                    "api.openai.com".into(),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.pin_of("openai"),
+            Some(vec![
+                "api.openai.com".to_string(),
+                "*.github.com".to_string()
+            ]),
+            "patterns are lowercased and deduplicated, as rules keys are"
+        );
+
+        // A new version replaces the pin: it lives with the value.
+        service
+            .update("openai", value("sk2"), None, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(backend.pin_of("openai"), Some(Vec::new()));
+    }
+
+    #[tokio::test]
+    async fn a_pin_that_is_not_a_host_pattern_is_refused_before_anything_is_written() {
+        let (service, backend) = service();
+        for bad in ["not a host", "*.", "*", "http://api.example.com", ""] {
+            let err = service
+                .create(
+                    "openai",
+                    value("sk"),
+                    SecretMetadata::new(),
+                    vec![bad.into()],
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                matches!(err, SecretsError::InvalidMetadata(_)),
+                "{bad:?} gave {err:?}"
+            );
+        }
+        let many: Vec<String> = (0..=MAX_ALLOWED_HOSTS)
+            .map(|i| format!("h{i}.example.com"))
+            .collect();
+        assert!(matches!(
+            service
+                .create("openai", value("sk"), SecretMetadata::new(), many)
+                .await,
+            Err(SecretsError::InvalidMetadata(_))
+        ));
+        assert_eq!(backend.version_of("openai"), None);
     }
 
     #[tokio::test]
@@ -836,7 +965,7 @@ mod tests {
     async fn ensure_names_exist_reports_only_the_missing_ones() {
         let (service, _) = service();
         service
-            .create("present", value("v"), SecretMetadata::new())
+            .create("present", value("v"), SecretMetadata::new(), Vec::new())
             .await
             .unwrap();
         let names: BTreeSet<String> = ["present", "absent"]

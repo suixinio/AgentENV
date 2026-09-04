@@ -122,7 +122,12 @@ impl ExternalResolverBackend {
 
 #[async_trait]
 impl SecretsBackend for ExternalResolverBackend {
-    async fn put(&self, _name: &str, _value: &SecretString) -> Result<i64, SecretsError> {
+    async fn put(
+        &self,
+        _name: &str,
+        _value: &SecretString,
+        _allowed_hosts: &[String],
+    ) -> Result<i64, SecretsError> {
         Err(SecretsError::Unavailable(anyhow::anyhow!(
             "the credential resolver owns its values; register the name there, not through /secrets"
         )))
@@ -337,7 +342,7 @@ mod tests {
             Err(SecretsError::Unavailable(_))
         ));
         assert!(matches!(
-            backend.put("db", &SecretString::new("v".into())).await,
+            backend.put("db", &SecretString::new("v".into()), &[]).await,
             Err(SecretsError::Unavailable(_))
         ));
         assert!(matches!(

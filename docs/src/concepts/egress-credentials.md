@@ -12,8 +12,13 @@ Store the value once:
 
 ```bash
 curl -X POST "$AENV_URL/secrets" -H "X-API-Key: $KEY" -H 'content-type: application/json' \
-  -d '{"name": "openai", "value": "sk-..."}'
+  -d '{"name": "openai", "value": "sk-...", "allowedHosts": ["api.openai.com"]}'
 ```
+
+`allowedHosts` is optional and pins the value to the hosts it may ever be sent to, in the same
+grammar rules keys use. It is the secret's own bound, checked after the rule that named it, so a
+rule that asks for this value for another host gets a `403` instead. Omit it and the rule is the
+only bound. A new version of a secret replaces its pin, because the pin lives with the value.
 
 Then declare, per sandbox, which domains get which headers:
 
@@ -141,7 +146,7 @@ values in the body:
 
 | Symptom | Reason |
 |---|---|
-| `403` | the sandbox policy denies the destination, the secret is not granted to this sandbox, or its value is gone |
+| `403` | the sandbox policy denies the destination, the secret is not granted to this sandbox, its value is gone, or the secret's `allowedHosts` does not cover this name (`secret_host_not_allowed`) |
 | `502` | the upstream is unreachable or unresolvable, its TLS failed, or the secrets store is down |
 | `505` | HTTP/2 to an intercepted name; use HTTP/1.1 |
 | connection closed at once | the broker is unreachable, or the sandbox exceeded its connection budget |
@@ -185,7 +190,10 @@ Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egr
   them. `aenv-egress-networkpolicy.yaml` lets only nodes in and only Vault, DNS and port 443 of
   public addresses out.
 - Nodes: `[egress_broker].mode = "remote"`, `endpoint = "aenv-egress:8443"`, the CA certificate
-  and the HMAC key. A node reports its broker state in every heartbeat, and the api half places a
+  and the HMAC key. Two CAs where the operator has split them: `ca_cert_path` verifies the
+  broker's server certificate and `guest_ca_cert_path` is what guests trust for intercepted
+  names, which is what lets the second one carry name constraints without invalidating the
+  broker's own `*.svc` certificate. A node reports its broker state in every heartbeat, and the api half places a
   sandbox with rules only on a node that reports `remote_ok`; when none does the create answers
   `503`.
 - The api half: `[secrets].backend = "vault"` with the Vault address and a token that can write
@@ -209,8 +217,7 @@ Metrics on the broker's `:9103`: `egress_conns_total{handler,outcome}`, `egress_
 
 ## Not covered
 
-Per-secret upstream restrictions, per-grant scoped broker tokens and multi-tenant ownership are
-later stages. ECH hides the server name and leaves
+Per-grant scoped broker tokens and multi-tenant ownership are later stages. ECH hides the server name and leaves
 only the passthrough path; the `egress_intercept_no_sni_total` counter shows how often that
 happens. See `docs/proposals/2026-09-03-sandbox-egress-credential-brokering.md` for the design
 and its review record.

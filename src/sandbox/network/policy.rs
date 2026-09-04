@@ -883,6 +883,12 @@ fn normalize_upstream_authority(authority: &str) -> Result<String> {
     Ok(format!("{canonical}:{port}"))
 }
 
+/// The `rules` key grammar, as an option rather than a `Result`: an exact DNS
+/// name or one leading `*.` wildcard, lowercased.
+pub fn normalize_host_pattern(pattern: &str) -> Option<String> {
+    normalize_domain_pattern(pattern).ok()
+}
+
 fn normalize_domain_pattern(pattern: &str) -> Result<String> {
     let (wildcard, domain) = pattern
         .strip_prefix("*.")

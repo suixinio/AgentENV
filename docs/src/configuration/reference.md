@@ -454,7 +454,8 @@ How a node reaches the egress broker that serves sandboxes declaring `network.ru
 |-----|------|---------|-------------|
 | `mode` | string | `"disabled"` | `disabled`, `embedded` (the broker core runs inside `aenv-node`; only valid with `[cluster].node_discovery_mode = "static"` and at most one static node) or `remote` (TLS to the `aenv-egress` deployment). |
 | `endpoint` | string | unset | `host:port` of the broker. Required in `remote` mode. |
-| `ca_cert_path` | path | unset | PEM bundle that verifies the broker's server certificate and is handed to guests with rules as an extra trust anchor. Required in `remote` mode. |
+| `ca_cert_path` | path | unset | PEM bundle that verifies the broker's server certificate. Required in `remote` mode. |
+| `guest_ca_cert_path` | path | unset | PEM bundle guests with rules trust for intercepted names, when the leaf-signing CA is a different one. Unset means the two are one CA, which is what a deployment that has not split them has. Splitting is what lets the leaf CA carry name constraints without invalidating the broker's own `*.svc` server certificate. |
 | `shared_secret` | string | unset | HMAC key the identity header is signed with. Required in `remote` mode; inject it from a Secret. |
 | `max_skew_ms` | integer | `30000` | Identity headers issued outside this window are refused by the broker. |
 | `per_sandbox_conns` | integer | `256` | Concurrent brokered connections one sandbox may hold; excess connections are closed. |

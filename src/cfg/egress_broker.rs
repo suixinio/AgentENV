@@ -36,10 +36,15 @@ pub struct EgressBrokerConfig {
     /// `host:port` of the broker; required in `remote` mode.
     #[config(env = "AENV_EGRESS_BROKER_ENDPOINT")]
     pub endpoint: Option<String>,
-    /// PEM bundle that verifies the broker's server certificate and is handed
-    /// to guests with `rules` as their extra trust anchor.
+    /// PEM bundle that verifies the broker's server certificate.
     #[config(env = "AENV_EGRESS_BROKER_CA_CERT_PATH")]
     pub ca_cert_path: Option<PathBuf>,
+    /// PEM bundle guests with `rules` trust for intercepted names, when it is
+    /// a different CA from the one above. Unset means the two are one CA.
+    /// Splitting them is what lets the leaf-signing CA carry name constraints
+    /// without those constraints reaching the broker's own server certificate.
+    #[config(env = "AENV_EGRESS_BROKER_GUEST_CA_CERT_PATH")]
+    pub guest_ca_cert_path: Option<PathBuf>,
     /// HMAC key the identity header is signed with; required in `remote` mode.
     #[config(env = "AENV_EGRESS_BROKER_SHARED_SECRET")]
     pub shared_secret: Option<String>,
@@ -65,6 +70,7 @@ impl fmt::Debug for EgressBrokerConfig {
             .field("mode", &self.mode)
             .field("endpoint", &self.endpoint)
             .field("ca_cert_path", &self.ca_cert_path)
+            .field("guest_ca_cert_path", &self.guest_ca_cert_path)
             .field(
                 "shared_secret",
                 &self.shared_secret.as_ref().map(|_| "[redacted]"),

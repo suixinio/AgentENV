@@ -276,6 +276,21 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
                 .await
             {
                 Ok(secret) => {
+                    // The rule said which name gets this value; the secret
+                    // itself says which names may ever get it, so a rule that
+                    // names it for another host does not make it reachable.
+                    if !secret.may_reach(&rc.name) {
+                        metrics::counter!(
+                            "egress_policy_denied_total",
+                            "reason" => "secret_host_not_allowed"
+                        )
+                        .increment(1);
+                        debug!(
+                            name = %rc.name,
+                            "a rule named a secret that is pinned to other hosts"
+                        );
+                        return synthesized(StatusCode::FORBIDDEN, "secret_host_not_allowed");
+                    }
                     resolved.insert(
                         marker.name.to_string(),
                         String::from_utf8_lossy(secret.expose()).into_owned(),
@@ -686,8 +701,18 @@ mod tests {
             let (ca_pem, ca_key) = generate_test_ca("broker test ca").unwrap();
             let signer =
                 Arc::new(CaSigner::from_pem(&ca_pem, &ca_key, SignerOptions::default()).unwrap());
-            let creds =
-                Arc::new(StaticSource::default().with("sbx-1", "exec-1", "openai", b"sk-test"));
+            let creds = Arc::new(
+                StaticSource::default()
+                    .with("sbx-1", "exec-1", "openai", b"sk-test")
+                    // Pinned to a name no rule in these tests matches.
+                    .with_pinned(
+                        "sbx-1",
+                        "exec-1",
+                        "elsewhere",
+                        b"sk-elsewhere",
+                        &["api.elsewhere.example"],
+                    ),
+            );
             let guard = Arc::new(
                 UpstreamGuard::new(BrokerDenyList::empty())
                     .with_resolver(Arc::new(FixedResolver("203.0.113.9".parse().unwrap()))),
@@ -845,6 +870,17 @@ mod tests {
             let response = terminated_request(&broker, rules, policy).await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
             assert_eq!(response.headers()[REASON_HEADER], "credential_denied");
+        }
+
+        #[tokio::test]
+        async fn a_rule_naming_a_secret_pinned_to_other_hosts_answers_403() {
+            let rules = serde_json::json!({
+                "*.test": [{ "transform": { "headers": { "Authorization": "Bearer ${aenv.secrets.elsewhere}" } } }]
+            });
+            let (broker, rules, policy) = start_broker(rules, false).await;
+            let response = terminated_request(&broker, rules, policy).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers()[REASON_HEADER], "secret_host_not_allowed");
         }
 
         async fn raw_exchange(

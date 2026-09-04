@@ -21,6 +21,7 @@ pub fn is_valid_secret_name(name: &str) -> bool {
 pub struct Secret {
     value: Zeroizing<Vec<u8>>,
     expires_at: Option<SystemTime>,
+    allowed_hosts: Vec<String>,
 }
 
 impl Secret {
@@ -28,7 +29,15 @@ impl Secret {
         Self {
             value: Zeroizing::new(value),
             expires_at,
+            allowed_hosts: Vec::new(),
         }
+    }
+
+    /// Pins this value to the hosts it may be sent to. An empty list is
+    /// unpinned: the rule that named it is then the only bound.
+    pub fn with_allowed_hosts(mut self, allowed_hosts: Vec<String>) -> Self {
+        self.allowed_hosts = allowed_hosts;
+        self
     }
 
     pub fn expose(&self) -> &[u8] {
@@ -38,6 +47,29 @@ impl Secret {
     pub fn expires_at(&self) -> Option<SystemTime> {
         self.expires_at
     }
+
+    pub fn allowed_hosts(&self) -> &[String] {
+        &self.allowed_hosts
+    }
+
+    /// Whether this value may be sent to `host`. Patterns are the ones
+    /// `rules` keys use: an exact name, or one leading `*.` wildcard that
+    /// matches any depth below it and never the apex.
+    pub fn may_reach(&self, host: &str) -> bool {
+        if self.allowed_hosts.is_empty() {
+            return true;
+        }
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.allowed_hosts.iter().any(|pattern| {
+            let pattern = pattern.trim_end_matches('.').to_ascii_lowercase();
+            match pattern.strip_prefix("*.") {
+                Some(suffix) => {
+                    host.len() > suffix.len() + 1 && host.ends_with(&format!(".{suffix}"))
+                }
+                None => host == pattern,
+            }
+        })
+    }
 }
 
 impl fmt::Debug for Secret {
@@ -45,6 +77,7 @@ impl fmt::Debug for Secret {
         f.debug_struct("Secret")
             .field("value", &"[redacted]")
             .field("expires_at", &self.expires_at)
+            .field("allowed_hosts", &self.allowed_hosts)
             .finish()
     }
 }
@@ -194,15 +227,29 @@ impl CredentialSource for NoCredentials {
 /// smoke runs.
 #[derive(Default)]
 pub struct StaticSource {
-    entries: HashMap<GrantKey, Vec<u8>>,
+    entries: HashMap<GrantKey, (Vec<u8>, Vec<String>)>,
     fields: HashMap<GrantKey, BTreeMap<String, String>>,
 }
 
 impl StaticSource {
-    pub fn with(mut self, sandbox_id: &str, execution_id: &str, name: &str, value: &[u8]) -> Self {
+    pub fn with(self, sandbox_id: &str, execution_id: &str, name: &str, value: &[u8]) -> Self {
+        self.with_pinned(sandbox_id, execution_id, name, value, &[])
+    }
+
+    pub fn with_pinned(
+        mut self,
+        sandbox_id: &str,
+        execution_id: &str,
+        name: &str,
+        value: &[u8],
+        allowed_hosts: &[&str],
+    ) -> Self {
         self.entries.insert(
             (sandbox_id.into(), execution_id.into(), name.into()),
-            value.to_vec(),
+            (
+                value.to_vec(),
+                allowed_hosts.iter().map(|host| host.to_string()).collect(),
+            ),
         );
         self
     }
@@ -235,7 +282,9 @@ impl CredentialSource for StaticSource {
     ) -> Result<Secret, CredentialError> {
         self.entries
             .get(&(sandbox_id.into(), execution_id.into(), name.into()))
-            .map(|value| Secret::new(value.clone(), None))
+            .map(|(value, allowed_hosts)| {
+                Secret::new(value.clone(), None).with_allowed_hosts(allowed_hosts.clone())
+            })
             .ok_or(CredentialError::Denied)
     }
 
@@ -400,6 +449,29 @@ mod tests {
         assert!(!printed.contains("sk-live"));
         assert!(printed.contains("[redacted]"));
         assert_eq!(secret.expose(), b"sk-live-very-secret");
+    }
+
+    #[test]
+    fn an_unpinned_secret_reaches_anything_and_a_pinned_one_reaches_its_patterns() {
+        let unpinned = Secret::new(b"v".to_vec(), None);
+        assert!(unpinned.may_reach("anywhere.example"));
+
+        let pinned = Secret::new(b"v".to_vec(), None)
+            .with_allowed_hosts(vec!["api.openai.com".into(), "*.github.com".into()]);
+        assert!(pinned.may_reach("api.openai.com"));
+        assert!(pinned.may_reach("API.OpenAI.com"));
+        assert!(pinned.may_reach("api.openai.com."));
+        assert!(pinned.may_reach("codeload.github.com"));
+        assert!(pinned.may_reach("a.b.github.com"));
+
+        assert!(
+            !pinned.may_reach("github.com"),
+            "a wildcard never matches the apex"
+        );
+        assert!(!pinned.may_reach("evil.com"));
+        assert!(!pinned.may_reach("api.openai.com.evil.com"));
+        assert!(!pinned.may_reach("notapi.openai.com"));
+        assert!(!pinned.may_reach("xgithub.com"));
     }
 
     #[test]

@@ -124,9 +124,18 @@ fn redacted(url: &Url) -> String {
 
 #[async_trait]
 impl SecretsBackend for VaultKv2Backend {
-    async fn put(&self, name: &str, value: &SecretString) -> Result<i64, SecretsError> {
+    async fn put(
+        &self,
+        name: &str,
+        value: &SecretString,
+        allowed_hosts: &[String],
+    ) -> Result<i64, SecretsError> {
         let url = self.url("data", &format!("secrets/{name}"))?;
-        let body = serde_json::json!({ "data": { "value": value.expose() } });
+        // The pin lives with the value because the broker reads it from the
+        // same document; a version written without one is unpinned.
+        let body = serde_json::json!({
+            "data": { "value": value.expose(), "allowed_hosts": allowed_hosts }
+        });
         let (status, json) = self.send(Method::POST, url.clone(), Some(body)).await?;
         Self::expect_success(&Method::POST, &url, status, false)?;
         json.as_ref()
@@ -273,7 +282,7 @@ mod tests {
         let fake = Fake::default();
         let backend = backend(&serve(fake.clone()).await);
         let version = backend
-            .put("openai", &SecretString::new("sk-live".into()))
+            .put("openai", &SecretString::new("sk-live".into()), &[])
             .await
             .unwrap();
         assert_eq!(version, 7);
@@ -286,7 +295,35 @@ mod tests {
         assert_eq!(seen[0].namespace.as_deref(), Some("admin"));
         assert_eq!(
             seen[0].body,
-            Some(serde_json::json!({ "data": { "value": "sk-live" } }))
+            Some(serde_json::json!({
+                "data": { "value": "sk-live", "allowed_hosts": [] }
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_value_carries_its_hosts_into_the_same_document() {
+        let fake = Fake::default();
+        let backend = backend(&serve(fake.clone()).await);
+        backend
+            .put(
+                "openai",
+                &SecretString::new("sk-live".into()),
+                &["api.openai.com".to_string(), "*.github.com".to_string()],
+            )
+            .await
+            .unwrap();
+
+        let seen = fake.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen[0].body,
+            Some(serde_json::json!({
+                "data": {
+                    "value": "sk-live",
+                    "allowed_hosts": ["api.openai.com", "*.github.com"]
+                }
+            })),
+            "the broker reads the pin from the value document, not from a ref row"
         );
     }
 
@@ -328,7 +365,7 @@ mod tests {
         };
         let backend = backend(&serve(fake).await);
         let err = backend
-            .put("openai", &SecretString::new("sk-live".into()))
+            .put("openai", &SecretString::new("sk-live".into()), &[])
             .await
             .err()
             .unwrap();

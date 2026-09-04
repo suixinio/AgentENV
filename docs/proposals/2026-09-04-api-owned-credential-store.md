@@ -1,7 +1,7 @@
 # api 半边自持凭据值：PostgreSQL 是唯一的凭据存储
 
 状态：三个决策点全部已裁决（§5.1 主密钥、§5.2 新鲜度、§5.3 隔离轴）。
-P0–P4 已实现（分期见 §7 末尾的落地记录）；P5 未开始，闸门是 P4 的 e2e 回执。
+P0–P4 已完成，回执见 §7 末尾的落地记录；P5（删除批）可以开始。
 关联：`2026-09-03-sandbox-egress-credential-brokering.md`（v1/v1.1 已实现）、
 `_egress-brokering-v1.1-implementation.md`
 
@@ -500,9 +500,35 @@ pve-mf overlay 切到 `postgres` 后端，`vault-dev` **保留不动**（回滚�
 | `feat(secrets): /secrets can hold the structured credential…` | P3：`fields` | 还要改 `adev` 的脱敏补丁 —— 方案没预见到 `value` 变成可选会让它匹配不上，也没预见到 `fields` 的生成类型是会打印的 `models::SecretString` |
 | `feat(deploy): the postgres credential store…` | P4 的清单部分 | e2e 回执还没拿到 |
 
-**P4 未完成的一半**：pve-mf 上要先建 `agentenv-secrets-key` 与 `egress-resolver` 两个
-Secret，再滚 api 与 broker，然后跑 `15_egress_credentials` 与 `16_egress_postgres`。
-这两套的回执是 P5 的闸门（G8），在拿到之前删除批不动。
+### P4 回执（2026-09-04，pve-mf，镜像 `mf-egress-7`）
+
+G8 的闸门已满足。
+
+- 迁移 `0003` 在集群上应用：`catalog_schema_migrations` = `1,2,3`。
+- **`15_egress_credentials`：All 23 tests passed (2 skipped)** —— 与切换前基线逐字相同，
+  两条跳过是 guest 侧探针（模板里没有 `git`、`curl` 的 libcurl 不支持 `--http3`），与后端无关。
+- **`16_egress_postgres`：All 9 tests passed，零跳过。** 这条路第一次完整跑通：凭据由套件
+  自己通过 `/secrets` 的 `fields` 写入（§4.5 存在的理由），guest 用占位 DSN 连上，
+  `current_user` 不是它写的那个，换一组占位落到同一账号，删除沙箱撤销 grant。
+- 全量 16 套件：**135 PASS / 10 SKIP / 0 FAIL**。断言点 145 = 切换前 01–15 基线 141 + 套件 16 的 4。
+  01–15 零回归。
+- 存储侧留痕观察（写两个版本再查表）：`kind` 分别是 `fields` 与 `opaque`，nonce 各 12 字节，
+  明文金丝雀不出现在 `ciphertext` 里，`allowed_hosts` 第一版是 `{pg.internal}`、第二版是 `{}`
+  —— §4.2 说的"pin 跟着版本走"在真库上成立。
+
+两点与本方案无关但在验收中暴露：
+
+1. 套件 16 的凭据必须带 `sslmode`。handler 的 `upstream_tls` 默认开（对真租户库是对的默认），
+   而验证用的上游是明文 postgres，缺这个字段时每次查询都是
+   `ERR:28000:the upstream refused TLS`，**而套件把它报成 skip、整体仍然 exit 0**。
+   已加 `E2E_PG_SSLMODE`。
+2. pve-mf 上 `[handlers.postgres]` 的开关与 `allowed_cidrs`、以及 NetworkPolicy 的 5432 出向
+   规则，是上一轮手工加的活体漂移，仓库里没有。`[handlers.*]` 无 env 绑定且 broker 配置是整文件
+   generator，overlay 只能整份复制。本次 apply 采取"渲染 → 注入 → apply"避开它。
+   **这条没修，是独立的一笔。**
+
+集群上还留着 4 条 Vault 时代的 `secret_refs` 行（`e2e-egress-…`、`verify_tenant_db`、
+`t7_db`、`t8_db`）：名字在、值不在新后端。引用它们的策略会被 400 挡下，不影响其它路径。
 
 ---
 

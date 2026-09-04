@@ -2,7 +2,12 @@
 
 > 2026-09-04 · 承接 `2026-09-03-sandbox-egress-credential-brokering.md` 的 §7 v1.1 与附录 A。
 > v1 已完成并在 pve-mf 验证（分支 `feat/egress-credential-brokering`，基线 `2f45023`）。
-> 这份是"改哪些文件、加哪些类型、测什么"，以及每阶段的验收判据。未实施。
+> 这份是"改哪些文件、加哪些类型、测什么"，以及每阶段的验收判据。
+>
+> **实施状态（2026-09-04）**：A/B/C/D 已实施，E 除 E1 外已实施，F 属消费方仓库。
+> 单元与守卫变异证据见各阶段提交；集群验收（A 阶段的 netns 判据、D 阶段的真实 PG）未做。
+> E1 的结论见下面 E 表格里的那一行：Vault 那条路要给 api 半边 `sys/policies/acl/*` 写权限，
+> 用一个更大的暴露换一个更小的，所以没走；`external_resolver` 从另一侧达到了同一个目的。
 
 ## 0. 起点：v1 留下的接缝
 
@@ -210,12 +215,12 @@ metric 能区分"被 allowlist 拒"和"被沙箱策略拒"。
 
 | 项 | 位置 | 内容 |
 |---|---|---|
-| E1 按 grant 限定范围的 broker 令牌 | api 半边 + broker | 签发 grant 时同签只读得到该 grant 名字的 scoped/wrapped 令牌，把 §4.6 的应用层检查变成 store 层约束。这是 S3 未消除的那一半 |
-| E2 broker 服务端证书单独一张 CA | `deploy/k8s/base/aenv-egress-secrets.example.yaml`、`tls.rs` | 两张 CA 分开后，签叶证书那张才能加 Name Constraints。这是 S6 的前置 |
-| E3 每 secret 的 `allowedHosts` | `secret_refs` + broker | 把一个密钥能去的上游钉在密钥上，而不只是钉在规则上 |
-| E4 叶证书缓存 | `crates/aenv-egress/src/tls.rs` | 陈旧队列项会驱逐刚刷新的叶证书；并发未命中会重复消耗签发预算。修法是刷新时清理旧队列项、签发期间持锁 |
-| E5 密钥值全程 Zeroizing | `src/api/generated` + `adev` | v1 已用 codegen 后处理去掉 XSS 校验与打印型 `Debug`，剩下的是让值从反序列化起就在 `Zeroizing` 里 |
-| E6 e2e harness 严格模式 | `scripts/tests/e2e/lib/` | 现在前置条件不满足记为通过是全 harness 的约定。加 `E2E_STRICT` 类开关让选定的套件硬失败，别在单个套件里做 |
+| E1 按 grant 限定范围的 broker 令牌 | api 半边 + broker | **不按原方案做。** 每 grant 一张 Vault 策略要给 api 半边 `sys/policies/acl/*` 写权限，即"能给自己写任意策略"，是更大的暴露。`external_resolver` 后端把这条检查放进了 store：broker 持有的令牌只能按 `(sandbox, execution, name)` 逐条问，问不出未授权的名字。Vault 后端的这条差距写进了 `concepts/egress-credentials.md` 的 Authorization |
+| E2 broker 服务端证书单独一张 CA（已做） | `deploy/k8s/base/aenv-egress-secrets.example.yaml`、`tls.rs` | 两张 CA 分开后，签叶证书那张才能加 Name Constraints。这是 S6 的前置 |
+| E3 每 secret 的 `allowedHosts`（已做） | `secret_refs` + broker | 把一个密钥能去的上游钉在密钥上，而不只是钉在规则上 |
+| E4 叶证书缓存（已做） | `crates/aenv-egress/src/tls.rs` | 陈旧队列项会驱逐刚刷新的叶证书；并发未命中会重复消耗签发预算。修法是刷新时清理旧队列项、签发期间持锁 |
+| E5 密钥值全程 Zeroizing（已做） | `src/api/generated` + `adev` | v1 已用 codegen 后处理去掉 XSS 校验与打印型 `Debug`，剩下的是让值从反序列化起就在 `Zeroizing` 里 |
+| E6 e2e harness 严格模式（已做） | `scripts/tests/e2e/lib/` | 现在前置条件不满足记为通过是全 harness 的约定。加 `E2E_STRICT` 类开关让选定的套件硬失败，别在单个套件里做 |
 
 ## F 阶段：消费方（uns-swe，不在本仓库）
 

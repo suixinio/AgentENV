@@ -170,13 +170,22 @@ cut connections already open — it stops the next one, no sooner than the broke
 cache TTL. **The proxy removes the credential from the sandbox; it does not by itself give each
 sandbox a database identity.**
 
-The broker process is trusted rather than confined by that check. It enforces the grant in its own
-code, and the Vault token it holds reads every value under the mount: KV v2 policy has no way to
-say "read `secrets/X` only when `grants/E` names it". What bounds a compromised broker is
-everything around the process — a token whose policy is `read` and cannot write itself a grant, a
-NetworkPolicy that admits only nodes and allows only Vault, DNS and port 443 out, and a non-root
-Pod with a read-only root filesystem. Confining the process itself needs a per-grant scoped or
-response-wrapped token issued at grant time; that is a later stage.
+Which side enforces the grant depends on the backend, and that is the difference between the two.
+
+With `vault`, the broker enforces it in its own code and the token it holds reads every value
+under the mount: KV v2 policy has no way to say "read `secrets/X` only when `grants/E` names it".
+What bounds a compromised broker is everything around the process — a token whose policy is
+`read` and cannot write itself a grant, a NetworkPolicy that admits only nodes and allows only
+Vault, DNS and port 443 out, and a non-root Pod with a read-only root filesystem. A per-grant
+Vault token would need a policy minted per grant, which means giving the api half write access to
+`sys/policies/acl/*` — the ability to write itself a policy for anything in Vault. That trades a
+larger exposure for a smaller one and is why it is not the fix.
+
+With `external_resolver` the check is the store's. The broker holds a token that lets it *ask*
+about one `(sandbox, execution, name)` at a time, not one that reads values; a resolver that has
+no grant for the triple answers `403`, and a compromised broker reads nothing that is not
+currently granted to some sandbox. That is the confinement a scoped token was meant to buy,
+reached from the other side.
 
 ## Deployment
 

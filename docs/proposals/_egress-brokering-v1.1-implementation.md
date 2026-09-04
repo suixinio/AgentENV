@@ -30,7 +30,7 @@ v1.1 不需要新的架构，四个接缝已经在位，postgres 与 tcp 是往�
   或第二个 TLS 栈。结构化解析器是 HTTP 客户端，不是数据库客户端。
 - 每个新守卫都要有变异证据（构造一次真实违规、确认守卫变红、复原）。
 
-## 0.2 已定的两条（2026-09-04 裁决，附录 A 据此修正）
+## 0.2 已定：附录 A 的两处修正（2026-09-04）
 
 **不建短期角色。** 附录 A 原本要求发放授权时 `CREATE ROLE sbx_<execution>`、撤销时 `DROP ROLE`。
 改为解析器直接返回消费方已有的每库凭据，不做任何 DDL、不新增存储。代价要写进文档：所有沙箱在
@@ -45,15 +45,36 @@ v1.1 不需要新的架构，四个接缝已经在位，postgres 与 tcp 是往�
 唯一的例外是 `replication`：它切换的是另一套协议模式，handler 的盲转发前提不成立，所以带
 `replication` 的启动一律**拒绝**（不是静默剔除），理由写进错误文案。
 
-## 0.3 仍待裁决的三件事
+## 0.3 已定的另外三条（2026-09-04）
 
-1. **显式端点声明放在哪。** 方案说走 `x-aenv-` 前缀的扩展字段，挂在 `network` 上。要确认它与
-   E2B 的 `network.rules` 并存时的校验顺序，以及 `brokers` 是否就此变成半公开。
-2. **`sslmode` 的支持面。** handler 对 `SSLRequest` 回 `N`，所以沙箱侧 DSN 只能是 `sslmode=disable`
-   或不写。若消费方需要 `verify-full`，就要给本地名字现签证书并把 CA 送进 guest，那等于把
-   显式端点的"无 CA"前提推翻。默认建议：v1.1 只支持 `disable`，写进文档。
-3. **allowlist 的粒度。** 每 handler 一份，还是全局一份加 handler 标签。附录 A 写的是"运营者为
-   `postgres` handler 配置的 CIDR allowlist"，倾向每 handler。
+**`sslmode` 只支持 `disable`。** handler 对 `SSLRequest` 回 `N`，沙箱侧 DSN 只能是 `sslmode=disable`
+或不写。不为 `verify-full` 给本地名字现签证书、不把 CA 送进 guest，显式端点"无 CA"的前提保住。
+消费方文档要写明：命名空间内那一段是明文，不出宿主机；真实的 TLS 与证书校验由 broker 对上游做。
+
+**allowlist 每 handler 一份。** 不做全局表加标签。空表等于该 handler 不可用，而不是放行一切。
+
+**显式端点仍按方案走 `x-aenv-` 扩展字段。** 见下面的对齐说明。
+
+## 0.4 与 e2b 的对齐（2026-09-04 查证 `e2b-infra`）
+
+**e2b 没有显式端点声明。** 它存储层的出口配置只有三组：`allowedAddresses` / `deniedAddresses`、
+按域名的 `rules`（只做 HTTP 头替换）、以及 SOCKS5 的 `egressProxyAddress` / `Username` / `Password`。
+全链路**没有任何按端口的配置**，也没有 handler 概念。
+
+相邻的是 `egressProxy`：透明 SOCKS5 隧道，"出站 TCP 在放行过滤之后被隧道转发，沙箱对此无感知"。
+实现上是 iptables REDIRECT 把**所有 TCP** 打到用户态代理，该代理接口同时提供 `CABundle()`，
+所以 HTTPS 中间人与证书下发也归它。仓库里只有接口与空实现。
+
+两条结论：
+
+- **透明拦截是 E2B 形状的做法**，他们没有"声明本地端点"这个念头。这支持 A3 的端口拦截那一条，
+  也是"guest 可以写任意 host"能成立的机制。
+- **SOCKS5 转的是字节，选不了协议 handler、绑不了凭据，改写不了 `StartupMessage`。**
+  所以显式端点声明是对上游的一处**有意偏离**，理由是我们需要"哪个端口用哪个 handler、配哪份凭据"，
+  而 e2b 的面表达不了这件事。
+
+一处我们更严：e2b 把 SOCKS5 口令明文存在沙箱网络配置里；我们的凭据在密钥存储或解析器后面，
+配置里不落值。
 
 ## A 阶段：显式本地端点
 
@@ -103,7 +124,7 @@ v1 刚修的 `Drop for BrokeredEndpoints` 与 `replace()` 顺序对显式端点�
 
 ### B1 运营者 allowlist（`crates/aenv-egress/src/policy.rs`、`deploy/k8s/base/config/aenv-egress.toml`）
 
-- 新增每 handler 的 CIDR allowlist 配置，`UpstreamGuard` 在既有拒绝表之后、沙箱策略之前检查。
+- 每 handler 一份 CIDR allowlist（0.3 已定），`UpstreamGuard` 在既有拒绝表之后、沙箱策略之前检查。
 - 空 allowlist 意味着该 handler 不可用，而不是放行一切。这是 fail-closed 的默认。
 
 ### B2 中继实现（`crates/aenv-egress/src/handlers/tcp.rs`）
@@ -150,7 +171,7 @@ metric 能区分"被 allowlist 拒"和"被沙箱策略拒"。
 
 ### D1 协议前半（`crates/aenv-egress/src/handlers/postgres.rs`，新文件）
 
-- `SSLRequest` 回 `N`（见 0.3 第 2 条待裁决）。
+- `SSLRequest` 回 `N`，沙箱侧只支持 `sslmode=disable`（0.3）。
 - 解析 `StartupMessage`，保留 guest 写的每个参数，等 D2 决定哪些被覆盖。
 - `CancelRequest` 是独立新连接，识别后转发到同一上游。
 
@@ -221,7 +242,8 @@ AgentENV 侧不为这个场景加任何专用面，消费方要做的是：
 
 ## 边界与已知取舍
 
-- guest 到 `helium` 是 netns 内明文。这条链路不出宿主机，但要在文档里写明。
+- guest 到本地 listener 是 netns 内明文（`sslmode=disable`，见 0.3）。这条链路不出宿主机，
+  但要在面向消费方的文档里写明，真实 TLS 与校验由 broker 对上游做。
 - DSN 长得像真凭据却是占位，文档必须显式说明，否则会被当成泄漏。
 - `postgres` handler 对任何 Postgres 协议的上游一样工作，它不是为某一个消费方写的。
 

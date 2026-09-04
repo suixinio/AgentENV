@@ -9,69 +9,104 @@ use tokio::net::TcpStream;
 
 use crate::header::EgressPolicySummary;
 
-/// Destinations no sandbox may reach through the broker regardless of its
-/// own policy. Defaults to the ranges a sandbox namespace already rejects
-/// plus loopback; the operator adds the cluster's Service and Pod CIDRs.
+/// Destinations no sandbox may reach through the broker regardless of its own
+/// policy, in two classes. The absolute ones are the broker's own host, the
+/// link-local range that carries cloud metadata, the families that are not
+/// destinations, and whatever the operator added — no configuration reaches
+/// those. The overridable ones are merely private, and an operator naming one
+/// of them in a per-handler allowlist is the whole point of that allowlist.
 #[derive(Clone, Debug)]
 pub struct BrokerDenyList {
-    cidrs: Vec<IpNetwork>,
+    absolute: Vec<IpNetwork>,
+    overridable: Vec<IpNetwork>,
 }
 
 impl Default for BrokerDenyList {
     fn default() -> Self {
-        Self::from_cidrs(DEFAULT_DENIED_CIDRS).expect("built-in cidrs parse")
+        Self {
+            absolute: parse_built_in(ABSOLUTE_DENIED_CIDRS),
+            overridable: parse_built_in(OVERRIDABLE_DENIED_CIDRS),
+        }
     }
 }
 
-const DEFAULT_DENIED_CIDRS: &[&str] = &[
+/// Not reachable through this broker under any configuration.
+const ABSOLUTE_DENIED_CIDRS: &[&str] = &[
     "0.0.0.0/8",
-    "10.0.0.0/8",
-    "100.64.0.0/10",
     "127.0.0.0/8",
     "169.254.0.0/16",
-    "172.16.0.0/12",
-    "192.168.0.0/16",
     "224.0.0.0/4",
     "240.0.0.0/4",
     "::/128",
     "::1/128",
-    "fc00::/7",
     "fe80::/10",
     "ff00::/8",
     "::ffff:0:0/96",
     "64:ff9b::/96",
 ];
 
+/// Denied to a destination the guest chose, reachable to one an operator named
+/// for a handler: the ranges real upstreams actually live in.
+const OVERRIDABLE_DENIED_CIDRS: &[&str] = &[
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fc00::/7",
+];
+
+fn parse_built_in(cidrs: &[&str]) -> Vec<IpNetwork> {
+    cidrs
+        .iter()
+        .map(|cidr| cidr.parse::<IpNetwork>().expect("built-in cidrs parse"))
+        .collect()
+}
+
 impl BrokerDenyList {
     /// No built-in ranges at all; for tests that talk to loopback.
     pub fn empty() -> Self {
-        Self { cidrs: Vec::new() }
+        Self {
+            absolute: Vec::new(),
+            overridable: Vec::new(),
+        }
     }
 
+    /// Exactly `cidrs`, all of them absolute.
     pub fn from_cidrs<S: AsRef<str>>(cidrs: &[S]) -> Result<Self, ipnetwork::IpNetworkError> {
-        let cidrs = cidrs
+        let absolute = cidrs
             .iter()
             .map(|c| c.as_ref().parse::<IpNetwork>())
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { cidrs })
+        Ok(Self {
+            absolute,
+            overridable: Vec::new(),
+        })
     }
 
-    /// The defaults plus `extra`.
+    /// The defaults plus `extra`. What the operator adds is absolute: naming a
+    /// range here is the statement that nothing reaches it, and the cluster's
+    /// own Service and Pod CIDRs are what belongs here.
     pub fn with_extra<S: AsRef<str>>(extra: &[S]) -> Result<Self, ipnetwork::IpNetworkError> {
         let mut list = Self::default();
-        list.cidrs.extend(Self::from_cidrs(extra)?.cidrs);
+        list.absolute.extend(Self::from_cidrs(extra)?.absolute);
         Ok(list)
     }
 
-    fn matches(&self, ip: IpAddr) -> Option<&IpNetwork> {
-        self.cidrs.iter().find(|net| net.contains(ip))
+    fn absolute_matches(&self, ip: IpAddr) -> bool {
+        self.absolute.iter().any(|net| net.contains(ip))
+    }
+
+    fn matches(&self, ip: IpAddr) -> bool {
+        self.absolute_matches(ip) || self.overridable.iter().any(|net| net.contains(ip))
     }
 }
 
 /// Handlers whose upstream is named by the endpoint declaration or by the
-/// credential resolver rather than by the guest's own connection. The
-/// sandbox's policy does not bound them, so without an operator allowlist
-/// they reach nothing.
+/// credential resolver rather than by the guest's own connection. Two things
+/// follow: without an operator allowlist they reach nothing, and inside one
+/// they reach what it names — including a private range, which is where the
+/// databases this exists for actually live — without the sandbox's own CIDR
+/// policy having a say, because the sandbox never addressed that upstream.
 pub const HANDLERS_REQUIRING_ALLOWLIST: [&str; 2] = ["tcp", "postgres"];
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -218,11 +253,20 @@ impl UpstreamGuard {
         Ok(ips)
     }
 
-    /// Broker deny list, then the handler's operator allowlist, then the
-    /// sandbox's allow list, deny list and base policy: the same order as the
-    /// namespace's FORWARD chains, with the operator's pin ahead of anything
-    /// the sandbox can say. An IPv4-mapped IPv6 address is checked as the
-    /// IPv4 address it maps.
+    /// The absolute deny list, then the handler's operator allowlist, then —
+    /// for a handler whose upstream the guest itself chose — the overridable
+    /// deny list and the sandbox's own allow list, deny list and base policy,
+    /// in the order the namespace's FORWARD chains apply them.
+    ///
+    /// A handler in [`HANDLERS_REQUIRING_ALLOWLIST`] is the other case: its
+    /// upstream comes from the endpoint declaration or the credential, the
+    /// guest never addressed it, and the operator's allowlist is what bounds
+    /// it. An address inside that allowlist is reached without consulting the
+    /// sandbox's CIDR policy, which would otherwise force the operator to
+    /// publish the upstream's address into the sandbox's own configuration —
+    /// the address the whole arrangement exists to keep out of it.
+    ///
+    /// An IPv4-mapped IPv6 address is checked as the IPv4 address it maps.
     pub fn check(
         &self,
         handler: &str,
@@ -230,16 +274,22 @@ impl UpstreamGuard {
         policy: &EgressPolicySummary,
     ) -> Result<(), DenyReason> {
         let ip = ip.to_canonical();
-        if self.deny.matches(ip).is_some() {
+        if self.deny.absolute_matches(ip) {
             return Err(DenyReason::BrokerDenied);
         }
+        let operator_chosen = HANDLERS_REQUIRING_ALLOWLIST.contains(&handler);
         match self.allowlists.get(handler) {
-            Some(pinned) if pinned.iter().any(|net| net.contains(ip)) => {}
-            Some(_) => return Err(DenyReason::HandlerDenied),
-            None if HANDLERS_REQUIRING_ALLOWLIST.contains(&handler) => {
-                return Err(DenyReason::HandlerUnpinned)
+            Some(pinned) if pinned.iter().any(|net| net.contains(ip)) => {
+                if operator_chosen {
+                    return Ok(());
+                }
             }
+            Some(_) => return Err(DenyReason::HandlerDenied),
+            None if operator_chosen => return Err(DenyReason::HandlerUnpinned),
             None => {}
+        }
+        if self.deny.matches(ip) {
+            return Err(DenyReason::BrokerDenied);
         }
         let allowed = parse_cidrs(&policy.allowed_cidrs)?;
         if allowed.iter().any(|net| net.contains(ip)) {
@@ -488,9 +538,9 @@ mod tests {
     #[test]
     fn the_mapped_and_nat64_prefixes_are_in_the_built_in_deny_list() {
         let deny = BrokerDenyList::default();
-        assert!(deny.matches(ip("::ffff:8.8.8.8")).is_some());
-        assert!(deny.matches(ip("64:ff9b::808:808")).is_some());
-        assert!(deny.matches(ip("2606:4700::1111")).is_none());
+        assert!(deny.matches(ip("::ffff:8.8.8.8")));
+        assert!(deny.matches(ip("64:ff9b::808:808")));
+        assert!(!deny.matches(ip("2606:4700::1111")));
         assert_eq!(
             UpstreamGuard::new(deny).check("http", ip("64:ff9b::a00:1"), &open_internet()),
             Err(DenyReason::BrokerDenied)

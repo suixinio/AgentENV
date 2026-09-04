@@ -34,9 +34,10 @@ cache_capacity = 4096
 mints_per_sandbox_per_minute = 60
 
 [upstream]
-# The cluster's Service and Pod CIDRs, on top of the built-in private ranges:
-# no sandbox reaches them through the broker whatever its own policy says.
-# k3s defaults; change them with the cluster.
+# The cluster's Service and Pod CIDRs. These are absolute: unlike the built-in
+# private ranges, no per-handler allowed_cidrs reopens them, so this is where a
+# range nothing may ever reach belongs. k3s defaults; change them with the
+# cluster.
 denied_cidrs = ["10.42.0.0/16", "10.43.0.0/16"]
 
 [vault]
@@ -71,6 +72,12 @@ echo = false
 # The byte relay for `tcp` endpoint declarations. An enabled handler with an
 # empty allowed_cidrs reaches nothing: the operator names where declarations
 # may point, and no sandbox input can widen it.
+#
+# A range named here is reached even when it is private, which is the point —
+# the upstream is the operator's choice, not the guest's, so neither the
+# built-in private ranges nor the sandbox's own egress policy bounds it. What
+# it still cannot reach is the broker's own host, the link-local range that
+# carries cloud metadata, and everything in [upstream].denied_cidrs.
 enabled = false
 allowed_cidrs = []
 
@@ -78,7 +85,9 @@ allowed_cidrs = []
 # Terminates the guest's Postgres startup exchange and authenticates upstream
 # with the credential the endpoint declaration names. The guest's DSN carries a
 # placeholder user and password that are never used. allowed_cidrs bounds where
-# a credential may point; empty means the handler reaches nothing.
+# a credential may point and reads exactly as [handlers.tcp]'s above; empty
+# means the handler reaches nothing. A tenant database on a private address
+# belongs here.
 enabled = false
 allowed_cidrs = []
 

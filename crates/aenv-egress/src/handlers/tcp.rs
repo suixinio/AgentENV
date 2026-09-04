@@ -221,15 +221,20 @@ mod tests {
         );
     }
 
+    /// The guest addressed a listener in its own namespace, not this upstream,
+    /// so its CIDR policy has nothing to say about it. Applying that policy
+    /// here would mean publishing the upstream's address into the sandbox's
+    /// own configuration, which is the address this arrangement exists to keep
+    /// out of it.
     #[test]
-    fn the_sandbox_policy_still_applies_inside_the_allowlist() {
+    fn the_sandbox_policy_does_not_bound_an_upstream_the_operator_chose() {
         let guard = UpstreamGuard::new(BrokerDenyList::empty())
             .with_allowlist(TcpRelayHandler::NAME, &["198.51.100.0/24"])
             .unwrap();
         let closed = EgressPolicySummary {
             allow_internet: false,
             allowed_cidrs: vec![],
-            denied_cidrs: vec![],
+            denied_cidrs: vec!["198.51.100.0/24".into()],
         };
         assert_eq!(
             guard.check(
@@ -237,7 +242,107 @@ mod tests {
                 "198.51.100.7".parse().unwrap(),
                 &closed
             ),
+            Ok(())
+        );
+        // Outside the operator's allowlist it is still refused, and that is
+        // the only thing that bounds this handler.
+        assert_eq!(
+            guard.check(
+                TcpRelayHandler::NAME,
+                "203.0.113.7".parse().unwrap(),
+                &closed
+            ),
+            Err(DenyReason::HandlerDenied)
+        );
+    }
+
+    /// The other class: the guest chose the destination itself, so everything
+    /// it says about destinations still applies.
+    #[test]
+    fn the_sandbox_policy_still_bounds_a_handler_the_guest_addressed() {
+        let guard = UpstreamGuard::new(BrokerDenyList::empty())
+            .with_allowlist("http", &["198.51.100.0/24"])
+            .unwrap();
+        let closed = EgressPolicySummary {
+            allow_internet: false,
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        assert_eq!(
+            guard.check("http", "198.51.100.7".parse().unwrap(), &closed),
             Err(DenyReason::InternetDisabled)
+        );
+    }
+
+    /// No allowlist reaches the broker's own host or the link-local range that
+    /// carries cloud metadata, however explicitly it names them.
+    #[test]
+    fn an_allowlist_cannot_name_its_way_to_the_absolute_denials() {
+        let guard = UpstreamGuard::new(BrokerDenyList::default())
+            .with_allowlist(
+                TcpRelayHandler::NAME,
+                &["127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/0"],
+            )
+            .unwrap();
+        let open = EgressPolicySummary {
+            allow_internet: true,
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        for absolute in ["127.0.0.1", "169.254.169.254", "224.0.0.1"] {
+            assert_eq!(
+                guard.check(TcpRelayHandler::NAME, absolute.parse().unwrap(), &open),
+                Err(DenyReason::BrokerDenied),
+                "{absolute}"
+            );
+        }
+    }
+
+    /// What the operator put in `upstream.denied_cidrs` — the cluster's own
+    /// Service and Pod CIDRs — is a statement that nothing reaches it, so a
+    /// handler allowlist does not reopen it either.
+    #[test]
+    fn an_allowlist_cannot_reopen_what_the_operator_denied() {
+        let guard = UpstreamGuard::new(BrokerDenyList::with_extra(&["10.42.0.0/16"]).unwrap())
+            .with_allowlist(TcpRelayHandler::NAME, &["10.42.0.0/16", "10.20.0.0/16"])
+            .unwrap();
+        let open = EgressPolicySummary {
+            allow_internet: true,
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        assert_eq!(
+            guard.check(TcpRelayHandler::NAME, "10.42.1.5".parse().unwrap(), &open),
+            Err(DenyReason::BrokerDenied)
+        );
+        assert_eq!(
+            guard.check(TcpRelayHandler::NAME, "10.20.1.5".parse().unwrap(), &open),
+            Ok(())
+        );
+    }
+
+    /// The upstream a declaration names is the operator's choice, and the
+    /// operators who need this handler have their databases on private
+    /// addresses. An allowlist that cannot reach one is a fail-closed switch
+    /// with nothing behind it.
+    #[test]
+    fn an_operator_allowlist_reaches_the_private_range_it_names() {
+        let guard = UpstreamGuard::new(BrokerDenyList::default())
+            .with_allowlist(TcpRelayHandler::NAME, &["10.20.0.0/16"])
+            .unwrap();
+        let open = EgressPolicySummary {
+            allow_internet: true,
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        assert_eq!(
+            guard.check(TcpRelayHandler::NAME, "10.20.1.5".parse().unwrap(), &open),
+            Ok(())
+        );
+        // Nothing outside the named range comes with it.
+        assert_eq!(
+            guard.check(TcpRelayHandler::NAME, "10.21.1.5".parse().unwrap(), &open),
+            Err(DenyReason::HandlerDenied)
         );
     }
 

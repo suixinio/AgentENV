@@ -120,6 +120,19 @@ Whatever the handler, an upstream must fall inside the operator's per-handler al
 reaches nothing: the endpoint declaration names the upstream, so the operator names where
 declarations may point.
 
+That allowlist reaches a private range when it names one, and it has to — the databases this
+exists for sit on private addresses inside a VPC. The upstream is the operator's choice and the
+guest never addressed it, so neither the broker's built-in private ranges nor the sandbox's own
+`allowOut` / `denyOut` / `allow_internet_access` bounds it; requiring the sandbox's policy to
+name the database would mean publishing its address into the sandbox's own configuration, which
+is the address the arrangement exists to keep out of it. Three things stay out of reach whatever
+an allowlist says: the broker's own host, the link-local range that carries cloud metadata, and
+everything the operator put in `[upstream].denied_cidrs` — which is where the cluster's own
+Service and Pod CIDRs go.
+
+`rules` is the other class: there the guest chose the destination itself, so the built-in ranges
+and the sandbox's own policy apply to it exactly as before.
+
 ## What happens on the wire
 
 A sandbox with rules gets a listener inside its own network namespace and a DNAT of its

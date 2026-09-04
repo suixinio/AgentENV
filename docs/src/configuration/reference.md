@@ -510,7 +510,7 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 | `ca.leaf_ttl_secs` | integer | `86400` | Lifetime of a minted leaf certificate. |
 | `ca.cache_capacity` | integer | `4096` | How many minted leaves are kept before the oldest name is evicted. |
 | `ca.mints_per_sandbox_per_minute` | integer | `60` | Per-sandbox signing budget. With match-before-sign this is what bounds the leaves an unconstrained CA can be made to issue. |
-| `upstream.denied_cidrs` | array of CIDR strings | `[]` | Destinations no sandbox reaches through the broker, on top of the built-in private ranges. The cluster's Service and Pod CIDRs belong here. |
+| `upstream.denied_cidrs` | array of CIDR strings | `[]` | Destinations nothing reaches through the broker. These are absolute: unlike the built-in private ranges, no per-handler `allowed_cidrs` reopens them, so a range that must never be reachable belongs here. The cluster's Service and Pod CIDRs are the ones that do. |
 | `vault.addr` | string | unset | Vault base URL. Unset runs the broker with no credential source and every marker answers 502. |
 | `vault.token_file` | path | unset | File holding the broker's Vault token. A read-only policy: the api half writes with a different token (`secrets-vault-writer`), which this Pod does not mount. |
 | `vault.mount` | string | `"aenv"` | KV v2 mount. Must match the api half's `[secrets.vault].mount`. |
@@ -529,9 +529,9 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 | `resolver.cache_capacity` | integer | `4096` | Credentials held at once, with the same expiry-ordered eviction as the Vault cache. |
 | `handlers.echo` | boolean | `false` | The `echo` identity handler, for smoke tests. Off in production. |
 | `handlers.tcp.enabled` | boolean | `false` | The `tcp` byte relay, which endpoint declarations name. |
-| `handlers.tcp.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations `tcp` reaches. An enabled handler with an empty list reaches nothing: a declaration names the upstream, so the operator names where declarations may point. Checked after the broker deny list and before the sandbox's own policy, so no sandbox input widens it. **TOML-file-only — no `env =` binding.** |
+| `handlers.tcp.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations `tcp` reaches. An enabled handler with an empty list reaches nothing: a declaration names the upstream, so the operator names where declarations may point. A range named here is reached even when it is private, because the upstream is the operator's choice and the guest never addressed it — neither the built-in private ranges nor the sandbox's own egress policy bounds it. It still cannot reach the broker's own host, link-local (cloud metadata), or anything in `upstream.denied_cidrs`. **TOML-file-only — no `env =` binding.** |
 | `handlers.postgres.enabled` | boolean | `false` | The `postgres` handler, which terminates the guest's startup exchange and authenticates upstream with the brokered credential. |
-| `handlers.postgres.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations a `postgres` credential may point at. An enabled handler with an empty list reaches nothing. **TOML-file-only — no `env =` binding.** |
+| `handlers.postgres.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations a `postgres` credential may point at, reading exactly as `handlers.tcp.allowed_cidrs` above. An enabled handler with an empty list reaches nothing; a tenant database on a private address belongs here. **TOML-file-only — no `env =` binding.** |
 | `handlers.http.allowed_cidrs` | array of CIDR strings | `[]` | Pins the `rules` handler further. Empty leaves it bounded by each sandbox's own egress policy, which is what already bounds an intercepted connection. **TOML-file-only — no `env =` binding.** |
 
 Environment variable overrides for this file are listed under

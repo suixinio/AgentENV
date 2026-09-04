@@ -30,18 +30,29 @@ v1.1 不需要新的架构，四个接缝已经在位，postgres 与 tcp 是往�
   或第二个 TLS 栈。结构化解析器是 HTTP 客户端，不是数据库客户端。
 - 每个新守卫都要有变异证据（构造一次真实违规、确认守卫变红、复原）。
 
-## 0.2 动工前必须裁决的四件事
+## 0.2 已定的两条（2026-09-04 裁决，附录 A 据此修正）
 
-这四件事影响接口形状，先定再写，否则要返工：
+**不建短期角色。** 附录 A 原本要求发放授权时 `CREATE ROLE sbx_<execution>`、撤销时 `DROP ROLE`。
+改为解析器直接返回消费方已有的每库凭据，不做任何 DDL、不新增存储。代价要写进文档：所有沙箱在
+数据库侧仍是同一个角色，审计日志分不出是哪个沙箱。**代理消除的是"凭据在沙箱里"，它本身不提供
+每沙箱的数据库身份。**
+
+**字段选择性覆盖。** 解析器返回哪些字段就只覆盖哪些字段，**没有被选中的字段一律原样透传**。
+以 `postgresql://user:pass@tier0/xxx` 为例，解析器给了 host、user、password，那么连接落到
+真实地址与真实账号，而 `xxx` 这个库名、`options`、`application_name` 等保持 guest 写的值。
+附录 A 原文"user、database 重写为解析器给的值"作废，database 只在解析器明确返回时才重写。
+
+唯一的例外是 `replication`：它切换的是另一套协议模式，handler 的盲转发前提不成立，所以带
+`replication` 的启动一律**拒绝**（不是静默剔除），理由写进错误文案。
+
+## 0.3 仍待裁决的三件事
 
 1. **显式端点声明放在哪。** 方案说走 `x-aenv-` 前缀的扩展字段，挂在 `network` 上。要确认它与
    E2B 的 `network.rules` 并存时的校验顺序，以及 `brokers` 是否就此变成半公开。
-2. **`sslmode` 的支持面。** handler 对 `SSLRequest` 回 `N`，所以统一 DSN 只能是 `sslmode=disable`
-   或不写。若消费方需要 `require`/`verify-full`，就要给 `helium` 现签证书并把 CA 送进 guest，
-   那等于把显式端点的"无 CA"前提推翻。默认建议：v1.1 只支持 `disable`，写进文档。
-3. **托管库没有建角色权限时走哪条路。** 退路是解析器直接返回 `rw_` 凭据，真实凭据只在 broker
-   内存里按 grant 存活。要确认这条退路是否算 v1.1 的一等场景（影响解析器契约的必填字段）。
-4. **allowlist 的粒度。** 每 handler 一份，还是全局一份加 handler 标签。附录 A 写的是"运营者为
+2. **`sslmode` 的支持面。** handler 对 `SSLRequest` 回 `N`，所以沙箱侧 DSN 只能是 `sslmode=disable`
+   或不写。若消费方需要 `verify-full`，就要给本地名字现签证书并把 CA 送进 guest，那等于把
+   显式端点的"无 CA"前提推翻。默认建议：v1.1 只支持 `disable`，写进文档。
+3. **allowlist 的粒度。** 每 handler 一份，还是全局一份加 handler 标签。附录 A 写的是"运营者为
    `postgres` handler 配置的 CIDR allowlist"，倾向每 handler。
 
 ## A 阶段：显式本地端点
@@ -65,16 +76,26 @@ v1.1 不需要新的架构，四个接缝已经在位，postgres 与 tcp 是往�
 - v1 刚把 `can_broker()` 收窄到只认 `RemoteOk`；embedded 依旧只服务 `tcp`，A 阶段之后
   `mode_serves_handler` 的表要同步更新。
 
-### A3 运行时（`crates/aenv-node/src/sandbox/egress/`、`src/sandbox/network/policy.rs`）
+### A3 运行时：两条到达路径（`crates/aenv-node/src/sandbox/egress/`、`src/sandbox/network/policy.rs`）
 
-- 在沙箱 netns 内 bind `169.254.0.22:<port>`。**显式端点没有 DNAT，也不需要 CA 进 guest**，
-  与 v1 的透明拦截是两条独立路径，不要复用 `install_intercept`。
-- `helium` 之类的友好名：默认 env `AENV_EGRESS_HOST` 加模板 `/etc/hosts` 别名（§6 P8）。
-- v1 刚修的 `Drop for BrokeredEndpoints` 与 `replace()` 顺序对显式端点同样适用，复用现有实现。
+在沙箱 netns 内 bind `169.254.0.22:<port>`。**显式端点没有 DNAT，也不需要 CA 进 guest**，与 v1 的
+透明拦截是两条独立路径，不要复用 `install_intercept`。但 guest 的 DSN 要真的走到这个 listener，
+名字必须先解析得出来——一个解析不了的 host 连 TCP 都不会发起，也就没有东西可拦截。两条机制，
+都要做，第二条可关：
 
-**A 阶段验收**：一个只声明 `tcp` 显式端点的沙箱起来后，netns 内有 listener、没有 DNAT 规则、
-guest 信任库没有新增 CA；身份头里 `handler`/`params` 与声明逐字一致；放到 disabled 节点上会被
-拒绝而不是静默无效。
+- **hosts 别名（必须）**：模板或 envd init 写入 `169.254.0.22 <name>`，`<name>` 由
+  `AENV_EGRESS_HOST` 给出（§6 P8）。这条让约定的名字精确生效，是消费方常量 DSN 的最小依赖。
+- **端口透明拦截（可选开关）**：复用 v1 为 443 建的 `install_intercept`，把 netns 内所有出站
+  该端口的流量 DNAT 到 listener，于是**任何能解析的 host** 都落到代理上。
+  **代价必须写进文档**：开了它，沙箱就再也直连不到任何其它同协议服务（例如用户自己的外部库），
+  会被静默改道。因此它是每沙箱可关的开关，不是全局默认。
+
+v1 刚修的 `Drop for BrokeredEndpoints` 与 `replace()` 顺序对显式端点同样适用，复用现有实现。
+
+**A 阶段验收**：只声明 `tcp` 显式端点的沙箱起来后，netns 内有 listener、guest 信任库没有新增 CA；
+写约定名字的客户端能连上；打开端口拦截后，写任意可解析 host 的客户端也落到同一个 listener，
+关掉后它恢复直连；身份头里 `handler`/`params` 与声明逐字一致；放到 broker 关闭的节点上会被拒绝
+而不是静默无效。
 
 ## B 阶段：`tcp` handler 变成真的
 
@@ -97,7 +118,8 @@ metric 能区分"被 allowlist 拒"和"被沙箱策略拒"。
 
 ## C 阶段：结构化凭据与外部解析器
 
-`postgres` 需要的不是一串字节，是 `{host, port, database, user, password, ttl}`。
+`postgres` 需要的不是一串字节，是一组字段：`host`、`port`、`user`、`password` 为必填，
+`database`、`options`、`ttl` 等按 0.2 的选择性覆盖规则可缺省，缺省即透传 guest 写的值。
 
 ### C1 `CredentialSource` 返回结构化值（`crates/aenv-egress/src/credential.rs`）
 
@@ -128,25 +150,38 @@ metric 能区分"被 allowlist 拒"和"被沙箱策略拒"。
 
 ### D1 协议前半（`crates/aenv-egress/src/handlers/postgres.rs`，新文件）
 
-- `SSLRequest` 回 `N`（见 0.2 第 2 条裁决）。
-- 解析 `StartupMessage`，取出 guest 的占位 `user`/`database`。
+- `SSLRequest` 回 `N`（见 0.3 第 2 条待裁决）。
+- 解析 `StartupMessage`，保留 guest 写的每个参数，等 D2 决定哪些被覆盖。
 - `CancelRequest` 是独立新连接，识别后转发到同一上游。
 
-### D2 上游与重写
+### D2 上游与选择性覆盖
 
-- `get` 拿到结构化凭据，`StartupMessage` 的 `user`/`database` **重写**为解析器给的值，
-  剔除 `replication` 参数。
-- 以 TLS 连 `host:port` 并校验主机名；地址必须落在 B1 的 allowlist 内。
-- **不向 guest 发 SCRAM 挑战**，guest DSN 里的占位口令永远不被使用。
+`get` 拿到结构化凭据后，按 0.2 的规则逐字段处理，**解析器没给的字段一律原样透传**：
+
+| 字段 | 解析器给了 | 解析器没给 |
+|---|---|---|
+| host / port | 连它，且必须落在 B1 的 allowlist 内 | 该授权不可用，合成 `28000` |
+| user | 重写 `StartupMessage` 的 user | 透传 guest 写的 user |
+| password | 用它对上游完成认证 | 该授权不可用 |
+| database | 重写 | **透传 guest 写的库名** |
+| options、application_name 等 | 重写 | 透传 |
+| replication | —— | 一律拒绝，见 0.2 |
+
+透传 database 的后果要在文档里写明：guest 能点名同一实例上的任意库，但凭据是运营者给的角色，
+越权的库会被数据库自己按权限拒绝，失败是 fail-closed 的。它会成为一个库名探测口，可接受。
+
+- 以 TLS 连 `host:port` 并**校验主机名**；自签 CA 的上游把 CA 配给 broker，而不是降级校验。
+- **不向 guest 发 SCRAM 挑战**，guest DSN 里那串口令永远不被使用。
 
 ### D3 认证与转发
 
-- 上游只接受 `AuthenticationSASL` / SCRAM-SHA-256，以短期角色完成握手。
+- 上游只接受 `AuthenticationSASL` / SCRAM-SHA-256，以解析器返回的账号完成握手。
 - 上游回 `AuthenticationOk` 之后才给 guest 回 `AuthenticationOk`，随后纯字节转发。
 - 上游 `ErrorResponse` 原样透传；无 grant 或取值失败时给 guest 合成 `28000`。
 
-**D 阶段验收**：e2e 中一个带常量 DSN 的沙箱连上真实 PG 并能查询；撤销后角色被删、在途连接被
-PG 切断；沙箱换任何 DSN 参数都不能改变实际连到的库与角色。
+**D 阶段验收**：带常量 DSN 的沙箱连上真实 PG 并能查询；把 DSN 里的用户名口令改成任意值，连接
+照常成功且落到同一个账号；撤销授权后新连接被拒；解析器没返回的字段（库名、`options`）与 guest
+写的逐字一致。
 
 ## E 阶段：v1 结转的加固项
 
@@ -165,20 +200,24 @@ PG 切断；沙箱换任何 DSN 参数都不能改变实际连到的库与角色
 
 AgentENV 侧不为这个场景加任何专用面，消费方要做的是：
 
-1. agent-platform 实现解析器三端点（`grant` / `revoke` / `get`）。
-2. 收到 grant 时在租户 PG 上 `CREATE ROLE sbx_<execution> LOGIN PASSWORD '…' VALID UNTIL '<ttl>'
-   IN ROLE rw_<db>`，收到 revoke 时 `DROP ROLE`（它已经在 `tenant_pg/lifecycle.go` 跑 DDL）。
-3. 创建请求带 `x-aenv` 显式端点声明与**常量** DSN；DSN 里的 user/password/database 都是占位，
-   文档必须写明这一点。
-4. 租户 PG 的 NetworkPolicy 放行 broker 所在 namespace。
-5. 删除 `apps/dab-node-agent`、`40-node-agent.yaml`、DAB 部署清单、`db_access` 的 principal 签发、
-   `customExtensionParams.dab`。
+1. agent-platform 实现解析器三端点（`grant` / `revoke` / `get`）。**不做 DDL**：`get` 直接返回
+   已有的每库凭据（现成的派生逻辑即可），`grant`/`revoke` 只维护授权记录。
+2. 创建请求带 `x-aenv` 显式端点声明与**常量** DSN，DSN 里的用户名口令是占位；模板或 envd 把
+   约定的主机名写进 `/etc/hosts`，否则客户端解析不出来就不会发起连接。
+3. 停止把真实凭据拼进 `DATABASE_URL` 注入沙箱环境变量。这是本次改造的目的，两个注入点都要改。
+4. 租户库的 NetworkPolicy 放行 broker 所在 namespace；自签 CA 的实例把 CA 配给 broker。
+5. 删除节点侧代理及其部署清单、principal 签发、相关的扩展参数。
+
+**顺带可拆掉的坑**：现在为了让 guest 连自签 CA 的共享实例，`sslmode` 被翻译成了"加密但不校验"，
+而那个值不是 libpq 合法值，模板一旦引入走 libpq 的运行时就会直接报错。改造后 guest 用
+`sslmode=disable` 明文连本地 listener，真实 TLS 与校验由 broker 做，这层翻译可以删掉。
 
 ## 生命周期（附录 A，实现时逐条对照）
 
-- pause/resume 后 execution 变了，api 重新 grant，消费方建新角色删旧角色。
+- pause/resume 后 execution 变了，api 重新 grant，消费方按新 execution 记一条授权。
 - fork 子沙箱得到父策略副本，api 为子 execution 请求 grant；消费方不签发则子沙箱首连得到 `28000`。
-- 吊销就是 `DROP ROLE`，是数据库层的事实，不依赖任何缓存 TTL，在途连接由 PG 切断。
+- 吊销是删授权记录，新连接立刻被拒。**不建短期角色的直接代价**：吊销不切断在途连接，
+  且生效时间受 broker 凭据缓存的过期时间限制。两条都要写进面向消费方的文档。
 
 ## 边界与已知取舍
 

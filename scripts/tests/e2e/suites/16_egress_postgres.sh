@@ -22,10 +22,12 @@ ENDPOINT_PORT="${E2E_PG_ENDPOINT_PORT:-5432}"
 # link, from network.internal's fixed VM link CIDR.
 LISTENER_IP="169.254.0.22"
 EGRESS_PY="${SUITE_DIR}/../egress_credentials_e2e.py"
-# A stock template has python3 and no psql, so the guest speaks the protocol
-# with this instead of a client it does not have.
-PROBE_PY="${SUITE_DIR}/../postgres_broker_probe.py"
-PROBE_B64="$(base64 -w0 < "${PROBE_PY}")"
+# No stock template has psql, so the guest speaks the protocol itself. Which
+# interpreter it has varies -- the driver's own base image ships perl and no
+# python3 -- so both are carried and the guest picks.
+PROBE_PY_B64="$(base64 -w0 < "${SUITE_DIR}/../postgres_broker_probe.py")"
+PROBE_PL_B64="$(base64 -w0 < "${SUITE_DIR}/../postgres_broker_probe.pl")"
+PROBE_RUNNER=""
 
 run_in_sandbox() {
   local sandbox_id="$1" cmd="$2"
@@ -38,9 +40,9 @@ run_in_sandbox() {
 brokered_query() {
   local sandbox_id="$1" user="$2" password="$3" database="$4" sql="$5" out
   out=$(run_in_sandbox "$sandbox_id" \
-    "printf %s '${PROBE_B64}' | base64 -d > /tmp/pgprobe.py && \
-     python3 /tmp/pgprobe.py '${LISTENER_IP}' '${ENDPOINT_PORT}' \
-       '${user}' '${password}' '${database}' \"${sql}\" 2>&1" | tail -n 1 || true)
+    "printf %s '${PROBE_B64}' | base64 -d > ${PROBE_PATH} && \
+     (${PROBE_RUNNER} ${PROBE_PATH} '${LISTENER_IP}' '${ENDPOINT_PORT}' \
+       '${user}' '${password}' '${database}' \"${sql}\" 2>&1 || true)" | tail -n 1 || true)
   printf '%s' "${out:-ERR:no output}"
 }
 
@@ -92,12 +94,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if ! run_in_sandbox "$sandbox_id" "command -v python3" >/dev/null 2>&1; then
-  warn "the template has no python3; the guest cannot speak the protocol under test"
-  _skip "brokered postgres, no python3 in the template"
+if run_in_sandbox "$sandbox_id" "command -v python3" >/dev/null 2>&1; then
+  PROBE_RUNNER="python3"; PROBE_B64="$PROBE_PY_B64"; PROBE_PATH="/tmp/pgprobe.py"
+elif run_in_sandbox "$sandbox_id" "command -v perl" >/dev/null 2>&1; then
+  PROBE_RUNNER="perl"; PROBE_B64="$PROBE_PL_B64"; PROBE_PATH="/tmp/pgprobe.pl"
+else
+  warn "the template has neither python3 nor perl; the guest cannot speak the protocol"
+  _skip "brokered postgres, no interpreter in the template"
   suite_summary "16_egress_postgres"
   exit 0
 fi
+_pass "the guest can speak the protocol with ${PROBE_RUNNER}"
 
 # -- The credential is the broker's, whatever the sandbox writes ---------------
 answer=$(brokered_query "$sandbox_id" placeholder placeholder "$PG_DATABASE" "select 1")

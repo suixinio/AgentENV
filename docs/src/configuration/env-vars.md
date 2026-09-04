@@ -117,7 +117,8 @@ nothing at all.
 `ca.leaf_ttl_secs`, `ca.cache_capacity`, `ca.mints_per_sandbox_per_minute`, `hmac.key_files`,
 `upstream.denied_cidrs`, `vault.timeout_ms`, `vault.cache_ttl_secs`, `vault.cache_capacity`,
 `resolver.timeout_ms`, `resolver.cache_ttl_secs`, `resolver.cache_capacity`, `handlers.echo` and
-the `handlers.tcp` / `handlers.http` tables have no environment binding; set them in the file.
+the `handlers.tcp` / `handlers.postgres` / `handlers.http` tables have no environment binding; set
+them in the file.
 
 ## E2B SDK / CLI
 

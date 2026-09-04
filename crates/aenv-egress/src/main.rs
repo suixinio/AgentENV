@@ -10,6 +10,7 @@ use std::time::Duration;
 use aenv_egress::credential::{CachingSource, NoCredentials};
 use aenv_egress::handlers::echo::IdentityEchoHandler;
 use aenv_egress::handlers::http::HttpHandler;
+use aenv_egress::handlers::postgres::PostgresHandler;
 use aenv_egress::handlers::tcp::TcpRelayHandler;
 use aenv_egress::resolver::ResolverSource;
 use aenv_egress::runtime::{self, Options, Runtime};
@@ -162,12 +163,15 @@ struct HandlersConfig {
     #[config(nested)]
     tcp: RelayHandlerConfig,
     #[config(nested)]
+    postgres: RelayHandlerConfig,
+    #[config(nested)]
     http: PinnedHandlerConfig,
 }
 
-/// A handler whose upstream comes from the endpoint declaration, so the
-/// operator names where it may go. An enabled handler with an empty
-/// allowlist reaches nothing.
+/// A handler whose upstream comes from the endpoint declaration or the
+/// credential rather than from the guest's own connection, so the operator
+/// names where it may go. An enabled handler with an empty allowlist reaches
+/// nothing.
 #[derive(Config)]
 struct RelayHandlerConfig {
     #[config(default = false)]
@@ -334,11 +338,24 @@ async fn main() -> Result<()> {
             .with_allowlist(TcpRelayHandler::NAME, &config.handlers.tcp.allowed_cidrs)
             .context("handlers.tcp.allowed_cidrs are not all cidrs")?;
     }
+    if config.handlers.postgres.enabled {
+        guard = guard
+            .with_allowlist(
+                PostgresHandler::NAME,
+                &config.handlers.postgres.allowed_cidrs,
+            )
+            .context("handlers.postgres.allowed_cidrs are not all cidrs")?;
+    }
     let mut dispatcher = Dispatcher::new(creds, Arc::new(guard)).with_handler(Arc::new(
         HttpHandler::new(Arc::clone(&signer)).context("build the http handler")?,
     ));
     if config.handlers.tcp.enabled {
         dispatcher = dispatcher.with_handler(Arc::new(TcpRelayHandler));
+    }
+    if config.handlers.postgres.enabled {
+        dispatcher = dispatcher.with_handler(Arc::new(
+            PostgresHandler::new().context("build the postgres handler")?,
+        ));
     }
     if config.handlers.echo {
         dispatcher = dispatcher.with_handler(Arc::new(IdentityEchoHandler));

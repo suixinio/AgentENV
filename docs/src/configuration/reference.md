@@ -529,6 +529,8 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 | `handlers.echo` | boolean | `false` | The `echo` identity handler, for smoke tests. Off in production. |
 | `handlers.tcp.enabled` | boolean | `false` | The `tcp` byte relay, which endpoint declarations name. |
 | `handlers.tcp.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations `tcp` reaches. An enabled handler with an empty list reaches nothing: a declaration names the upstream, so the operator names where declarations may point. Checked after the broker deny list and before the sandbox's own policy, so no sandbox input widens it. **TOML-file-only — no `env =` binding.** |
+| `handlers.postgres.enabled` | boolean | `false` | The `postgres` handler, which terminates the guest's startup exchange and authenticates upstream with the brokered credential. |
+| `handlers.postgres.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations a `postgres` credential may point at. An enabled handler with an empty list reaches nothing. **TOML-file-only — no `env =` binding.** |
 | `handlers.http.allowed_cidrs` | array of CIDR strings | `[]` | Pins the `rules` handler further. Empty leaves it bounded by each sandbox's own egress policy, which is what already bounds an intercepted connection. **TOML-file-only — no `env =` binding.** |
 
 Environment variable overrides for this file are listed under

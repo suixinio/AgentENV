@@ -74,6 +74,14 @@ echo = false
 enabled = false
 allowed_cidrs = []
 
+[handlers.postgres]
+# Terminates the guest's Postgres startup exchange and authenticates upstream
+# with the credential the endpoint declaration names. The guest's DSN carries a
+# placeholder user and password that are never used. allowed_cidrs bounds where
+# a credential may point; empty means the handler reaches nothing.
+enabled = false
+allowed_cidrs = []
+
 [handlers.http]
 # The `rules` handler is already bounded by each sandbox's own egress policy,
 # so an empty list leaves it bounded by that alone. A non-empty list pins it

@@ -48,5 +48,8 @@ tracing = { version = "0.1", features = ["attributes"] }
 uuid = { version = "1", features = ["serde"] }
 validator = { version = "0.20", features = ["derive"] }
 
+# The secret value field `redact_secret_value_models` rewrites is one of these.
+zeroize = { version = "1", features = ["serde"] }
+
 [dev-dependencies]
 tracing-subscriber = "0.3"

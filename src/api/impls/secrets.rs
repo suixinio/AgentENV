@@ -115,7 +115,7 @@ impl Secrets<()> for ApiImpl {
                 ))
             }
         };
-        let value = SecretString::new(body.value.clone());
+        let value = SecretString::new(body.value.to_string());
         match service
             .create(
                 &body.name,
@@ -210,7 +210,7 @@ impl Secrets<()> for ApiImpl {
                 return Ok(SecretsSecretIdPostResponse::Status503_NoSecretsStoreIsConfigured(err))
             }
         };
-        let value = SecretString::new(body.value.clone());
+        let value = SecretString::new(body.value.to_string());
         let metadata = body.metadata.as_ref().map(|m| metadata_from(Some(m)));
         match service
             .update(

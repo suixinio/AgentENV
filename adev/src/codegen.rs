@@ -174,9 +174,34 @@ fn run_server(project_root: &std::path::Path) -> Result<()> {
 
     // Anchored on formatted text, so format first and again afterwards.
     util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
+    add_zeroize_dependency(&server_dir.join("Cargo.toml"))?;
     redact_secret_value_models(&server_dir.join("src/models.rs"))?;
     util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
     util::info("AENV server generated.");
+    Ok(())
+}
+
+/// The generator writes the manifest too, so the one dependency the redacted
+/// value field needs is added back after every run.
+fn add_zeroize_dependency(cargo_toml: &std::path::Path) -> Result<()> {
+    let content = std::fs::read_to_string(cargo_toml)?;
+    if content.contains("\nzeroize = ") {
+        return Ok(());
+    }
+    let anchor = "\n[dev-dependencies]";
+    let at = content.find(anchor).ok_or_else(|| {
+        anyhow::anyhow!(
+            "the generated Cargo.toml has no [dev-dependencies] to insert before; a secret \
+             value would ship without the crate that wipes it"
+        )
+    })?;
+    let added =
+        "\n# The secret value field `redact_secret_value_models` rewrites is one of these.\n\
+                 zeroize = { version = \"1\", features = [\"serde\"] }\n";
+    std::fs::write(
+        cargo_toml,
+        format!("{}{added}{}", &content[..at], &content[at..]),
+    )?;
     Ok(())
 }
 
@@ -188,8 +213,9 @@ const GENERATED_DERIVE: &str = "#[derive(Debug, Clone, PartialEq, serde::Seriali
 const REDACTED_DERIVE: &str =
     "#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]";
 
-/// A secret is opaque bytes: markup inside one is not an attack, and it must
-/// never reach a log line.
+/// A secret is opaque bytes: markup inside one is not an attack, it must never
+/// reach a log line, and its buffer is wiped when the model drops rather than
+/// freed with the value still in it.
 fn redact_secret_value_models(models_rs: &std::path::Path) -> Result<()> {
     let mut content = std::fs::read_to_string(models_rs)?;
     for model in SECRET_VALUE_MODELS {
@@ -219,7 +245,11 @@ fn redact_secret_value_model(content: &str, model: &str) -> Result<String> {
     let validated_value = "    #[serde(rename = \"value\")]\n    \
                            #[validate(custom(function = \"check_xss_string\"))]\n    \
                            pub value: String,";
-    let plain_value = "    #[serde(rename = \"value\")]\n    pub value: String,";
+    // `Zeroizing` rather than a `Drop` on the model: the `conversion` feature
+    // derives `frunk::LabelledGeneric`, which moves out of the struct and
+    // cannot do that for a type that implements `Drop`.
+    let plain_value =
+        "    #[serde(rename = \"value\")]\n    pub value: zeroize::Zeroizing<String>,";
     let body = &content[start..body_end];
     if !body.contains(validated_value) {
         anyhow::bail!(
@@ -237,10 +267,74 @@ fn redact_secret_value_model(content: &str, model: &str) -> Result<String> {
          f.write_str(\"{model}([redacted])\")\n    }}\n}}\n"
     );
 
+    let rest = redact_secret_value_tail(&content[body_end..], model)?;
     Ok(format!(
-        "{}{rewritten}{redacted_debug}{}",
+        "{}{rewritten}{redacted_debug}{rest}",
         &content[..start],
-        &content[body_end..]
+    ))
+}
+
+/// The value field's type change and its printing `Display` both live after
+/// the struct body: the generator's constructor and `FromStr` build the field,
+/// and `Display` writes it into a query string.
+fn redact_secret_value_tail(tail: &str, model: &str) -> Result<String> {
+    let parsed = format!("\"value missing in {model}\".to_string())?,");
+    let parsed_wrapped =
+        format!("\"value missing in {model}\".to_string())?\n                .into(),");
+    if !tail.contains(&parsed) {
+        anyhow::bail!(
+            "{model} no longer has a FromStr that builds the value field; the generator's \
+             output changed and a secret value would ship in a plain String"
+        );
+    }
+    let tail = tail.replacen(&parsed, &parsed_wrapped, 1);
+
+    // Both remaining edits are one line inside one impl block, so each is
+    // scoped to that block: the same line appears in every other model.
+    let tail = rewrite_in_block(
+        &tail,
+        &format!("impl {model} {{"),
+        "\n            value,\n",
+        "\n            value: value.into(),\n",
+        &format!("{model}'s constructor no longer builds the value field"),
+    )?;
+    rewrite_in_block(
+        &tail,
+        &format!("impl std::fmt::Display for {model} {{"),
+        "Some(self.value.to_string()),",
+        "Some(\"[redacted]\".to_string()),",
+        &format!("{model}'s Display no longer writes the value, or writes it differently"),
+    )
+}
+
+/// Replaces `needle` once inside the block that starts at `header` and ends at
+/// the first line holding only `}`.
+fn rewrite_in_block(
+    content: &str,
+    header: &str,
+    needle: &str,
+    replacement: &str,
+    what: &str,
+) -> Result<String> {
+    let start = content
+        .find(header)
+        .ok_or_else(|| anyhow::anyhow!("{what}: no {header:?} block"))?;
+    let end = content[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset + "\n}\n".len())
+        .ok_or_else(|| anyhow::anyhow!("{what}: {header:?} has no end"))?;
+    let block = &content[start..end];
+    if !block.contains(needle) {
+        anyhow::bail!(
+            "{what}; the generator's output changed and a secret value would ship in a plain \
+             String or in a query string"
+        );
+    }
+    Ok(format!(
+        "{}{}{}",
+        &content[..start],
+        block.replacen(needle, replacement, 1),
+        &content[end..]
     ))
 }
 
@@ -319,7 +413,16 @@ mod tests {
              pub struct {model} {{\n    \
              #[serde(rename = \"value\")]\n    \
              #[validate(custom(function = \"check_xss_string\"))]\n    \
-             pub value: String,\n}}\n\ntail\n"
+             pub value: String,\n}}\n\n\
+             impl {model} {{\n    \
+             pub fn new(name: String, value: String) -> {model} {{\n        \
+             {model} {{\n            \
+             name,\n            \
+             value,\n        }}\n    }}\n}}\n\n\
+             impl std::str::FromStr for {model} {{\n        \
+             value: rep.next().ok_or_else(|| \"value missing in {model}\".to_string())?,\n}}\n\n\
+             impl std::fmt::Display for {model} {{\n        \
+             Some(self.value.to_string()),\n}}\n\ntail\n"
         )
     }
 
@@ -332,9 +435,46 @@ mod tests {
         assert!(!rewritten.contains(GENERATED_DERIVE));
         assert!(rewritten.contains(REDACTED_DERIVE));
         assert!(rewritten.contains("f.write_str(\"NewSecret([redacted])\")"));
-        assert!(rewritten.contains("pub value: String,"));
+        assert!(rewritten.contains("pub value: zeroize::Zeroizing<String>,"));
+        assert!(
+            !rewritten.contains("impl Drop for NewSecret"),
+            "the conversion feature's LabelledGeneric moves out of the model, so the wipe \
+             belongs to the field's type and not to the model"
+        );
+        assert!(rewritten.contains("Some(\"[redacted]\".to_string()),"));
+        assert!(!rewritten.contains("Some(self.value.to_string()),"));
+        assert!(rewritten.contains("value: value.into(),"));
         assert!(rewritten.starts_with("prelude\n"));
         assert!(rewritten.ends_with("tail\n"));
+    }
+
+    #[test]
+    fn the_dependency_the_injected_drop_calls_is_added_once_and_only_once() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let cargo_toml = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &cargo_toml,
+            "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1\"\n\n[dev-dependencies]\ntracing-subscriber = \"0.3\"\n",
+        )
+        .unwrap();
+
+        add_zeroize_dependency(&cargo_toml).unwrap();
+        add_zeroize_dependency(&cargo_toml).unwrap();
+
+        let written = std::fs::read_to_string(&cargo_toml).unwrap();
+        assert_eq!(written.matches("\nzeroize = ").count(), 1);
+        assert!(
+            written.find("\nzeroize = ").unwrap() < written.find("[dev-dependencies]").unwrap(),
+            "it belongs in [dependencies], not the dev ones"
+        );
+    }
+
+    #[test]
+    fn a_manifest_without_the_anchor_is_an_error_rather_than_a_silent_skip() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let cargo_toml = dir.path().join("Cargo.toml");
+        std::fs::write(&cargo_toml, "[package]\nname = \"x\"\n").unwrap();
+        assert!(add_zeroize_dependency(&cargo_toml).is_err());
     }
 
     #[test]
@@ -347,5 +487,17 @@ mod tests {
             "",
         );
         assert!(redact_secret_value_model(&no_validator, "NewSecret").is_err());
+
+        for gone in [
+            "            value,\n",
+            "\"value missing in NewSecret\".to_string())?,",
+            "Some(self.value.to_string()),",
+        ] {
+            let without = generated_model("NewSecret").replace(gone, "");
+            assert!(
+                redact_secret_value_model(&without, "NewSecret").is_err(),
+                "a missing {gone:?} must be an error, not a silent skip"
+            );
+        }
     }
 }

@@ -3278,7 +3278,7 @@ pub struct NewSecret {
 
     /// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
     #[serde(rename = "value")]
-    pub value: String,
+    pub value: zeroize::Zeroizing<String>,
 
     /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
     #[serde(rename = "metadata")]
@@ -3308,7 +3308,7 @@ impl NewSecret {
     pub fn new(name: String, value: String) -> NewSecret {
         NewSecret {
             name,
-            value,
+            value: value.into(),
             metadata: None,
             allowed_hosts: None,
         }
@@ -3324,7 +3324,7 @@ impl std::fmt::Display for NewSecret {
             Some("name".to_string()),
             Some(self.name.to_string()),
             Some("value".to_string()),
-            Some(self.value.to_string()),
+            Some("[redacted]".to_string()),
             // Skipping metadata in query parameter serialization
             self.allowed_hosts.as_ref().map(|allowed_hosts| {
                 [
@@ -3426,7 +3426,8 @@ impl std::str::FromStr for NewSecret {
                 .value
                 .into_iter()
                 .next()
-                .ok_or_else(|| "value missing in NewSecret".to_string())?,
+                .ok_or_else(|| "value missing in NewSecret".to_string())?
+                .into(),
             metadata: intermediate_rep.metadata.into_iter().next(),
             allowed_hosts: intermediate_rep.allowed_hosts.into_iter().next(),
         })
@@ -8403,7 +8404,7 @@ impl std::ops::DerefMut for SecretString {
 pub struct SecretUpdate {
     /// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
     #[serde(rename = "value")]
-    pub value: String,
+    pub value: zeroize::Zeroizing<String>,
 
     /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
     #[serde(rename = "metadata")]
@@ -8428,7 +8429,7 @@ impl SecretUpdate {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new(value: String) -> SecretUpdate {
         SecretUpdate {
-            value,
+            value: value.into(),
             metadata: None,
             allowed_hosts: None,
         }
@@ -8442,7 +8443,7 @@ impl std::fmt::Display for SecretUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let params: Vec<Option<String>> = vec![
             Some("value".to_string()),
-            Some(self.value.to_string()),
+            Some("[redacted]".to_string()),
             // Skipping metadata in query parameter serialization
             self.allowed_hosts.as_ref().map(|allowed_hosts| {
                 [
@@ -8534,7 +8535,8 @@ impl std::str::FromStr for SecretUpdate {
                 .value
                 .into_iter()
                 .next()
-                .ok_or_else(|| "value missing in SecretUpdate".to_string())?,
+                .ok_or_else(|| "value missing in SecretUpdate".to_string())?
+                .into(),
             metadata: intermediate_rep.metadata.into_iter().next(),
             allowed_hosts: intermediate_rep.allowed_hosts.into_iter().next(),
         })

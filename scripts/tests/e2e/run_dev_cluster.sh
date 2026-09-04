@@ -69,6 +69,17 @@
 #                                            18079, below the node range)
 #   AENV_TEMPLATE_ID                      - skip self-building a base template
 #   SUITE_FILTER                          - glob against suites/*.sh (default: *.sh)
+#   E2E_PG_SECRET                         - name of a structured credential the
+#                                            broker can resolve to a Postgres
+#                                            upstream; 16_egress_postgres skips
+#                                            without it, because /secrets stores
+#                                            one opaque value and a structured
+#                                            one is written by the operator or
+#                                            answered by the resolver
+#   E2E_PG_DATABASE                       - database 16_egress_postgres connects
+#                                            to (default: postgres)
+#   E2E_PG_ENDPOINT_PORT                  - port it declares the endpoint on
+#                                            (default: 5432)
 #   E2E_STRICT_SUITES                     - comma or space separated suite names
 #                                            (or "all") whose skipped
 #                                            preconditions fail instead of

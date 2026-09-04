@@ -34,12 +34,16 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_EGRESS_BROKER_NODE_CONNS` | `20000` | `[egress_broker].node_conns` |
 | `AENV_EGRESS_BROKER_OPEN_TIMEOUT_MS` | `3000` | `[egress_broker].open_timeout_ms` |
 | — | `[]` | `[egress_broker].embedded_tcp_allowed_cidrs` is a list, so confique cannot bind it from the environment; set it in the config file or an overlay. |
-| `AENV_SECRETS_BACKEND` | `disabled` | `[secrets].backend`: `disabled` or `vault`. Read by `aenv-api` only. |
+| `AENV_SECRETS_BACKEND` | `disabled` | `[secrets].backend`: `disabled`, `vault` or `external_resolver`. Read by `aenv-api` only. |
 | `AENV_SECRETS_VAULT_ADDR` | unset | `[secrets.vault].addr` |
 | `AENV_SECRETS_VAULT_TOKEN` | unset | `[secrets.vault].token`; mount it from a Secret (`secrets-vault-writer` in `deploy/k8s/base`). A write-only credential — this half never reads a value back — and deliberately not the broker's read-only token. |
 | `AENV_SECRETS_VAULT_MOUNT` | `aenv` | `[secrets.vault].mount` |
 | `AENV_SECRETS_VAULT_NAMESPACE` | unset | `[secrets.vault].namespace` |
 | `AENV_SECRETS_VAULT_TIMEOUT_MS` | `5000` | `[secrets.vault].timeout_ms` |
+| `AENV_SECRETS_RESOLVER_URL` | unset | `[secrets.resolver].url` |
+| `AENV_SECRETS_RESOLVER_TOKEN` | unset | `[secrets.resolver].token` |
+| `AENV_SECRETS_RESOLVER_TOKEN_FILE` | unset | `[secrets.resolver].token_file` |
+| `AENV_SECRETS_RESOLVER_TIMEOUT_MS` | `5000` | `[secrets.resolver].timeout_ms` |
 | ~~`AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT`~~ | — | **Removed.** It was a Stage A/D5-only bridge (a second, best-effort heartbeat target dialled concurrently with `[cluster].scheduler_endpoint`) meant to feed `aenv-api`'s own node registry ahead of a wider cutover. Once the primary heartbeat itself could target `agentenv-api` directly (`node-heartbeat-config`), the bridge became redundant — a second, concurrent send to the same target would only double the request rate for no new coverage — and the field, its config struct member, and the reporter's dual-send machinery were deleted. **Setting it today does nothing:** no field declares the name, so it is read by nothing and refused by nothing. |
 | ~~`AENV_NODE_PLACEMENT_SOURCE`~~ | — | **Removed.** It used to choose where `aenv-api` resolved a known node's current address, cluster membership, and sandbox placement/routing: `scheduler` (the code default — asked a Go scheduler process over gRPC for all of it) or `native` (answered all of it from api's own process instead — a local `src/node_registry` node registry fed by Kubernetes discovery and node heartbeats for node identity/membership, and `[binding_store]`'s Redis routing table for `Schedule`/`LookupNode`/`RecordAssignment`). The Go scheduler process is deleted from the tree (see CLAUDE.md's "Distributed Control Plane" section), so `native` is the only behavior left — `aenv-api` now always builds its own node registry, unconditionally, with no scheduler endpoint required for any of it — and the switch was deleted along with the alternative it used to choose. **Setting it today does nothing:** no field declares the name, so it is read by nothing and refused by nothing. A startup refusal carried un-migrated manifests through the cutover for one release and has since been removed with the rest of that scaffolding. |
 | ~~`AENV_BINDING_STORE_BACKEND`~~ | — | **Removed.** It chose which sandbox-to-node routing table backend `Schedule`/`LookupNode`/`RecordAssignment` answered from: `in_memory` (one replica's own table) or `redis` (the shared table every replica reads and writes). It had exactly one legal value — `build_binding_store` (`crates/aenv-api/src/bin/aenv-api.rs`) refused `in_memory` unconditionally, because a routing table one replica cannot see misroutes silently and nothing at that layer can tell a lone replica from one of several — so the field, its `BindingStoreBackendKind` enum and the refusal arm were all deleted and `aenv-api` always constructs the Redis store. **Setting it today does nothing:** no field declares the name, so it is read by nothing and refused by nothing — and the only value a working deployment could have set it to (`redis`) is exactly what now happens with the variable absent, so leaving it behind cannot degrade anything. `InMemoryBindingStore` still exists, compiled only under `cfg(test)` / the `test-support` feature, so the shared binding-store contract suite can keep running against both backends. |
@@ -107,10 +111,13 @@ nothing at all.
 | `AENV_EGRESS_VAULT_TOKEN_FILE` | from file | `vault.token_file`: a file, not the token itself — unlike the api half's `AENV_SECRETS_VAULT_TOKEN`, which is the value. The two are different credentials: this one only reads, that one only writes. |
 | `AENV_EGRESS_VAULT_MOUNT` | `aenv` | `vault.mount`. Must match the api half's `AENV_SECRETS_VAULT_MOUNT`. |
 | `AENV_EGRESS_VAULT_NAMESPACE` | unset | `vault.namespace`: Vault Enterprise namespace header, when used. |
+| `AENV_EGRESS_RESOLVER_URL` | unset | `resolver.url`: the external credential resolver, the same base the api half posts grants to. Set at most one of this and `AENV_EGRESS_VAULT_ADDR`; with both, the resolver is used and `[vault]` is ignored. |
+| `AENV_EGRESS_RESOLVER_TOKEN_FILE` | from file | `resolver.token_file`: a file holding the bearer token, not the token itself. |
 
 `ca.leaf_ttl_secs`, `ca.cache_capacity`, `ca.mints_per_sandbox_per_minute`, `hmac.key_files`,
-`upstream.denied_cidrs`, `vault.timeout_ms`, `vault.cache_ttl_secs`, `vault.cache_capacity` and
-`handlers.tcp` have no environment binding; set them in the file.
+`upstream.denied_cidrs`, `vault.timeout_ms`, `vault.cache_ttl_secs`, `vault.cache_capacity`,
+`resolver.timeout_ms`, `resolver.cache_ttl_secs`, `resolver.cache_capacity`, `handlers.echo` and
+the `handlers.tcp` / `handlers.http` tables have no environment binding; set them in the file.
 
 ## E2B SDK / CLI
 

@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use reqwest::{StatusCode, Url};
 use zeroize::Zeroizing;
 
-use crate::credential::{is_valid_secret_name, CredentialError, CredentialSource, Secret};
+use crate::credential::{
+    is_valid_secret_name, CredentialError, CredentialFields, CredentialSource, Secret,
+};
 
 pub struct VaultSource {
     client: reqwest::Client,
@@ -71,14 +73,14 @@ impl VaultSource {
     }
 }
 
-#[async_trait]
-impl CredentialSource for VaultSource {
-    async fn get(
+impl VaultSource {
+    /// The secret's data, once a grant for `execution_id` covers `name`.
+    async fn granted_secret(
         &self,
         sandbox_id: &str,
         execution_id: &str,
         name: &str,
-    ) -> Result<Secret, CredentialError> {
+    ) -> Result<serde_json::Value, CredentialError> {
         if !is_valid_secret_name(name) || execution_id.contains('/') || execution_id.is_empty() {
             return Err(CredentialError::Denied);
         }
@@ -94,15 +96,52 @@ impl CredentialSource for VaultSource {
         if granted_sandbox != Some(sandbox_id) || !granted_names {
             return Err(CredentialError::Denied);
         }
-        let Some(data) = self.read(&format!("secrets/{name}")).await? else {
-            return Err(CredentialError::Denied);
-        };
+        self.read(&format!("secrets/{name}"))
+            .await?
+            .ok_or(CredentialError::Denied)
+    }
+}
+
+#[async_trait]
+impl CredentialSource for VaultSource {
+    async fn get(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        name: &str,
+    ) -> Result<Secret, CredentialError> {
+        let data = self.granted_secret(sandbox_id, execution_id, name).await?;
         match data.get("value").and_then(|v| v.as_str()) {
             Some(value) => Ok(Secret::new(value.as_bytes().to_vec(), None)),
             None => Err(CredentialError::Unavailable(
                 "the secret carries no string value".into(),
             )),
         }
+    }
+
+    /// Every key of the secret except `value`, which belongs to the opaque
+    /// form. A secret written only as `value` has no structured form here.
+    async fn get_fields(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        name: &str,
+    ) -> Result<CredentialFields, CredentialError> {
+        let data = self.granted_secret(sandbox_id, execution_id, name).await?;
+        let Some(object) = data.as_object() else {
+            return Err(CredentialError::Unavailable(
+                "the secret is not an object".into(),
+            ));
+        };
+        let mut object = object.clone();
+        object.remove("value");
+        let fields = CredentialFields::from_json(&object, None)?;
+        if fields.is_empty() {
+            return Err(CredentialError::Unavailable(
+                "the secret carries no fields besides value".into(),
+            ));
+        }
+        Ok(fields)
     }
 }
 
@@ -208,6 +247,57 @@ mod tests {
         let source = serve(fake).await;
         assert_eq!(
             source.get("sbx-1", "exec-1", "openai").await.err().unwrap(),
+            CredentialError::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn a_granted_secret_reads_as_fields_with_value_left_to_the_opaque_form() {
+        let fake = Fake::default();
+        with(
+            &fake,
+            "grants/exec-1",
+            json!({ "sandbox_id": "sbx-1", "names": ["tenant_db"] }),
+        );
+        with(
+            &fake,
+            "secrets/tenant_db",
+            json!({ "value": "ignored", "host": "db.internal", "port": 5432, "user": "rw_app" }),
+        );
+        let source = serve(fake).await;
+        let fields = source
+            .get_fields("sbx-1", "exec-1", "tenant_db")
+            .await
+            .unwrap();
+
+        assert_eq!(fields.get("host"), Some("db.internal"));
+        assert_eq!(fields.get("port"), Some("5432"));
+        assert_eq!(fields.get("user"), Some("rw_app"));
+        assert_eq!(fields.get("value"), None);
+        assert_eq!(fields.get("password"), None);
+        assert!(!format!("{fields:?}").contains("rw_app"));
+    }
+
+    #[tokio::test]
+    async fn a_secret_with_only_a_value_has_no_structured_form_and_no_grant_is_denied() {
+        let fake = Fake::default();
+        with(
+            &fake,
+            "grants/exec-1",
+            json!({ "sandbox_id": "sbx-1", "names": ["openai"] }),
+        );
+        with(&fake, "secrets/openai", json!({ "value": "sk-live" }));
+        let source = serve(fake).await;
+        assert!(matches!(
+            source.get_fields("sbx-1", "exec-1", "openai").await,
+            Err(CredentialError::Unavailable(_))
+        ));
+        assert_eq!(
+            source
+                .get_fields("sbx-1", "exec-2", "openai")
+                .await
+                .err()
+                .unwrap(),
             CredentialError::Denied
         );
     }

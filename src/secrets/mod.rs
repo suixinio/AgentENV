@@ -122,6 +122,13 @@ pub trait SecretsBackend: Send + Sync {
         names: &[String],
     ) -> Result<(), SecretsError>;
     async fn revoke(&self, sandbox_id: &str, execution_id: &str) -> Result<(), SecretsError>;
+
+    /// Which of `names` this backend does not know, for a backend that owns
+    /// the names as well as the values. `None` leaves the ref store as the
+    /// authority, which is what a value store answers.
+    async fn missing_names(&self, _names: &[String]) -> Result<Option<Vec<String>>, SecretsError> {
+        Ok(None)
+    }
 }
 
 /// The `/secrets` operations and grant issuance, over a ref store and a
@@ -254,11 +261,19 @@ impl SecretsService {
             return Ok(());
         }
         let names: Vec<String> = names.iter().cloned().collect();
-        let missing = self
-            .refs
+        let missing = match self
+            .values
             .missing_names(&names)
             .await
-            .map_err(MissingSecrets::Store)?;
+            .map_err(MissingSecrets::Store)?
+        {
+            Some(missing) => missing,
+            None => self
+                .refs
+                .missing_names(&names)
+                .await
+                .map_err(MissingSecrets::Store)?,
+        };
         if missing.is_empty() {
             Ok(())
         } else {
@@ -751,6 +766,70 @@ mod tests {
             .chain(rest.iter())
             .map(|s| s.name.as_str())
             .eq(["a", "b", "c"]));
+    }
+
+    /// A backend that owns its names, the way an external resolver does.
+    #[derive(Default)]
+    struct NameOwningBackend {
+        known: Vec<String>,
+    }
+
+    #[async_trait]
+    impl SecretsBackend for NameOwningBackend {
+        async fn put(&self, _: &str, _: &SecretString) -> Result<i64, SecretsError> {
+            Err(SecretsError::Unavailable(anyhow::anyhow!(
+                "owned elsewhere"
+            )))
+        }
+        async fn delete(&self, _: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::Unavailable(anyhow::anyhow!(
+                "owned elsewhere"
+            )))
+        }
+        async fn grant(&self, _: &str, _: &str, _: &[String]) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn revoke(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            Ok(())
+        }
+        async fn missing_names(
+            &self,
+            names: &[String],
+        ) -> Result<Option<Vec<String>>, SecretsError> {
+            Ok(Some(
+                names
+                    .iter()
+                    .filter(|name| !self.known.contains(name))
+                    .cloned()
+                    .collect(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_owns_its_names_answers_instead_of_the_ref_store() {
+        let service = SecretsService::new(
+            Arc::new(InMemorySecretRefStore::default()),
+            Arc::new(NameOwningBackend {
+                known: vec!["tenant_db".to_string()],
+            }),
+        );
+        let names = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        };
+
+        // The ref store holds no row for either name, so an answer that only
+        // consulted it would call both of them missing.
+        service
+            .ensure_names_exist(&names(&["tenant_db"]))
+            .await
+            .unwrap();
+        let err = service
+            .ensure_names_exist(&names(&["tenant_db", "absent"]))
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, MissingSecrets::Missing(missing) if missing == ["absent"]));
     }
 
     #[tokio::test]

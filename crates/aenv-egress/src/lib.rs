@@ -20,6 +20,8 @@ pub mod handlers;
 pub mod header;
 pub mod marker;
 pub mod policy;
+#[cfg(feature = "resolver")]
+pub mod resolver;
 pub mod runtime;
 pub mod sni;
 #[cfg(feature = "tls")]
@@ -28,7 +30,7 @@ pub mod transport;
 #[cfg(feature = "vault")]
 pub mod vault;
 
-pub use credential::{CredentialError, CredentialSource, Secret};
+pub use credential::{CredentialError, CredentialFields, CredentialSource, Secret};
 pub use dispatch::{Dispatcher, Reject};
 pub use handler::{ConnCtx, Handler, HandlerError};
 pub use header::{Ack, EgressPolicySummary, IdentityHeader, ReplayCache, VerifyError};

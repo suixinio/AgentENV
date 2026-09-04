@@ -464,11 +464,13 @@ How a node reaches the egress broker that serves sandboxes declaring `network.ru
 
 ## `[secrets]`
 
-Where `aenv-api` stores secret values and grants for `/secrets` and `network.rules`. Only the api half reads this section; its PostgreSQL holds names and versions in `secret_refs`, never a value. With `backend = "disabled"`, `/secrets` answers 503 and rules that reference secrets are refused.
+Where `aenv-api` stores secret values and grants for `/secrets`, `network.rules` and endpoint credentials. Only the api half reads this section; its PostgreSQL holds names and versions in `secret_refs`, never a value. With `backend = "disabled"`, `/secrets` answers 503 and rules that reference secrets are refused.
+
+With `backend = "external_resolver"` the credentials never enter AgentENV at all: this half posts grants and revocations to the operator's service, the broker resolves values against the same base, and the resolver is also the authority on which names exist. `/secrets` then refuses to store or delete a value, because it owns neither.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `backend` | string | `"disabled"` | `disabled` or `vault`. |
+| `backend` | string | `"disabled"` | `disabled`, `vault`, or `external_resolver`. |
 
 ## `[secrets.vault]`
 
@@ -513,8 +515,17 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 | `vault.mount` | string | `"aenv"` | KV v2 mount. Must match the api half's `[secrets.vault].mount`. |
 | `vault.namespace` | string | unset | Vault Enterprise namespace header, when used. |
 | `vault.timeout_ms` | integer | `5000` | Timeout for each Vault call. |
+| `resolver.url` | string | unset | Base URL of the external credential resolver. Call paths (`grants`, `grants/revoke`, `credentials/exists`) are joined onto it, so a path prefix is kept. Required with `backend = "external_resolver"`; point the broker's `[resolver].url` at the same base. |
+| `resolver.token` | string | unset | Bearer token for those calls. `resolver.token_file` wins when both are set. |
+| `resolver.token_file` | path | unset | File holding that token, for injecting it from a Secret. |
+| `resolver.timeout_ms` | integer | `5000` | Timeout for each resolver call. |
 | `vault.cache_ttl_secs` | integer | `30` | How long a resolved value is reused before Vault is asked again. |
 | `vault.cache_capacity` | integer | `4096` | Values held at once. Expired entries leave on every insert and the soonest to expire is dropped at capacity, so secret bytes are not retained past the TTL. |
+| `resolver.url` | string | unset | Base URL of the external credential resolver, the same base the api half posts grants to. Set at most one of this and `vault.addr`; with both, the resolver is used and `[vault]` is ignored. |
+| `resolver.token_file` | path | unset | File holding the bearer token for resolver calls. |
+| `resolver.timeout_ms` | integer | `5000` | Timeout for each resolver call. |
+| `resolver.cache_ttl_secs` | integer | `30` | How long a resolved credential is reused. It bounds how long a revocation takes to bite: a revoked grant is only noticed on the next lookup. |
+| `resolver.cache_capacity` | integer | `4096` | Credentials held at once, with the same expiry-ordered eviction as the Vault cache. |
 | `handlers.echo` | boolean | `false` | The `echo` identity handler, for smoke tests. Off in production. |
 | `handlers.tcp.enabled` | boolean | `false` | The `tcp` byte relay, which endpoint declarations name. |
 | `handlers.tcp.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations `tcp` reaches. An enabled handler with an empty list reaches nothing: a declaration names the upstream, so the operator names where declarations may point. Checked after the broker deny list and before the sandbox's own policy, so no sandbox input widens it. **TOML-file-only — no `env =` binding.** |

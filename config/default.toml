@@ -176,8 +176,11 @@ open_timeout_ms = 3000
 embedded_tcp_allowed_cidrs = []
 
 [secrets]
-# Where aenv-api stores secret values and grants: "disabled" or "vault".
-# aenv-api's PostgreSQL holds names and versions only; a node reads none of this.
+# Where aenv-api stores secret values and grants: "disabled", "vault", or
+# "external_resolver" (an operator-run service that owns the credentials; this
+# half records grants there and the broker resolves values against the same
+# base, so /secrets refuses to store a value). aenv-api's PostgreSQL holds
+# names and versions only; a node reads none of this.
 backend = "disabled"
 
 [secrets.vault]
@@ -187,6 +190,15 @@ backend = "disabled"
 # <mount>/grants/<execution_id>.
 mount = "aenv"
 # namespace = "admin"
+timeout_ms = 5000
+
+[secrets.resolver]
+# Base URL of the external credential resolver; call paths are joined onto it,
+# so a path prefix here is kept. Point the broker's own [resolver] at the same
+# base. Required when backend = "external_resolver".
+# url = "http://agent-platform.apps.svc/internal/aenv"
+# token = "replace-with-a-bearer-token"
+# token_file = "/etc/aenv/resolver/token"
 timeout_ms = 5000
 
 [cluster]

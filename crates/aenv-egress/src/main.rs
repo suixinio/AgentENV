@@ -11,6 +11,7 @@ use aenv_egress::credential::{CachingSource, NoCredentials};
 use aenv_egress::handlers::echo::IdentityEchoHandler;
 use aenv_egress::handlers::http::HttpHandler;
 use aenv_egress::handlers::tcp::TcpRelayHandler;
+use aenv_egress::resolver::ResolverSource;
 use aenv_egress::runtime::{self, Options, Runtime};
 use aenv_egress::tls::{CaSigner, SignerOptions};
 use aenv_egress::vault::VaultSource;
@@ -63,6 +64,8 @@ struct EgressConfig {
     upstream: UpstreamConfig,
     #[config(nested)]
     vault: VaultSourceConfig,
+    #[config(nested)]
+    resolver: ResolverSourceConfig,
     #[config(nested)]
     handlers: HandlersConfig,
 }
@@ -127,6 +130,26 @@ struct VaultSourceConfig {
     cache_ttl_secs: u64,
     /// Values held at once; expired entries leave on every insert and the
     /// soonest to expire is dropped at capacity.
+    #[config(default = 4_096usize)]
+    cache_capacity: usize,
+}
+
+/// The operator-run resolver that owns the credentials themselves. Set at
+/// most one of this and `[vault]`; with both, the resolver wins and the Vault
+/// section is ignored.
+#[derive(Config)]
+struct ResolverSourceConfig {
+    /// Base URL; call paths are joined onto it, so a path prefix is kept.
+    #[config(env = "AENV_EGRESS_RESOLVER_URL")]
+    url: Option<String>,
+    #[config(env = "AENV_EGRESS_RESOLVER_TOKEN_FILE")]
+    token_file: Option<PathBuf>,
+    #[config(default = 5_000u64)]
+    timeout_ms: u64,
+    /// How long a resolved credential is reused before the resolver is asked
+    /// again. It bounds how long a revocation takes to bite.
+    #[config(default = 30u64)]
+    cache_ttl_secs: u64,
     #[config(default = 4_096usize)]
     cache_capacity: usize,
 }
@@ -239,31 +262,62 @@ async fn main() -> Result<()> {
             .context("build the server tls acceptor")?,
     );
 
-    let creds: Arc<dyn CredentialSource> = match config.vault.addr.as_deref() {
-        Some(addr) => {
-            let token_file = config
-                .vault
-                .token_file
-                .as_ref()
-                .context("vault.addr is set but vault.token_file is not")?;
-            let token = read_secret_file(token_file, "vault token")?;
-            let source = VaultSource::new(
-                addr,
-                std::str::from_utf8(&token).context("vault token is not utf-8")?,
-                &config.vault.mount,
-                config.vault.namespace.clone(),
-                Duration::from_millis(config.vault.timeout_ms),
+    let creds: Arc<dyn CredentialSource> = match (
+        config.resolver.url.as_deref(),
+        config.vault.addr.as_deref(),
+    ) {
+        (Some(url), vault) => {
+            if vault.is_some() {
+                tracing::warn!(
+                    "both resolver.url and vault.addr are set; the resolver is used and vault is ignored"
+                );
+            }
+            let token = match config.resolver.token_file.as_ref() {
+                Some(path) => Some(String::from_utf8(read_secret_file(
+                    path,
+                    "resolver token",
+                )?)?),
+                None => None,
+            };
+            let source = ResolverSource::new(
+                url,
+                token.as_deref(),
+                Duration::from_millis(config.resolver.timeout_ms),
             )
-            .context("configure the Vault credential source")?;
+            .context("configure the external resolver credential source")?;
             Arc::new(
-                CachingSource::new(source, Duration::from_secs(config.vault.cache_ttl_secs))
-                    .with_capacity(config.vault.cache_capacity),
+                CachingSource::new(source, Duration::from_secs(config.resolver.cache_ttl_secs))
+                    .with_capacity(config.resolver.cache_capacity),
             )
         }
-        None => {
-            tracing::warn!("no vault.addr: every credential marker will answer 502");
-            Arc::new(NoCredentials)
-        }
+        (None, vault_addr) => match vault_addr {
+            Some(addr) => {
+                let token_file = config
+                    .vault
+                    .token_file
+                    .as_ref()
+                    .context("vault.addr is set but vault.token_file is not")?;
+                let token = read_secret_file(token_file, "vault token")?;
+                let source = VaultSource::new(
+                    addr,
+                    std::str::from_utf8(&token).context("vault token is not utf-8")?,
+                    &config.vault.mount,
+                    config.vault.namespace.clone(),
+                    Duration::from_millis(config.vault.timeout_ms),
+                )
+                .context("configure the Vault credential source")?;
+                Arc::new(
+                    CachingSource::new(source, Duration::from_secs(config.vault.cache_ttl_secs))
+                        .with_capacity(config.vault.cache_capacity),
+                )
+            }
+            None => {
+                tracing::warn!(
+                "neither resolver.url nor vault.addr is set: every credential lookup will answer 502"
+            );
+                Arc::new(NoCredentials)
+            }
+        },
     };
 
     let mut guard = UpstreamGuard::new(

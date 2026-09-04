@@ -134,6 +134,9 @@ pub enum SecretsBackendKind {
     Disabled,
     /// HashiCorp Vault KV v2.
     Vault,
+    /// An operator-run service that owns the credentials themselves. This
+    /// half records grants there; the broker resolves values there.
+    ExternalResolver,
 }
 
 impl SecretsBackendKind {
@@ -141,6 +144,7 @@ impl SecretsBackendKind {
         match self {
             Self::Disabled => "disabled",
             Self::Vault => "vault",
+            Self::ExternalResolver => "external_resolver",
         }
     }
 }
@@ -153,6 +157,8 @@ pub struct SecretsConfig {
     pub backend: SecretsBackendKind,
     #[config(nested)]
     pub vault: VaultConfig,
+    #[config(nested)]
+    pub resolver: SecretsResolverConfig,
 }
 
 impl fmt::Debug for SecretsConfig {
@@ -160,6 +166,7 @@ impl fmt::Debug for SecretsConfig {
         f.debug_struct("SecretsConfig")
             .field("backend", &self.backend)
             .field("vault", &self.vault)
+            .field("resolver", &self.resolver)
             .finish()
     }
 }
@@ -193,10 +200,47 @@ impl fmt::Debug for VaultConfig {
     }
 }
 
+/// The external credential resolver both halves talk to: this half posts
+/// grants and revocations, the broker resolves values against the same base.
+#[derive(Config, Clone)]
+pub struct SecretsResolverConfig {
+    /// Base URL; the call paths are joined onto it, so a path prefix here is
+    /// kept.
+    #[config(env = "AENV_SECRETS_RESOLVER_URL")]
+    pub url: Option<String>,
+    /// Bearer token. `token_file` wins when both are set.
+    #[config(env = "AENV_SECRETS_RESOLVER_TOKEN")]
+    pub token: Option<String>,
+    #[config(env = "AENV_SECRETS_RESOLVER_TOKEN_FILE")]
+    pub token_file: Option<PathBuf>,
+    #[config(default = 5_000u64, env = "AENV_SECRETS_RESOLVER_TIMEOUT_MS")]
+    pub timeout_ms: u64,
+}
+
+impl fmt::Debug for SecretsResolverConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretsResolverConfig")
+            .field("url", &self.url)
+            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
+            .field("token_file", &self.token_file)
+            .field("timeout_ms", &self.timeout_ms)
+            .finish()
+    }
+}
+
 impl SecretsConfig {
     pub fn validate(&self) -> Result<()> {
         match self.backend {
             SecretsBackendKind::Disabled => Ok(()),
+            SecretsBackendKind::ExternalResolver => {
+                if is_blank(self.resolver.url.as_deref()) {
+                    bail!("secrets.backend = \"external_resolver\" requires secrets.resolver.url");
+                }
+                if self.resolver.timeout_ms == 0 {
+                    bail!("secrets.resolver.timeout_ms must be > 0");
+                }
+                Ok(())
+            }
             SecretsBackendKind::Vault => {
                 if is_blank(self.vault.addr.as_deref()) {
                     bail!("secrets.backend = \"vault\" requires secrets.vault.addr");

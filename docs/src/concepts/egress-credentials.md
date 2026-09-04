@@ -242,7 +242,10 @@ PostgreSQL that holds `secret_refs`, encrypted with AES-256-GCM under a master k
 reads from a file and the database never sees; grants are rows in `secret_grants`. The broker
 holds a bearer for `POST /internal/credentials/resolve` and asks about one
 `(sandbox, execution, name)` at a time, exactly as it does for an external resolver — a
-compromised broker reads nothing that is not granted to some live sandbox. What this backend
+compromised broker reads nothing that is not granted to some live sandbox. That endpoint is on
+the api half's own port, beside the REST surface, and no API key reaches it: the bearer is the
+only thing in front of it, so it belongs behind the same boundary that port already has. The
+shipped manifests give `agentenv-api` a ClusterIP Service and no ingress. What this backend
 costs is on the other side: `aenv-api` can open every stored value, where the other two backends
 leave it able only to write. That is the price of needing no credential store beside AgentENV,
 and it is the reason the master key is a mounted file rather than a column, an environment

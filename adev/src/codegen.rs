@@ -429,6 +429,9 @@ fn fix_duplicate_auth_trait(path: &std::path::Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The four places the generator writes one of the two secret fields,
+    /// in the shape it writes them: both are optional, and `fields` is a map
+    /// of a printing newtype.
     fn generated_model(model: &str) -> String {
         format!(
             "prelude\n\n{GENERATED_DERIVE}\n\
@@ -436,37 +439,63 @@ mod tests {
              pub struct {model} {{\n    \
              #[serde(rename = \"value\")]\n    \
              #[validate(custom(function = \"check_xss_string\"))]\n    \
-             pub value: String,\n}}\n\n\
+             #[serde(skip_serializing_if = \"Option::is_none\")]\n    \
+             pub value: Option<String>,\n\n    \
+             #[serde(rename = \"fields\")]\n    \
+             #[validate(custom(function = \"check_xss_map_nested\"))]\n    \
+             #[serde(skip_serializing_if = \"Option::is_none\")]\n    \
+             pub fields: Option<std::collections::HashMap<String, models::SecretString>>,\n}}\n\n\
              impl {model} {{\n    \
-             pub fn new(name: String, value: String) -> {model} {{\n        \
+             pub fn new(name: String) -> {model} {{\n        \
              {model} {{\n            \
              name,\n            \
-             value,\n        }}\n    }}\n}}\n\n\
+             value: None,\n            \
+             fields: None,\n        }}\n    }}\n}}\n\n\
              impl std::str::FromStr for {model} {{\n        \
-             value: rep.next().ok_or_else(|| \"value missing in {model}\".to_string())?,\n}}\n\n\
-             impl std::fmt::Display for {model} {{\n        \
-             Some(self.value.to_string()),\n}}\n\ntail\n"
+             struct IntermediateRep {{\n            \
+             pub value: Vec<String>,\n            \
+             pub fields: Vec<std::collections::HashMap<String, models::SecretString>>,\n        \
+             }}\n        \
+             {model} {{\n            \
+             value: intermediate_rep.value.into_iter().next(),\n            \
+             fields: intermediate_rep.fields.into_iter().next(),\n        }}\n}}\n\n\
+             impl std::fmt::Display for {model} {{\n            \
+             self.value\n                .as_ref()\n                \
+             .map(|value| [\"value\".to_string(), value.to_string()].join(\",\")),\n}}\n\ntail\n"
         )
     }
 
     #[test]
-    fn the_secret_value_loses_its_validator_and_its_printing_debug() {
+    fn both_secret_fields_lose_their_validator_and_their_printing_debug() {
         let rewritten = redact_secret_value_model(&generated_model("NewSecret"), "NewSecret")
             .expect("the generated shape is the one this step rewrites");
 
         assert!(!rewritten.contains("check_xss_string"));
+        assert!(!rewritten.contains("check_xss_map_nested"));
         assert!(!rewritten.contains(GENERATED_DERIVE));
         assert!(rewritten.contains(REDACTED_DERIVE));
         assert!(rewritten.contains("f.write_str(\"NewSecret([redacted])\")"));
-        assert!(rewritten.contains("pub value: zeroize::Zeroizing<String>,"));
+        assert!(rewritten.contains("pub value: Option<zeroize::Zeroizing<String>>,"));
+        assert!(rewritten.contains(
+            "pub fields: Option<std::collections::HashMap<String, \
+                      zeroize::Zeroizing<String>>>,"
+        ));
+        assert!(
+            !rewritten.contains("models::SecretString"),
+            "that newtype's derived Debug prints, so no secret field may keep it"
+        );
         assert!(
             !rewritten.contains("impl Drop for NewSecret"),
             "the conversion feature's LabelledGeneric moves out of the model, so the wipe \
              belongs to the field's type and not to the model"
         );
-        assert!(rewritten.contains("Some(\"[redacted]\".to_string()),"));
-        assert!(!rewritten.contains("Some(self.value.to_string()),"));
-        assert!(rewritten.contains("value: value.into(),"));
+        assert!(rewritten.contains(
+            ".map(|_| [\"value\".to_string(), \"[redacted]\".to_string()].join(\",\")),"
+        ));
+        assert!(!rewritten.contains("value.to_string()"));
+        assert!(
+            rewritten.contains("value: intermediate_rep.value.into_iter().next().map(Into::into),")
+        );
         assert!(rewritten.starts_with("prelude\n"));
         assert!(rewritten.ends_with("tail\n"));
     }
@@ -505,16 +534,13 @@ mod tests {
         let no_struct = generated_model("NewSecret").replace("NewSecret", "SomethingElse");
         assert!(redact_secret_value_model(&no_struct, "NewSecret").is_err());
 
-        let no_validator = generated_model("NewSecret").replace(
-            "    #[validate(custom(function = \"check_xss_string\"))]\n",
-            "",
-        );
-        assert!(redact_secret_value_model(&no_validator, "NewSecret").is_err());
-
         for gone in [
-            "            value,\n",
-            "\"value missing in NewSecret\".to_string())?,",
-            "Some(self.value.to_string()),",
+            "    #[validate(custom(function = \"check_xss_string\"))]\n",
+            "    #[validate(custom(function = \"check_xss_map_nested\"))]\n",
+            "            pub fields: Vec<std::collections::HashMap<String, \
+             models::SecretString>>,\n",
+            "            value: intermediate_rep.value.into_iter().next(),\n",
+            ".map(|value| [\"value\".to_string(), value.to_string()].join(\",\")),",
         ] {
             let without = generated_model("NewSecret").replace(gone, "");
             assert!(

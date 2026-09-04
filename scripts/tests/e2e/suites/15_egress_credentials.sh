@@ -38,7 +38,7 @@ guest_http_code() {
 # -- Preconditions -------------------------------------------------------------
 if ! python3 -c 'import e2b' >/dev/null 2>&1; then
   warn "python e2b SDK not importable; the suite cannot run commands inside sandboxes"
-  _pass "skipped: python e2b SDK not installed"
+  _skip "skipped: python e2b SDK not installed"
   suite_summary
   exit 0
 fi
@@ -48,7 +48,7 @@ secret_value="sk-e2e-$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | h
 api_post "/secrets" "$(jq -nc --arg n "$secret_name" --arg v "$secret_value" '{name: $n, value: $v}')"
 if [[ "$HTTP_STATUS" == "503" ]]; then
   warn "POST /secrets answered 503: no secrets store on this deployment"
-  _pass "skipped: no secrets store configured"
+  _skip "skipped: no secrets store configured"
   suite_summary
   exit 0
 fi
@@ -69,7 +69,7 @@ rules_json=$(jq -nc --arg d "$EGRESS_UPSTREAM" --arg n "$secret_name" \
 sandbox_id=$(create_sandbox "$AENV_TEMPLATE_ID" 120 "$rules_json"); _sync_http
 if [[ "$HTTP_STATUS" == "503" ]]; then
   warn "no node reports a usable egress broker; the deployment has rules support off"
-  _pass "skipped: no egress broker on any node"
+  _skip "skipped: no egress broker on any node"
   api_delete "/secrets/${secret_id}"
   suite_summary
   exit 0
@@ -116,7 +116,7 @@ fi
 git_probe=$(run_in_sandbox "$sandbox_id" "command -v git >/dev/null && (git ls-remote --exit-code https://${UNDECLARED_UPSTREAM}/git/git.git HEAD >/dev/null 2>&1 && echo ok || echo fail) || echo nogit" || echo fail)
 case "$git_probe" in
   ok) _pass "git ls-remote to an undeclared domain works" ;;
-  nogit) warn "git not installed in the template; skipping the git probe"; _pass "skipped: git probe" ;;
+  nogit) warn "git not installed in the template; skipping the git probe"; _skip "git probe" ;;
   *) _fail "git ls-remote to an undeclared domain" "ok" "$git_probe" ;;
 esac
 
@@ -125,7 +125,7 @@ h3=$(run_in_sandbox "$sandbox_id" "curl --http3 -sS -o /dev/null -w '%{http_vers
 case "$h3" in
   1.1|2) _pass "curl --http3 fell back to TCP (HTTP/${h3})" ;;
   3) _fail "HTTP/3 must not bypass the intercept" "TCP fallback" "HTTP/3" ;;
-  *) warn "guest curl has no HTTP/3 support (${h3}); skipping the fallback probe"; _pass "skipped: http3 probe" ;;
+  *) warn "guest curl has no HTTP/3 support (${h3}); skipping the fallback probe"; _skip "http3 probe" ;;
 esac
 
 # -- 4. A forked child has its own grant ---------------------------------------
@@ -142,7 +142,7 @@ if [[ "$HTTP_STATUS" == "200" || "$HTTP_STATUS" == "201" ]]; then
   fi
 else
   warn "fork answered HTTP ${HTTP_STATUS}; skipping the child grant check"
-  _pass "skipped: fork unavailable"
+  _skip "skipped: fork unavailable"
 fi
 
 # -- 3. allow_internet_access=false is denied at the broker too -------------------
@@ -207,7 +207,7 @@ if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
   assert_eq "$recovered" "Bearer ${secret_value}" "brokered requests recover after the broker returns"
 else
   warn "not a Kubernetes run with kubectl; skipping broker rollout and outage checks"
-  _pass "skipped: broker rollout/outage checks"
+  _skip "skipped: broker rollout/outage checks"
 fi
 
 # -- Cleanup ----------------------------------------------------------------------

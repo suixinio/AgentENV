@@ -21,11 +21,11 @@ if command -v e2b >/dev/null 2>&1; then
     cli_available=1
   else
     warn "e2b CLI is installed but fails to run (possibly incompatible Node.js version); skipping CLI checks"
-    _pass "skipped CLI checks (e2b CLI broken)"
+    _skip "skipped CLI checks (e2b CLI broken)"
   fi
 else
   warn "e2b CLI not found; skipping CLI checks"
-  _pass "skipped CLI checks (e2b CLI not installed)"
+  _skip "skipped CLI checks (e2b CLI not installed)"
 fi
 
 if [[ "$cli_available" == "1" ]]; then
@@ -143,7 +143,7 @@ if python3 -c 'import e2b' >/dev/null 2>&1; then
   fi
 else
   warn "e2b Python SDK not installed; skipping Python SDK checks"
-  _pass "skipped Python SDK checks (e2b package not installed)"
+  _skip "skipped Python SDK checks (e2b package not installed)"
 fi
 
 # -- e2b TypeScript SDK template + sandbox compatibility --
@@ -154,7 +154,7 @@ if [[ -f "$ts_sdk_script" ]] && command -v npm >/dev/null 2>&1; then
   (cd "${SUITE_DIR}/.." && npm install --no-save --package-lock=false e2b@latest 2>&1)
   if ! "$tsx_bin" --version >/dev/null 2>&1; then
     warn "tsx not available after npm install; skipping TypeScript SDK checks"
-    _pass "skipped TypeScript SDK checks (tsx not available)"
+    _skip "skipped TypeScript SDK checks (tsx not available)"
   else
   sdk_timeout="${E2B_COMPAT_TS_TIMEOUT_SECONDS:-360}"
   log "Running: e2b TypeScript SDK compatibility (${ts_sdk_script})"
@@ -174,7 +174,7 @@ if [[ -f "$ts_sdk_script" ]] && command -v npm >/dev/null 2>&1; then
   fi
 else
   warn "npm/npx not found; skipping TypeScript SDK checks"
-  _pass "skipped TypeScript SDK checks (npm/npx not installed)"
+  _skip "skipped TypeScript SDK checks (npm/npx not installed)"
 fi
 
 suite_summary "09_e2b"

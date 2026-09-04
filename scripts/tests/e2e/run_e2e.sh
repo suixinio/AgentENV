@@ -13,6 +13,9 @@
 #   E2E_TEMPLATE_USER_IMAGE - Optional fromImage override for the base template build
 #   SKIP_BUILD            - Set to 1 to skip the build step
 #   SUITE_FILTER          - Run only suites matching this glob (e.g. "02*")
+#   E2E_STRICT_SUITES     - Comma or space separated suite names (or "all")
+#                           whose skipped preconditions fail instead of counting
+#                           as passes.
 #   E2E_MODE              - Runtime mode: compose or k8s (single-node is refused;
 #                           see the check below for why)
 #   E2E_SPLIT_ADDRESSES   - default 1: REST at the api half, the data plane at

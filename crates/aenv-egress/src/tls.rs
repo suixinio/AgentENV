@@ -72,9 +72,20 @@ pub struct CaSigner {
     budgets: Mutex<HashMap<String, (u64, u32)>>,
 }
 
+/// A leaf still worth serving has to outlive the connection about to use it.
+const REFRESH_MARGIN: Duration = Duration::from_secs(60);
+
 struct LeafCache {
-    by_name: HashMap<String, Arc<Leaf>>,
-    order: VecDeque<String>,
+    by_name: HashMap<String, CachedLeaf>,
+    /// Insertion order for eviction. A refreshed name leaves its previous
+    /// entry behind, so an entry only evicts the leaf whose `seq` it names.
+    order: VecDeque<(String, u64)>,
+    next_seq: u64,
+}
+
+struct CachedLeaf {
+    leaf: Arc<Leaf>,
+    seq: u64,
 }
 
 impl CaSigner {
@@ -93,6 +104,7 @@ impl CaSigner {
             cache: Mutex::new(LeafCache {
                 by_name: HashMap::new(),
                 order: VecDeque::new(),
+                next_seq: 0,
             }),
             budgets: Mutex::new(HashMap::new()),
         })
@@ -104,36 +116,47 @@ impl CaSigner {
     }
 
     /// A leaf for `name`, from the cache when one is live, otherwise minted
-    /// against `sandbox_id`'s per-minute budget.
+    /// against `sandbox_id`'s per-minute budget. The cache lock is held
+    /// across minting, so concurrent connections for one name mint once and
+    /// charge the budget once instead of racing each other.
     pub fn leaf_for(&self, name: &str, sandbox_id: &str) -> Result<Arc<Leaf>, SignError> {
         if !is_certifiable_name(name) {
             return Err(SignError::InvalidName(name.to_string()));
         }
         let now = SystemTime::now();
-        {
-            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(leaf) = cache.by_name.get(name) {
-                if leaf.expires_at > now + Duration::from_secs(60) {
-                    return Ok(Arc::clone(leaf));
-                }
-                cache.by_name.remove(name);
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = cache.by_name.get(name) {
+            if cached.leaf.expires_at > now + REFRESH_MARGIN {
+                return Ok(Arc::clone(&cached.leaf));
             }
+            cache.by_name.remove(name);
         }
         self.charge_budget(sandbox_id, now)?;
         let leaf = Arc::new(self.mint(name, now)?);
         #[cfg(feature = "tls")]
         metrics::counter!("egress_tls_leaf_minted_total").increment(1);
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        cache.next_seq += 1;
+        let seq = cache.next_seq;
         while cache.by_name.len() >= self.options.cache_capacity {
-            match cache.order.pop_front() {
-                Some(oldest) => {
-                    cache.by_name.remove(&oldest);
-                }
-                None => break,
+            let Some((oldest, oldest_seq)) = cache.order.pop_front() else {
+                break;
+            };
+            if cache
+                .by_name
+                .get(&oldest)
+                .is_some_and(|cached| cached.seq == oldest_seq)
+            {
+                cache.by_name.remove(&oldest);
             }
         }
-        cache.by_name.insert(name.to_string(), Arc::clone(&leaf));
-        cache.order.push_back(name.to_string());
+        cache.by_name.insert(
+            name.to_string(),
+            CachedLeaf {
+                leaf: Arc::clone(&leaf),
+                seq,
+            },
+        );
+        cache.order.push_back((name.to_string(), seq));
         Ok(leaf)
     }
 
@@ -323,5 +346,64 @@ mod tests {
         signer.leaf_for("c.example", "sbx").unwrap();
         let a_again = signer.leaf_for("a.example", "sbx").unwrap();
         assert!(!Arc::ptr_eq(&a, &a_again), "a was evicted and minted again");
+    }
+
+    /// Refreshing a name leaves its earlier queue entry at the front; that
+    /// entry must not evict the leaf now standing under the same name.
+    #[test]
+    fn a_refreshed_name_is_not_evicted_by_the_queue_entry_it_replaced() {
+        let signer = signer(SignerOptions {
+            cache_capacity: 3,
+            mints_per_sandbox_per_minute: 100,
+            ..SignerOptions::default()
+        });
+        let first = signer.leaf_for("a.example", "sbx").unwrap();
+        signer.leaf_for("b.example", "sbx").unwrap();
+        // What an expiry does: the entry leaves the map and its queue entry
+        // stays behind, so the refresh below appends a second one.
+        signer.cache.lock().unwrap().by_name.remove("a.example");
+        let refreshed = signer.leaf_for("a.example", "sbx").unwrap();
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+
+        signer.leaf_for("c.example", "sbx").unwrap();
+        // Eviction now runs and meets a's stale queue entry before b's.
+        signer.leaf_for("d.example", "sbx").unwrap();
+
+        let again = signer.leaf_for("a.example", "sbx").unwrap();
+        assert!(
+            Arc::ptr_eq(&refreshed, &again),
+            "the stale queue entry evicted the leaf that replaced it"
+        );
+    }
+
+    #[test]
+    fn concurrent_connections_for_one_name_mint_once_and_charge_the_budget_once() {
+        let signer = Arc::new(signer(SignerOptions {
+            mints_per_sandbox_per_minute: 1,
+            ..SignerOptions::default()
+        }));
+        let leaves: Vec<Arc<Leaf>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let signer = Arc::clone(&signer);
+                    scope.spawn(move || signer.leaf_for("api.example.com", "sbx-1"))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .unwrap()
+                        .expect("one mint is within a budget of one")
+                })
+                .collect()
+        });
+        assert!(
+            leaves
+                .windows(2)
+                .all(|pair| Arc::ptr_eq(&pair[0], &pair[1])),
+            "every caller must get the one leaf that was minted"
+        );
     }
 }

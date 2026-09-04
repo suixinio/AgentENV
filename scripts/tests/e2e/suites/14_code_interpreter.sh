@@ -12,7 +12,7 @@ log "Suite: Code Interpreter Compatibility"
 # (`CODE_INTERPRETER_IMAGE` overrides it), but has not yet passed this suite
 # against AgentENV. Re-enable only after a manual compatibility run succeeds.
 warn "code interpreter suite temporarily disabled; skipping"
-_pass "skipped code interpreter checks (replacement image not yet validated)"
+_skip "skipped code interpreter checks (replacement image not yet validated)"
 suite_summary "14_code_interpreter"
 exit 0
 
@@ -22,7 +22,7 @@ export E2B_API_KEY="e2b_000000"
 
 if ! python3 -c 'import e2b_code_interpreter' >/dev/null 2>&1; then
   warn "e2b_code_interpreter Python package not installed; skipping"
-  _pass "skipped code interpreter checks (e2b_code_interpreter not installed)"
+  _skip "skipped code interpreter checks (e2b_code_interpreter not installed)"
   suite_summary "14_code_interpreter"
   exit 0
 fi

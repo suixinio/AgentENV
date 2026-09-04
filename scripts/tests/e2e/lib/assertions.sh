@@ -6,6 +6,7 @@ if [[ -z "${E2E_ASSERTIONS_SH_LOADED:-}" ]]; then
 
   _PASS_COUNT=0
   _FAIL_COUNT=0
+  _SKIP_COUNT=0
 
   _pass() {
     ((_PASS_COUNT++)) || true
@@ -16,6 +17,36 @@ if [[ -z "${E2E_ASSERTIONS_SH_LOADED:-}" ]]; then
     ((_FAIL_COUNT++)) || true
     printf "  %b[FAIL]%b %s\n" "${LOG_COLOR_RED:-}" "${LOG_COLOR_RESET:-}" "$1" >&2
     [[ -n "${2:-}" ]] && printf "         expected: %s\n         got:      %s\n" "$2" "$3" >&2
+  }
+
+  # Whether this suite must exercise every path it can skip. Names come from
+  # E2E_STRICT_SUITES, a comma or space separated list matched against the name
+  # `init_suite` was given, or the word "all".
+  _suite_is_strict() {
+    local list="${E2E_STRICT_SUITES:-}"
+    [[ -n "$list" ]] || return 1
+    local name="${_E2E_SUITE_NAME:-}"
+    local entry
+    for entry in ${list//,/ }; do
+      if [[ "$entry" == "all" || "$entry" == "$name" ]]; then
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  # A precondition this run does not meet. It counts toward the total so a
+  # partial environment still reports one, and the summary says how many were
+  # skipped; a suite named in E2E_STRICT_SUITES fails on it instead, which is
+  # how a run that must exercise a path proves it did.
+  _skip() {
+    if _suite_is_strict; then
+      _fail "$1" "the path to run" "skipped, and E2E_STRICT_SUITES names this suite"
+      return
+    fi
+    ((_SKIP_COUNT++)) || true
+    ((_PASS_COUNT++)) || true
+    printf "  %b[SKIP]%b %s\n" "${LOG_COLOR_YELLOW:-}" "${LOG_COLOR_RESET:-}" "$1"
   }
 
   assert_eq() {
@@ -70,12 +101,14 @@ if [[ -z "${E2E_ASSERTIONS_SH_LOADED:-}" ]]; then
   suite_summary() {
     local suite_name="${1:-suite}"
     local total=$((_PASS_COUNT + _FAIL_COUNT))
+    local skipped=""
+    [[ "$_SKIP_COUNT" -gt 0 ]] && skipped=" (${_SKIP_COUNT} skipped)"
     _E2E_SUITE_SUMMARY_RAN=1
     echo ""
     if [[ "$_FAIL_COUNT" -eq 0 ]]; then
-      printf "%b[%s] All %d tests passed.%b\n" "${LOG_COLOR_GREEN:-}" "$suite_name" "$total" "${LOG_COLOR_RESET:-}"
+      printf "%b[%s] All %d tests passed.%s%b\n" "${LOG_COLOR_GREEN:-}" "$suite_name" "$total" "$skipped" "${LOG_COLOR_RESET:-}"
     else
-      printf "%b[%s] %d/%d tests failed.%b\n" "${LOG_COLOR_RED:-}" "$suite_name" "$_FAIL_COUNT" "$total" "${LOG_COLOR_RESET:-}"
+      printf "%b[%s] %d/%d tests failed.%s%b\n" "${LOG_COLOR_RED:-}" "$suite_name" "$_FAIL_COUNT" "$total" "$skipped" "${LOG_COLOR_RESET:-}"
     fi
     return $(( _FAIL_COUNT > 0 ? 1 : 0 ))
   }

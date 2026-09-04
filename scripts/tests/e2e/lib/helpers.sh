@@ -634,6 +634,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     source "${e2e_dir}/lib/helpers.sh"
 
     LOG_TAG="${1:-E2E}"
+    _E2E_SUITE_NAME="${1:-}"
     _E2E_SUITE_SUMMARY_RAN=0
     trap e2e_report_suite_error ERR
   }

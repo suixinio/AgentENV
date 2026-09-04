@@ -10,14 +10,14 @@ log "Suite: Shared POSIX Template Repository"
 
 if ! e2e_mode_is_clustered; then
   warn "Skipping shared repository checks outside clustered modes."
-  _pass "skipped outside clustered modes"
+  _skip "skipped outside clustered modes"
   suite_summary "12_template_shared_repository"
   exit 0
 fi
 
 if [[ -z "${AENV_NODE_A_URL:-}" || -z "${AENV_NODE_B_URL:-}" ]]; then
   warn "Skipping shared repository checks because fewer than two AgentENV node endpoints are available."
-  _pass "skipped because clustered runtime exposed fewer than two AgentENV nodes"
+  _skip "skipped because clustered runtime exposed fewer than two AgentENV nodes"
   suite_summary "12_template_shared_repository"
   exit 0
 fi
@@ -29,7 +29,7 @@ fi
 # read back from, and the property is no longer observable from outside.
 if ! node_rest_is_served; then
   warn "Skipping shared repository checks: nodes no longer serve user-facing REST."
-  _pass "cross-node template flow $(node_rest_skip_reason)"
+  _skip "cross-node template flow $(node_rest_skip_reason)"
   suite_summary "12_template_shared_repository"
   exit 0
 fi

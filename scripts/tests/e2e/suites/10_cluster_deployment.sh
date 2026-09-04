@@ -12,7 +12,7 @@ cluster_group="cluster-$(date +%s%N)"
 
 if ! e2e_mode_is_clustered; then
   warn "Skipping cluster deployment checks outside clustered modes."
-  _pass "skipped outside clustered modes"
+  _skip "skipped outside clustered modes"
   suite_summary "10_cluster_deployment"
   exit 0
 fi
@@ -29,7 +29,7 @@ if [[ -n "${AENV_NODE_B_URL:-}" ]]; then
   api_get_no_auth_at "${AENV_NODE_B_URL}" "/health"
   assert_status "$HTTP_STATUS" "204" "runtime node B health endpoint is reachable"
 else
-  _pass "runtime node B health check skipped because only one node endpoint is available"
+  _skip "runtime node B health check skipped because only one node endpoint is available"
 fi
 
 # Consecutive creates should alternate across runtime nodes with round-robin.
@@ -52,7 +52,7 @@ if ! node_rest_is_served; then
   # putting the fact anywhere else: no user-facing endpoint names a sandbox's
   # owning node. Restoring round-robin-distribution coverage needs an API
   # affordance, not a test change.
-  _pass "cross-node distribution and local exclusion $(node_rest_skip_reason)"
+  _skip "cross-node distribution and local exclusion $(node_rest_skip_reason)"
   suite_summary "10_cluster_deployment"
   exit 0
 fi
@@ -67,7 +67,7 @@ if [[ -n "$first_owner_url" && -n "$second_owner_url" ]]; then
   second_owner_label=$(node_label_for_url "$second_owner_url")
 
   if [[ "${node_count}" -lt 2 ]]; then
-    _pass "cross-node distribution check skipped because only one runtime node endpoint is available"
+    _skip "cross-node distribution check skipped because only one runtime node endpoint is available"
   elif [[ "$first_owner_url" != "$second_owner_url" ]]; then
     _pass "gateway distributed sandboxes across ${first_owner_label} and ${second_owner_label}"
   else
@@ -93,7 +93,7 @@ if [[ -n "$first_owner_url" ]]; then
   if [[ "$first_owner_url" != "$second_owner_url" ]]; then
     assert_eq "$count" "0" "owner node #1 local /sandboxes excludes sandbox #2 from another node"
   else
-    _pass "owner node #1 local exclusion skipped because both sandboxes landed on the same node"
+    _skip "owner node #1 local exclusion skipped because both sandboxes landed on the same node"
   fi
 fi
 
@@ -106,7 +106,7 @@ if [[ -n "$second_owner_url" ]]; then
   if [[ "$first_owner_url" != "$second_owner_url" ]]; then
     assert_eq "$count" "0" "owner node #2 local /sandboxes excludes sandbox #1 from another node"
   else
-    _pass "owner node #2 local exclusion skipped because both sandboxes landed on the same node"
+    _skip "owner node #2 local exclusion skipped because both sandboxes landed on the same node"
   fi
 fi
 

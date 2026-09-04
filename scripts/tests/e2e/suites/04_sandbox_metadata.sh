@@ -35,7 +35,7 @@ if e2e_mode_is_clustered && ! node_rest_is_served; then
   # sandboxes and not the other node's — cannot be expressed against the split:
   # nodes serve no `/sandboxes`, and no user-facing API says which node owns a
   # sandbox. Restoring it needs an API affordance, not a test change.
-  _pass "cross-node local metadata contrast $(node_rest_skip_reason)"
+  _skip "cross-node local metadata contrast $(node_rest_skip_reason)"
 elif e2e_mode_is_clustered; then
   owner_a=$(find_sandbox_node_url "$id_a")
   owner_b=$(find_sandbox_node_url "$id_b")
@@ -53,7 +53,7 @@ elif e2e_mode_is_clustered; then
     count=$(echo "$HTTP_BODY" | jq '[.[] | select(.sandboxID == "'"$id_a"'")] | length')
     assert_eq "$count" "0" "non-owner local filter does not return sandbox A"
   else
-    _pass "cross-node local metadata contrast skipped because both sandboxes landed on the same node"
+    _skip "cross-node local metadata contrast skipped because both sandboxes landed on the same node"
   fi
 fi
 

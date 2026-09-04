@@ -69,6 +69,11 @@
 #                                            18079, below the node range)
 #   AENV_TEMPLATE_ID                      - skip self-building a base template
 #   SUITE_FILTER                          - glob against suites/*.sh (default: *.sh)
+#   E2E_STRICT_SUITES                     - comma or space separated suite names
+#                                            (or "all") whose skipped
+#                                            preconditions fail instead of
+#                                            counting as passes. Use it when a
+#                                            run must prove it exercised a path.
 #   AENV_API_KEY / AENV_ADMIN_TOKEN       - default to the same e2e-test-key /
 #                                            e2e-admin-token values run_e2e.sh
 #                                            uses; override if this cluster's

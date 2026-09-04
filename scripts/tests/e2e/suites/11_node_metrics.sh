@@ -227,7 +227,7 @@ done < <(echo "${baseline_nodes_json}" | jq -r '.[] | [
 # Restoring this needs a user-facing way to ask which node owns a sandbox.
 # There is none today, which is why this is a skip and not a rewrite.
 if e2e_mode_is_clustered && ! node_rest_is_served; then
-  _pass "per-node metric attribution $(node_rest_skip_reason)"
+  _skip "per-node metric attribution $(node_rest_skip_reason)"
   suite_summary "11_node_metrics"
   exit 0
 fi
@@ -371,7 +371,7 @@ if e2e_mode_is_clustered; then
     fi
   done
 else
-  _pass "scheduler binding cleanup check skipped outside clustered modes"
+  _skip "scheduler binding cleanup check skipped outside clustered modes"
 fi
 
 for node_id in "${!BASELINE_SANDBOX_COUNT[@]}"; do

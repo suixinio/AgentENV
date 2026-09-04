@@ -3278,7 +3278,13 @@ pub struct NewSecret {
 
     /// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
     #[serde(rename = "value")]
-    pub value: zeroize::Zeroizing<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<zeroize::Zeroizing<String>>,
+
+    /// Structured credential for a handler that authenticates to the upstream itself, such as a `postgres` endpoint: host, port, user, password, database. Mutually exclusive with `value`; exactly one of the two is required. Each entry is a scalar and each key must match `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and ignores the rest.
+    #[serde(rename = "fields")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<std::collections::HashMap<String, zeroize::Zeroizing<String>>>,
 
     /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
     #[serde(rename = "metadata")]
@@ -3305,10 +3311,11 @@ lazy_static::lazy_static! {
 
 impl NewSecret {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
-    pub fn new(name: String, value: String) -> NewSecret {
+    pub fn new(name: String) -> NewSecret {
         NewSecret {
             name,
-            value: value.into(),
+            value: None,
+            fields: None,
             metadata: None,
             allowed_hosts: None,
         }
@@ -3323,8 +3330,11 @@ impl std::fmt::Display for NewSecret {
         let params: Vec<Option<String>> = vec![
             Some("name".to_string()),
             Some(self.name.to_string()),
-            Some("value".to_string()),
-            Some("[redacted]".to_string()),
+            self.value
+                .as_ref()
+                .map(|_| ["value".to_string(), "[redacted]".to_string()].join(",")),
+            // Skipping fields in query parameter serialization
+
             // Skipping metadata in query parameter serialization
             self.allowed_hosts.as_ref().map(|allowed_hosts| {
                 [
@@ -3360,6 +3370,7 @@ impl std::str::FromStr for NewSecret {
         struct IntermediateRep {
             pub name: Vec<String>,
             pub value: Vec<String>,
+            pub fields: Vec<std::collections::HashMap<String, zeroize::Zeroizing<String>>>,
             pub metadata: Vec<std::collections::HashMap<String, String>>,
             pub allowed_hosts: Vec<Vec<String>>,
         }
@@ -3391,6 +3402,12 @@ impl std::str::FromStr for NewSecret {
                     "value" => intermediate_rep.value.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    "fields" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSecret"
+                                .to_string(),
+                        );
+                    }
                     "metadata" => {
                         return std::result::Result::Err(
                             "Parsing a container in this style is not supported in NewSecret"
@@ -3422,12 +3439,8 @@ impl std::str::FromStr for NewSecret {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "name missing in NewSecret".to_string())?,
-            value: intermediate_rep
-                .value
-                .into_iter()
-                .next()
-                .ok_or_else(|| "value missing in NewSecret".to_string())?
-                .into(),
+            value: intermediate_rep.value.into_iter().next().map(Into::into),
+            fields: intermediate_rep.fields.into_iter().next(),
             metadata: intermediate_rep.metadata.into_iter().next(),
             allowed_hosts: intermediate_rep.allowed_hosts.into_iter().next(),
         })
@@ -8404,7 +8417,13 @@ impl std::ops::DerefMut for SecretString {
 pub struct SecretUpdate {
     /// A secret value in transit. It is passed to the secrets store and never stored, logged or returned by this API.
     #[serde(rename = "value")]
-    pub value: zeroize::Zeroizing<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<zeroize::Zeroizing<String>>,
+
+    /// Structured credential for a handler that authenticates to the upstream itself, such as a `postgres` endpoint: host, port, user, password, database. Mutually exclusive with `value`; exactly one of the two is required. Each entry is a scalar and each key must match `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and ignores the rest.
+    #[serde(rename = "fields")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<std::collections::HashMap<String, zeroize::Zeroizing<String>>>,
 
     /// Customer metadata of the secret. Always present, empty when unset. At most 32 entries; keys are limited to 128 bytes, values to 1024 bytes, and a secret's metadata to 8192 bytes in total.
     #[serde(rename = "metadata")]
@@ -8427,9 +8446,10 @@ impl std::fmt::Debug for SecretUpdate {
 
 impl SecretUpdate {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
-    pub fn new(value: String) -> SecretUpdate {
+    pub fn new() -> SecretUpdate {
         SecretUpdate {
-            value: value.into(),
+            value: None,
+            fields: None,
             metadata: None,
             allowed_hosts: None,
         }
@@ -8442,8 +8462,11 @@ impl SecretUpdate {
 impl std::fmt::Display for SecretUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let params: Vec<Option<String>> = vec![
-            Some("value".to_string()),
-            Some("[redacted]".to_string()),
+            self.value
+                .as_ref()
+                .map(|_| ["value".to_string(), "[redacted]".to_string()].join(",")),
+            // Skipping fields in query parameter serialization
+
             // Skipping metadata in query parameter serialization
             self.allowed_hosts.as_ref().map(|allowed_hosts| {
                 [
@@ -8478,6 +8501,7 @@ impl std::str::FromStr for SecretUpdate {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub value: Vec<String>,
+            pub fields: Vec<std::collections::HashMap<String, zeroize::Zeroizing<String>>>,
             pub metadata: Vec<std::collections::HashMap<String, String>>,
             pub allowed_hosts: Vec<Vec<String>>,
         }
@@ -8505,6 +8529,12 @@ impl std::str::FromStr for SecretUpdate {
                     "value" => intermediate_rep.value.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    "fields" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in SecretUpdate"
+                                .to_string(),
+                        );
+                    }
                     "metadata" => {
                         return std::result::Result::Err(
                             "Parsing a container in this style is not supported in SecretUpdate"
@@ -8531,12 +8561,8 @@ impl std::str::FromStr for SecretUpdate {
 
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(SecretUpdate {
-            value: intermediate_rep
-                .value
-                .into_iter()
-                .next()
-                .ok_or_else(|| "value missing in SecretUpdate".to_string())?
-                .into(),
+            value: intermediate_rep.value.into_iter().next().map(Into::into),
+            fields: intermediate_rep.fields.into_iter().next(),
             metadata: intermediate_rep.metadata.into_iter().next(),
             allowed_hosts: intermediate_rep.allowed_hosts.into_iter().next(),
         })

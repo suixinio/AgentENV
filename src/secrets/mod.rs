@@ -913,6 +913,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_structured_credential_round_trips_and_its_field_names_are_checked() {
+        let (service, backend) = service();
+        let created = service
+            .create(
+                "tenant_db",
+                fields(&[("host", "pg.internal"), ("port", "5432"), ("password", "")]),
+                SecretMetadata::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.current_version, 1);
+        match backend.value_of("tenant_db").unwrap() {
+            SecretValue::Fields(stored) => {
+                assert_eq!(stored.len(), 3);
+                assert_eq!(stored["host"].expose(), "pg.internal");
+                assert_eq!(
+                    stored["password"].expose(),
+                    "",
+                    "an empty password is a real configuration; only an unnamed field is not"
+                );
+            }
+            SecretValue::Opaque(_) => panic!("fields were stored as an opaque value"),
+        }
+
+        assert!(matches!(
+            service
+                .create("empty", fields(&[]), SecretMetadata::new(), Vec::new())
+                .await,
+            Err(SecretsError::EmptyValue)
+        ));
+        for bad in [
+            "",
+            "with space",
+            "with/slash",
+            &"k".repeat(MAX_SECRET_FIELD_KEY_LEN + 1),
+        ] {
+            assert!(
+                matches!(
+                    service
+                        .create(
+                            "db",
+                            fields(&[(bad, "v")]),
+                            SecretMetadata::new(),
+                            Vec::new()
+                        )
+                        .await,
+                    Err(SecretsError::InvalidMetadata(_))
+                ),
+                "{bad:?} was accepted as a field name"
+            );
+        }
+        let many: Vec<(String, String)> = (0..=MAX_SECRET_FIELDS)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        assert!(matches!(
+            service
+                .create(
+                    "db",
+                    SecretValue::Fields(
+                        many.iter()
+                            .map(|(k, v)| (k.clone(), SecretString::new(v.clone())))
+                            .collect()
+                    ),
+                    SecretMetadata::new(),
+                    Vec::new(),
+                )
+                .await,
+            Err(SecretsError::InvalidMetadata(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn listing_pages_by_id_with_a_cursor() {
         let (service, _) = service();
         for name in ["a", "b", "c"] {

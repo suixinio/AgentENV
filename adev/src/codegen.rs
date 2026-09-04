@@ -215,7 +215,8 @@ const REDACTED_DERIVE: &str =
 
 /// A secret is opaque bytes: markup inside one is not an attack, it must never
 /// reach a log line, and its buffer is wiped when the model drops rather than
-/// freed with the value still in it.
+/// freed with the value still in it. Both shapes a write can carry — the
+/// opaque `value` and every entry of the structured `fields` — get that.
 fn redact_secret_value_models(models_rs: &std::path::Path) -> Result<()> {
     let mut content = std::fs::read_to_string(models_rs)?;
     for model in SECRET_VALUE_MODELS {
@@ -242,24 +243,47 @@ fn redact_secret_value_model(content: &str, model: &str) -> Result<String> {
         .map(|offset| start + offset + "\n}\n".len())
         .ok_or_else(|| anyhow::anyhow!("{model} has no struct body to rewrite"))?;
 
-    let validated_value = "    #[serde(rename = \"value\")]\n    \
-                           #[validate(custom(function = \"check_xss_string\"))]\n    \
-                           pub value: String,";
     // `Zeroizing` rather than a `Drop` on the model: the `conversion` feature
     // derives `frunk::LabelledGeneric`, which moves out of the struct and
-    // cannot do that for a type that implements `Drop`.
-    let plain_value =
-        "    #[serde(rename = \"value\")]\n    pub value: zeroize::Zeroizing<String>,";
+    // cannot do that for a type that implements `Drop`. Dropping the `fields`
+    // validation drops nothing that guarded a value — the generated check
+    // only rejects markup in the *keys* — but the map's value type has to
+    // stop being `models::SecretString`, which prints.
+    let unvalidate = [
+        (
+            "    #[serde(rename = \"value\")]\n    \
+             #[validate(custom(function = \"check_xss_string\"))]\n    \
+             #[serde(skip_serializing_if = \"Option::is_none\")]\n    \
+             pub value: Option<String>,",
+            "    #[serde(rename = \"value\")]\n    \
+             #[serde(skip_serializing_if = \"Option::is_none\")]\n    \
+             pub value: Option<zeroize::Zeroizing<String>>,",
+            "value",
+        ),
+        (
+            "    #[serde(rename = \"fields\")]\n    \
+             #[validate(custom(function = \"check_xss_map_nested\"))]\n    \
+             #[serde(skip_serializing_if = \"Option::is_none\")]\n    \
+             pub fields: Option<std::collections::HashMap<String, models::SecretString>>,",
+            "    #[serde(rename = \"fields\")]\n    \
+             #[serde(skip_serializing_if = \"Option::is_none\")]\n    \
+             pub fields: \
+             Option<std::collections::HashMap<String, zeroize::Zeroizing<String>>>,",
+            "fields",
+        ),
+    ];
     let body = &content[start..body_end];
-    if !body.contains(validated_value) {
-        anyhow::bail!(
-            "{model} has no XSS-validated value field to unvalidate; the generator's output \
-             changed and a secret containing markup would be rejected with a 400"
-        );
+    let mut rewritten = body.to_string();
+    for (validated, plain, field) in unvalidate {
+        if !rewritten.contains(validated) {
+            anyhow::bail!(
+                "{model} has no XSS-validated {field} field to unvalidate; the generator's \
+                 output changed and a secret containing markup would be rejected with a 400"
+            );
+        }
+        rewritten = rewritten.replace(validated, plain);
     }
-    let rewritten =
-        body.replace(validated_value, plain_value)
-            .replacen(GENERATED_DERIVE, REDACTED_DERIVE, 1);
+    let rewritten = rewritten.replacen(GENERATED_DERIVE, REDACTED_DERIVE, 1);
 
     let redacted_debug = format!(
         "\nimpl std::fmt::Debug for {model} {{\n    \
@@ -274,35 +298,34 @@ fn redact_secret_value_model(content: &str, model: &str) -> Result<String> {
     ))
 }
 
-/// The value field's type change and its printing `Display` both live after
-/// the struct body: the generator's constructor and `FromStr` build the field,
-/// and `Display` writes it into a query string.
+/// The two fields' type changes and the printing `Display` both live after the
+/// struct body: `FromStr` parses into an intermediate representation and
+/// builds them, and `Display` writes the value into a query string.
+///
+/// Every edit is one line inside one impl block, so each is scoped to that
+/// block: the same line appears in every other model.
 fn redact_secret_value_tail(tail: &str, model: &str) -> Result<String> {
-    let parsed = format!("\"value missing in {model}\".to_string())?,");
-    let parsed_wrapped =
-        format!("\"value missing in {model}\".to_string())?\n                .into(),");
-    if !tail.contains(&parsed) {
-        anyhow::bail!(
-            "{model} no longer has a FromStr that builds the value field; the generator's \
-             output changed and a secret value would ship in a plain String"
-        );
-    }
-    let tail = tail.replacen(&parsed, &parsed_wrapped, 1);
-
-    // Both remaining edits are one line inside one impl block, so each is
-    // scoped to that block: the same line appears in every other model.
+    let from_str = format!("impl std::str::FromStr for {model} {{");
+    let tail = rewrite_in_block(
+        tail,
+        &from_str,
+        "            pub fields: Vec<std::collections::HashMap<String, models::SecretString>>,\n",
+        "            pub fields: \
+         Vec<std::collections::HashMap<String, zeroize::Zeroizing<String>>>,\n",
+        &format!("{model}'s FromStr no longer parses fields into what the struct holds"),
+    )?;
     let tail = rewrite_in_block(
         &tail,
-        &format!("impl {model} {{"),
-        "\n            value,\n",
-        "\n            value: value.into(),\n",
-        &format!("{model}'s constructor no longer builds the value field"),
+        &from_str,
+        "            value: intermediate_rep.value.into_iter().next(),\n",
+        "            value: intermediate_rep.value.into_iter().next().map(Into::into),\n",
+        &format!("{model}'s FromStr no longer builds the value field"),
     )?;
     rewrite_in_block(
         &tail,
         &format!("impl std::fmt::Display for {model} {{"),
-        "Some(self.value.to_string()),",
-        "Some(\"[redacted]\".to_string()),",
+        ".map(|value| [\"value\".to_string(), value.to_string()].join(\",\")),",
+        ".map(|_| [\"value\".to_string(), \"[redacted]\".to_string()].join(\",\")),",
         &format!("{model}'s Display no longer writes the value, or writes it differently"),
     )
 }

@@ -9,11 +9,18 @@ init_suite "16_egress_postgres"
 log "Suite: Brokered Postgres (explicit endpoints + a credential the sandbox never holds)"
 
 # The upstream this suite brokers to. It has to be reachable from the broker
-# Pod and inside `[handlers.postgres].allowed_cidrs`; the credential named
-# below has to resolve to it with a user and a password that work. Nothing
-# here creates either: a structured credential is written by the operator (or
-# answered by the resolver), because `/secrets` stores one opaque value.
+# Pod and inside `[handlers.postgres].allowed_cidrs`.
+#
+# Two ways to name the credential. `E2E_PG_SECRET` names one that already
+# exists, whoever wrote it — the only option against a store this API cannot
+# write, such as an external resolver. Otherwise, give the connection itself
+# in E2E_PG_HOST / E2E_PG_USER / E2E_PG_PASSWORD and the suite writes a
+# structured credential through `/secrets` and removes it afterwards.
 PG_SECRET="${E2E_PG_SECRET:-}"
+PG_HOST="${E2E_PG_HOST:-}"
+PG_PORT="${E2E_PG_PORT:-5432}"
+PG_USER="${E2E_PG_USER:-}"
+PG_PASSWORD="${E2E_PG_PASSWORD:-}"
 PG_DATABASE="${E2E_PG_DATABASE:-postgres}"
 # The probe sets application_name to "probe"; a resolver that overrides it is
 # a legitimate deployment and the assertion below says which case it saw.
@@ -52,8 +59,52 @@ endpoint_json() {
 }
 
 # -- Preconditions -------------------------------------------------------------
+sandbox_id=""
+created_secret=""
+# `set -e` is on, so each arm is a full `if` rather than `[[ ]] && cmd`: an
+# empty variable would otherwise end the trap before the second one runs.
+cleanup() {
+  if [[ -n "$sandbox_id" ]]; then
+    api_delete "/sandboxes/${sandbox_id}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$created_secret" ]]; then
+    api_delete "/secrets/${created_secret}" >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if [[ -z "$PG_SECRET" && -n "$PG_HOST" && -n "$PG_USER" ]]; then
+  PG_SECRET="e2e-pg-$(date +%s)-$RANDOM"
+  api_post "/secrets" "$(jq -nc --arg n "$PG_SECRET" --arg h "$PG_HOST" --arg p "$PG_PORT" \
+    --arg u "$PG_USER" --arg w "$PG_PASSWORD" \
+    '{name: $n, fields: {host: $h, port: $p, user: $u, password: $w}}')"
+  case "$HTTP_STATUS" in
+    201)
+      created_secret="$PG_SECRET"
+      _pass "wrote a structured credential through /secrets"
+      ;;
+    503)
+      warn "POST /secrets answered 503: no secrets store on this deployment"
+      _skip "brokered postgres, no secrets store configured"
+      suite_summary "16_egress_postgres"
+      exit 0
+      ;;
+    400)
+      warn "this deployment's /secrets does not take a fields body: ${HTTP_BODY}"
+      _skip "brokered postgres, the store cannot hold a structured credential"
+      suite_summary "16_egress_postgres"
+      exit 0
+      ;;
+    *)
+      _fail "create a structured credential" "201" "$HTTP_STATUS ${HTTP_BODY}"
+      suite_summary "16_egress_postgres"
+      exit 1
+      ;;
+  esac
+fi
+
 if [[ -z "$PG_SECRET" ]]; then
-  warn "E2E_PG_SECRET is unset: this suite needs a structured credential the broker can resolve"
+  warn "neither E2E_PG_SECRET nor E2E_PG_HOST/E2E_PG_USER is set: nothing names a credential"
   _skip "brokered postgres, no credential named"
   suite_summary "16_egress_postgres"
   exit 0
@@ -98,11 +149,6 @@ case "$HTTP_STATUS" in
     ;;
 esac
 assert_not_empty "$sandbox_id" "sandbox with a postgres endpoint started"
-
-cleanup() {
-  [[ -n "${sandbox_id:-}" ]] && api_delete "/sandboxes/${sandbox_id}" >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
 
 if run_in_sandbox "$sandbox_id" "command -v python3" >/dev/null 2>&1; then
   PROBE_RUNNER="python3"; PROBE_B64="$PROBE_PY_B64"; PROBE_PATH="/tmp/pgprobe.py"

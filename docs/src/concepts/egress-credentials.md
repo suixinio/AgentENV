@@ -83,6 +83,21 @@ inside the sandbox and the handler behind it:
 }
 ```
 
+That credential is the other shape `/secrets` takes:
+
+```bash
+curl -X POST "$AENV_URL/secrets" -H "X-API-Key: $KEY" -H 'content-type: application/json' \
+  -d '{"name": "tenant_db", "fields": {"host": "pg.internal", "port": "5432",
+       "user": "app_rw", "password": "..."}}'
+```
+
+`value` and `fields` are mutually exclusive and one of them is required: a header substitution
+takes the first, a handler that authenticates to the upstream itself takes the second. Field
+names match `^[a-zA-Z0-9_-]{1,64}$` and there are at most 32 of them; the values are opaque
+strings and a handler ignores the fields it does not know. `POST /secrets/{id}` writes a new
+version in either shape, and a sandbox holding a grant for the name moves to it within one
+credential-cache TTL without a new grant.
+
 The sandbox connects to `169.254.0.22:5432` with a DSN whose user and password are placeholders:
 
 ```

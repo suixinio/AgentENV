@@ -505,7 +505,6 @@ components:
       type: object
       required:
         - name
-        - value
       properties:
         name:
           type: string
@@ -518,6 +517,17 @@ components:
             secret identifiers.
         value:
           $ref: "#/components/schemas/SecretString"
+        fields:
+          type: object
+          description: >
+            Structured credential for a handler that authenticates to the upstream
+            itself, such as a `postgres` endpoint: host, port, user, password,
+            database. Mutually exclusive with `value`; exactly one of the two is
+            required. Each entry is a scalar and each key must match
+            `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and
+            ignores the rest.
+          additionalProperties:
+            $ref: "#/components/schemas/SecretString"
         metadata:
           $ref: "#/components/schemas/SecretMetadata"
         allowedHosts:
@@ -533,11 +543,20 @@ components:
 
     SecretUpdate:
       type: object
-      required:
-        - value
       properties:
         value:
           $ref: "#/components/schemas/SecretString"
+        fields:
+          type: object
+          description: >
+            Structured credential for a handler that authenticates to the upstream
+            itself, such as a `postgres` endpoint: host, port, user, password,
+            database. Mutually exclusive with `value`; exactly one of the two is
+            required. Each entry is a scalar and each key must match
+            `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and
+            ignores the rest.
+          additionalProperties:
+            $ref: "#/components/schemas/SecretString"
         metadata:
           $ref: "#/components/schemas/SecretMetadata"
         allowedHosts:

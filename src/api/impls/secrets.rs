@@ -38,6 +38,29 @@ fn secret_model(secret: SecretRef) -> models::Secret {
     }
 }
 
+/// Exactly one of the two shapes a write may carry. `fields` is the only
+/// form a handler that speaks a protocol to the upstream can use; `value` is
+/// what a header substitution takes.
+fn value_from(
+    value: Option<&zeroize::Zeroizing<String>>,
+    fields: Option<&HashMap<String, zeroize::Zeroizing<String>>>,
+) -> Result<SecretValue, models::Error> {
+    match (value, fields) {
+        (Some(value), None) => Ok(SecretValue::Opaque(SecretString::new(value.to_string()))),
+        (None, Some(fields)) => Ok(SecretValue::Fields(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), SecretString::new(value.to_string())))
+                .collect(),
+        )),
+        (Some(_), Some(_)) => Err(ApiImpl::error(
+            400,
+            "value and fields are mutually exclusive; give exactly one",
+        )),
+        (None, None) => Err(ApiImpl::error(400, "one of value or fields is required")),
+    }
+}
+
 fn metadata_from(model: Option<&HashMap<String, String>>) -> SecretMetadata {
     model
         .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
@@ -117,7 +140,10 @@ impl Secrets<()> for ApiImpl {
                 ))
             }
         };
-        let value = SecretValue::Opaque(SecretString::new(body.value.to_string()));
+        let value = match value_from(body.value.as_ref(), body.fields.as_ref()) {
+            Ok(value) => value,
+            Err(err) => return Ok(SecretsPostResponse::Status400_BadRequest(err)),
+        };
         match service
             .create(
                 &body.name,
@@ -212,7 +238,10 @@ impl Secrets<()> for ApiImpl {
                 return Ok(SecretsSecretIdPostResponse::Status503_NoSecretsStoreIsConfigured(err))
             }
         };
-        let value = SecretValue::Opaque(SecretString::new(body.value.to_string()));
+        let value = match value_from(body.value.as_ref(), body.fields.as_ref()) {
+            Ok(value) => value,
+            Err(err) => return Ok(SecretsSecretIdPostResponse::Status400_BadRequest(err)),
+        };
         let metadata = body.metadata.as_ref().map(|m| metadata_from(Some(m)));
         match service
             .update(
@@ -246,12 +275,50 @@ impl Secrets<()> for ApiImpl {
 mod tests {
     use agentenv_http_server::models;
 
-    #[test]
-    fn a_secret_value_is_never_printed() {
-        let created = models::NewSecret::new("gh".to_string(), "sk-live-123".to_string());
-        assert_eq!(format!("{created:?}"), "NewSecret([redacted])");
+    use super::*;
 
-        let updated = models::SecretUpdate::new("sk-live-456".to_string());
+    fn zeroizing(value: &str) -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new(value.to_string())
+    }
+
+    #[test]
+    fn a_secret_value_is_never_printed_in_either_shape() {
+        let mut created = models::NewSecret::new("gh".to_string());
+        created.value = Some(zeroizing("sk-live-123"));
+        assert_eq!(format!("{created:?}"), "NewSecret([redacted])");
+        assert!(!created.to_string().contains("sk-live-123"));
+
+        let mut updated = models::SecretUpdate::new();
+        updated.fields = Some(
+            [("password".to_string(), zeroizing("sk-live-456"))]
+                .into_iter()
+                .collect(),
+        );
         assert_eq!(format!("{updated:?}"), "SecretUpdate([redacted])");
+        assert!(!updated.to_string().contains("sk-live-456"));
+    }
+
+    #[test]
+    fn a_write_carries_exactly_one_of_value_and_fields() {
+        let value = zeroizing("sk");
+        let fields: HashMap<String, zeroize::Zeroizing<String>> =
+            [("password".to_string(), zeroizing("pw"))]
+                .into_iter()
+                .collect();
+
+        assert!(matches!(
+            value_from(Some(&value), None),
+            Ok(SecretValue::Opaque(_))
+        ));
+        assert!(matches!(
+            value_from(None, Some(&fields)),
+            Ok(SecretValue::Fields(_))
+        ));
+        for refused in [
+            value_from(Some(&value), Some(&fields)),
+            value_from(None, None),
+        ] {
+            assert_eq!(refused.err().map(|err| err.code), Some(400));
+        }
     }
 }

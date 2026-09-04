@@ -465,15 +465,13 @@ How a node reaches the egress broker that serves sandboxes declaring `network.ru
 
 ## `[secrets]`
 
-Where `aenv-api` stores secret values and grants for `/secrets`, `network.rules` and endpoint credentials. Only the api half reads this section; its PostgreSQL always holds names and versions in `secret_refs`. With `backend = "disabled"`, `/secrets` answers 503 and rules that reference secrets are refused.
+Where `aenv-api` keeps secret values and grants for `/secrets`, `network.rules` and endpoint credentials. Only the api half reads this section. With `backend = "disabled"`, `/secrets` answers 503 and rules that reference secrets are refused.
 
-With `backend = "postgres"` the values live in that same database, encrypted under a master key this process reads from a file, and `aenv-api` also serves the broker's resolve endpoint. It is the one backend that can open a stored value, and the one that needs no store beside AgentENV.
-
-With `backend = "external_resolver"` the credentials never enter AgentENV at all: this half posts grants and revocations to the operator's service, the broker resolves values against the same base, and the resolver is also the authority on which names exist. `/secrets` then refuses to store or delete a value, because it owns neither.
+With `backend = "postgres"` the values live in the same PostgreSQL that holds their names and versions, encrypted with AES-256-GCM under a master key this process reads from a file, and `aenv-api` also serves the broker's resolve endpoint. It is the only backend, and the only credential store a deployment needs beside AgentENV itself.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `backend` | string | `"disabled"` | `disabled`, `postgres`, `vault`, or `external_resolver`. |
+| `backend` | string | `"disabled"` | `disabled` or `postgres`. |
 
 ## `[secrets.pg]`
 
@@ -483,18 +481,6 @@ Values in `aenv-api`'s own PostgreSQL, AES-256-GCM under one master key. Both ke
 |-----|------|---------|-------------|
 | `key_file` | path | unset | File holding the base64 32-byte master key. Required when `backend = "postgres"`. Mount it from a Secret; it is never written to the database holding the ciphertexts, and losing it loses every stored value. |
 | `resolver_token_file` | path | unset | File holding the bearer the broker presents at `POST /internal/credentials/resolve`. Required when `backend = "postgres"`; the broker's own `resolver.token_file` holds the same value. Read once at startup. |
-
-## `[secrets.vault]`
-
-HashiCorp Vault KV v2. Values live at `<mount>/secrets/<name>`, grants at `<mount>/grants/<execution_id>`.
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `addr` | string | unset | Base URL of the Vault server. Required when `backend = "vault"`. |
-| `token` | string | unset | Vault token. Required when `backend = "vault"`; inject it from a Secret. |
-| `mount` | string | `"aenv"` | KV v2 mount, one path segment. |
-| `namespace` | string | unset | Vault Enterprise namespace header, when used. |
-| `timeout_ms` | integer | `5000` | Timeout for each Vault call. |
 
 ## `aenv-egress.toml`
 
@@ -522,18 +508,11 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 | `ca.cache_capacity` | integer | `4096` | How many minted leaves are kept before the oldest name is evicted. |
 | `ca.mints_per_sandbox_per_minute` | integer | `60` | Per-sandbox signing budget. With match-before-sign this is what bounds the leaves an unconstrained CA can be made to issue. |
 | `upstream.denied_cidrs` | array of CIDR strings | `[]` | Destinations nothing reaches through the broker. These are absolute: unlike the built-in private ranges, no per-handler `allowed_cidrs` reopens them, so a range that must never be reachable belongs here. The cluster's Service and Pod CIDRs are the ones that do. |
-| `vault.addr` | string | unset | Vault base URL. Unset runs the broker with no credential source and every marker answers 502. |
-| `vault.token_file` | path | unset | File holding the broker's Vault token. A read-only policy: the api half writes with a different token (`secrets-vault-writer`), which this Pod does not mount. |
-| `vault.mount` | string | `"aenv"` | KV v2 mount. Must match the api half's `[secrets.vault].mount`. |
-| `vault.namespace` | string | unset | Vault Enterprise namespace header, when used. |
-| `vault.timeout_ms` | integer | `5000` | Timeout for each Vault call. |
-| `vault.cache_ttl_secs` | integer | `30` | How long a resolved value is reused before Vault is asked again. |
-| `vault.cache_capacity` | integer | `4096` | Values held at once. Expired entries leave on every insert and the soonest to expire is dropped at capacity, so secret bytes are not retained past the TTL. |
-| `resolver.url` | string | unset | Base URL the broker resolves credentials against, the same base the api half posts grants to. With `[secrets].backend = "postgres"` that base is `aenv-api` itself — `http://agentenv-api:8000/internal` — and the NetworkPolicy has to admit it. Set at most one of this and `vault.addr`; with both, the resolver is used and `[vault]` is ignored. |
-| `resolver.token_file` | path | unset | File holding the bearer token for resolver calls. Against the `postgres` backend it holds the same value as the api half's `[secrets.pg].resolver_token_file`. |
+| `resolver.url` | string | unset | Base URL the broker resolves credentials against. With `[secrets].backend = "postgres"` that base is `aenv-api` itself — `http://agentenv-api:8000/internal` — and the NetworkPolicy has to admit it. Unset leaves the broker with no credential source: it warns once at startup and every marker answers 502. |
+| `resolver.token_file` | path | unset | File holding the bearer token for resolver calls. It holds the same value as the api half's `[secrets.pg].resolver_token_file`. |
 | `resolver.timeout_ms` | integer | `5000` | Timeout for each resolver call. |
 | `resolver.cache_ttl_secs` | integer | `30` | How long a resolved credential is reused. It bounds how long a revocation takes to bite: a revoked grant is only noticed on the next lookup. |
-| `resolver.cache_capacity` | integer | `4096` | Credentials held at once, with the same expiry-ordered eviction as the Vault cache. |
+| `resolver.cache_capacity` | integer | `4096` | Credentials held at once. Expired entries leave on every insert and the soonest to expire is dropped at capacity, so credential bytes are not retained past the TTL. |
 | `handlers.echo` | boolean | `false` | The `echo` identity handler, for smoke tests. Off in production. |
 | `handlers.tcp.enabled` | boolean | `false` | The `tcp` byte relay, which endpoint declarations name. |
 | `handlers.tcp.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations `tcp` reaches. An enabled handler with an empty list reaches nothing: a declaration names the upstream, so the operator names where declarations may point. A range named here is reached even when it is private, because the upstream is the operator's choice and the guest never addressed it — neither the built-in private ranges nor the sandbox's own egress policy bounds it. It still cannot reach the broker's own host, link-local (cloud metadata), or anything in `upstream.denied_cidrs`. **TOML-file-only — no `env =` binding.** |

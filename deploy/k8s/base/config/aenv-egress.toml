@@ -40,30 +40,12 @@ mints_per_sandbox_per_minute = 60
 # cluster.
 denied_cidrs = ["10.42.0.0/16", "10.43.0.0/16"]
 
-[vault]
-# Unset leaves the broker without a credential source: every marker answers
-# 502 credential_unavailable. Set it to the same server the api half writes.
-# addr = "http://vault.vault.svc:8200"
-token_file = "/etc/aenv-egress/vault/token"
-mount = "aenv"
-timeout_ms = 5000
-cache_ttl_secs = 30
-# Values held at once. Expired entries leave on every insert, so a finished
-# execution's secret is not kept past its ttl.
-cache_capacity = 4096
-
 [resolver]
-# Where the broker resolves credentials. Set at most one of this and [vault];
-# with both, the resolver wins and [vault] is ignored.
-#
-# Two things it can point at. With [secrets].backend = "postgres" it is the
-# api half itself, which serves the same contract:
+# Where the broker resolves credentials. Unset leaves it without a source and
+# every marker answers 502. With [secrets].backend = "postgres" this is the
+# api half itself:
 #   url = "http://agentenv-api:8000/internal"
-# With backend = "external_resolver" it is the operator's own service, which
-# the api half also posts grants to:
-#   url = "http://agent-platform.apps.svc/internal/aenv"
-# Either way the two halves must name the same base, and the NetworkPolicy
-# has to admit it.
+# The NetworkPolicy has to admit whatever it names.
 token_file = "/etc/aenv-egress/resolver/token"
 timeout_ms = 5000
 # How long a resolved credential is reused. It bounds how long a revocation

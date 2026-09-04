@@ -30,26 +30,6 @@ kind: Kustomization
 # 🔴 Losing `agentenv-secrets-key` loses every stored value. It is not in the
 # database's own Secret and a database backup cannot recover it.
 #
-# `vault-dev.yaml` stays applied as the rollback target. Going back is one
-# ConfigMap key and one patch:
-#
-#   NS=agentenv-system
-#   kubectl -n $NS patch configmap secrets-store-config --type merge \
-#     -p '{"data":{"AENV_SECRETS_BACKEND":"vault","AENV_SECRETS_VAULT_ADDR":"http://vault-dev:8200"}}'
-#   # plus AENV_EGRESS_VAULT_ADDR back on the broker in place of
-#   # AENV_EGRESS_RESOLVER_URL below, and then, because a dev-mode Vault holds
-#   # its state in memory, the reader token has to be re-issued against it:
-#   READER=$(kubectl -n $NS get secret egress-vault -o jsonpath='{.data.token}' | base64 -d)
-#   kubectl -n $NS exec -i deploy/vault-dev -- vault policy write aenv-egress-reader - <<'HCL'
-#   path "aenv/data/secrets/*" { capabilities = ["read"] }
-#   path "aenv/data/grants/*"  { capabilities = ["read"] }
-#   HCL
-#   kubectl -n $NS exec deploy/vault-dev -- \
-#     vault token create -id="$READER" -policy=aenv-egress-reader -period=768h
-#
-# Every value written since the switch stays in PostgreSQL and is not in that
-# Vault, so a rollback is a rollback of the code path, not of the data.
-#
 # Everything else, including the /var/lib/aenv hostPath, matches
 # `overlays/default`. The `agentenv-runtime-secrets` Secret is likewise NOT
 # generated here for the reason that overlay spells out at length: one
@@ -60,7 +40,6 @@ namespace: agentenv-system
 
 resources:
   - ../../base
-  - vault-dev.yaml
 
 configMapGenerator:
   - name: regctl-config
@@ -75,9 +54,6 @@ configMapGenerator:
     behavior: merge
     literals:
       - AENV_SECRETS_BACKEND=postgres
-      # Still set, and unread while the backend is postgres: it is what the
-      # rollback above puts back into service.
-      - AENV_SECRETS_VAULT_ADDR=http://vault-dev:8200
 
 generatorOptions:
   disableNameSuffixHash: true
@@ -94,10 +70,7 @@ patches:
       - op: replace
         path: /spec/template/spec/volumes/0/hostPath/path
         value: /var/lib/aenv
-  # The credential source. Only one of AENV_EGRESS_RESOLVER_URL and
-  # AENV_EGRESS_VAULT_ADDR belongs here: with both, the broker uses the
-  # resolver, ignores [vault] and says so once a startup — a warning that
-  # would then sit in the log forever describing a configuration nobody chose.
+  # The credential source: the api half's own resolve endpoint.
   - target:
       kind: Deployment
       name: aenv-egress
@@ -107,21 +80,3 @@ patches:
         value:
           name: AENV_EGRESS_RESOLVER_URL
           value: http://agentenv-api:8000/internal
-  # base lets the broker reach a Vault in the `vault` namespace; this cluster's
-  # dev Vault runs beside the broker. Kept for the rollback: while the backend
-  # is postgres the broker never dials it. The api half's own 8000 is already
-  # in base.
-  - target:
-      kind: NetworkPolicy
-      name: aenv-egress
-    patch: |-
-      - op: add
-        path: /spec/egress/-
-        value:
-          to:
-            - podSelector:
-                matchLabels:
-                  app.kubernetes.io/name: vault-dev
-          ports:
-            - port: 8200
-              protocol: TCP

@@ -195,16 +195,12 @@ broker serves a value only under a matching grant, so what a sandbox can obtain 
 broker is exactly its own grant and nothing else — that is the axis the grant bounds. The node
 records nothing: it starts what the api half dispatched and holds no store to refuse or consult.
 
-With `[secrets].backend = "external_resolver"` the credential never enters AgentENV at all: the
-api half posts the same `(sandbox, execution, names)` grant to a service the operator runs, and
-the broker asks that service for the value. Two consequences follow from the credential being
-the operator's existing per-database account rather than one minted per sandbox: every sandbox is
-the same role to the database, so its audit log cannot tell them apart, and a revocation does not
-cut connections already open — it stops the next one, no sooner than the broker's credential
-cache TTL. **The proxy removes the credential from the sandbox; it does not by itself give each
-sandbox a database identity.**
+Two consequences follow from the credential being the operator's existing per-database account
+rather than one minted per sandbox: every sandbox is the same role to the database, so its audit
+log cannot tell them apart, and a revocation does not cut connections already open — it stops the
+next one, no sooner than the broker's credential cache TTL. **The proxy removes the credential
+from the sandbox; it does not by itself give each sandbox a database identity.**
 
-Which side enforces the grant depends on the backend, and that is the difference between the two.
 
 ### What a grant does not bound
 
@@ -228,34 +224,25 @@ sandbox because a secret was deleted is worse than waking it degraded. The wake 
 naming the sandbox and the missing names; the guest sees the same synthetic `403` any denied
 credential produces.
 
-With `vault`, the broker enforces it in its own code and the token it holds reads every value
-under the mount: KV v2 policy has no way to say "read `secrets/X` only when `grants/E` names it".
-What bounds a compromised broker is everything around the process — a token whose policy is
-`read` and cannot write itself a grant, a NetworkPolicy that admits only nodes and allows only
-Vault, DNS and port 443 out, and a non-root Pod with a read-only root filesystem. A per-grant
-Vault token would need a policy minted per grant, which means giving the api half write access to
-`sys/policies/acl/*` — the ability to write itself a policy for anything in Vault. That trades a
-larger exposure for a smaller one and is why it is not the fix.
+### Where the check happens
 
-With `postgres` the check is this half's own. Values live in `secret_values` in the same
-PostgreSQL that holds `secret_refs`, encrypted with AES-256-GCM under a master key `aenv-api`
-reads from a file and the database never sees; grants are rows in `secret_grants`. The broker
-holds a bearer for `POST /internal/credentials/resolve` and asks about one
-`(sandbox, execution, name)` at a time, exactly as it does for an external resolver — a
-compromised broker reads nothing that is not granted to some live sandbox. That endpoint is on
-the api half's own port, beside the REST surface, and no API key reaches it: the bearer is the
-only thing in front of it, so it belongs behind the same boundary that port already has. The
-shipped manifests give `agentenv-api` a ClusterIP Service and no ingress. What this backend
-costs is on the other side: `aenv-api` can open every stored value, where the other two backends
-leave it able only to write. That is the price of needing no credential store beside AgentENV,
-and it is the reason the master key is a mounted file rather than a column, an environment
-variable or a `pgcrypto` argument that would reach the query log.
+The api half's own. Values live in `secret_values` in the same PostgreSQL that holds
+`secret_refs`, encrypted with AES-256-GCM under a master key `aenv-api` reads from a file and the
+database never sees; grants are rows in `secret_grants`. The broker holds a bearer for
+`POST /internal/credentials/resolve` and asks about one `(sandbox, execution, name)` at a time —
+it holds no credential that reads a value, so a compromised broker reads nothing that is not
+granted to some live sandbox right now. Everything a grant does not cover is one `404` that says
+nothing about what exists.
 
-With `external_resolver` the check is the store's. The broker holds a token that lets it *ask*
-about one `(sandbox, execution, name)` at a time, not one that reads values; a resolver that has
-no grant for the triple answers `403`, and a compromised broker reads nothing that is not
-currently granted to some sandbox. That is the confinement a scoped token was meant to buy,
-reached from the other side.
+That endpoint is on the api half's own port, beside the REST surface, and no API key reaches it:
+the bearer is the only thing in front of it, so it belongs behind the same boundary that port
+already has. The shipped manifests give `agentenv-api` a ClusterIP Service and no ingress.
+
+What it costs is on the other side: `aenv-api` can open every stored value. That is the price of
+needing no credential store beside AgentENV, and it is the reason the master key is a mounted
+file rather than a column, an environment variable or a `pgcrypto` argument that would reach the
+query log. Whoever holds a dump of `secret_values` does not hold the key, and a database backup
+does not recover it.
 
 ## Deployment
 
@@ -265,9 +252,9 @@ Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egr
 - `aenv-egress` (`deploy/k8s/base/aenv-egress-deployment.yaml`, image
   `deploy/docker/Dockerfile.aenv-egress`): the broker, reading
   `deploy/k8s/base/config/aenv-egress.toml`. It needs the `egress-ca`, `egress-server`,
-  `egress-hmac` and `egress-vault` Secrets; `aenv-egress-secrets.example.yaml` says how to mint
-  them. `aenv-egress-networkpolicy.yaml` lets only nodes in and only Vault, DNS and port 443 of
-  public addresses out.
+  `egress-hmac` and `egress-resolver` Secrets; `aenv-egress-secrets.example.yaml` says how to mint
+  them. `aenv-egress-networkpolicy.yaml` lets only nodes in and only the api half, DNS and port
+  443 of public addresses out.
 - Nodes: `[egress_broker].mode = "remote"`, `endpoint = "aenv-egress:8443"`, the CA certificate
   and the HMAC key. Two CAs where the operator has split them: `ca_cert_path` verifies the
   broker's server certificate and `guest_ca_cert_path` is what guests trust for intercepted
@@ -275,17 +262,13 @@ Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egr
   broker's own `*.svc` certificate. A node reports its broker state in every heartbeat, and the api half places a
   sandbox with rules only on a node that reports `remote_ok`; when none does the create answers
   `503`.
-- The api half: `[secrets].backend = "vault"` with the Vault address and a token that can write
-  `<mount>/data/secrets/*` and `<mount>/data/grants/*` and delete the matching `<mount>/metadata/*`
-  paths — the `secrets-vault-writer` Secret, a different credential from the broker's read-only
-  `egress-vault`. PostgreSQL gets a `secret_refs` table holding names and versions only.
-
-  Or `[secrets].backend = "postgres"`, which needs no store beside AgentENV: two mounted files,
-  `[secrets.pg].key_file` (base64 of 32 bytes) and `[secrets.pg].resolver_token_file`, and the
-  same PostgreSQL gains `secret_values` and `secret_grants`. The broker then points its
-  `[resolver].url` at `http://agentenv-api:8000/internal` with a `token_file` holding that same
-  bearer, and its NetworkPolicy has to admit the api half's 8000. Losing the master key loses
-  every stored value; it is not recoverable from a database backup, which is the point.
+- The api half: `[secrets].backend = "postgres"` and two mounted files,
+  `[secrets.pg].key_file` (base64 of 32 bytes, the `agentenv-secrets-key` Secret) and
+  `[secrets.pg].resolver_token_file` (the `egress-resolver` Secret, the same bearer the broker
+  mounts). PostgreSQL gains `secret_values` and `secret_grants` beside `secret_refs`. The broker
+  points its `[resolver].url` at `http://agentenv-api:8000/internal`, and its NetworkPolicy has
+  to admit that port. Losing the master key loses every stored value; it is not recoverable from
+  a database backup, which is the point.
 
 `AENV_EGRESS_BROKER_MODE` and `AENV_SECRETS_BACKEND` are both read once at process startup, so
 editing either ConfigMap changes nothing until the process that reads it restarts:

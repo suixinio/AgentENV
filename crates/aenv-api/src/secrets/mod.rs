@@ -1,10 +1,8 @@
-//! The api half's secrets: names and versions in PostgreSQL, values in this
-//! process's own database, in Vault or in an operator-run resolver.
+//! The api half's secrets: names and versions in PostgreSQL, values in the
+//! same database, encrypted under a key it reads from a file.
 
 pub mod envelope;
 pub mod pg;
-pub mod resolver;
-pub mod vault;
 
 use std::sync::Arc;
 
@@ -17,42 +15,20 @@ use zeroize::Zeroizing;
 pub use envelope::Envelope;
 pub use pg::values::PgSecretValues;
 pub use pg::PgSecretRefStore;
-pub use resolver::ExternalResolverBackend;
-pub use vault::VaultKv2Backend;
 
-/// What `[secrets]` assembled. `values` is present only for a backend whose
-/// values this process can open, which is also the only backend that serves
-/// the broker's resolve endpoint from here.
+/// What `[secrets]` assembled: the `/secrets` service, the values half the
+/// resolve endpoint reads through, and the bearer that endpoint checks.
 pub struct SecretsAssembly {
     pub service: Arc<SecretsService>,
-    pub values: Option<Arc<PgSecretValues>>,
-    pub resolver_token: Option<Zeroizing<String>>,
+    pub values: Arc<PgSecretValues>,
+    pub resolver_token: Zeroizing<String>,
 }
 
 /// Builds what `[secrets]` describes, or `None` when the backend is disabled
 /// and `/secrets` must answer 503.
 pub fn build_secrets_service(config: &AppConfig, pool: &PgPool) -> Result<Option<SecretsAssembly>> {
-    let refs = || Arc::new(PgSecretRefStore::new(pool.clone()));
     match config.secrets.backend {
         SecretsBackendKind::Disabled => Ok(None),
-        SecretsBackendKind::Vault => {
-            let vault = VaultKv2Backend::from_config(&config.secrets.vault)
-                .context("configure the Vault secrets backend")?;
-            Ok(Some(SecretsAssembly {
-                service: Arc::new(SecretsService::new(refs(), Arc::new(vault))),
-                values: None,
-                resolver_token: None,
-            }))
-        }
-        SecretsBackendKind::ExternalResolver => {
-            let resolver = ExternalResolverBackend::from_config(&config.secrets.resolver)
-                .context("configure the external resolver secrets backend")?;
-            Ok(Some(SecretsAssembly {
-                service: Arc::new(SecretsService::new(refs(), Arc::new(resolver))),
-                values: None,
-                resolver_token: None,
-            }))
-        }
         SecretsBackendKind::Postgres => {
             let pg = &config.secrets.pg;
             let key_file = pg
@@ -79,11 +55,11 @@ pub fn build_secrets_service(config: &AppConfig, pool: &PgPool) -> Result<Option
             let values = Arc::new(PgSecretValues::new(pool.clone(), envelope));
             Ok(Some(SecretsAssembly {
                 service: Arc::new(SecretsService::new(
-                    refs(),
+                    Arc::new(PgSecretRefStore::new(pool.clone())),
                     Arc::clone(&values) as Arc<dyn aenv_core::secrets::SecretsBackend>,
                 )),
-                values: Some(values),
-                resolver_token: Some(token),
+                values,
+                resolver_token: token,
             }))
         }
     }

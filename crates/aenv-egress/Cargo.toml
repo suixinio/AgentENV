@@ -37,15 +37,12 @@ tls = [
     "dep:http",
     "dep:metrics",
 ]
-# The Vault KV v2 credential source the broker binary reads grants and values from.
-vault = ["dep:reqwest"]
-# The external HTTP resolver credential source, for deployments whose
-# credentials live in the consumer's own service rather than in a store here.
+# The broker's only credential source: an HTTP resolve endpoint, served by
+# the api half or by an operator's own service.
 resolver = ["dep:reqwest"]
 # Everything the `aenv-egress` binary needs on top of the library features.
 bin = [
     "tls",
-    "vault",
     "resolver",
     "remote",
     "dep:clap",

@@ -51,18 +51,8 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Vault, wherever it runs; adjust the namespace label to the deployment.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: vault
-      ports:
-        - protocol: TCP
-          port: 8200
-    # The credential source, when it is the api half itself
-    # ([secrets].backend = "postgres"). Without this the broker's every
-    # lookup times out and nothing says why. Harmless with any other backend:
-    # a broker that never calls the api half does not use this rule.
+    # The credential source: the api half's resolve endpoint. Without this
+    # the broker's every lookup times out and nothing says why.
     - to:
         - podSelector:
             matchLabels:

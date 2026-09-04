@@ -46,7 +46,8 @@
 - **C2** 节点上不放额外进程。
 - **C3** 同语言 Rust，同一个 TLS 栈：工作区只允许 openssl/native-tls，rustls 是 `crates/aenv`
   的唯一例外（`Cargo.toml:128-135`）。
-- **C4** aenv-api 与 aenv-node 不落值。
+- **C4** aenv-api 与 aenv-node 不落值。**（已被 `2026-09-04-api-owned-credential-store.md` §5.1 推翻：
+  `postgres` 后端下 aenv-api 持有主密钥并能解密。aenv-node 仍然不落值。）**
 - **C5** 当前没有租户身份：`Claims` 是单元结构，鉴权只判断 header 非空
   （`src/api/impls/mod.rs:35`，`src/api/impls/auth.rs:31-36`）。所有权语义必须等它存在再做。
 
@@ -395,7 +396,8 @@ Name Constraints）。
 
 ## 8. 不做的事
 
-- aenv-api 与 aenv-node 不落值；不给 `customExtensionParams` 加敏感通道。
+- aenv-api 与 aenv-node 不落值（C4，后被 `2026-09-04-api-owned-credential-store.md` §5.1 推翻）；
+  不给 `customExtensionParams` 加敏感通道。
 - 生产形态下运行时不做协议解析或 TLS 终止；运行时只转发字节。
 - 本功能不在节点上新增 sidecar、DaemonSet、hostPath socket，也不新增任何进入沙箱 netns 的
   外部进程（自定义扩展现有的 `networkNamespacePath` 契约不受影响）。

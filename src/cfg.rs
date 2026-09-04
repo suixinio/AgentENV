@@ -7,8 +7,7 @@ pub mod network;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::Config;
 pub use egress_broker::{
-    EgressBrokerConfig, EgressBrokerMode, SecretsBackendKind, SecretsConfig, SecretsResolverConfig,
-    VaultConfig,
+    EgressBrokerConfig, EgressBrokerMode, SecretsBackendKind, SecretsConfig, SecretsPgConfig,
 };
 pub use image::{
     ImageCacheConfig, ImageConfig, ImageRemoteBlocksCacheConfig, ImageResolverConfig,

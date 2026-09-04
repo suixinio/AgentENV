@@ -463,14 +463,8 @@ spec:
                   key: SANDBOX_PROXY_DOMAINS
                   optional: true
             # The secrets store behind /secrets and network.rules. `disabled`
-            # ships; `vault` needs the address here and a token in the
-            # secrets-vault-writer Secret that can create/update
-            # <mount>/data/{secrets,grants}/* and delete the matching
-            # <mount>/metadata/* paths. That is a strictly different capability
-            # set from the read-only token the broker mounts as `egress-vault`,
-            # and the two are separate Secrets so neither process holds the
-            # other's: this half writes values and grants and never reads one
-            # back, the broker reads and never writes.
+            # ships; `postgres` keeps values and grants in the database this
+            # process already holds and serves the broker's lookups itself.
             # All optional: an api Pod applies and starts without any of it.
             - name: AENV_SECRETS_BACKEND
               valueFrom:
@@ -478,25 +472,12 @@ spec:
                   name: secrets-store-config
                   key: AENV_SECRETS_BACKEND
                   optional: true
-            - name: AENV_SECRETS_VAULT_ADDR
-              valueFrom:
-                configMapKeyRef:
-                  name: secrets-store-config
-                  key: AENV_SECRETS_VAULT_ADDR
-                  optional: true
-            - name: AENV_SECRETS_VAULT_TOKEN
-              valueFrom:
-                secretKeyRef:
-                  name: secrets-vault-writer
-                  key: token
-                  optional: true
-            # `postgres` instead: the values live in the database this
-            # process already holds, and these two name files rather than
-            # values, because an environment variable holding a master key is
-            # readable from /proc, a crash dump and `kubectl describe`. Both
-            # come from the projected `credential-store` volume below, whose
-            # sources are optional — a Pod without them starts and only fails
-            # if the backend is actually set to postgres.
+            # `postgres` names files rather than values, because an
+            # environment variable holding a master key is readable from
+            # /proc, a crash dump and `kubectl describe`. Both come from the
+            # projected `credential-store` volume below, whose sources are
+            # optional — a Pod without them starts and only fails if the
+            # backend is actually set to postgres.
             - name: AENV_SECRETS_PG_KEY_FILE
               valueFrom:
                 configMapKeyRef:

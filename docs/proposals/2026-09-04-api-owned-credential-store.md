@@ -1,7 +1,7 @@
 # api 半边自持凭据值：PostgreSQL 是唯一的凭据存储
 
 状态：三个决策点全部已裁决（§5.1 主密钥、§5.2 新鲜度、§5.3 隔离轴）。
-P0–P4 已完成，回执见 §7 末尾的落地记录；P5（删除批）可以开始。
+**P0–P5 全部完成**，回执与偏离见 §7 末尾的落地记录。
 关联：`2026-09-03-sandbox-egress-credential-brokering.md`（v1/v1.1 已实现）、
 `_egress-brokering-v1.1-implementation.md`
 
@@ -486,6 +486,11 @@ pve-mf overlay 切到 `postgres` 后端，`vault-dev` **保留不动**（回滚�
 `cargo check -p aenv-egress --no-default-features --features resolver` 现在就通过，
 而且 `make check-crate-boundaries` 会逐个 feature 单独构建，这条不会再退回去。
 
+已完成。`[secrets].backend` 收敛为 `disabled | postgres`，`aenv-egress` 的 `vault` feature、
+`VaultSource`、`VaultKv2Backend`、`ExternalResolverBackend`、两个配置段、`vault-dev.yaml`、
+`egress-vault` 与 `secrets-vault-writer` 两个 Secret 全部移除。9 个被删的环境变量按
+`env-vars.md` 的惯例各留了一条"设置它今天会发生什么"。
+
 ---
 
 ## 落地记录
@@ -498,7 +503,9 @@ pve-mf overlay 切到 `postgres` 后端，`vault-dev` **保留不动**（回滚�
 | `feat(secrets): say what a grant does not bound…` | P0：§5.3 的不变式 + 正向测试 + v2 接入点注释，§4.9 的唤醒告警 | 存在性查询挂在 `GrantIssuer` 上（`unknown_names`，返回 `Option` 以区分"查不到"与"都在"），而不是在 `launch_sandbox` 里直接调 `SecretsService` —— 编排器只认识 `GrantIssuer` |
 | `feat(secrets): a postgres credential store…` | P1 + P2 合并 | 合成一个提交：拆开的话两半各自都编译不过（`SecretsAssembly` 与 `new_control_plane_only` 的签名跨在两边）。`SecretValue` 提前到这一批引入，避免 P3 再改一次 `put` 的签名；顺手修了迁移错误信息里那条漏掉 `secret_refs` 的回滚命令 |
 | `feat(secrets): /secrets can hold the structured credential…` | P3：`fields` | 还要改 `adev` 的脱敏补丁 —— 方案没预见到 `value` 变成可选会让它匹配不上，也没预见到 `fields` 的生成类型是会打印的 `models::SecretString` |
-| `feat(deploy): the postgres credential store…` | P4 的清单部分 | e2e 回执还没拿到 |
+| `feat(deploy): the postgres credential store…` | P4 的清单部分 | —— |
+| `test(e2e): the seeded credential can name the upstream's sslmode` | P4 验收暴露的缺口 | 方案没预见到：不带 `sslmode` 的凭据让套件 16 静默 skip |
+| `refactor(secrets): postgres is the only credential store` | P5 删除批 | 见下 |
 
 ### P4 回执（2026-09-04，pve-mf，镜像 `mf-egress-7`）
 

@@ -1,6 +1,7 @@
 //! `aenv-egress`: the broker deployment. Terminates the runtime's TLS,
 //! verifies identity headers, serves the `http` handler (and, when asked,
-//! the `tcp` echo handler) and reads credentials from Vault under grants.
+//! the `tcp` echo handler) and resolves credentials one grant at a time
+//! against the endpoint `[resolver].url` names.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -15,7 +16,6 @@ use aenv_egress::handlers::tcp::TcpRelayHandler;
 use aenv_egress::resolver::ResolverSource;
 use aenv_egress::runtime::{self, Options, Runtime};
 use aenv_egress::tls::{CaSigner, SignerOptions};
-use aenv_egress::vault::VaultSource;
 use aenv_egress::{BrokerDenyList, CredentialSource, Dispatcher, UpstreamGuard};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -64,8 +64,6 @@ struct EgressConfig {
     #[config(nested)]
     upstream: UpstreamConfig,
     #[config(nested)]
-    vault: VaultSourceConfig,
-    #[config(nested)]
     resolver: ResolverSourceConfig,
     #[config(nested)]
     handlers: HandlersConfig,
@@ -112,32 +110,9 @@ struct UpstreamConfig {
     denied_cidrs: Vec<String>,
 }
 
-#[derive(Config)]
-struct VaultSourceConfig {
-    /// Unset runs the broker without any credential source: every marker
-    /// resolves to 502.
-    #[config(env = "AENV_EGRESS_VAULT_ADDR")]
-    addr: Option<String>,
-    #[config(env = "AENV_EGRESS_VAULT_TOKEN_FILE")]
-    token_file: Option<PathBuf>,
-    #[config(default = "aenv", env = "AENV_EGRESS_VAULT_MOUNT")]
-    mount: String,
-    #[config(env = "AENV_EGRESS_VAULT_NAMESPACE")]
-    namespace: Option<String>,
-    #[config(default = 5_000u64)]
-    timeout_ms: u64,
-    /// How long a value is reused before Vault is asked again.
-    #[config(default = 30u64)]
-    cache_ttl_secs: u64,
-    /// Values held at once; expired entries leave on every insert and the
-    /// soonest to expire is dropped at capacity.
-    #[config(default = 4_096usize)]
-    cache_capacity: usize,
-}
-
-/// The operator-run resolver that owns the credentials themselves. Set at
-/// most one of this and `[vault]`; with both, the resolver wins and the Vault
-/// section is ignored.
+/// Where the broker resolves credentials: the api half's own endpoint, or an
+/// operator's service serving the same contract. Unset runs the broker
+/// without any credential source and every marker answers 502.
 #[derive(Config)]
 struct ResolverSourceConfig {
     /// Base URL; call paths are joined onto it, so a path prefix is kept.
@@ -266,16 +241,8 @@ async fn main() -> Result<()> {
             .context("build the server tls acceptor")?,
     );
 
-    let creds: Arc<dyn CredentialSource> = match (
-        config.resolver.url.as_deref(),
-        config.vault.addr.as_deref(),
-    ) {
-        (Some(url), vault) => {
-            if vault.is_some() {
-                tracing::warn!(
-                    "both resolver.url and vault.addr are set; the resolver is used and vault is ignored"
-                );
-            }
+    let creds: Arc<dyn CredentialSource> = match config.resolver.url.as_deref() {
+        Some(url) => {
             let token = match config.resolver.token_file.as_ref() {
                 Some(path) => Some(String::from_utf8(read_secret_file(
                     path,
@@ -288,40 +255,16 @@ async fn main() -> Result<()> {
                 token.as_deref(),
                 Duration::from_millis(config.resolver.timeout_ms),
             )
-            .context("configure the external resolver credential source")?;
+            .context("configure the credential resolver")?;
             Arc::new(
                 CachingSource::new(source, Duration::from_secs(config.resolver.cache_ttl_secs))
                     .with_capacity(config.resolver.cache_capacity),
             )
         }
-        (None, vault_addr) => match vault_addr {
-            Some(addr) => {
-                let token_file = config
-                    .vault
-                    .token_file
-                    .as_ref()
-                    .context("vault.addr is set but vault.token_file is not")?;
-                let token = read_secret_file(token_file, "vault token")?;
-                let source = VaultSource::new(
-                    addr,
-                    std::str::from_utf8(&token).context("vault token is not utf-8")?,
-                    &config.vault.mount,
-                    config.vault.namespace.clone(),
-                    Duration::from_millis(config.vault.timeout_ms),
-                )
-                .context("configure the Vault credential source")?;
-                Arc::new(
-                    CachingSource::new(source, Duration::from_secs(config.vault.cache_ttl_secs))
-                        .with_capacity(config.vault.cache_capacity),
-                )
-            }
-            None => {
-                tracing::warn!(
-                "neither resolver.url nor vault.addr is set: every credential lookup will answer 502"
-            );
-                Arc::new(NoCredentials)
-            }
-        },
+        None => {
+            tracing::warn!("resolver.url is not set: every credential lookup will answer 502");
+            Arc::new(NoCredentials)
+        }
     };
 
     let mut guard = UpstreamGuard::new(

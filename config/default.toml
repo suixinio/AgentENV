@@ -179,13 +179,11 @@ open_timeout_ms = 3000
 embedded_tcp_allowed_cidrs = []
 
 [secrets]
-# Where aenv-api stores secret values and grants: "disabled", "postgres" (its
-# own database, encrypted under a master key it reads from a file, and it
-# serves the broker's resolve endpoint itself), "vault", or
-# "external_resolver" (an operator-run service that owns the credentials; this
-# half records grants there and the broker resolves values against the same
-# base, so /secrets refuses to store a value). aenv-api's PostgreSQL always
-# holds names and versions; a node reads none of this.
+# Where aenv-api keeps secret values and grants: "disabled" or "postgres".
+# `disabled` ships: /secrets answers 503 and rules naming secrets are refused.
+# `postgres` keeps values in the same database that holds their names and
+# versions, encrypted under a master key this half reads from a file, and
+# serves the broker's credential lookups itself. A node reads none of this.
 backend = "disabled"
 
 [secrets.pg]
@@ -197,24 +195,6 @@ backend = "disabled"
 # The bearer the broker presents at POST /internal/credentials/resolve. The
 # broker's own [resolver].token_file holds the same value.
 # resolver_token_file = "/etc/aenv/secrets/resolver-token"
-
-[secrets.vault]
-# addr = "https://vault.vault.svc:8200"
-# token = "replace-with-a-vault-token"
-# KV v2 mount; values live under <mount>/secrets/<name>, grants under
-# <mount>/grants/<execution_id>.
-mount = "aenv"
-# namespace = "admin"
-timeout_ms = 5000
-
-[secrets.resolver]
-# Base URL of the external credential resolver; call paths are joined onto it,
-# so a path prefix here is kept. Point the broker's own [resolver] at the same
-# base. Required when backend = "external_resolver".
-# url = "http://agent-platform.apps.svc/internal/aenv"
-# token = "replace-with-a-bearer-token"
-# token_file = "/etc/aenv/resolver/token"
-timeout_ms = 5000
 
 [cluster]
 # `aenv-api` resolves node placement (`Schedule`/`LookupNode`/

@@ -199,8 +199,8 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         &snapshot_manager,
     ))));
 
-    // Names and grants for network rules. Whether a value passes through this
-    // process depends on the backend: `postgres` holds them, the other two do not.
+    // Names, values and grants for network rules; this process holds the key
+    // that opens them and serves the broker's lookups from the same database.
     let secrets = aenv_api::secrets::build_secrets_service(config, &pg_pool)?;
     if let Some(secrets) = &secrets {
         orchestrator.set_grant_issuer(
@@ -267,15 +267,14 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         Duration::from_secs(config.cluster.native_warmup_timeout_secs),
     );
 
-    // The broker's resolve endpoint, for the one backend whose values this
-    // process can open. Every other backend mounts nothing.
+    // The broker's resolve endpoint. A deployment with `[secrets].backend =
+    // "disabled"` assembles no store and mounts nothing.
     let credential_routes = match secrets.as_ref() {
-        Some(aenv_api::secrets::SecretsAssembly {
-            values: Some(values),
-            resolver_token: Some(token),
-            ..
-        }) => aenv_api::secrets::pg::resolve_route::router(Arc::clone(values), token.clone()),
-        _ => axum::Router::new(),
+        Some(secrets) => aenv_api::secrets::pg::resolve_route::router(
+            Arc::clone(&secrets.values),
+            secrets.resolver_token.clone(),
+        ),
+        None => axum::Router::new(),
     };
 
     Ok(Assembly {

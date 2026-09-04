@@ -140,7 +140,7 @@ check-crate-boundaries:
 	  echo "aenv-egress links a database, the byte half, aenv-core or a second TLS stack; the broker contract is a leaf on openssl only."; \
 	  fail=1; \
 	fi; \
-	for feature in core vault resolver remote tls; do \
+	for feature in core resolver remote tls; do \
 	  $(CARGO) check -q -p aenv-egress --no-default-features --features $$feature >/dev/null 2>&1 || { \
 	    echo "aenv-egress does not build with only its \"$$feature\" feature. Every build in the tree turns on either one feature or all of them, so a reference from one optional module into another compiles everywhere and fails for whoever enables just the one."; \
 	    fail=1; }; \
@@ -196,8 +196,8 @@ test: test-agent test-envd test-ublk
 #
 # The package list reaches `aenv-egress` with its default features (`core`),
 # which is what `aenv-node` links and deliberately carries no TLS stack, no
-# Vault client and no `http` handler. The broker binary's own code — the leaf
-# signer, the Vault grant check, the header injection — lives behind `bin`, so
+# credential resolver and no `http` handler. The broker binary's own code — the
+# leaf signer, the resolver client, the header injection — lives behind `bin`, so
 # it needs the second invocation to be executed at all rather than only
 # type-checked by `make clippy`'s `--all-features`.
 test-unit:

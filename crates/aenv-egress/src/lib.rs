@@ -27,8 +27,6 @@ pub mod sni;
 #[cfg(feature = "tls")]
 pub mod tls;
 pub mod transport;
-#[cfg(feature = "vault")]
-pub mod vault;
 
 pub use credential::{CredentialError, CredentialFields, CredentialSource, Secret};
 pub use dispatch::{Dispatcher, Reject};

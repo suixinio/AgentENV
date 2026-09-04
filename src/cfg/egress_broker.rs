@@ -138,11 +138,6 @@ impl EgressBrokerConfig {
 pub enum SecretsBackendKind {
     /// `/secrets` answers 503 and `rules` referencing secrets are refused.
     Disabled,
-    /// HashiCorp Vault KV v2.
-    Vault,
-    /// An operator-run service that owns the credentials themselves. This
-    /// half records grants there; the broker resolves values there.
-    ExternalResolver,
     /// aenv-api's own PostgreSQL, values encrypted under a master key this
     /// half holds. It also serves the broker's resolve endpoint.
     Postgres,
@@ -152,8 +147,6 @@ impl SecretsBackendKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
-            Self::Vault => "vault",
-            Self::ExternalResolver => "external_resolver",
             Self::Postgres => "postgres",
         }
     }
@@ -166,10 +159,6 @@ pub struct SecretsConfig {
     #[config(default = "disabled", env = "AENV_SECRETS_BACKEND")]
     pub backend: SecretsBackendKind,
     #[config(nested)]
-    pub vault: VaultConfig,
-    #[config(nested)]
-    pub resolver: SecretsResolverConfig,
-    #[config(nested)]
     pub pg: SecretsPgConfig,
 }
 
@@ -177,66 +166,7 @@ impl fmt::Debug for SecretsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretsConfig")
             .field("backend", &self.backend)
-            .field("vault", &self.vault)
-            .field("resolver", &self.resolver)
             .field("pg", &self.pg)
-            .finish()
-    }
-}
-
-#[derive(Config, Clone)]
-pub struct VaultConfig {
-    /// Base URL of the Vault server, such as `https://vault.vault.svc:8200`.
-    #[config(env = "AENV_SECRETS_VAULT_ADDR")]
-    pub addr: Option<String>,
-    #[config(env = "AENV_SECRETS_VAULT_TOKEN")]
-    pub token: Option<String>,
-    /// KV v2 mount; values live under `<mount>/secrets/<name>`, grants under
-    /// `<mount>/grants/<execution_id>`.
-    #[config(default = "aenv", env = "AENV_SECRETS_VAULT_MOUNT")]
-    pub mount: String,
-    #[config(env = "AENV_SECRETS_VAULT_NAMESPACE")]
-    pub namespace: Option<String>,
-    #[config(default = 5_000u64, env = "AENV_SECRETS_VAULT_TIMEOUT_MS")]
-    pub timeout_ms: u64,
-}
-
-impl fmt::Debug for VaultConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VaultConfig")
-            .field("addr", &self.addr)
-            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
-            .field("mount", &self.mount)
-            .field("namespace", &self.namespace)
-            .field("timeout_ms", &self.timeout_ms)
-            .finish()
-    }
-}
-
-/// The external credential resolver both halves talk to: this half posts
-/// grants and revocations, the broker resolves values against the same base.
-#[derive(Config, Clone)]
-pub struct SecretsResolverConfig {
-    /// Base URL; the call paths are joined onto it, so a path prefix here is
-    /// kept.
-    #[config(env = "AENV_SECRETS_RESOLVER_URL")]
-    pub url: Option<String>,
-    /// Bearer token. `token_file` wins when both are set.
-    #[config(env = "AENV_SECRETS_RESOLVER_TOKEN")]
-    pub token: Option<String>,
-    #[config(env = "AENV_SECRETS_RESOLVER_TOKEN_FILE")]
-    pub token_file: Option<PathBuf>,
-    #[config(default = 5_000u64, env = "AENV_SECRETS_RESOLVER_TIMEOUT_MS")]
-    pub timeout_ms: u64,
-}
-
-impl fmt::Debug for SecretsResolverConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SecretsResolverConfig")
-            .field("url", &self.url)
-            .field("token", &self.token.as_ref().map(|_| "[redacted]"))
-            .field("token_file", &self.token_file)
-            .field("timeout_ms", &self.timeout_ms)
             .finish()
     }
 }
@@ -270,15 +200,6 @@ impl SecretsConfig {
     pub fn validate(&self) -> Result<()> {
         match self.backend {
             SecretsBackendKind::Disabled => Ok(()),
-            SecretsBackendKind::ExternalResolver => {
-                if is_blank(self.resolver.url.as_deref()) {
-                    bail!("secrets.backend = \"external_resolver\" requires secrets.resolver.url");
-                }
-                if self.resolver.timeout_ms == 0 {
-                    bail!("secrets.resolver.timeout_ms must be > 0");
-                }
-                Ok(())
-            }
             SecretsBackendKind::Postgres => {
                 for (name, path) in [
                     ("key_file", &self.pg.key_file),
@@ -290,25 +211,34 @@ impl SecretsConfig {
                 }
                 Ok(())
             }
-            SecretsBackendKind::Vault => {
-                if is_blank(self.vault.addr.as_deref()) {
-                    bail!("secrets.backend = \"vault\" requires secrets.vault.addr");
-                }
-                if is_blank(self.vault.token.as_deref()) {
-                    bail!("secrets.backend = \"vault\" requires secrets.vault.token");
-                }
-                if self.vault.mount.trim().is_empty() || self.vault.mount.contains('/') {
-                    bail!("secrets.vault.mount must be a single non-empty path segment");
-                }
-                if self.vault.timeout_ms == 0 {
-                    bail!("secrets.vault.timeout_ms must be > 0");
-                }
-                Ok(())
-            }
         }
     }
 }
 
 fn is_blank(value: Option<&str>) -> bool {
     value.is_none_or(|value| value.trim().is_empty())
+}
+
+#[cfg(test)]
+mod secrets_backend_tests {
+    use super::SecretsBackendKind;
+
+    #[test]
+    fn a_removed_backend_name_is_refused_rather_than_ignored() {
+        // `docs/src/configuration/env-vars.md` says setting one of the removed
+        // AENV_SECRETS_VAULT_* names does nothing, while AENV_SECRETS_BACKEND
+        // still naming a removed backend is refused. That asymmetry is what
+        // keeps a half-migrated manifest from starting against a store this
+        // build cannot reach.
+        for gone in ["vault", "external_resolver"] {
+            let parsed: Result<SecretsBackendKind, _> =
+                serde_json::from_value(serde_json::Value::String(gone.to_string()));
+            assert!(parsed.is_err(), "{gone:?} still parses");
+        }
+        for kept in ["disabled", "postgres"] {
+            let parsed: SecretsBackendKind =
+                serde_json::from_value(serde_json::Value::String(kept.to_string())).unwrap();
+            assert_eq!(parsed.as_str(), kept);
+        }
+    }
 }

@@ -51,6 +51,12 @@ pub struct EgressBrokerConfig {
     pub node_conns: u32,
     #[config(default = 3_000u64, env = "AENV_EGRESS_BROKER_OPEN_TIMEOUT_MS")]
     pub open_timeout_ms: u64,
+    /// Where the embedded broker's `tcp` handler may connect. Empty leaves
+    /// that handler reaching nothing, which is what an embedded node without
+    /// this key should do. `remote` mode reads the broker's own config
+    /// instead.
+    #[config(default = [])]
+    pub embedded_tcp_allowed_cidrs: Vec<String>,
 }
 
 impl fmt::Debug for EgressBrokerConfig {
@@ -67,6 +73,10 @@ impl fmt::Debug for EgressBrokerConfig {
             .field("per_sandbox_conns", &self.per_sandbox_conns)
             .field("node_conns", &self.node_conns)
             .field("open_timeout_ms", &self.open_timeout_ms)
+            .field(
+                "embedded_tcp_allowed_cidrs",
+                &self.embedded_tcp_allowed_cidrs,
+            )
             .finish()
     }
 }

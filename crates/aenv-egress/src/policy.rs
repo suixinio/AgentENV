@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,10 +68,20 @@ impl BrokerDenyList {
     }
 }
 
+/// Handlers whose upstream is named by the endpoint declaration or by the
+/// credential resolver rather than by the guest's own connection. The
+/// sandbox's policy does not bound them, so without an operator allowlist
+/// they reach nothing.
+pub const HANDLERS_REQUIRING_ALLOWLIST: [&str; 2] = ["tcp", "postgres"];
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DenyReason {
     #[error("destination is inside a range the broker never reaches")]
     BrokerDenied,
+    #[error("destination is outside the operator allowlist for this handler")]
+    HandlerDenied,
+    #[error("this handler reaches nothing until the operator gives it an allowlist")]
+    HandlerUnpinned,
     #[error("destination is inside a range the sandbox policy denies")]
     SandboxDenied,
     #[error("the sandbox policy allows no internet access")]
@@ -83,6 +94,8 @@ impl DenyReason {
     pub fn reason(&self) -> &'static str {
         match self {
             Self::BrokerDenied => "broker_denied_cidr",
+            Self::HandlerDenied => "handler_denied_cidr",
+            Self::HandlerUnpinned => "handler_no_allowlist",
             Self::SandboxDenied => "sandbox_denied_cidr",
             Self::InternetDisabled => "internet_disabled",
             Self::MalformedPolicy => "malformed_policy",
@@ -145,6 +158,7 @@ impl Resolver for SystemResolver {
 /// checked address itself, never back through a name.
 pub struct UpstreamGuard {
     deny: BrokerDenyList,
+    allowlists: HashMap<String, Vec<IpNetwork>>,
     resolver: Arc<dyn Resolver>,
     connect_timeout: Duration,
 }
@@ -153,9 +167,28 @@ impl UpstreamGuard {
     pub fn new(deny: BrokerDenyList) -> Self {
         Self {
             deny,
+            allowlists: HashMap::new(),
             resolver: Arc::new(SystemResolver),
             connect_timeout: Duration::from_secs(10),
         }
+    }
+
+    /// Pins `handler` to `cidrs`. A handler with no allowlist reaches
+    /// whatever the deny list and the sandbox policy allow, except for the
+    /// handlers in [`HANDLERS_REQUIRING_ALLOWLIST`], which then reach
+    /// nothing; an allowlist that parses to no range switches its handler off
+    /// the same way.
+    pub fn with_allowlist<S: AsRef<str>>(
+        mut self,
+        handler: &str,
+        cidrs: &[S],
+    ) -> Result<Self, ipnetwork::IpNetworkError> {
+        let cidrs = cidrs
+            .iter()
+            .map(|cidr| cidr.as_ref().parse::<IpNetwork>())
+            .collect::<Result<Vec<_>, _>>()?;
+        self.allowlists.insert(handler.to_string(), cidrs);
+        Ok(self)
     }
 
     pub fn with_resolver(mut self, resolver: Arc<dyn Resolver>) -> Self {
@@ -185,13 +218,28 @@ impl UpstreamGuard {
         Ok(ips)
     }
 
-    /// Broker deny list, then the sandbox's allow list, deny list and base
-    /// policy: the same order as the namespace's FORWARD chains. An
-    /// IPv4-mapped IPv6 address is checked as the IPv4 address it maps.
-    pub fn check(&self, ip: IpAddr, policy: &EgressPolicySummary) -> Result<(), DenyReason> {
+    /// Broker deny list, then the handler's operator allowlist, then the
+    /// sandbox's allow list, deny list and base policy: the same order as the
+    /// namespace's FORWARD chains, with the operator's pin ahead of anything
+    /// the sandbox can say. An IPv4-mapped IPv6 address is checked as the
+    /// IPv4 address it maps.
+    pub fn check(
+        &self,
+        handler: &str,
+        ip: IpAddr,
+        policy: &EgressPolicySummary,
+    ) -> Result<(), DenyReason> {
         let ip = ip.to_canonical();
         if self.deny.matches(ip).is_some() {
             return Err(DenyReason::BrokerDenied);
+        }
+        match self.allowlists.get(handler) {
+            Some(pinned) if pinned.iter().any(|net| net.contains(ip)) => {}
+            Some(_) => return Err(DenyReason::HandlerDenied),
+            None if HANDLERS_REQUIRING_ALLOWLIST.contains(&handler) => {
+                return Err(DenyReason::HandlerUnpinned)
+            }
+            None => {}
         }
         let allowed = parse_cidrs(&policy.allowed_cidrs)?;
         if allowed.iter().any(|net| net.contains(ip)) {
@@ -212,6 +260,7 @@ impl UpstreamGuard {
     /// address checked is the address dialled, in its canonical form.
     pub async fn connect_checked(
         &self,
+        handler: &str,
         host: &str,
         port: u16,
         policy: &EgressPolicySummary,
@@ -223,7 +272,8 @@ impl UpstreamGuard {
             .map(|ip| ip.to_canonical())
             .collect();
         for ip in &ips {
-            self.check(*ip, policy).map_err(UpstreamError::Denied)?;
+            self.check(handler, *ip, policy)
+                .map_err(UpstreamError::Denied)?;
         }
         let mut last_err = None;
         for ip in ips {
@@ -240,11 +290,12 @@ impl UpstreamGuard {
     /// connection's `original_dst`.
     pub async fn connect_checked_addr(
         &self,
+        handler: &str,
         addr: SocketAddr,
         policy: &EgressPolicySummary,
     ) -> Result<TcpStream, UpstreamError> {
         let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
-        self.check(addr.ip(), policy)
+        self.check(handler, addr.ip(), policy)
             .map_err(UpstreamError::Denied)?;
         self.connect(addr).await
     }
@@ -303,13 +354,19 @@ mod tests {
             "fd00::1",
         ] {
             assert_eq!(
-                guard.check(ip(denied), &permissive),
+                guard.check("http", ip(denied), &permissive),
                 Err(DenyReason::BrokerDenied),
                 "{denied}"
             );
         }
-        assert_eq!(guard.check(ip("93.184.216.34"), &permissive), Ok(()));
-        assert_eq!(guard.check(ip("2606:4700::1111"), &permissive), Ok(()));
+        assert_eq!(
+            guard.check("http", ip("93.184.216.34"), &permissive),
+            Ok(())
+        );
+        assert_eq!(
+            guard.check("http", ip("2606:4700::1111"), &permissive),
+            Ok(())
+        );
     }
 
     #[test]
@@ -318,10 +375,13 @@ mod tests {
             BrokerDenyList::with_extra(&["10.96.0.0/12", "203.0.113.0/24"]).unwrap(),
         );
         assert_eq!(
-            guard.check(ip("203.0.113.7"), &open_internet()),
+            guard.check("http", ip("203.0.113.7"), &open_internet()),
             Err(DenyReason::BrokerDenied)
         );
-        assert_eq!(guard.check(ip("203.0.112.7"), &open_internet()), Ok(()));
+        assert_eq!(
+            guard.check("http", ip("203.0.112.7"), &open_internet()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -333,11 +393,11 @@ mod tests {
             denied_cidrs: vec![],
         };
         assert_eq!(
-            guard.check(ip("93.184.216.34"), &closed),
+            guard.check("http", ip("93.184.216.34"), &closed),
             Err(DenyReason::InternetDisabled)
         );
         assert_eq!(
-            guard.check(ip("8.8.8.8"), &closed),
+            guard.check("http", ip("8.8.8.8"), &closed),
             Err(DenyReason::InternetDisabled)
         );
 
@@ -345,9 +405,9 @@ mod tests {
             allowed_cidrs: vec!["8.8.8.8/32".into()],
             ..closed
         };
-        assert_eq!(guard.check(ip("8.8.8.8"), &with_allow), Ok(()));
+        assert_eq!(guard.check("http", ip("8.8.8.8"), &with_allow), Ok(()));
         assert_eq!(
-            guard.check(ip("8.8.4.4"), &with_allow),
+            guard.check("http", ip("8.8.4.4"), &with_allow),
             Err(DenyReason::InternetDisabled)
         );
     }
@@ -360,13 +420,13 @@ mod tests {
             allowed_cidrs: vec!["203.0.113.10/32".into(), "10.0.0.0/8".into()],
             denied_cidrs: vec!["203.0.113.0/24".into()],
         };
-        assert_eq!(guard.check(ip("203.0.113.10"), &policy), Ok(()));
+        assert_eq!(guard.check("http", ip("203.0.113.10"), &policy), Ok(()));
         assert_eq!(
-            guard.check(ip("203.0.113.11"), &policy),
+            guard.check("http", ip("203.0.113.11"), &policy),
             Err(DenyReason::SandboxDenied)
         );
         assert_eq!(
-            guard.check(ip("10.2.3.4"), &policy),
+            guard.check("http", ip("10.2.3.4"), &policy),
             Err(DenyReason::BrokerDenied)
         );
     }
@@ -380,7 +440,7 @@ mod tests {
             denied_cidrs: vec!["example.com".into()],
         };
         assert_eq!(
-            guard.check(ip("93.184.216.34"), &policy),
+            guard.check("http", ip("93.184.216.34"), &policy),
             Err(DenyReason::MalformedPolicy)
         );
     }
@@ -399,13 +459,19 @@ mod tests {
             "::ffff:169.254.169.254",
         ] {
             assert_eq!(
-                guard.check(ip(denied), &permissive),
+                guard.check("http", ip(denied), &permissive),
                 Err(DenyReason::BrokerDenied),
                 "{denied}"
             );
         }
-        assert_eq!(guard.check(ip("2606:4700::1111"), &permissive), Ok(()));
-        assert_eq!(guard.check(ip("::ffff:93.184.216.34"), &permissive), Ok(()));
+        assert_eq!(
+            guard.check("http", ip("2606:4700::1111"), &permissive),
+            Ok(())
+        );
+        assert_eq!(
+            guard.check("http", ip("::ffff:93.184.216.34"), &permissive),
+            Ok(())
+        );
 
         let unlisted = UpstreamGuard::new(BrokerDenyList::empty());
         let sandbox = EgressPolicySummary {
@@ -414,7 +480,7 @@ mod tests {
             denied_cidrs: vec!["203.0.113.0/24".into()],
         };
         assert_eq!(
-            unlisted.check(ip("::ffff:203.0.113.5"), &sandbox),
+            unlisted.check("http", ip("::ffff:203.0.113.5"), &sandbox),
             Err(DenyReason::SandboxDenied)
         );
     }
@@ -426,7 +492,7 @@ mod tests {
         assert!(deny.matches(ip("64:ff9b::808:808")).is_some());
         assert!(deny.matches(ip("2606:4700::1111")).is_none());
         assert_eq!(
-            UpstreamGuard::new(deny).check(ip("64:ff9b::a00:1"), &open_internet()),
+            UpstreamGuard::new(deny).check("http", ip("64:ff9b::a00:1"), &open_internet()),
             Err(DenyReason::BrokerDenied)
         );
     }
@@ -448,7 +514,7 @@ mod tests {
             .with_resolver(Arc::new(FixedResolver(vec![ip("::ffff:127.0.0.1")])));
 
         let (stream, addr) = guard
-            .connect_checked("mapped.example", bound.port(), &open_internet())
+            .connect_checked("http", "mapped.example", bound.port(), &open_internet())
             .await
             .unwrap();
         assert_eq!(addr, bound);
@@ -466,7 +532,7 @@ mod tests {
             .unwrap();
 
         let stream = guard
-            .connect_checked_addr(mapped, &open_internet())
+            .connect_checked_addr("http", mapped, &open_internet())
             .await
             .unwrap();
         assert_eq!(stream.peer_addr().unwrap(), bound);
@@ -478,7 +544,7 @@ mod tests {
             FixedResolver(vec![ip("93.184.216.34"), ip("10.0.0.5")]),
         ));
         let err = guard
-            .connect_checked("rebinding.example", 443, &open_internet())
+            .connect_checked("http", "rebinding.example", 443, &open_internet())
             .await
             .err()
             .unwrap();
@@ -494,7 +560,7 @@ mod tests {
         let guard = UpstreamGuard::new(BrokerDenyList::default())
             .with_resolver(Arc::new(FixedResolver(vec![])));
         let err = guard
-            .connect_checked("nowhere.example", 443, &open_internet())
+            .connect_checked("http", "nowhere.example", 443, &open_internet())
             .await
             .err()
             .unwrap();
@@ -510,7 +576,7 @@ mod tests {
             .with_resolver(Arc::new(FixedResolver(vec![bound.ip()])));
 
         let (stream, addr) = guard
-            .connect_checked("anything.example", bound.port(), &open_internet())
+            .connect_checked("http", "anything.example", bound.port(), &open_internet())
             .await
             .unwrap();
         assert_eq!(addr, bound);
@@ -522,7 +588,11 @@ mod tests {
     async fn connect_checked_addr_applies_the_same_check_to_an_original_destination() {
         let guard = UpstreamGuard::new(BrokerDenyList::default());
         let err = guard
-            .connect_checked_addr("169.254.169.254:80".parse().unwrap(), &open_internet())
+            .connect_checked_addr(
+                "http",
+                "169.254.169.254:80".parse().unwrap(),
+                &open_internet(),
+            )
             .await
             .err()
             .unwrap();
@@ -536,7 +606,7 @@ mod tests {
             ..open_internet()
         };
         let err = guard
-            .connect_checked_addr("93.184.216.34:443".parse().unwrap(), &closed)
+            .connect_checked_addr("http", "93.184.216.34:443".parse().unwrap(), &closed)
             .await
             .err()
             .unwrap();

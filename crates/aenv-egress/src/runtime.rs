@@ -270,7 +270,7 @@ mod tests {
 
     use super::*;
     use crate::credential::NoCredentials;
-    use crate::handlers::tcp::{IdentityBanner, TcpEchoHandler};
+    use crate::handlers::echo::{IdentityBanner, IdentityEchoHandler};
     use crate::header::test_support::sample_header;
     use crate::policy::{BrokerDenyList, UpstreamGuard};
 
@@ -282,7 +282,7 @@ mod tests {
                 Arc::new(NoCredentials),
                 Arc::new(UpstreamGuard::new(BrokerDenyList::default())),
             )
-            .with_handler(Arc::new(TcpEchoHandler)),
+            .with_handler(Arc::new(IdentityEchoHandler)),
         );
         Arc::new(Runtime::new(
             Options::new(vec![KEY.to_vec()], Duration::from_secs(30), 1024),
@@ -413,7 +413,7 @@ mod tests {
                     Arc::new(NoCredentials),
                     Arc::new(UpstreamGuard::new(BrokerDenyList::default())),
                 )
-                .with_handler(Arc::new(TcpEchoHandler)),
+                .with_handler(Arc::new(IdentityEchoHandler)),
             );
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();

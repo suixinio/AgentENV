@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aenv_egress::credential::NoCredentials;
-use aenv_egress::handlers::tcp::TcpEchoHandler;
+use aenv_egress::handlers::echo::IdentityEchoHandler;
+use aenv_egress::handlers::tcp::TcpRelayHandler;
 use aenv_egress::transport::RemoteTransport;
 use aenv_egress::{
     BrokerDenyList, BrokerTransport, Dispatcher, EgressPolicySummary, EmbeddedTransport,
@@ -90,9 +91,13 @@ impl EgressRuntime {
                     BrokerDenyList::with_extra(&denied)
                         .context("egress_broker: always_denied_cidrs are not all cidrs")?,
                 );
+                let guard = guard
+                    .with_allowlist(TcpRelayHandler::NAME, &egress.embedded_tcp_allowed_cidrs)
+                    .context("egress_broker: embedded_tcp_allowed_cidrs are not all cidrs")?;
                 let dispatcher = Arc::new(
                     Dispatcher::new(Arc::new(NoCredentials), Arc::new(guard))
-                        .with_handler(Arc::new(TcpEchoHandler)),
+                        .with_handler(Arc::new(IdentityEchoHandler))
+                        .with_handler(Arc::new(TcpRelayHandler)),
                 );
                 Arc::new(EmbeddedTransport::new(dispatcher))
             }
@@ -246,14 +251,16 @@ impl EgressRuntime {
     }
 }
 
-/// Which handlers a broker mode dispatches. The embedded transport carries
-/// only [`TcpEchoHandler`], which the node's own integration tests read the
-/// identity banner from; the `http` handler public rules name lives in the
-/// broker process.
+/// Which handlers a broker mode dispatches. The embedded transport has no
+/// credential source and no TLS stack, so it carries the two handlers that
+/// need neither: [`IdentityEchoHandler`] and [`TcpRelayHandler`]. Everything
+/// else lives in the broker process.
 pub fn mode_serves_handler(mode: EgressBrokerMode, handler: &str) -> bool {
     match mode {
         EgressBrokerMode::Disabled => false,
-        EgressBrokerMode::Embedded => handler == TcpEchoHandler::NAME,
+        EgressBrokerMode::Embedded => {
+            handler == IdentityEchoHandler::NAME || handler == TcpRelayHandler::NAME
+        }
         EgressBrokerMode::Remote => true,
     }
 }
@@ -673,7 +680,11 @@ mod tests {
         assert!(!mode_serves_handler(EgressBrokerMode::Disabled, handler));
         assert!(mode_serves_handler(
             EgressBrokerMode::Embedded,
-            TcpEchoHandler::NAME
+            IdentityEchoHandler::NAME
+        ));
+        assert!(mode_serves_handler(
+            EgressBrokerMode::Embedded,
+            TcpRelayHandler::NAME
         ));
     }
 

@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aenv_egress::credential::{CachingSource, NoCredentials};
+use aenv_egress::handlers::echo::IdentityEchoHandler;
 use aenv_egress::handlers::http::HttpHandler;
-use aenv_egress::handlers::tcp::TcpEchoHandler;
+use aenv_egress::handlers::tcp::TcpRelayHandler;
 use aenv_egress::runtime::{self, Options, Runtime};
 use aenv_egress::tls::{CaSigner, SignerOptions};
 use aenv_egress::vault::VaultSource;
@@ -132,9 +133,32 @@ struct VaultSourceConfig {
 
 #[derive(Config)]
 struct HandlersConfig {
-    /// The `tcp` identity echo handler, for smoke tests; off in production.
+    /// The `echo` identity handler, for smoke tests; off in production.
     #[config(default = false)]
-    tcp: bool,
+    echo: bool,
+    #[config(nested)]
+    tcp: RelayHandlerConfig,
+    #[config(nested)]
+    http: PinnedHandlerConfig,
+}
+
+/// A handler whose upstream comes from the endpoint declaration, so the
+/// operator names where it may go. An enabled handler with an empty
+/// allowlist reaches nothing.
+#[derive(Config)]
+struct RelayHandlerConfig {
+    #[config(default = false)]
+    enabled: bool,
+    #[config(default = [])]
+    allowed_cidrs: Vec<String>,
+}
+
+/// A handler the sandbox's own policy already bounds. An empty allowlist
+/// leaves it bounded by that policy alone; a non-empty one pins it further.
+#[derive(Config)]
+struct PinnedHandlerConfig {
+    #[config(default = [])]
+    allowed_cidrs: Vec<String>,
 }
 
 fn read_secret_file(path: &PathBuf, what: &str) -> Result<Vec<u8>> {
@@ -242,15 +266,28 @@ async fn main() -> Result<()> {
         }
     };
 
-    let guard = Arc::new(UpstreamGuard::new(
+    let mut guard = UpstreamGuard::new(
         BrokerDenyList::with_extra(&config.upstream.denied_cidrs)
             .context("upstream.denied_cidrs are not all cidrs")?,
-    ));
-    let mut dispatcher = Dispatcher::new(creds, guard).with_handler(Arc::new(
+    );
+    if !config.handlers.http.allowed_cidrs.is_empty() {
+        guard = guard
+            .with_allowlist(HttpHandler::NAME, &config.handlers.http.allowed_cidrs)
+            .context("handlers.http.allowed_cidrs are not all cidrs")?;
+    }
+    if config.handlers.tcp.enabled {
+        guard = guard
+            .with_allowlist(TcpRelayHandler::NAME, &config.handlers.tcp.allowed_cidrs)
+            .context("handlers.tcp.allowed_cidrs are not all cidrs")?;
+    }
+    let mut dispatcher = Dispatcher::new(creds, Arc::new(guard)).with_handler(Arc::new(
         HttpHandler::new(Arc::clone(&signer)).context("build the http handler")?,
     ));
-    if config.handlers.tcp {
-        dispatcher = dispatcher.with_handler(Arc::new(TcpEchoHandler));
+    if config.handlers.tcp.enabled {
+        dispatcher = dispatcher.with_handler(Arc::new(TcpRelayHandler));
+    }
+    if config.handlers.echo {
+        dispatcher = dispatcher.with_handler(Arc::new(IdentityEchoHandler));
     }
     let runtime = Arc::new(Runtime::new(
         Options {

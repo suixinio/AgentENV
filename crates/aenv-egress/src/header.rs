@@ -274,7 +274,7 @@ pub(crate) mod test_support {
             execution_id: "exec-1".into(),
             template_id: "tmpl-1".into(),
             port: 40443,
-            handler: "tcp".into(),
+            handler: "echo".into(),
             params: serde_json::json!({ "rules": { "api.example.com": [] } }),
             original_dst: Some("93.184.216.34:443".parse().unwrap()),
             egress: EgressPolicySummary {

@@ -52,5 +52,18 @@ cache_ttl_secs = 30
 cache_capacity = 4096
 
 [handlers]
-# The tcp identity-echo handler; leave off outside smoke tests.
-tcp = false
+# The identity-echo handler; leave off outside smoke tests.
+echo = false
+
+[handlers.tcp]
+# The byte relay for `tcp` endpoint declarations. An enabled handler with an
+# empty allowed_cidrs reaches nothing: the operator names where declarations
+# may point, and no sandbox input can widen it.
+enabled = false
+allowed_cidrs = []
+
+[handlers.http]
+# The `rules` handler is already bounded by each sandbox's own egress policy,
+# so an empty list leaves it bounded by that alone. A non-empty list pins it
+# further, and then every rules upstream must fall inside it.
+allowed_cidrs = []

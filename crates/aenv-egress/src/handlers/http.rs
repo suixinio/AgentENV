@@ -316,7 +316,7 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
 
     let (tcp, _) = match rc
         .guard
-        .connect_checked(&rc.name, HTTPS_PORT, &rc.ctx.egress)
+        .connect_checked(HttpHandler::NAME, &rc.name, HTTPS_PORT, &rc.ctx.egress)
         .await
     {
         Ok(connected) => connected,
@@ -420,7 +420,10 @@ async fn passthrough(
             "no original destination for a passthrough connection".into(),
         ));
     };
-    let mut upstream = match guard.connect_checked_addr(dst, &ctx.egress).await {
+    let mut upstream = match guard
+        .connect_checked_addr(HttpHandler::NAME, dst, &ctx.egress)
+        .await
+    {
         Ok(upstream) => upstream,
         Err(UpstreamError::Denied(reason)) => {
             metrics::counter!("egress_policy_denied_total", "reason" => reason.reason())
@@ -651,7 +654,7 @@ mod tests {
 
         use super::super::*;
         use crate::credential::StaticSource;
-        use crate::handlers::tcp::TcpEchoHandler;
+        use crate::handlers::echo::IdentityEchoHandler;
         use crate::header::test_support::sample_header;
         use crate::header::{EgressPolicySummary, IdentityHeader};
         use crate::policy::BrokerDenyList;
@@ -692,7 +695,7 @@ mod tests {
             let dispatcher = Arc::new(
                 Dispatcher::new(creds, guard)
                     .with_handler(Arc::new(HttpHandler::new(Arc::clone(&signer)).unwrap()))
-                    .with_handler(Arc::new(TcpEchoHandler)),
+                    .with_handler(Arc::new(IdentityEchoHandler)),
             );
             let runtime = Arc::new(Runtime::new(
                 Options::new(vec![KEY.to_vec()], Duration::from_secs(30), 1024),
@@ -735,11 +738,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn the_remote_transport_reaches_the_tcp_handler_over_tls() {
+        async fn the_remote_transport_reaches_the_echo_handler_over_tls() {
             let (broker, _, policy) = start_broker(serde_json::json!({}), false).await;
             let stream = broker
                 .transport
-                .open(header("tcp", serde_json::json!({}), policy, None))
+                .open(header("echo", serde_json::json!({}), policy, None))
                 .await
                 .unwrap();
             let mut stream = tokio::io::BufReader::new(stream);
@@ -762,7 +765,7 @@ mod tests {
             )
             .unwrap();
             let err = wrong
-                .open(header("tcp", serde_json::json!({}), policy, None))
+                .open(header("echo", serde_json::json!({}), policy, None))
                 .await
                 .err()
                 .unwrap();
@@ -777,7 +780,7 @@ mod tests {
             let stream = broker
                 .transport
                 .open(header(
-                    "tcp",
+                    "echo",
                     serde_json::json!({}),
                     EgressPolicySummary {
                         allow_internet: true,

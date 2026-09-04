@@ -105,7 +105,7 @@ impl Dispatcher {
 mod tests {
     use super::*;
     use crate::credential::NoCredentials;
-    use crate::handlers::tcp::TcpEchoHandler;
+    use crate::handlers::echo::IdentityEchoHandler;
     use crate::header::test_support::sample_header;
     use crate::policy::BrokerDenyList;
 
@@ -114,7 +114,7 @@ mod tests {
             Arc::new(NoCredentials),
             Arc::new(UpstreamGuard::new(BrokerDenyList::default())),
         )
-        .with_handler(Arc::new(TcpEchoHandler))
+        .with_handler(Arc::new(IdentityEchoHandler))
     }
 
     #[test]
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn a_known_handler_is_accepted() {
         let handler = dispatcher().accept(&sample_header()).unwrap();
-        assert_eq!(handler.name(), "tcp");
+        assert_eq!(handler.name(), "echo");
     }
 
     #[tokio::test]

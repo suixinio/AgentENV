@@ -18,6 +18,14 @@ pub trait GrantIssuer: Send + Sync {
     ) -> anyhow::Result<()>;
 
     async fn revoke(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> anyhow::Result<()>;
+
+    /// The subset of `names` the store holds no secret for, or `None` when
+    /// this issuer cannot answer. A store outage and an all-present answer
+    /// must not look alike to a caller that only warns, which is why the
+    /// two are different values rather than an empty list.
+    async fn unknown_names(&self, _names: &BTreeSet<String>) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// The issuer of an api half with `[secrets].backend = "disabled"`. A grant
@@ -116,6 +124,7 @@ pub mod recording {
     #[derive(Default)]
     pub struct RecordingGrantIssuer {
         events: Mutex<Vec<GrantEvent>>,
+        unknown: Mutex<Option<Vec<String>>>,
     }
 
     impl RecordingGrantIssuer {
@@ -125,6 +134,12 @@ pub mod recording {
 
         pub fn events(&self) -> Vec<GrantEvent> {
             self.events.lock().unwrap().clone()
+        }
+
+        /// What this issuer answers when asked which names are unknown.
+        /// Unset leaves it unable to say, which is the default.
+        pub fn answer_unknown_names(&self, unknown: Vec<String>) {
+            *self.unknown.lock().unwrap() = Some(unknown);
         }
     }
 
@@ -154,6 +169,10 @@ pub mod recording {
                 execution_id,
             });
             Ok(())
+        }
+
+        async fn unknown_names(&self, _names: &BTreeSet<String>) -> Option<Vec<String>> {
+            self.unknown.lock().unwrap().clone()
         }
     }
 }

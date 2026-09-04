@@ -191,6 +191,28 @@ sandbox a database identity.**
 
 Which side enforces the grant depends on the backend, and that is the difference between the two.
 
+### What a grant does not bound
+
+**The isolation axis is the control-plane credential.** A secret name is unique across the
+deployment, and any holder of an API key may reference any name that exists: nothing checks that
+this sandbox is entitled to `tenant_db_ws99`. What `(sandbox, execution)` bounds is which names
+*this run* may read, not who a secret belongs to.
+
+Name secrets after where they came from — `tenant_db_ws42`, `app_7f3c9e21` — and keep the
+identifier in the name. Nothing validates the prefix; its whole job is to make a sandbox that
+references somebody else's credential visible in an audit, which a bare `db` never would.
+
+A sandbox may reference up to 16 brokered endpoints, so one sandbox can front several such
+credentials, each on its own port. Rotating one is a new version under the same name and needs no
+new grant: the broker reads the current version, and every sandbox holding a grant for that name
+moves to it within one credential-cache TTL.
+
+The create and network-update paths refuse a policy naming a secret that does not exist. A
+resume does not — the policy was accepted when the sandbox was created, and refusing to wake a
+sandbox because a secret was deleted is worse than waking it degraded. The wake logs a warning
+naming the sandbox and the missing names; the guest sees the same synthetic `403` any denied
+credential produces.
+
 With `vault`, the broker enforces it in its own code and the token it holds reads every value
 under the mount: KV v2 policy has no way to say "read `secrets/X` only when `grants/E` names it".
 What bounds a compromised broker is everything around the process — a token whose policy is

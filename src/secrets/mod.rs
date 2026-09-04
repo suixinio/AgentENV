@@ -328,6 +328,19 @@ impl GrantIssuer for SecretsService {
             .await?;
         Ok(())
     }
+
+    async fn unknown_names(&self, names: &BTreeSet<String>) -> Option<Vec<String>> {
+        match self.ensure_names_exist(names).await {
+            Ok(()) => Some(Vec::new()),
+            Err(MissingSecrets::Missing(missing)) => Some(missing),
+            // The grant this answer precedes fails loudly on the same
+            // outage, so reporting it here would only duplicate it.
+            Err(MissingSecrets::Store(err)) => {
+                tracing::debug!(error = %format_args!("{err:#}"), "secrets store could not say which names exist");
+                None
+            }
+        }
+    }
 }
 
 pub fn validate_name(name: &str) -> Result<(), SecretsError> {
@@ -979,6 +992,85 @@ mod tests {
         let only_present: BTreeSet<String> = ["present".to_string()].into_iter().collect();
         assert!(service.ensure_names_exist(&only_present).await.is_ok());
         assert!(service.ensure_names_exist(&BTreeSet::new()).await.is_ok());
+    }
+
+    // The isolation axis is the control-plane credential: whoever reaches
+    // this service may grant any name that exists to any sandbox. When an
+    // ownership axis lands, this is the test that has to change.
+    #[tokio::test]
+    async fn any_name_that_exists_can_be_granted_to_any_sandbox() {
+        let (service, backend) = service();
+        for name in ["tenant_db_ws42", "tenant_db_ws99"] {
+            service
+                .create(name, value("dsn"), SecretMetadata::new(), Vec::new())
+                .await
+                .unwrap();
+        }
+        let sandbox = SandboxId::new();
+        let execution = ExecutionId::new();
+        let both: BTreeSet<String> = ["tenant_db_ws42", "tenant_db_ws99"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+
+        service.grant(sandbox, execution, &both).await.unwrap();
+
+        assert_eq!(
+            backend
+                .grants_for(&sandbox.to_string(), &execution.to_string())
+                .unwrap(),
+            vec!["tenant_db_ws42".to_string(), "tenant_db_ws99".to_string()],
+            "nothing here ties a name to an owner; the prefix is a naming \
+             discipline for audit, not a check"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_that_cannot_answer_is_not_an_all_present_answer() {
+        let (service, _) = service();
+        service
+            .create("present", value("v"), SecretMetadata::new(), Vec::new())
+            .await
+            .unwrap();
+        let names: BTreeSet<String> = ["present".to_string(), "absent".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            service.unknown_names(&names).await,
+            Some(vec!["absent".to_string()])
+        );
+
+        let broken = SecretsService::new(
+            Arc::new(InMemorySecretRefStore::default()),
+            Arc::new(UnavailableBackend),
+        );
+        assert_eq!(
+            broken.unknown_names(&names).await,
+            None,
+            "an outage must not read as \"every name is present\""
+        );
+    }
+
+    /// A backend that owns its names and cannot reach them.
+    struct UnavailableBackend;
+
+    #[async_trait]
+    impl SecretsBackend for UnavailableBackend {
+        async fn put(&self, _: &str, _: &SecretString, _: &[String]) -> Result<i64, SecretsError> {
+            Err(SecretsError::Unavailable(anyhow::anyhow!("down")))
+        }
+        async fn delete(&self, _: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::Unavailable(anyhow::anyhow!("down")))
+        }
+        async fn grant(&self, _: &str, _: &str, _: &[String]) -> Result<(), SecretsError> {
+            Err(SecretsError::Unavailable(anyhow::anyhow!("down")))
+        }
+        async fn revoke(&self, _: &str, _: &str) -> Result<(), SecretsError> {
+            Err(SecretsError::Unavailable(anyhow::anyhow!("down")))
+        }
+        async fn missing_names(&self, _: &[String]) -> Result<Option<Vec<String>>, SecretsError> {
+            Err(SecretsError::Unavailable(anyhow::anyhow!("down")))
+        }
     }
 
     #[tokio::test]

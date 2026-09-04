@@ -4994,6 +4994,30 @@ async fn a_create_with_rules_grants_before_start_and_a_delete_revokes() -> Resul
 }
 
 #[tokio::test]
+async fn a_name_the_store_does_not_hold_is_reported_and_still_starts() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    let grants = RecordingGrantIssuer::shared();
+    grants.answer_unknown_names(vec!["openai".to_string()]);
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+
+    // A wake carries a policy accepted long ago; a secret deleted since then
+    // degrades the sandbox and must not keep it from coming back.
+    let created = orchestrator.create_sandbox(request).await?;
+    assert!(matches!(
+        grants.events().first(),
+        Some(GrantEvent::Grant { names, .. }) if names.contains("openai")
+    ));
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_create_without_rules_asks_for_no_grant() -> Result<()> {
     use crate::orchestrator::grants::recording::RecordingGrantIssuer;
 

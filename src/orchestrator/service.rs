@@ -1392,6 +1392,13 @@ where
 
     /// Grants the names the policy references before the sandbox can open a
     /// brokered connection. An empty set is a no-op for every issuer.
+    ///
+    /// Nothing here asks whether this sandbox may use these names: the
+    /// isolation axis is the control-plane credential, and a grant bounds
+    /// what one incarnation may read, not who owns a secret. An ownership
+    /// check belongs in this function once `Claims` carries an identity to
+    /// check against — the broker, the store and the public surface all read
+    /// the grant as it is and need no change for it.
     async fn grant_secrets(
         &self,
         sandbox_id: SandboxId,
@@ -1401,6 +1408,22 @@ where
         let names = policy.egress.referenced_secret_names();
         if names.is_empty() {
             return Ok(());
+        }
+        // Only the create and network-update paths refuse an unknown name;
+        // a wake carries a policy that was accepted long ago and must not be
+        // refused now, so a name deleted meanwhile is reported here and the
+        // sandbox still starts. Without this the guest gets a synthetic 403
+        // and the operator gets nothing.
+        if let Some(missing) = self.grants().unknown_names(&names).await {
+            if !missing.is_empty() {
+                warn!(
+                    %sandbox_id,
+                    %execution_id,
+                    missing = %missing.join(", "),
+                    "starting a sandbox whose policy names secrets the store does not hold; \
+                     brokered connections using them will be refused"
+                );
+            }
         }
         self.grants()
             .grant(sandbox_id, execution_id, &names)

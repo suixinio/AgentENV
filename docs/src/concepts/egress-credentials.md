@@ -19,6 +19,8 @@ curl -X POST "$AENV_URL/secrets" -H "X-API-Key: $KEY" -H 'content-type: applicat
 grammar rules keys use. It is the secret's own bound, checked after the rule that named it, so a
 rule that asks for this value for another host gets a `403` instead. Omit it and the rule is the
 only bound. A new version of a secret replaces its pin, because the pin lives with the value.
+It applies to a `value` only: a `fields` credential names its own upstream, so a pin given with
+one is refused with `400`.
 
 Then declare, per sandbox, which domains get which headers:
 
@@ -93,10 +95,14 @@ curl -X POST "$AENV_URL/secrets" -H "X-API-Key: $KEY" -H 'content-type: applicat
 
 `value` and `fields` are mutually exclusive and one of them is required: a header substitution
 takes the first, a handler that authenticates to the upstream itself takes the second. Field
-names match `^[a-zA-Z0-9_-]{1,64}$` and there are at most 32 of them; the values are opaque
-strings and a handler ignores the fields it does not know. `POST /secrets/{id}` writes a new
-version in either shape, and a sandbox holding a grant for the name moves to it within one
-credential-cache TTL without a new grant.
+names match `^[a-zA-Z0-9_-]{1,64}$` and there are at most 32 of them; the values are strings
+(a port is `"5432"`) and a handler ignores the fields it does not know. A secret keeps the shape
+it was created with: `POST /secrets/{id}` writes a new version in that same shape and refuses
+the other with `400`, and a sandbox holding a grant for the name moves to the new version within
+one credential-cache TTL without a new grant. Creating a sandbox whose policy reads a secret in
+the other shape, a `fields` credential as a header value or a `value` as a `postgres` endpoint
+credential, is refused with `400` before the sandbox is placed, rather than answered `502` on
+its first brokered connection.
 
 The sandbox connects to `169.254.0.22:5432` with a DSN whose user and password are placeholders:
 

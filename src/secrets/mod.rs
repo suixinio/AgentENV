@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use zeroize::Zeroizing;
@@ -56,6 +56,40 @@ pub type SecretFields = BTreeMap<String, SecretString>;
 pub const MAX_SECRET_FIELDS: usize = 32;
 pub const MAX_SECRET_FIELD_KEY_LEN: usize = 64;
 
+/// The shape of a stored secret. A secret keeps the shape it was created
+/// with: a header substitution reads `Opaque` and a protocol handler reads
+/// `Fields`, and a policy is checked against the stored shape before the
+/// sandbox is placed rather than at connection time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SecretKind {
+    Opaque,
+    Fields,
+}
+
+impl SecretKind {
+    /// The spelling a store records alongside the ciphertext.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Opaque => "opaque",
+            Self::Fields => "fields",
+        }
+    }
+
+    pub fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "opaque" => Some(Self::Opaque),
+            "fields" => Some(Self::Fields),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for SecretKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What a `/secrets` write carries. `Opaque` is one value substituted into a
 /// header; `Fields` is a credential a protocol handler takes apart itself,
 /// which is the only form a `postgres` endpoint can use.
@@ -66,11 +100,10 @@ pub enum SecretValue {
 }
 
 impl SecretValue {
-    /// The `kind` a store records alongside the ciphertext.
-    pub fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> SecretKind {
         match self {
-            Self::Opaque(_) => "opaque",
-            Self::Fields(_) => "fields",
+            Self::Opaque(_) => SecretKind::Opaque,
+            Self::Fields(_) => SecretKind::Fields,
         }
     }
 
@@ -79,12 +112,6 @@ impl SecretValue {
             Self::Opaque(value) => value.is_empty(),
             Self::Fields(fields) => fields.is_empty(),
         }
-    }
-}
-
-impl From<SecretString> for SecretValue {
-    fn from(value: SecretString) -> Self {
-        Self::Opaque(value)
     }
 }
 
@@ -105,14 +132,27 @@ pub struct SecretRef {
 pub enum SecretsError {
     #[error("secret name must match [a-zA-Z0-9_-]{{1,{MAX_SECRET_NAME_LEN}}}")]
     InvalidName,
+    #[error("secret name must not start with {SECRET_ID_PREFIX}, which is reserved for secret identifiers")]
+    ReservedName,
     #[error("{0}")]
     InvalidMetadata(String),
     #[error("secret value must not be empty")]
     EmptyValue,
+    #[error("fields must carry at least one entry")]
+    EmptyFields,
     #[error("secret not found")]
     NotFound,
     #[error("a secret named {0:?} already exists")]
     AlreadyExists(String),
+    #[error(
+        "secret {name:?} holds {stored}; a new version keeps the shape a secret was created with, \
+         so a {offered} credential is a new secret"
+    )]
+    ShapeChanged {
+        name: String,
+        stored: SecretKind,
+        offered: SecretKind,
+    },
     #[error("secrets store unavailable: {0}")]
     Unavailable(#[source] anyhow::Error),
 }
@@ -148,13 +188,24 @@ pub trait SecretRefStore: Send + Sync {
     async fn missing_names(&self, names: &[String]) -> Result<Vec<String>, SecretsError>;
 }
 
+/// One grant row: the incarnation it names. The reaper compares it with the
+/// live records and revokes what no record backs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Grant {
+    pub sandbox_id: String,
+    pub execution_id: String,
+}
+
 /// The value store. Writes return the version they created; grants make a
 /// (sandbox, execution) able to read the named values.
 #[async_trait]
 pub trait SecretsBackend: Send + Sync {
     /// `allowed_hosts` pins the value to the hosts it may be sent to; empty
     /// leaves the rule that names it as the only bound. It is stored with the
-    /// value because the broker reads it there, not from the ref row.
+    /// value because the broker reads it there, not from the ref row. A
+    /// backend that shares its storage with the ref row records the new
+    /// version there in the same transaction, so what it serves is never
+    /// ahead of what `GET /secrets/{id}` reports.
     async fn put(
         &self,
         name: &str,
@@ -170,11 +221,25 @@ pub trait SecretsBackend: Send + Sync {
     ) -> Result<(), SecretsError>;
     async fn revoke(&self, sandbox_id: &str, execution_id: &str) -> Result<(), SecretsError>;
 
-    /// Which of `names` this backend does not know, for a backend that owns
-    /// the names as well as the values. `None` leaves the ref store as the
-    /// authority, which is what a value store answers.
-    async fn missing_names(&self, _names: &[String]) -> Result<Option<Vec<String>>, SecretsError> {
+    /// The shape each of `names` is stored in, for a backend that owns the
+    /// names as well as the values; a name absent from the map has no
+    /// value. `None` leaves the ref store as the authority on existence and
+    /// leaves the shape unchecked, which is what a value store answers.
+    async fn kinds_of(
+        &self,
+        _names: &[String],
+    ) -> Result<Option<BTreeMap<String, SecretKind>>, SecretsError> {
         Ok(None)
+    }
+
+    /// Grants recorded before `granted_before`, oldest first and at most
+    /// `limit`, for the reaper. A backend that keeps no grants answers none.
+    async fn grants_before(
+        &self,
+        _granted_before: SystemTime,
+        _limit: usize,
+    ) -> Result<Vec<Grant>, SecretsError> {
+        Ok(Vec::new())
     }
 }
 
@@ -201,6 +266,7 @@ impl SecretsService {
         validate_metadata(&metadata)?;
         let allowed_hosts = validate_allowed_hosts(allowed_hosts)?;
         validate_value(&value)?;
+        validate_pin_fits(&value, &allowed_hosts)?;
         let secret_id = new_secret_id();
         self.refs.create(&secret_id, name, &metadata).await?;
         let version = match self.values.put(name, &value, &allowed_hosts).await {
@@ -232,7 +298,9 @@ impl SecretsService {
     }
 
     /// A new version replaces the pin as well as the value: the pin lives
-    /// with the value, so a version written without one is unpinned.
+    /// with the value, so a version written without one is unpinned. The
+    /// shape does not change: a policy that reads the name was checked
+    /// against it, and the next version has to satisfy the same check.
     pub async fn update(
         &self,
         id_or_name: &str,
@@ -245,11 +313,24 @@ impl SecretsService {
         }
         let allowed_hosts = validate_allowed_hosts(allowed_hosts)?;
         validate_value(&value)?;
+        validate_pin_fits(&value, &allowed_hosts)?;
         let existing = self
             .refs
             .get(id_or_name)
             .await?
             .ok_or(SecretsError::NotFound)?;
+        let stored = self
+            .values
+            .kinds_of(std::slice::from_ref(&existing.name))
+            .await?
+            .and_then(|kinds| kinds.get(&existing.name).copied());
+        if let Some(stored) = stored.filter(|stored| *stored != value.kind()) {
+            return Err(SecretsError::ShapeChanged {
+                name: existing.name,
+                stored,
+                offered: value.kind(),
+            });
+        }
         let version = self
             .values
             .put(&existing.name, &value, &allowed_hosts)
@@ -307,37 +388,112 @@ impl SecretsService {
         self.refs.list(after, limit.max(1)).await
     }
 
-    /// `Ok(())` when every name has a row; otherwise the missing names.
-    pub async fn ensure_names_exist(&self, names: &BTreeSet<String>) -> Result<(), MissingSecrets> {
-        if names.is_empty() {
+    /// `Ok(())` when every name has a value in the shape its use needs. A
+    /// backend that cannot say which shape it holds is checked for
+    /// existence alone, against the ref rows.
+    pub async fn ensure_usable(
+        &self,
+        wanted: &BTreeMap<String, SecretKind>,
+    ) -> Result<(), UnusableSecrets> {
+        if wanted.is_empty() {
             return Ok(());
         }
-        let names: Vec<String> = names.iter().cloned().collect();
-        let missing = match self
+        let names: Vec<String> = wanted.keys().cloned().collect();
+        let stored = self
             .values
-            .missing_names(&names)
+            .kinds_of(&names)
             .await
-            .map_err(MissingSecrets::Store)?
-        {
-            Some(missing) => missing,
-            None => self
+            .map_err(UnusableSecrets::Store)?;
+        let Some(stored) = stored else {
+            let missing = self
                 .refs
                 .missing_names(&names)
                 .await
-                .map_err(MissingSecrets::Store)?,
+                .map_err(UnusableSecrets::Store)?;
+            return if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(UnusableSecrets::Missing(missing))
+            };
         };
-        if missing.is_empty() {
+        let missing: Vec<String> = names
+            .iter()
+            .filter(|name| !stored.contains_key(name.as_str()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            return Err(UnusableSecrets::Missing(missing));
+        }
+        let mismatched: Vec<ShapeMismatch> = wanted
+            .iter()
+            .filter_map(|(name, needed)| {
+                let stored = *stored.get(name)?;
+                (stored != *needed).then(|| ShapeMismatch {
+                    name: name.clone(),
+                    stored,
+                    needed: *needed,
+                })
+            })
+            .collect();
+        if mismatched.is_empty() {
             Ok(())
         } else {
-            Err(MissingSecrets::Missing(missing))
+            Err(UnusableSecrets::WrongShape(mismatched))
         }
+    }
+
+    /// Grants older than `min_age` whose incarnation the caller may compare
+    /// with its live records. Rows the caller cannot name are skipped.
+    async fn grants_older_than(
+        &self,
+        min_age: Duration,
+        limit: usize,
+    ) -> Result<Vec<(SandboxId, ExecutionId)>, SecretsError> {
+        let before = SystemTime::now()
+            .checked_sub(min_age)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        Ok(self
+            .values
+            .grants_before(before, limit)
+            .await?
+            .into_iter()
+            .filter_map(|grant| {
+                Some((
+                    SandboxId::parse_str(&grant.sandbox_id).ok()?,
+                    ExecutionId::parse_str(&grant.execution_id).ok()?,
+                ))
+            })
+            .collect())
+    }
+}
+
+/// One name a policy uses in a shape other than the one stored under it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapeMismatch {
+    pub name: String,
+    pub stored: SecretKind,
+    pub needed: SecretKind,
+}
+
+impl fmt::Display for ShapeMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} holds {} but is used as {}",
+            self.name, self.stored, self.needed
+        )
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum MissingSecrets {
+pub enum UnusableSecrets {
     #[error("unknown secret name(s): {}", .0.join(", "))]
     Missing(Vec<String>),
+    #[error(
+        "secret(s) stored in another shape than the policy uses: {}",
+        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")
+    )]
+    WrongShape(Vec<ShapeMismatch>),
     #[error(transparent)]
     Store(SecretsError),
 }
@@ -364,17 +520,31 @@ impl GrantIssuer for SecretsService {
         Ok(())
     }
 
-    async fn unknown_names(&self, names: &BTreeSet<String>) -> Option<Vec<String>> {
-        match self.ensure_names_exist(names).await {
+    async fn unusable_names(&self, wanted: &BTreeMap<String, SecretKind>) -> Option<Vec<String>> {
+        match self.ensure_usable(wanted).await {
             Ok(()) => Some(Vec::new()),
-            Err(MissingSecrets::Missing(missing)) => Some(missing),
+            Err(UnusableSecrets::Missing(missing)) => Some(missing),
+            Err(UnusableSecrets::WrongShape(mismatched)) => Some(
+                mismatched
+                    .into_iter()
+                    .map(|mismatch| mismatch.to_string())
+                    .collect(),
+            ),
             // The grant this answer precedes fails loudly on the same
             // outage, so reporting it here would only duplicate it.
-            Err(MissingSecrets::Store(err)) => {
+            Err(UnusableSecrets::Store(err)) => {
                 tracing::debug!(error = %format_args!("{err:#}"), "secrets store could not say which names exist");
                 None
             }
         }
+    }
+
+    async fn stale_grant_candidates(
+        &self,
+        min_age: Duration,
+        limit: usize,
+    ) -> anyhow::Result<Vec<(SandboxId, ExecutionId)>> {
+        Ok(self.grants_older_than(min_age, limit).await?)
     }
 }
 
@@ -382,12 +552,16 @@ impl GrantIssuer for SecretsService {
 /// its values: an empty password is a real configuration, an unnamed field
 /// is not.
 pub fn validate_value(value: &SecretValue) -> Result<(), SecretsError> {
-    if value.is_empty() {
-        return Err(SecretsError::EmptyValue);
-    }
     let SecretValue::Fields(fields) = value else {
-        return Ok(());
+        return if value.is_empty() {
+            Err(SecretsError::EmptyValue)
+        } else {
+            Ok(())
+        };
     };
+    if fields.is_empty() {
+        return Err(SecretsError::EmptyFields);
+    }
     if fields.len() > MAX_SECRET_FIELDS {
         return Err(SecretsError::InvalidMetadata(format!(
             "the credential has {} fields; at most {MAX_SECRET_FIELDS} are allowed",
@@ -409,12 +583,39 @@ pub fn validate_value(value: &SecretValue) -> Result<(), SecretsError> {
     Ok(())
 }
 
-pub fn validate_name(name: &str) -> Result<(), SecretsError> {
-    if is_valid_secret_name(name) && !name.starts_with(SECRET_ID_PREFIX) {
-        Ok(())
-    } else {
-        Err(SecretsError::InvalidName)
+/// A pin bounds where an opaque value may be sent. A `fields` credential
+/// names its own upstream and no handler consults a pin for it, so one
+/// offered with it would be accepted and never enforced.
+pub fn validate_pin_fits(
+    value: &SecretValue,
+    allowed_hosts: &[String],
+) -> Result<(), SecretsError> {
+    if matches!(value, SecretValue::Fields(_)) && !allowed_hosts.is_empty() {
+        return Err(SecretsError::InvalidMetadata(
+            "allowedHosts applies to a value; a fields credential names its own upstream".into(),
+        ));
     }
+    Ok(())
+}
+
+pub fn validate_name(name: &str) -> Result<(), SecretsError> {
+    if !is_valid_secret_name(name) {
+        Err(SecretsError::InvalidName)
+    } else if name.starts_with(SECRET_ID_PREFIX) {
+        Err(SecretsError::ReservedName)
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether `token` has the shape of an identifier this service issues:
+/// the prefix and 32 hex digits. A list cursor is such an identifier, so a
+/// caller handing back anything else is refused rather than silently paged
+/// from the start.
+pub fn is_secret_id(token: &str) -> bool {
+    token
+        .strip_prefix(SECRET_ID_PREFIX)
+        .is_some_and(|rest| rest.len() == 32 && rest.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 pub const MAX_ALLOWED_HOSTS: usize = 32;
@@ -486,7 +687,8 @@ pub mod memory {
     use async_trait::async_trait;
 
     use super::{
-        SecretMetadata, SecretRef, SecretRefStore, SecretValue, SecretsBackend, SecretsError,
+        Grant, SecretKind, SecretMetadata, SecretRef, SecretRefStore, SecretValue, SecretsBackend,
+        SecretsError,
     };
 
     #[derive(Default)]
@@ -582,11 +784,15 @@ pub mod memory {
 
     /// Holds values and grants in memory. Exposes what a test needs to
     /// assert on; never used outside tests and embedded smoke runs.
+    /// One grant as the in-memory backend keeps it: the names and when it
+    /// was recorded, keyed by `(sandbox_id, execution_id)`.
+    type GrantRow = (Vec<String>, SystemTime);
+
     #[derive(Default)]
     pub struct InMemorySecretsBackend {
         values: Mutex<HashMap<String, (i64, SecretValue)>>,
         pins: Mutex<HashMap<String, Vec<String>>>,
-        grants: Mutex<HashMap<(String, String), Vec<String>>>,
+        grants: Mutex<HashMap<(String, String), GrantRow>>,
         pub fail_puts: std::sync::atomic::AtomicBool,
     }
 
@@ -604,7 +810,24 @@ pub mod memory {
                 .lock()
                 .unwrap()
                 .get(&(sandbox_id.to_string(), execution_id.to_string()))
-                .cloned()
+                .map(|(names, _)| names.clone())
+        }
+
+        /// Moves a grant's timestamp back, so a test can age it without waiting.
+        pub fn backdate_grant(
+            &self,
+            sandbox_id: &str,
+            execution_id: &str,
+            by: std::time::Duration,
+        ) {
+            if let Some((_, granted_at)) = self
+                .grants
+                .lock()
+                .unwrap()
+                .get_mut(&(sandbox_id.to_string(), execution_id.to_string()))
+            {
+                *granted_at = granted_at.checked_sub(by).unwrap_or(SystemTime::UNIX_EPOCH);
+            }
         }
 
         pub fn value_of(&self, name: &str) -> Option<SecretValue> {
@@ -662,7 +885,7 @@ pub mod memory {
         ) -> Result<(), SecretsError> {
             self.grants.lock().unwrap().insert(
                 (sandbox_id.to_string(), execution_id.to_string()),
-                names.to_vec(),
+                (names.to_vec(), SystemTime::now()),
             );
             Ok(())
         }
@@ -673,6 +896,46 @@ pub mod memory {
                 .unwrap()
                 .remove(&(sandbox_id.to_string(), execution_id.to_string()));
             Ok(())
+        }
+
+        async fn kinds_of(
+            &self,
+            names: &[String],
+        ) -> Result<Option<BTreeMap<String, SecretKind>>, SecretsError> {
+            let values = self.values.lock().unwrap();
+            Ok(Some(
+                names
+                    .iter()
+                    .filter_map(|name| Some((name.clone(), values.get(name)?.1.kind())))
+                    .collect(),
+            ))
+        }
+
+        async fn grants_before(
+            &self,
+            granted_before: SystemTime,
+            limit: usize,
+        ) -> Result<Vec<Grant>, SecretsError> {
+            let grants = self.grants.lock().unwrap();
+            let mut old: Vec<(SystemTime, Grant)> = grants
+                .iter()
+                .filter(|(_, (_, granted_at))| *granted_at < granted_before)
+                .map(|((sandbox_id, execution_id), (_, granted_at))| {
+                    (
+                        *granted_at,
+                        Grant {
+                            sandbox_id: sandbox_id.clone(),
+                            execution_id: execution_id.clone(),
+                        },
+                    )
+                })
+                .collect();
+            old.sort_by_key(|(granted_at, _)| *granted_at);
+            Ok(old
+                .into_iter()
+                .map(|(_, grant)| grant)
+                .take(limit)
+                .collect())
         }
     }
 }
@@ -854,7 +1117,7 @@ mod tests {
     #[tokio::test]
     async fn names_are_validated_and_unique() {
         let (service, _) = service();
-        for bad in ["", "with/slash", "sec_reserved", &"a".repeat(129)] {
+        for bad in ["", "with/slash", &"a".repeat(129)] {
             assert!(matches!(
                 service
                     .create(bad, value("v"), SecretMetadata::new(), Vec::new())
@@ -862,12 +1125,36 @@ mod tests {
                 Err(SecretsError::InvalidName)
             ));
         }
+        assert!(
+            matches!(
+                service
+                    .create(
+                        "sec_reserved",
+                        value("v"),
+                        SecretMetadata::new(),
+                        Vec::new()
+                    )
+                    .await,
+                Err(SecretsError::ReservedName)
+            ),
+            "a well-formed name in the identifier namespace is refused for that reason"
+        );
         assert!(matches!(
             service
                 .create("empty", value(""), SecretMetadata::new(), Vec::new())
                 .await,
             Err(SecretsError::EmptyValue)
         ));
+        assert!(is_secret_id(&new_secret_id()));
+        for not_an_id in [
+            "garbage",
+            "sec_",
+            "sec_xyz",
+            "SEC_0123456789abcdef0123456789abcdef",
+            "",
+        ] {
+            assert!(!is_secret_id(not_an_id), "{not_an_id:?}");
+        }
         service
             .create("gh", value("v"), SecretMetadata::new(), Vec::new())
             .await
@@ -942,7 +1229,7 @@ mod tests {
             service
                 .create("empty", fields(&[]), SecretMetadata::new(), Vec::new())
                 .await,
-            Err(SecretsError::EmptyValue)
+            Err(SecretsError::EmptyFields)
         ));
         for bad in [
             "",
@@ -1031,18 +1318,25 @@ mod tests {
         async fn revoke(&self, _: &str, _: &str) -> Result<(), SecretsError> {
             Ok(())
         }
-        async fn missing_names(
+        async fn kinds_of(
             &self,
             names: &[String],
-        ) -> Result<Option<Vec<String>>, SecretsError> {
+        ) -> Result<Option<BTreeMap<String, SecretKind>>, SecretsError> {
             Ok(Some(
                 names
                     .iter()
-                    .filter(|name| !self.known.contains(name))
-                    .cloned()
+                    .filter(|name| self.known.contains(name))
+                    .map(|name| (name.clone(), SecretKind::Opaque))
                     .collect(),
             ))
         }
+    }
+
+    fn opaque_uses(names: &[&str]) -> BTreeMap<String, SecretKind> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), SecretKind::Opaque))
+            .collect()
     }
 
     #[tokio::test]
@@ -1117,47 +1411,200 @@ mod tests {
                 known: vec!["tenant_db".to_string()],
             }),
         );
-        let names = |names: &[&str]| -> BTreeSet<String> {
-            names.iter().map(|name| name.to_string()).collect()
-        };
-
         // The ref store holds no row for either name, so an answer that only
         // consulted it would call both of them missing.
         service
-            .ensure_names_exist(&names(&["tenant_db"]))
+            .ensure_usable(&opaque_uses(&["tenant_db"]))
             .await
             .unwrap();
         let err = service
-            .ensure_names_exist(&names(&["tenant_db", "absent"]))
+            .ensure_usable(&opaque_uses(&["tenant_db", "absent"]))
             .await
             .err()
             .unwrap();
-        assert!(matches!(err, MissingSecrets::Missing(missing) if missing == ["absent"]));
+        assert!(matches!(err, UnusableSecrets::Missing(missing) if missing == ["absent"]));
     }
 
     #[tokio::test]
-    async fn ensure_names_exist_reports_only_the_missing_ones() {
+    async fn ensure_usable_reports_only_the_missing_ones() {
         let (service, _) = service();
         service
             .create("present", value("v"), SecretMetadata::new(), Vec::new())
             .await
             .unwrap();
-        let names: BTreeSet<String> = ["present", "absent"]
-            .into_iter()
-            .map(String::from)
-            .collect();
-        match service.ensure_names_exist(&names).await {
-            Err(MissingSecrets::Missing(missing)) => assert_eq!(missing, vec!["absent"]),
+        match service
+            .ensure_usable(&opaque_uses(&["present", "absent"]))
+            .await
+        {
+            Err(UnusableSecrets::Missing(missing)) => assert_eq!(missing, vec!["absent"]),
             other => panic!("expected the missing name, got {other:?}"),
         }
-        let only_present: BTreeSet<String> = ["present".to_string()].into_iter().collect();
-        assert!(service.ensure_names_exist(&only_present).await.is_ok());
-        assert!(service.ensure_names_exist(&BTreeSet::new()).await.is_ok());
+        assert!(service
+            .ensure_usable(&opaque_uses(&["present"]))
+            .await
+            .is_ok());
+        assert!(service.ensure_usable(&BTreeMap::new()).await.is_ok());
     }
 
-    // The isolation axis is the control-plane credential: whoever reaches
-    // this service may grant any name that exists to any sandbox. When an
-    // ownership axis lands, this is the test that has to change.
+    #[tokio::test]
+    async fn a_name_used_in_the_other_shape_is_unusable_before_placement() {
+        let (service, _) = service();
+        service
+            .create("openai", value("sk"), SecretMetadata::new(), Vec::new())
+            .await
+            .unwrap();
+        service
+            .create(
+                "tenant_db",
+                fields(&[("host", "pg.internal")]),
+                SecretMetadata::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let mut wanted = BTreeMap::new();
+        wanted.insert("openai".to_string(), SecretKind::Fields);
+        wanted.insert("tenant_db".to_string(), SecretKind::Opaque);
+        match service.ensure_usable(&wanted).await {
+            Err(UnusableSecrets::WrongShape(mismatched)) => assert_eq!(
+                mismatched,
+                vec![
+                    ShapeMismatch {
+                        name: "openai".into(),
+                        stored: SecretKind::Opaque,
+                        needed: SecretKind::Fields,
+                    },
+                    ShapeMismatch {
+                        name: "tenant_db".into(),
+                        stored: SecretKind::Fields,
+                        needed: SecretKind::Opaque,
+                    },
+                ]
+            ),
+            other => panic!("expected both shapes to be refused, got {other:?}"),
+        }
+        assert_eq!(
+            service.unusable_names(&wanted).await.unwrap().len(),
+            2,
+            "a wake reports a wrong shape the way it reports a missing name"
+        );
+
+        let mut right = BTreeMap::new();
+        right.insert("openai".to_string(), SecretKind::Opaque);
+        right.insert("tenant_db".to_string(), SecretKind::Fields);
+        assert!(service.ensure_usable(&right).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_new_version_keeps_the_shape_the_secret_was_created_with() {
+        let (service, backend) = service();
+        service
+            .create("openai", value("sk"), SecretMetadata::new(), Vec::new())
+            .await
+            .unwrap();
+        let err = service
+            .update("openai", fields(&[("password", "sk")]), None, Vec::new())
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                &err,
+                SecretsError::ShapeChanged { name, stored: SecretKind::Opaque, offered: SecretKind::Fields }
+                    if name == "openai"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            backend.version_of("openai"),
+            Some(1),
+            "a refused version leaves the served one alone"
+        );
+        service
+            .update("openai", value("sk2"), None, Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(backend.version_of("openai"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn a_pin_is_refused_on_a_fields_credential() {
+        let (service, backend) = service();
+        let err = service
+            .create(
+                "tenant_db",
+                fields(&[("host", "pg-a.internal")]),
+                SecretMetadata::new(),
+                vec!["pg-b.internal".into()],
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SecretsError::InvalidMetadata(_)), "{err:?}");
+        assert_eq!(backend.version_of("tenant_db"), None);
+
+        service
+            .create(
+                "tenant_db",
+                fields(&[("host", "pg-a.internal")]),
+                SecretMetadata::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let err = service
+            .update(
+                "tenant_db",
+                fields(&[("host", "pg-a.internal")]),
+                None,
+                vec!["pg-b.internal".into()],
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SecretsError::InvalidMetadata(_)), "{err:?}");
+        assert_eq!(backend.version_of("tenant_db"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn only_grants_older_than_the_horizon_are_reaper_candidates() {
+        let (service, backend) = service();
+        let old_sandbox = SandboxId::new();
+        let old_execution = ExecutionId::new();
+        let fresh_sandbox = SandboxId::new();
+        let fresh_execution = ExecutionId::new();
+        let names: BTreeSet<String> = ["openai".to_string()].into_iter().collect();
+        service
+            .grant(old_sandbox, old_execution, &names)
+            .await
+            .unwrap();
+        service
+            .grant(fresh_sandbox, fresh_execution, &names)
+            .await
+            .unwrap();
+        backend.backdate_grant(
+            &old_sandbox.to_string(),
+            &old_execution.to_string(),
+            Duration::from_secs(3600),
+        );
+
+        assert_eq!(
+            service
+                .stale_grant_candidates(Duration::from_secs(600), 10)
+                .await
+                .unwrap(),
+            vec![(old_sandbox, old_execution)]
+        );
+        assert!(service
+            .stale_grant_candidates(Duration::from_secs(7200), 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // Nothing here ties a name to an owner: the isolation axis is the
+    // control-plane credential.
     #[tokio::test]
     async fn any_name_that_exists_can_be_granted_to_any_sandbox() {
         let (service, backend) = service();
@@ -1193,11 +1640,9 @@ mod tests {
             .create("present", value("v"), SecretMetadata::new(), Vec::new())
             .await
             .unwrap();
-        let names: BTreeSet<String> = ["present".to_string(), "absent".to_string()]
-            .into_iter()
-            .collect();
+        let names = opaque_uses(&["present", "absent"]);
         assert_eq!(
-            service.unknown_names(&names).await,
+            service.unusable_names(&names).await,
             Some(vec!["absent".to_string()])
         );
 
@@ -1206,7 +1651,7 @@ mod tests {
             Arc::new(UnavailableBackend),
         );
         assert_eq!(
-            broken.unknown_names(&names).await,
+            broken.unusable_names(&names).await,
             None,
             "an outage must not read as \"every name is present\""
         );
@@ -1229,7 +1674,10 @@ mod tests {
         async fn revoke(&self, _: &str, _: &str) -> Result<(), SecretsError> {
             Err(SecretsError::Unavailable(anyhow::anyhow!("down")))
         }
-        async fn missing_names(&self, _: &[String]) -> Result<Option<Vec<String>>, SecretsError> {
+        async fn kinds_of(
+            &self,
+            _: &[String],
+        ) -> Result<Option<BTreeMap<String, SecretKind>>, SecretsError> {
             Err(SecretsError::Unavailable(anyhow::anyhow!("down")))
         }
     }

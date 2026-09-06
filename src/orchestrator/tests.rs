@@ -5000,7 +5000,7 @@ async fn a_name_the_store_does_not_hold_is_reported_and_still_starts() -> Result
     setup();
     let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
     let grants = RecordingGrantIssuer::shared();
-    grants.answer_unknown_names(vec!["openai".to_string()]);
+    grants.answer_unusable_names(vec!["openai".to_string()]);
     orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
 
     let mut request = create_request(Some(60), &[]);
@@ -5014,6 +5014,50 @@ async fn a_name_the_store_does_not_hold_is_reported_and_still_starts() -> Result
         Some(GrantEvent::Grant { names, .. }) if names.contains("openai")
     ));
     orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_reaper_revokes_aged_grants_no_record_backs_and_keeps_live_ones() -> Result<()> {
+    use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
+
+    setup();
+    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
+    let grants = RecordingGrantIssuer::shared();
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = policy_with_rules("openai");
+    let live = orchestrator.create_sandbox(request).await?;
+
+    // A grant whose record is gone, and one whose record now names another
+    // incarnation, are both orphans; the live sandbox's own grant is not.
+    let gone = (SandboxId::new(), ExecutionId::new());
+    let superseded = (live.id, ExecutionId::new());
+    grants.answer_stale_grants(vec![(live.id, live.execution_id), gone, superseded]);
+
+    let reaped = orchestrator.reap_orphaned_grants().await?;
+    assert_eq!(reaped, vec![gone, superseded]);
+    let revoked: Vec<_> = grants
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, GrantEvent::Revoke { .. }))
+        .collect();
+    assert_eq!(
+        revoked,
+        vec![
+            GrantEvent::Revoke {
+                sandbox_id: gone.0,
+                execution_id: gone.1,
+            },
+            GrantEvent::Revoke {
+                sandbox_id: superseded.0,
+                execution_id: superseded.1,
+            },
+        ]
+    );
+
+    orchestrator.delete_sandbox(live.id).await?;
     Ok(())
 }
 

@@ -104,7 +104,9 @@ components:
     paginationNextToken:
       name: nextToken
       in: query
-      description: Cursor to start the list from
+      description: >
+        Cursor to start the list from, as returned in a previous response's
+        `X-Next-Token`. A value this API did not issue is refused with 400.
       required: false
       schema:
         type: string
@@ -523,9 +525,12 @@ components:
             Structured credential for a handler that authenticates to the upstream
             itself, such as a `postgres` endpoint: host, port, user, password,
             database. Mutually exclusive with `value`; exactly one of the two is
-            required. Each entry is a scalar and each key must match
-            `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and
-            ignores the rest.
+            required. Each entry is a string (a port is `"5432"`, not `5432`) and
+            each key must match `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the
+            fields it knows and ignores the rest. A secret keeps the shape it was
+            created with: a later version of a `fields` secret carries `fields`,
+            and a sandbox policy that names the secret is checked against that
+            shape before the sandbox is placed.
           additionalProperties:
             $ref: "#/components/schemas/SecretString"
         metadata:
@@ -537,7 +542,9 @@ components:
             is an exact DNS name or one leading wildcard ("*.example.com"), the same
             grammar network rules keys use. An empty or absent list leaves the rule
             that names the secret as the only bound; a non-empty one refuses the
-            value for any other host even when a rule asks for it.
+            value for any other host even when a rule asks for it. Only with
+            `value`: a `fields` credential names its own upstream, and a pin given
+            with one is refused.
           items:
             type: string
 
@@ -552,9 +559,12 @@ components:
             Structured credential for a handler that authenticates to the upstream
             itself, such as a `postgres` endpoint: host, port, user, password,
             database. Mutually exclusive with `value`; exactly one of the two is
-            required. Each entry is a scalar and each key must match
-            `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and
-            ignores the rest.
+            required. Each entry is a string (a port is `"5432"`, not `5432`) and
+            each key must match `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the
+            fields it knows and ignores the rest. A secret keeps the shape it was
+            created with: a later version of a `fields` secret carries `fields`,
+            and a sandbox policy that names the secret is checked against that
+            shape before the sandbox is placed.
           additionalProperties:
             $ref: "#/components/schemas/SecretString"
         metadata:
@@ -566,7 +576,9 @@ components:
             is an exact DNS name or one leading wildcard ("*.example.com"), the same
             grammar network rules keys use. An empty or absent list leaves the rule
             that names the secret as the only bound; a non-empty one refuses the
-            value for any other host even when a rule asks for it.
+            value for any other host even when a rule asks for it. Only with
+            `value`: a `fields` credential names its own upstream, and a pin given
+            with one is refused.
           items:
             type: string
 

@@ -44,14 +44,14 @@ fn at_ms(ms: i64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(u64::try_from(ms).unwrap_or(0))
 }
 
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
-fn unavailable(err: impl Into<anyhow::Error>) -> SecretsError {
+pub(super) fn unavailable(err: impl Into<anyhow::Error>) -> SecretsError {
     SecretsError::Unavailable(err.into())
 }
 

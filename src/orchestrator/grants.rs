@@ -1,8 +1,10 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::secrets::SecretKind;
 use crate::types::{ExecutionId, SandboxId};
 
 /// Records which secret names one incarnation of a sandbox may read. The
@@ -19,12 +21,24 @@ pub trait GrantIssuer: Send + Sync {
 
     async fn revoke(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> anyhow::Result<()>;
 
-    /// The subset of `names` the store holds no secret for, or `None` when
-    /// this issuer cannot answer. A store outage and an all-present answer
-    /// must not look alike to a caller that only warns, which is why the
-    /// two are different values rather than an empty list.
-    async fn unknown_names(&self, _names: &BTreeSet<String>) -> Option<Vec<String>> {
+    /// The subset of `wanted` the store holds no secret for, or holds in a
+    /// shape other than the one the policy uses it in; `None` when this
+    /// issuer cannot answer. A store outage and an all-present answer must
+    /// not look alike to a caller that only warns, which is why the two are
+    /// different values rather than an empty list.
+    async fn unusable_names(&self, _wanted: &BTreeMap<String, SecretKind>) -> Option<Vec<String>> {
         None
+    }
+
+    /// Grants at least `min_age` old, oldest first and at most `limit`, for
+    /// the orchestrator to compare with its records and revoke where no
+    /// record backs them. An issuer that keeps no grants answers none.
+    async fn stale_grant_candidates(
+        &self,
+        _min_age: Duration,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<(SandboxId, ExecutionId)>> {
+        Ok(Vec::new())
     }
 }
 
@@ -100,12 +114,14 @@ impl GrantIssuer for GrantsIssuedUpstream {
 /// Remembers every call, for orchestrator tests.
 #[cfg(any(test, feature = "test-support"))]
 pub mod recording {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use async_trait::async_trait;
 
     use super::GrantIssuer;
+    use crate::secrets::SecretKind;
     use crate::types::{ExecutionId, SandboxId};
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +141,7 @@ pub mod recording {
     pub struct RecordingGrantIssuer {
         events: Mutex<Vec<GrantEvent>>,
         unknown: Mutex<Option<Vec<String>>>,
+        stale: Mutex<Vec<(SandboxId, ExecutionId)>>,
     }
 
     impl RecordingGrantIssuer {
@@ -136,10 +153,15 @@ pub mod recording {
             self.events.lock().unwrap().clone()
         }
 
-        /// What this issuer answers when asked which names are unknown.
+        /// What this issuer answers when asked which names are unusable.
         /// Unset leaves it unable to say, which is the default.
-        pub fn answer_unknown_names(&self, unknown: Vec<String>) {
+        pub fn answer_unusable_names(&self, unknown: Vec<String>) {
             *self.unknown.lock().unwrap() = Some(unknown);
+        }
+
+        /// What this issuer offers the reaper as aged grants.
+        pub fn answer_stale_grants(&self, stale: Vec<(SandboxId, ExecutionId)>) {
+            *self.stale.lock().unwrap() = stale;
         }
     }
 
@@ -171,8 +193,26 @@ pub mod recording {
             Ok(())
         }
 
-        async fn unknown_names(&self, _names: &BTreeSet<String>) -> Option<Vec<String>> {
+        async fn unusable_names(
+            &self,
+            _wanted: &BTreeMap<String, SecretKind>,
+        ) -> Option<Vec<String>> {
             self.unknown.lock().unwrap().clone()
+        }
+
+        async fn stale_grant_candidates(
+            &self,
+            _min_age: Duration,
+            limit: usize,
+        ) -> anyhow::Result<Vec<(SandboxId, ExecutionId)>> {
+            Ok(self
+                .stale
+                .lock()
+                .unwrap()
+                .iter()
+                .take(limit)
+                .copied()
+                .collect())
         }
     }
 }

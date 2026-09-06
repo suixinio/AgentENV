@@ -6,19 +6,17 @@
 //! method that opens an envelope, and the internal resolve endpoint is its
 //! only caller.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aenv_core::secrets::{SecretValue, SecretsBackend, SecretsError};
+use aenv_core::secrets::{Grant, SecretKind, SecretValue, SecretsBackend, SecretsError};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 use zeroize::Zeroizing;
 
-use crate::secrets::envelope::{Envelope, Sealed};
-
-const KIND_OPAQUE: &str = "opaque";
-const KIND_FIELDS: &str = "fields";
+use super::{now_ms, unavailable};
+use crate::secrets::envelope::{Binding, Envelope, Sealed};
 
 pub struct PgSecretValues {
     pool: PgPool,
@@ -36,7 +34,8 @@ pub enum ResolveError {
 }
 
 /// One resolved credential, in the shape the broker's resolver contract
-/// expects. Both forms carry the pin stored with the version they came from.
+/// expects. An opaque value carries the pin stored with its version; a
+/// fields credential names its own upstream and is never pinned.
 pub enum ResolvedCredential {
     Opaque {
         value: Zeroizing<String>,
@@ -44,7 +43,6 @@ pub enum ResolvedCredential {
     },
     Fields {
         fields: BTreeMap<String, Zeroizing<String>>,
-        allowed_hosts: Vec<String>,
     },
 }
 
@@ -95,17 +93,28 @@ impl PgSecretValues {
             ciphertext: row.get("ciphertext"),
             nonce: row.get("nonce"),
         };
+        // The kind and the pin are read from the same row as the ciphertext
+        // and are part of what it is bound to: a row re-typed or re-scoped
+        // in place does not open, so neither is trusted before this point.
         let plaintext = self
             .envelope
-            .open(name, version, &sealed)
+            .open(
+                &Binding {
+                    name,
+                    version,
+                    kind: &kind,
+                    allowed_hosts: &allowed_hosts,
+                },
+                &sealed,
+            )
             .map_err(ResolveError::Unavailable)?;
 
-        match kind.as_str() {
-            KIND_OPAQUE => Ok(ResolvedCredential::Opaque {
+        match SecretKind::parse(&kind) {
+            Some(SecretKind::Opaque) => Ok(ResolvedCredential::Opaque {
                 value: decode_utf8(plaintext)?,
                 allowed_hosts,
             }),
-            KIND_FIELDS => {
+            Some(SecretKind::Fields) => {
                 let fields: BTreeMap<String, String> = serde_json::from_slice(&plaintext)
                     .map_err(|err| ResolveError::Unavailable(err.into()))?;
                 Ok(ResolvedCredential::Fields {
@@ -113,11 +122,10 @@ impl PgSecretValues {
                         .into_iter()
                         .map(|(key, value)| (key, Zeroizing::new(value)))
                         .collect(),
-                    allowed_hosts,
                 })
             }
-            other => Err(ResolveError::Unavailable(anyhow!(
-                "stored value of {name:?} has kind {other:?}"
+            None => Err(ResolveError::Unavailable(anyhow!(
+                "stored value of {name:?} has kind {kind:?}"
             ))),
         }
     }
@@ -132,15 +140,10 @@ fn decode_utf8(plaintext: Zeroizing<Vec<u8>>) -> Result<Zeroizing<String>, Resol
     }
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+fn to_ms(at: SystemTime) -> i64 {
+    at.duration_since(UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
-}
-
-fn unavailable(err: impl Into<anyhow::Error>) -> SecretsError {
-    SecretsError::Unavailable(err.into())
 }
 
 fn plaintext_of(value: &SecretValue) -> Result<Zeroizing<Vec<u8>>, SecretsError> {
@@ -162,7 +165,10 @@ fn plaintext_of(value: &SecretValue) -> Result<Zeroizing<Vec<u8>>, SecretsError>
 impl SecretsBackend for PgSecretValues {
     /// Versions are allocated under a lock on the ref row rather than by
     /// `MAX(version) + 1` alone: the ciphertext is bound to the version it
-    /// is stored at, so the number has to be settled before the seal.
+    /// is stored at, so the number has to be settled before the seal. The
+    /// ref row's `current_version` moves in the same transaction, so the
+    /// version `resolve` serves is never one `GET /secrets/{id}` has not
+    /// reported.
     async fn put(
         &self,
         name: &str,
@@ -189,12 +195,22 @@ impl SecretsBackend for PgSecretValues {
         .await
         .map_err(unavailable)?;
 
+        let kind = value.kind().as_str();
         let sealed = self
             .envelope
-            .seal(name, version, &plaintext)
+            .seal(
+                &Binding {
+                    name,
+                    version,
+                    kind,
+                    allowed_hosts,
+                },
+                &plaintext,
+            )
             .map_err(unavailable)?;
         drop(plaintext);
 
+        let now = now_ms();
         sqlx::query(
             "INSERT INTO secret_values \
              (name, version, kind, ciphertext, nonce, allowed_hosts, created_at_ms) \
@@ -202,14 +218,21 @@ impl SecretsBackend for PgSecretValues {
         )
         .bind(name)
         .bind(version)
-        .bind(match value {
-            SecretValue::Opaque(_) => KIND_OPAQUE,
-            SecretValue::Fields(_) => KIND_FIELDS,
-        })
+        .bind(kind)
         .bind(&sealed.ciphertext)
         .bind(&sealed.nonce)
         .bind(allowed_hosts)
-        .bind(now_ms())
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(unavailable)?;
+        sqlx::query(
+            "UPDATE secret_refs SET current_version = GREATEST(current_version, $2), \
+             updated_at_ms = $3 WHERE name = $1",
+        )
+        .bind(name)
+        .bind(version)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(unavailable)?;
@@ -263,22 +286,53 @@ impl SecretsBackend for PgSecretValues {
 
     /// This backend owns the values, so a name with a ref row but no version
     /// is missing here: a policy naming it would be refused at resolve time
-    /// whatever the ref store says.
-    async fn missing_names(&self, names: &[String]) -> Result<Option<Vec<String>>, SecretsError> {
-        let present: Vec<String> =
-            sqlx::query_scalar("SELECT DISTINCT name FROM secret_values WHERE name = ANY($1)")
-                .bind(names)
-                .fetch_all(&self.pool)
-                .await
-                .map_err(unavailable)?;
-        let present: BTreeSet<&str> = present.iter().map(String::as_str).collect();
-        Ok(Some(
-            names
-                .iter()
-                .filter(|name| !present.contains(name.as_str()))
-                .cloned()
-                .collect(),
-        ))
+    /// whatever the ref store says. The shape is the newest version's, which
+    /// is the one `resolve` serves.
+    async fn kinds_of(
+        &self,
+        names: &[String],
+    ) -> Result<Option<BTreeMap<String, SecretKind>>, SecretsError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (name) name, kind FROM secret_values \
+             WHERE name = ANY($1) ORDER BY name, version DESC",
+        )
+        .bind(names)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        let mut kinds = BTreeMap::new();
+        for (name, kind) in rows {
+            let Some(kind) = SecretKind::parse(&kind) else {
+                return Err(unavailable(anyhow!(
+                    "stored value of {name:?} has kind {kind:?}"
+                )));
+            };
+            kinds.insert(name, kind);
+        }
+        Ok(Some(kinds))
+    }
+
+    async fn grants_before(
+        &self,
+        granted_before: SystemTime,
+        limit: usize,
+    ) -> Result<Vec<Grant>, SecretsError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT sandbox_id, execution_id FROM secret_grants \
+             WHERE granted_at_ms < $1 ORDER BY granted_at_ms LIMIT $2",
+        )
+        .bind(to_ms(granted_before))
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(unavailable)?;
+        Ok(rows
+            .into_iter()
+            .map(|(sandbox_id, execution_id)| Grant {
+                sandbox_id,
+                execution_id,
+            })
+            .collect())
     }
 }
 
@@ -519,21 +573,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_delete_removes_every_version_and_missing_names_answers_for_values() {
+    async fn a_row_re_typed_or_re_scoped_in_place_does_not_open() {
+        let (values, refs, pool) = values_or_skip!("secret_values_binding");
+        for name in ["openai", "tenant_db"] {
+            named(&refs, name).await;
+        }
+        values
+            .put(
+                "openai",
+                &opaque("sk-live"),
+                &["api.openai.com".to_string()],
+            )
+            .await
+            .unwrap();
+        values
+            .put(
+                "tenant_db",
+                &fields(&[("host", "pg.internal"), ("password", "p")]),
+                &[],
+            )
+            .await
+            .unwrap();
+        values
+            .grant(
+                "sbx-1",
+                "exec-1",
+                &["openai".to_string(), "tenant_db".to_string()],
+            )
+            .await
+            .unwrap();
+
+        // Clearing the pin would let any rule send the value anywhere;
+        // re-typing the credential would hand the whole JSON out as a header.
+        sqlx::query("UPDATE secret_values SET allowed_hosts = '{}' WHERE name = 'openai'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE secret_values SET kind = 'opaque' WHERE name = 'tenant_db'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for name in ["openai", "tenant_db"] {
+            assert!(
+                matches!(
+                    values.resolve("sbx-1", "exec-1", name).await,
+                    Err(ResolveError::Unavailable(_))
+                ),
+                "{name} opened after its row was altered"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_put_moves_the_ref_rows_current_version_in_the_same_transaction() {
+        let (values, refs, _pool) = values_or_skip!("secret_values_current_version");
+        named(&refs, "openai").await;
+        assert_eq!(
+            refs.get("openai").await.unwrap().unwrap().current_version,
+            0
+        );
+
+        values.put("openai", &opaque("v1"), &[]).await.unwrap();
+        values.put("openai", &opaque("v2"), &[]).await.unwrap();
+        assert_eq!(
+            refs.get("openai").await.unwrap().unwrap().current_version,
+            2,
+            "what resolve serves is what the API reports, without a second write"
+        );
+    }
+
+    #[tokio::test]
+    async fn grants_before_a_horizon_come_back_oldest_first() {
+        let (values, _refs, pool) = values_or_skip!("secret_values_grants_before");
+        for (execution, sandbox) in [
+            ("exec-old", "sbx-1"),
+            ("exec-mid", "sbx-2"),
+            ("exec-new", "sbx-3"),
+        ] {
+            values
+                .grant(sandbox, execution, &["openai".to_string()])
+                .await
+                .unwrap();
+        }
+        let now = now_ms();
+        sqlx::query("UPDATE secret_grants SET granted_at_ms = $2 WHERE execution_id = $1")
+            .bind("exec-old")
+            .bind(now - 3_600_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE secret_grants SET granted_at_ms = $2 WHERE execution_id = $1")
+            .bind("exec-mid")
+            .bind(now - 1_800_000)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let horizon = SystemTime::now() - std::time::Duration::from_secs(600);
+        let old = values.grants_before(horizon, 10).await.unwrap();
+        assert_eq!(
+            old,
+            vec![
+                Grant {
+                    sandbox_id: "sbx-1".into(),
+                    execution_id: "exec-old".into(),
+                },
+                Grant {
+                    sandbox_id: "sbx-2".into(),
+                    execution_id: "exec-mid".into(),
+                },
+            ]
+        );
+        assert_eq!(values.grants_before(horizon, 1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_delete_removes_every_version_and_kinds_of_answers_for_values() {
         let (values, refs, _pool) = values_or_skip!("secret_values_delete");
-        for name in ["openai", "unwritten"] {
+        for name in ["openai", "unwritten", "tenant_db"] {
             named(&refs, name).await;
         }
         values.put("openai", &opaque("v1"), &[]).await.unwrap();
         values.put("openai", &opaque("v2"), &[]).await.unwrap();
+        values
+            .put("tenant_db", &fields(&[("host", "h")]), &[])
+            .await
+            .unwrap();
 
         let names = vec![
             "openai".to_string(),
             "unwritten".to_string(),
             "absent".to_string(),
+            "tenant_db".to_string(),
         ];
-        let missing = values.missing_names(&names).await.unwrap().unwrap();
-        assert_eq!(missing, vec!["unwritten".to_string(), "absent".to_string()]);
+        let kinds = values.kinds_of(&names).await.unwrap().unwrap();
+        assert_eq!(
+            kinds,
+            BTreeMap::from([
+                ("openai".to_string(), SecretKind::Opaque),
+                ("tenant_db".to_string(), SecretKind::Fields),
+            ]),
+            "a name with a row and no version is absent, like one with no row"
+        );
 
         values.delete("openai").await.unwrap();
         values

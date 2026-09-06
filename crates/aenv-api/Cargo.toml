@@ -61,8 +61,7 @@ zeroize = "1"
 
 [dev-dependencies]
 aenv-core = { path = "../..", features = ["test-support"] }
-# 🔴 A dev dependency, not a normal one: the only HTTP client this crate now
-# makes is the one its resolve-endpoint tests drive the endpoint with. The two
-# backends that spoke HTTP to a credential store are gone.
+# A dev dependency, not a normal one: the only HTTP client this crate makes is
+# the one its resolve-endpoint tests drive the endpoint with.
 reqwest = { version = "0.13", features = ["json"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }

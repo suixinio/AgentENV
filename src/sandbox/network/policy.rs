@@ -7,6 +7,7 @@ use std::{
 
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use crate::cfg::network::normalize_dns_name;
+use crate::secrets::SecretKind;
 
 pub const ALL_INTERNET_TRAFFIC_CIDR: &str = "0.0.0.0/0";
 
@@ -180,6 +181,27 @@ impl SandboxNetworkEgressPolicy {
             policy.rules = normalized_rules;
         }
         for declaration in normalize_endpoints(endpoints.unwrap_or_default())? {
+            // A header marker reads an opaque value and an endpoint
+            // credential reads fields; no stored secret satisfies both.
+            if let Some(credential) = declaration
+                .params
+                .get("credential")
+                .and_then(serde_json::Value::as_str)
+            {
+                let in_a_rule = policy
+                    .rules
+                    .values()
+                    .flatten()
+                    .flat_map(|rule| rule.transform.headers.values())
+                    .flat_map(|value| secret_markers(value))
+                    .any(|marker| marker.name == credential);
+                if in_a_rule {
+                    bail!(
+                        "secret {credential:?} is both an endpoint credential and a header marker; \
+                         a secret has one shape, so use two secrets"
+                    );
+                }
+            }
             policy.brokers.push(BrokeredEndpoint {
                 port: declaration.port,
                 handler: declaration.handler.clone(),
@@ -206,19 +228,27 @@ impl SandboxNetworkEgressPolicy {
     /// Every secret name the rules and the endpoints refer to, for grant
     /// issuance.
     pub fn referenced_secret_names(&self) -> BTreeSet<String> {
+        self.referenced_secrets().into_keys().collect()
+    }
+
+    /// Every secret name the policy refers to, with the shape that use
+    /// reads: a header marker takes an opaque value, an endpoint credential
+    /// the fields a handler takes apart. A name used both ways is refused by
+    /// `with_rules_and_endpoints`, so each name maps to one shape.
+    pub fn referenced_secrets(&self) -> BTreeMap<String, SecretKind> {
         let from_rules = self
             .rules
             .values()
             .flatten()
             .flat_map(|rule| rule.transform.headers.values())
             .flat_map(|value| secret_markers(value))
-            .map(|marker| marker.name.to_string());
+            .map(|marker| (marker.name.to_string(), SecretKind::Opaque));
         let from_endpoints = self
             .endpoints
             .iter()
             .filter_map(|endpoint| endpoint.params.get("credential"))
             .filter_map(|credential| credential.as_str())
-            .map(str::to_string);
+            .map(|name| (name.to_string(), SecretKind::Fields));
         from_rules.chain(from_endpoints).collect()
     }
 
@@ -1490,6 +1520,33 @@ mod tests {
             policy.referenced_secret_names(),
             BTreeSet::from(["openai".to_string(), "tenant_db".to_string()])
         );
+        assert_eq!(
+            policy.referenced_secrets(),
+            BTreeMap::from([
+                ("openai".to_string(), SecretKind::Opaque),
+                ("tenant_db".to_string(), SecretKind::Fields),
+            ]),
+            "each use names the shape it reads"
+        );
+    }
+
+    #[test]
+    fn a_name_used_as_both_a_marker_and_a_credential_is_refused() {
+        let err = SandboxNetworkEgressPolicy::with_rules_and_endpoints(
+            None,
+            None,
+            Some(rules(
+                "api.example.com",
+                &[("authorization", "Bearer ${aenv.secrets.db}")],
+            )),
+            Some(vec![endpoint(
+                5432,
+                "postgres",
+                serde_json::json!({"credential": "db"}),
+            )]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("one shape"), "{err}");
     }
 
     #[test]

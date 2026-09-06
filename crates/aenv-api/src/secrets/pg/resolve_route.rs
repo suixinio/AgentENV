@@ -11,8 +11,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -26,6 +27,10 @@ use super::values::{PgSecretValues, ResolveError, ResolvedCredential};
 /// Path the broker's `RESOLVE_PATH` lands on when its base URL ends in
 /// `/internal`.
 pub const RESOLVE_PATH: &str = "/internal/credentials/resolve";
+
+/// A request is three short identifiers; the bearer check runs before the
+/// body is read, and a body past this is refused unread.
+const MAX_REQUEST_BYTES: usize = 4096;
 
 #[derive(Clone)]
 struct ResolveState {
@@ -43,25 +48,18 @@ struct ResolveRequest {
 
 /// The routes `new_control_plane_only` merges for this backend.
 pub fn router(values: Arc<PgSecretValues>, token: Zeroizing<String>) -> Router {
+    let state = ResolveState {
+        values,
+        token: Arc::new(token),
+    };
     Router::new()
         .route(RESOLVE_PATH, post(resolve))
-        .with_state(ResolveState {
-            values,
-            token: Arc::new(token),
-        })
-}
-
-/// Length first, then every byte: an early return on the first mismatch
-/// turns the token into something a caller can walk one byte at a time.
-fn token_matches(presented: &str, expected: &str) -> bool {
-    if presented.len() != expected.len() {
-        return false;
-    }
-    presented
-        .bytes()
-        .zip(expected.bytes())
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .with_state(state)
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -70,6 +68,27 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")
+}
+
+/// Answers 401 before any extractor touches the body. The line it logs is
+/// the only place a bearer mismatch between the two halves shows up on this
+/// side; the broker turns the 401 into an outage rather than a denial.
+async fn require_bearer(
+    State(state): State<ResolveState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let presented = bearer(request.headers());
+    if !presented.is_some_and(|presented| {
+        aenv_core::api::constant_time_eq(presented.as_bytes(), state.token.as_bytes())
+    }) {
+        warn!(
+            "a credential resolve request presented no valid bearer; the broker's \
+             resolver.token_file and secrets.pg.resolver_token_file must hold the same value"
+        );
+        return answer(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+    }
+    next.run(request).await
 }
 
 fn answer(status: StatusCode, body: serde_json::Value) -> Response {
@@ -84,17 +103,22 @@ fn answer(status: StatusCode, body: serde_json::Value) -> Response {
 
 async fn resolve(
     State(state): State<ResolveState>,
-    headers: HeaderMap,
     body: Result<Json<ResolveRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    if !bearer(&headers).is_some_and(|presented| token_matches(presented, &state.token)) {
-        return answer(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
-    }
-    let Ok(Json(request)) = body else {
-        return answer(
-            StatusCode::BAD_REQUEST,
-            json!({"error": "malformed request"}),
-        );
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(axum::extract::rejection::JsonRejection::BytesRejection(_)) => {
+            return answer(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                json!({"error": "request too large"}),
+            );
+        }
+        Err(_) => {
+            return answer(
+                StatusCode::BAD_REQUEST,
+                json!({"error": "malformed request"}),
+            );
+        }
     };
     // A name the store could never hold is refused before it reaches a
     // query, and refused the way an ungranted one is.
@@ -117,18 +141,12 @@ async fn resolve(
             StatusCode::OK,
             json!({"value": value.as_str(), "allowedHosts": allowed_hosts}),
         ),
-        Ok(ResolvedCredential::Fields {
-            fields,
-            allowed_hosts,
-        }) => {
+        Ok(ResolvedCredential::Fields { fields }) => {
             let fields: BTreeMap<&str, &str> = fields
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str()))
                 .collect();
-            answer(
-                StatusCode::OK,
-                json!({"fields": fields, "allowedHosts": allowed_hosts}),
-            )
+            answer(StatusCode::OK, json!({"fields": fields}))
         }
         // 404 and not 500: the broker reads 401/403/404 as a refusal the
         // guest sees as a synthetic 403, and everything else as an outage it
@@ -279,7 +297,43 @@ mod tests {
         assert_eq!(response.status(), 200);
         assert_eq!(
             response.json::<serde_json::Value>().await.unwrap(),
-            json!({"fields": {"host": "pg.internal", "port": "5432"}, "allowedHosts": []})
+            json!({"fields": {"host": "pg.internal", "port": "5432"}}),
+            "a fields credential names its own upstream and carries no pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bearer_is_checked_before_the_body_is_read_and_a_large_body_is_refused() {
+        let (endpoint, values, refs) = endpoint_or_skip!("resolve_route_body_limit");
+        seed(&refs, &values, "openai", opaque("sk-live")).await;
+        values
+            .grant("sbx-1", "exec-1", &["openai".to_string()])
+            .await
+            .unwrap();
+
+        let oversized = json!({
+            "sandboxId": "sbx-1",
+            "executionId": "exec-1",
+            "name": "openai",
+            "padding": "x".repeat(2 * MAX_REQUEST_BYTES),
+        });
+        let response = endpoint.post(Some("Bearer wrong"), oversized.clone()).await;
+        assert_eq!(
+            response.status(),
+            401,
+            "a wrong bearer is refused whatever the body carries"
+        );
+        let response = endpoint
+            .post(Some(&format!("Bearer {TOKEN}")), oversized)
+            .await;
+        assert_eq!(
+            response.status(),
+            413,
+            "an authenticated caller still cannot make the endpoint buffer a large body"
+        );
+        assert_eq!(
+            endpoint.resolve("sbx-1", "exec-1", "openai").await.status(),
+            200
         );
     }
 

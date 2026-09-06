@@ -20,7 +20,7 @@ use crate::orchestrator::{
 use crate::sandbox::network::policy::{DomainRule, EndpointDeclaration, HeaderTransform};
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
-use crate::secrets::MissingSecrets;
+use crate::secrets::UnusableSecrets;
 use crate::snapshot::SnapshotAlias;
 use crate::types::{SandboxId, SandboxResources};
 use agentenv_http_server::apis::sandboxes::*;
@@ -522,11 +522,13 @@ fn validate_custom_extension_params(params: Option<&CustomExtensionParams>) -> a
 }
 
 impl ApiImpl {
-    /// Every secret a policy's rules name must exist before the sandbox is
-    /// placed; without a store, rules that name secrets cannot be honoured.
+    /// Every secret a policy names must exist, in the shape the policy reads
+    /// it in, before the sandbox is placed; a mismatch found here is a 400
+    /// rather than a 502 on the first brokered connection. Without a store,
+    /// rules that name secrets cannot be honoured.
     async fn check_rule_secrets(&self, policy: &SandboxNetworkPolicy) -> Result<(), models::Error> {
-        let names = policy.egress.referenced_secret_names();
-        if names.is_empty() {
+        let wanted = policy.egress.referenced_secrets();
+        if wanted.is_empty() {
             return Ok(());
         }
         let Some(secrets) = self.secrets() else {
@@ -535,16 +537,27 @@ impl ApiImpl {
                 "network rules reference secrets but no secrets store is configured",
             ));
         };
-        match secrets.ensure_names_exist(&names).await {
+        match secrets.ensure_usable(&wanted).await {
             Ok(()) => Ok(()),
-            Err(MissingSecrets::Missing(missing)) => Err(Self::error(
+            Err(UnusableSecrets::Missing(missing)) => Err(Self::error(
                 400,
                 format!(
                     "network rules reference unknown secret(s): {}",
                     missing.join(", ")
                 ),
             )),
-            Err(MissingSecrets::Store(err)) => {
+            Err(UnusableSecrets::WrongShape(mismatched)) => Err(Self::error(
+                400,
+                format!(
+                    "network rules use secret(s) in another shape than they are stored in: {}",
+                    mismatched
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ),
+            )),
+            Err(UnusableSecrets::Store(err)) => {
                 warn!(error = %format_args!("{err:#}"), "could not check secret names");
                 Err(Self::error(503, "the secrets store could not be reached"))
             }
@@ -3000,5 +3013,38 @@ mod rule_secret_check_tests {
             panic!("an unknown name is the caller's mistake, got {cold:?}");
         };
         assert_eq!(error.code, 400);
+    }
+
+    #[tokio::test]
+    async fn a_create_reading_a_fields_credential_as_a_header_value_answers_400() {
+        let service = SecretsService::new(
+            Arc::new(InMemorySecretRefStore::default()),
+            Arc::new(InMemorySecretsBackend::default()),
+        );
+        service
+            .create(
+                "tenant_db",
+                SecretValue::Fields(
+                    [("host".to_string(), SecretString::new("pg.internal".into()))]
+                        .into_iter()
+                        .collect(),
+                ),
+                SecretMetadata::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("seeding a fields credential");
+        let api = surface(Some(Arc::new(service))).await;
+
+        let warm = warm_create(&api, "tenant_db").await;
+        let SandboxesPostResponse::Status400_BadRequest(error) = warm else {
+            panic!("a shape mismatch is the caller's mistake, got {warm:?}");
+        };
+        assert_eq!(error.code, 400);
+        assert!(
+            error.message.contains("tenant_db") && error.message.contains("shape"),
+            "{}",
+            error.message
+        );
     }
 }

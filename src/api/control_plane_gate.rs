@@ -195,8 +195,10 @@ impl ControlPlaneGate {
     }
 }
 
-/// Compares equal-length credentials without data-dependent early exit.
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+/// Compares credentials without data-dependent early exit: length first,
+/// then every byte, so a mismatch is not something a caller can walk one
+/// byte at a time.
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
     }

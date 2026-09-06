@@ -47,6 +47,12 @@ const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// Maximum expired sandboxes processed per eviction round.
 const AUTO_EVICT_BATCH_LIMIT: usize = 256;
 
+/// A grant younger than this is left alone by the reaper: a create grants
+/// before it writes the record, and a resume carries the record across
+/// nodes, so a fresh grant with no record yet is not an orphan.
+const GRANT_REAP_MIN_AGE: Duration = Duration::from_secs(10 * 60);
+const GRANT_REAP_BATCH_LIMIT: usize = 256;
+
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
     Success,
@@ -1405,26 +1411,27 @@ where
         execution_id: ExecutionId,
         policy: &SandboxNetworkPolicy,
     ) -> anyhow::Result<()> {
-        let names = policy.egress.referenced_secret_names();
-        if names.is_empty() {
+        let wanted = policy.egress.referenced_secrets();
+        if wanted.is_empty() {
             return Ok(());
         }
-        // Only the create and network-update paths refuse an unknown name;
+        // Only the create and network-update paths refuse an unusable name;
         // a wake carries a policy that was accepted long ago and must not be
-        // refused now, so a name deleted meanwhile is reported here and the
-        // sandbox still starts. Without this the guest gets a synthetic 403
-        // and the operator gets nothing.
-        if let Some(missing) = self.grants().unknown_names(&names).await {
-            if !missing.is_empty() {
+        // refused now, so a name deleted or reshaped meanwhile is reported
+        // here and the sandbox still starts. Without this the guest gets a
+        // synthetic 403 and the operator gets nothing.
+        if let Some(unusable) = self.grants().unusable_names(&wanted).await {
+            if !unusable.is_empty() {
                 warn!(
                     %sandbox_id,
                     %execution_id,
-                    missing = %missing.join(", "),
-                    "starting a sandbox whose policy names secrets the store does not hold; \
+                    unusable = %unusable.join(", "),
+                    "starting a sandbox whose policy names secrets the store cannot serve as used; \
                      brokered connections using them will be refused"
                 );
             }
         }
+        let names: BTreeSet<String> = wanted.into_keys().collect();
         self.grants()
             .grant(sandbox_id, execution_id, &names)
             .await
@@ -1437,11 +1444,47 @@ where
     }
 
     /// Best effort: a grant that outlives its incarnation is unusable because
-    /// the execution id it names is gone; the warning is for the operator.
+    /// the execution id it names is gone; the warning is for the operator,
+    /// and the reaper picks the row up on a later round.
     async fn revoke_secrets(&self, sandbox_id: SandboxId, execution_id: ExecutionId) {
         if let Err(err) = self.grants().revoke(sandbox_id, execution_id).await {
             warn!(%sandbox_id, %execution_id, error = %format_args!("{err:#}"), "failed to revoke secret grants");
         }
+    }
+
+    /// Revokes aged grants no record backs: a teardown whose revoke failed,
+    /// or a record that expired out of the store while its node was
+    /// unreachable, would otherwise leave the incarnation resolvable for
+    /// ever. A grant whose sandbox record names the same incarnation is
+    /// live and kept; a store that cannot answer ends the round, since
+    /// nothing can then be compared against.
+    pub async fn reap_orphaned_grants(&self) -> Result<Vec<(SandboxId, ExecutionId)>> {
+        let candidates = self
+            .grants()
+            .stale_grant_candidates(GRANT_REAP_MIN_AGE, GRANT_REAP_BATCH_LIMIT)
+            .await
+            .map_err(|err| OrchestratorError::InternalError(format!("{err:#}")))?;
+        let mut reaped = Vec::new();
+        for (sandbox_id, execution_id) in candidates {
+            let record = match self.store.get(&sandbox_id).await {
+                Ok(record) => record,
+                Err(err) => {
+                    warn!(
+                        %sandbox_id,
+                        error = ?err,
+                        "grant reaper stopped: the store could not say whether the sandbox exists"
+                    );
+                    break;
+                }
+            };
+            if record.is_some_and(|record| record.execution_id == execution_id) {
+                continue;
+            }
+            info!(%sandbox_id, %execution_id, "revoking a secret grant no sandbox record backs");
+            self.revoke_secrets(sandbox_id, execution_id).await;
+            reaped.push((sandbox_id, execution_id));
+        }
+        Ok(reaped)
     }
 
     /// One write supersedes the whole previous name set; an empty set revokes.
@@ -2419,6 +2462,9 @@ where
                         };
                         if let Err(err) = this.evict_expired_sandboxes().await {
                             warn!("auto-evict task failed: {err}");
+                        }
+                        if let Err(err) = this.reap_orphaned_grants().await {
+                            warn!("grant reaper failed: {err}");
                         }
                     }
                 }

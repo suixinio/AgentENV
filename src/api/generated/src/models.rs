@@ -227,7 +227,7 @@ pub struct V2SandboxesGetQueryParams {
     #[serde(rename = "state")]
     #[serde(default)]
     pub state: Vec<models::SandboxState>,
-    /// Cursor to start the list from
+    /// Cursor to start the list from, as returned in a previous response's `X-Next-Token`. A value this API did not issue is refused with 400.
     #[serde(rename = "nextToken")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -241,7 +241,7 @@ pub struct V2SandboxesGetQueryParams {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SecretsGetQueryParams {
-    /// Cursor to start the list from
+    /// Cursor to start the list from, as returned in a previous response's `X-Next-Token`. A value this API did not issue is refused with 400.
     #[serde(rename = "nextToken")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -285,7 +285,7 @@ pub struct SnapshotsGetQueryParams {
     #[validate(range(min = 1u32, max = 100u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
-    /// Cursor to start the list from
+    /// Cursor to start the list from, as returned in a previous response's `X-Next-Token`. A value this API did not issue is refused with 400.
     #[serde(rename = "nextToken")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -309,7 +309,7 @@ pub struct TemplatesGetQueryParams {
     #[serde(rename = "teamID")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
-    /// Cursor to start the list from
+    /// Cursor to start the list from, as returned in a previous response's `X-Next-Token`. A value this API did not issue is refused with 400.
     #[serde(rename = "nextToken")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -342,7 +342,7 @@ pub struct TemplatesTemplateIdGetPathParams {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct TemplatesTemplateIdGetQueryParams {
-    /// Cursor to start the list from
+    /// Cursor to start the list from, as returned in a previous response's `X-Next-Token`. A value this API did not issue is refused with 400.
     #[serde(rename = "nextToken")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -359,7 +359,7 @@ pub struct V2TemplatesGetQueryParams {
     #[serde(rename = "teamID")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub team_id: Option<String>,
-    /// Cursor to start the list from
+    /// Cursor to start the list from, as returned in a previous response's `X-Next-Token`. A value this API did not issue is refused with 400.
     #[serde(rename = "nextToken")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<String>,
@@ -3281,7 +3281,7 @@ pub struct NewSecret {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<zeroize::Zeroizing<String>>,
 
-    /// Structured credential for a handler that authenticates to the upstream itself, such as a `postgres` endpoint: host, port, user, password, database. Mutually exclusive with `value`; exactly one of the two is required. Each entry is a scalar and each key must match `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and ignores the rest.
+    /// Structured credential for a handler that authenticates to the upstream itself, such as a `postgres` endpoint: host, port, user, password, database. Mutually exclusive with `value`; exactly one of the two is required. Each entry is a string (a port is `\"5432\"`, not `5432`) and each key must match `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and ignores the rest. A secret keeps the shape it was created with: a later version of a `fields` secret carries `fields`, and a sandbox policy that names the secret is checked against that shape before the sandbox is placed.
     #[serde(rename = "fields")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<std::collections::HashMap<String, zeroize::Zeroizing<String>>>,
@@ -3292,7 +3292,7 @@ pub struct NewSecret {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
 
-    /// Hosts this value may ever be sent to, an AgentENV extension. Each entry is an exact DNS name or one leading wildcard (\"*.example.com\"), the same grammar network rules keys use. An empty or absent list leaves the rule that names the secret as the only bound; a non-empty one refuses the value for any other host even when a rule asks for it.
+    /// Hosts this value may ever be sent to, an AgentENV extension. Each entry is an exact DNS name or one leading wildcard (\"*.example.com\"), the same grammar network rules keys use. An empty or absent list leaves the rule that names the secret as the only bound; a non-empty one refuses the value for any other host even when a rule asks for it. Only with `value`: a `fields` credential names its own upstream, and a pin given with one is refused.
     #[serde(rename = "allowedHosts")]
     #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -8420,7 +8420,7 @@ pub struct SecretUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<zeroize::Zeroizing<String>>,
 
-    /// Structured credential for a handler that authenticates to the upstream itself, such as a `postgres` endpoint: host, port, user, password, database. Mutually exclusive with `value`; exactly one of the two is required. Each entry is a scalar and each key must match `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and ignores the rest.
+    /// Structured credential for a handler that authenticates to the upstream itself, such as a `postgres` endpoint: host, port, user, password, database. Mutually exclusive with `value`; exactly one of the two is required. Each entry is a string (a port is `\"5432\"`, not `5432`) and each key must match `^[a-zA-Z0-9_-]{1,64}$`. A handler reads the fields it knows and ignores the rest. A secret keeps the shape it was created with: a later version of a `fields` secret carries `fields`, and a sandbox policy that names the secret is checked against that shape before the sandbox is placed.
     #[serde(rename = "fields")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<std::collections::HashMap<String, zeroize::Zeroizing<String>>>,
@@ -8431,7 +8431,7 @@ pub struct SecretUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<std::collections::HashMap<String, String>>,
 
-    /// Hosts this value may ever be sent to, an AgentENV extension. Each entry is an exact DNS name or one leading wildcard (\"*.example.com\"), the same grammar network rules keys use. An empty or absent list leaves the rule that names the secret as the only bound; a non-empty one refuses the value for any other host even when a rule asks for it.
+    /// Hosts this value may ever be sent to, an AgentENV extension. Each entry is an exact DNS name or one leading wildcard (\"*.example.com\"), the same grammar network rules keys use. An empty or absent list leaves the rule that names the secret as the only bound; a non-empty one refuses the value for any other host even when a rule asks for it. Only with `value`: a `fields` credential names its own upstream, and a pin given with one is refused.
     #[serde(rename = "allowedHosts")]
     #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]

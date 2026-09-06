@@ -9,7 +9,8 @@ use tracing::warn;
 
 use super::ApiImpl;
 use crate::secrets::{
-    SecretMetadata, SecretRef, SecretString, SecretValue, SecretsError, SecretsService,
+    is_secret_id, SecretMetadata, SecretRef, SecretString, SecretValue, SecretsError,
+    SecretsService,
 };
 use agentenv_http_server::apis::secrets::{
     Secrets, SecretsGetResponse, SecretsPostResponse, SecretsSecretIdDeleteResponse,
@@ -71,9 +72,12 @@ fn metadata_from(model: Option<&HashMap<String, String>>) -> SecretMetadata {
 /// detail so nothing about the value or the store's response leaks.
 fn client_error(err: &SecretsError) -> Option<models::Error> {
     match err {
-        SecretsError::InvalidName | SecretsError::InvalidMetadata(_) | SecretsError::EmptyValue => {
-            Some(ApiImpl::error(400, err.to_string()))
-        }
+        SecretsError::InvalidName
+        | SecretsError::ReservedName
+        | SecretsError::InvalidMetadata(_)
+        | SecretsError::EmptyValue
+        | SecretsError::EmptyFields
+        | SecretsError::ShapeChanged { .. } => Some(ApiImpl::error(400, err.to_string())),
         SecretsError::NotFound => Some(ApiImpl::error(404, "secret not found")),
         SecretsError::AlreadyExists(_) => Some(ApiImpl::error(409, err.to_string())),
         SecretsError::Unavailable(_) => None,
@@ -109,6 +113,16 @@ impl Secrets<()> for ApiImpl {
             .limit
             .map(|limit| (limit as usize).clamp(1, MAX_PAGE))
             .unwrap_or(DEFAULT_PAGE);
+        // The cursor is a secret id this API handed out; anything else would
+        // sort before every id and silently restart the listing.
+        if let Some(token) = query_params.next_token.as_deref() {
+            if !is_secret_id(token) {
+                return Ok(SecretsGetResponse::Status400_BadRequest(Self::error(
+                    400,
+                    "nextToken is not a cursor this API issued",
+                )));
+            }
+        }
         match service
             .list(query_params.next_token.as_deref(), limit)
             .await

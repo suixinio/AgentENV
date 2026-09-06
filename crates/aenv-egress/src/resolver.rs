@@ -22,7 +22,7 @@ pub const RESOLVE_PATH: &str = "credentials/resolve";
 pub struct ResolverSource {
     client: reqwest::Client,
     resolve: Url,
-    token: Option<Zeroizing<String>>,
+    token: Zeroizing<String>,
 }
 
 #[derive(Serialize)]
@@ -35,21 +35,24 @@ struct ResolveRequest<'a> {
 
 impl ResolverSource {
     /// `base` is a directory URL: a path that does not end in `/` would drop
-    /// its last segment when the call path is joined onto it.
-    pub fn new(base: &str, token: Option<&str>, timeout: Duration) -> anyhow::Result<Self> {
+    /// its last segment when the call path is joined onto it. The endpoint
+    /// always checks a bearer, so an empty `token` is refused here rather
+    /// than answered 401 on every lookup.
+    pub fn new(base: &str, token: &str, timeout: Duration) -> anyhow::Result<Self> {
         let base = base.trim();
         let base = Url::parse(&if base.ends_with('/') {
             base.to_string()
         } else {
             format!("{base}/")
         })?;
+        let token = token.trim();
+        if token.is_empty() {
+            anyhow::bail!("the resolver token is empty");
+        }
         Ok(Self {
             client: reqwest::Client::builder().timeout(timeout).build()?,
             resolve: base.join(RESOLVE_PATH)?,
-            token: token
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-                .map(|token| Zeroizing::new(token.to_string())),
+            token: Zeroizing::new(token.to_string()),
         })
     }
 
@@ -62,25 +65,27 @@ impl ResolverSource {
         if !is_valid_secret_name(name) || execution_id.is_empty() || sandbox_id.is_empty() {
             return Err(CredentialError::Denied);
         }
-        let mut request = self
+        let response = self
             .client
             .post(self.resolve.clone())
             .json(&ResolveRequest {
                 sandbox_id,
                 execution_id,
                 name,
-            });
-        if let Some(token) = &self.token {
-            request = request.bearer_auth(token.as_str());
-        }
-        let response = request
+            })
+            .bearer_auth(self.token.as_str())
             .send()
             .await
             .map_err(|err| CredentialError::Unavailable(format!("resolver: {err}")))?;
         match response.status() {
-            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED => {
-                Err(CredentialError::Denied)
-            }
+            StatusCode::FORBIDDEN | StatusCode::NOT_FOUND => Err(CredentialError::Denied),
+            // The endpoint refused this broker, not this grant: an operator
+            // error that must read as an outage, not as a policy denial.
+            StatusCode::UNAUTHORIZED => Err(CredentialError::Unavailable(
+                "the resolver refused the broker's bearer; resolver.token_file and the api half's \
+                 secrets.pg.resolver_token_file must hold the same value"
+                    .into(),
+            )),
             status if status.is_success() => response
                 .json()
                 .await
@@ -186,7 +191,7 @@ mod tests {
         });
         ResolverSource::new(
             &format!("http://{addr}{base_suffix}"),
-            Some("resolver-token"),
+            "resolver-token",
             Duration::from_secs(2),
         )
         .unwrap()
@@ -202,7 +207,7 @@ mod tests {
         answering(
             &fake,
             StatusCode::OK,
-            json!({"fields": {"host": "db.internal", "port": 5432, "user": "rw_app", "password": "p"}}),
+            json!({"fields": {"host": "db.internal", "port": "5432", "user": "rw_app", "password": "p"}}),
         );
         let source = serve(fake.clone(), "").await;
 
@@ -254,11 +259,37 @@ mod tests {
         ));
 
         let unreachable =
-            ResolverSource::new("http://127.0.0.1:9", None, Duration::from_millis(300)).unwrap();
+            ResolverSource::new("http://127.0.0.1:9", "t", Duration::from_millis(300)).unwrap();
         assert!(matches!(
             unreachable.get_fields("s", "e", "n").await,
             Err(CredentialError::Unavailable(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn a_refused_bearer_is_an_outage_the_operator_sees_not_a_denial() {
+        let fake = Fake::default();
+        answering(
+            &fake,
+            StatusCode::UNAUTHORIZED,
+            json!({"error": "unauthorized"}),
+        );
+        let source = serve(fake, "").await;
+        match source.get("sbx-1", "exec-1", "openai").await {
+            Err(CredentialError::Unavailable(reason)) => {
+                assert!(reason.contains("token_file"), "{reason}")
+            }
+            other => panic!("a 401 must not read as a policy denial, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_resolver_without_a_token_is_refused_at_construction() {
+        for token in ["", "  \n"] {
+            assert!(
+                ResolverSource::new("http://127.0.0.1:9", token, Duration::from_secs(1)).is_err()
+            );
+        }
     }
 
     #[tokio::test]

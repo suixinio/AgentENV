@@ -136,6 +136,13 @@ impl PostgresHandler {
             Ok(fields) => fields,
             Err(err) => {
                 let reason = err.reason();
+                if let crate::credential::CredentialError::Unavailable(why) = &err {
+                    tracing::warn!(
+                        endpoint_port = ctx.port,
+                        reason = %why,
+                        "a credential could not be resolved; the guest gets an auth refusal"
+                    );
+                }
                 return Err(Refusal::Tell(
                     SQLSTATE_INVALID_AUTHORIZATION,
                     format!("the broker holds no usable credential for this sandbox ({reason})"),

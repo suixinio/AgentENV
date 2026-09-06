@@ -297,9 +297,19 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
                     );
                 }
                 Err(err) => {
-                    let status = match err {
+                    let status = match &err {
                         CredentialError::Denied => StatusCode::FORBIDDEN,
-                        CredentialError::Unavailable(_) => StatusCode::BAD_GATEWAY,
+                        // A denial is the policy working; an outage is the
+                        // operator's, and this line is where the broker says
+                        // why (a refused bearer, an unreachable resolver).
+                        CredentialError::Unavailable(reason) => {
+                            warn!(
+                                name = %rc.name,
+                                reason = %reason,
+                                "a credential could not be resolved; the guest gets a 502"
+                            );
+                            StatusCode::BAD_GATEWAY
+                        }
                     };
                     metrics::counter!("egress_policy_denied_total", "reason" => err.reason())
                         .increment(1);

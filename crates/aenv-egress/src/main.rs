@@ -118,6 +118,8 @@ struct ResolverSourceConfig {
     /// Base URL; call paths are joined onto it, so a path prefix is kept.
     #[config(env = "AENV_EGRESS_RESOLVER_URL")]
     url: Option<String>,
+    /// Required whenever `url` is set: the endpoint checks a bearer on every
+    /// call.
     #[config(env = "AENV_EGRESS_RESOLVER_TOKEN_FILE")]
     token_file: Option<PathBuf>,
     #[config(default = 5_000u64)]
@@ -243,16 +245,16 @@ async fn main() -> Result<()> {
 
     let creds: Arc<dyn CredentialSource> = match config.resolver.url.as_deref() {
         Some(url) => {
-            let token = match config.resolver.token_file.as_ref() {
-                Some(path) => Some(String::from_utf8(read_secret_file(
-                    path,
-                    "resolver token",
-                )?)?),
-                None => None,
+            let Some(token_path) = config.resolver.token_file.as_ref() else {
+                bail!(
+                    "resolver.url is set but resolver.token_file is not: the resolve endpoint \
+                     requires a bearer, and without one every lookup would be refused"
+                );
             };
+            let token = String::from_utf8(read_secret_file(token_path, "resolver token")?)?;
             let source = ResolverSource::new(
                 url,
-                token.as_deref(),
+                &token,
                 Duration::from_millis(config.resolver.timeout_ms),
             )
             .context("configure the credential resolver")?;

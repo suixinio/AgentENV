@@ -125,9 +125,10 @@ impl CredentialFields {
         }
     }
 
-    /// Reads a JSON object, coercing each scalar to its string form so a
-    /// resolver may write a port as a number. A nested value is refused
-    /// rather than stringified into something the handler would misread.
+    /// Reads a JSON object of string fields, the shape `/secrets` stores. A
+    /// null is an absent field; anything else that is not a string is
+    /// refused rather than stringified into something the handler would
+    /// misread.
     pub fn from_json(
         object: &serde_json::Map<String, serde_json::Value>,
         expires_at: Option<SystemTime>,
@@ -136,12 +137,10 @@ impl CredentialFields {
         for (name, value) in object {
             let value = match value {
                 serde_json::Value::String(value) => value.clone(),
-                serde_json::Value::Number(value) => value.to_string(),
-                serde_json::Value::Bool(value) => value.to_string(),
                 serde_json::Value::Null => continue,
                 _ => {
                     return Err(CredentialError::Unavailable(format!(
-                        "credential field {name:?} is not a scalar"
+                        "credential field {name:?} is not a string"
                     )))
                 }
             };
@@ -696,25 +695,33 @@ mod tests {
     }
 
     #[test]
-    fn a_field_set_reads_scalars_and_refuses_anything_deeper() {
+    fn a_field_set_reads_strings_and_refuses_anything_else() {
         let object = serde_json::json!({
             "host": "db.internal",
-            "port": 5432,
-            "sslmode": false,
+            "port": "5432",
+            "password": "",
             "database": null,
         });
         let fields = CredentialFields::from_json(object.as_object().unwrap(), None).unwrap();
         assert_eq!(fields.get("host"), Some("db.internal"));
         assert_eq!(fields.get("port"), Some("5432"));
-        assert_eq!(fields.get("sslmode"), Some("false"));
+        assert_eq!(fields.get("password"), Some(""), "empty is a value");
         assert_eq!(fields.get("database"), None, "null is absent, not empty");
-        assert!(fields.names().eq(["host", "port", "sslmode"]));
+        assert!(fields.names().eq(["host", "password", "port"]));
 
-        let nested = serde_json::json!({"host": {"name": "db"}});
-        assert!(matches!(
-            CredentialFields::from_json(nested.as_object().unwrap(), None),
-            Err(CredentialError::Unavailable(_))
-        ));
+        for not_a_string in [
+            serde_json::json!({"host": {"name": "db"}}),
+            serde_json::json!({"port": 5432}),
+            serde_json::json!({"sslmode": false}),
+        ] {
+            assert!(
+                matches!(
+                    CredentialFields::from_json(not_a_string.as_object().unwrap(), None),
+                    Err(CredentialError::Unavailable(_))
+                ),
+                "{not_a_string}"
+            );
+        }
     }
 
     #[test]

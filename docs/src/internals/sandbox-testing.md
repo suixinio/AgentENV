@@ -636,16 +636,21 @@ egress CA when the node has one, an empty string otherwise). On the guest side:
   arm64, pins its own tag from its own registry through `[tools].version` and
   `[tools].url` in a node config overlay.
 
-`crates/aenv-node/tests/integration/egress.rs` exercises the intercept with the
-embedded broker and its `tcp` handler. It needs a node config with
-`[egress_broker].mode = "embedded"` and `[cluster].node_discovery_mode =
-"static"` and fails, rather than skips, when the mode is anything else.
-`tests/fixtures/egress-embedded-overlay.toml` is that overlay, and
+`crates/aenv-node/tests/integration/egress.rs` exercises the intercept against
+a real `aenv-egress` process it starts itself, over the node-local Unix socket.
+It needs a node config with `[egress_broker].mode = "local"` and a
+`socket_path`, a broker binary at `AENV_EGRESS_BINARY_PATH`, and the `openssl`
+CLI to mint the throwaway CA the broker refuses to start without; it fails,
+rather than skips, when any of those is missing.
+`tests/fixtures/egress-local-overlay.toml` is that overlay, and
 `make test-agent-integration` runs these tests as a second cargo invocation
-with `AENV_CONFIG_OVERLAY_PATH` pointing at it while the first invocation
-passes `--skip egress::` — one process environment cannot hold both configs, so
-the target splits rather than changing the config every other integration test
-reads.
+with `AENV_CONFIG_OVERLAY_PATH` pointing at it — plus
+`AENV_EGRESS_BROKER_SOCKET_PATH` under the per-run state directory, so two runs
+on one machine never share a socket — while the first invocation passes
+`--skip egress::`. One process environment cannot hold both configs, so the
+target splits rather than changing the config every other integration test
+reads. The broker child is armed with `PR_SET_PDEATHSIG`: a test binary that
+dies takes it with it rather than leaving the socket held.
 
 `scripts/tests/e2e/suites/15_egress_credentials.sh` is the API-level pass. Like
 suites 04, 07 and 09-12 it records an unmet prerequisite (no SDK, no secrets

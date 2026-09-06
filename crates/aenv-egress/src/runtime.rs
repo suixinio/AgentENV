@@ -518,6 +518,24 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn the_probe_answers_only_while_the_broker_reads() {
+            let broker = start(options()).await;
+            let transport = transport(&broker);
+
+            transport
+                .probe()
+                .await
+                .expect("a live broker reads the probe");
+
+            broker.shutdown.send(()).unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(10), broker.joined).await;
+            transport
+                .probe()
+                .await
+                .expect_err("a stopped broker binds nothing");
+        }
+
+        #[tokio::test]
         async fn the_node_uid_is_admitted() {
             let broker = start(Options {
                 expected_peer_uid: Some(own_uid()),

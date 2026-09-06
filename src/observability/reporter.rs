@@ -539,8 +539,8 @@ pub fn egress_broker_wire(
     match state {
         Local::Disabled => scheduler::EgressBrokerState::Disabled,
         Local::Embedded => scheduler::EgressBrokerState::Embedded,
-        Local::RemoteOk => scheduler::EgressBrokerState::RemoteOk,
-        Local::RemoteUnreachable => scheduler::EgressBrokerState::RemoteUnreachable,
+        Local::LocalOk => scheduler::EgressBrokerState::LocalOk,
+        Local::LocalUnreachable => scheduler::EgressBrokerState::LocalUnreachable,
     }
 }
 

@@ -96,14 +96,19 @@ func (NodeStatus) EnumDescriptor() ([]byte, []int) {
 }
 
 // How a node reaches the egress broker, as the node itself reports it.
+//
+// 3 and 4 named the cluster-wide broker Deployment a node reached over TLS.
+// No build emits them; an api half that receives one decodes it as
+// UNSPECIFIED, which is not a placement target — which is the direction a
+// half-rolled fleet has to fail in.
 type EgressBrokerState int32
 
 const (
-	EgressBrokerState_EGRESS_BROKER_STATE_UNSPECIFIED        EgressBrokerState = 0
-	EgressBrokerState_EGRESS_BROKER_STATE_DISABLED           EgressBrokerState = 1
-	EgressBrokerState_EGRESS_BROKER_STATE_EMBEDDED           EgressBrokerState = 2
-	EgressBrokerState_EGRESS_BROKER_STATE_REMOTE_OK          EgressBrokerState = 3
-	EgressBrokerState_EGRESS_BROKER_STATE_REMOTE_UNREACHABLE EgressBrokerState = 4
+	EgressBrokerState_EGRESS_BROKER_STATE_UNSPECIFIED       EgressBrokerState = 0
+	EgressBrokerState_EGRESS_BROKER_STATE_DISABLED          EgressBrokerState = 1
+	EgressBrokerState_EGRESS_BROKER_STATE_EMBEDDED          EgressBrokerState = 2
+	EgressBrokerState_EGRESS_BROKER_STATE_LOCAL_OK          EgressBrokerState = 5
+	EgressBrokerState_EGRESS_BROKER_STATE_LOCAL_UNREACHABLE EgressBrokerState = 6
 )
 
 // Enum value maps for EgressBrokerState.
@@ -112,15 +117,15 @@ var (
 		0: "EGRESS_BROKER_STATE_UNSPECIFIED",
 		1: "EGRESS_BROKER_STATE_DISABLED",
 		2: "EGRESS_BROKER_STATE_EMBEDDED",
-		3: "EGRESS_BROKER_STATE_REMOTE_OK",
-		4: "EGRESS_BROKER_STATE_REMOTE_UNREACHABLE",
+		5: "EGRESS_BROKER_STATE_LOCAL_OK",
+		6: "EGRESS_BROKER_STATE_LOCAL_UNREACHABLE",
 	}
 	EgressBrokerState_value = map[string]int32{
-		"EGRESS_BROKER_STATE_UNSPECIFIED":        0,
-		"EGRESS_BROKER_STATE_DISABLED":           1,
-		"EGRESS_BROKER_STATE_EMBEDDED":           2,
-		"EGRESS_BROKER_STATE_REMOTE_OK":          3,
-		"EGRESS_BROKER_STATE_REMOTE_UNREACHABLE": 4,
+		"EGRESS_BROKER_STATE_UNSPECIFIED":       0,
+		"EGRESS_BROKER_STATE_DISABLED":          1,
+		"EGRESS_BROKER_STATE_EMBEDDED":          2,
+		"EGRESS_BROKER_STATE_LOCAL_OK":          5,
+		"EGRESS_BROKER_STATE_LOCAL_UNREACHABLE": 6,
 	}
 )
 
@@ -787,7 +792,7 @@ type NodeSnapshot struct {
 	CreateFails          uint64                 `protobuf:"varint,12,opt,name=create_fails,json=createFails,proto3" json:"create_fails,omitempty"`
 	ReportedAtUnixMs     int64                  `protobuf:"varint,13,opt,name=reported_at_unix_ms,json=reportedAtUnixMs,proto3" json:"reported_at_unix_ms,omitempty"`
 	// Whether this node can run sandboxes that declare network rules. The api
-	// half places such sandboxes only on nodes reporting EMBEDDED or REMOTE_OK.
+	// half places such sandboxes only on nodes reporting LOCAL_OK.
 	EgressBroker  EgressBrokerState `protobuf:"varint,17,opt,name=egress_broker,json=egressBroker,proto3,enum=scheduler.v1.EgressBrokerState" json:"egress_broker,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -2340,13 +2345,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x16NODE_STATUS_CONNECTING\x10\x02\x12\x19\n" +
 	"\x15NODE_STATUS_UNHEALTHY\x10\x03\x12\x19\n" +
 	"\x15NODE_STATUS_LINGERING\x10\x04\x12\x18\n" +
-	"\x14NODE_STATUS_DRAINING\x10\x05*\xcb\x01\n" +
+	"\x14NODE_STATUS_DRAINING\x10\x05*\x9c\x02\n" +
 	"\x11EgressBrokerState\x12#\n" +
 	"\x1fEGRESS_BROKER_STATE_UNSPECIFIED\x10\x00\x12 \n" +
 	"\x1cEGRESS_BROKER_STATE_DISABLED\x10\x01\x12 \n" +
-	"\x1cEGRESS_BROKER_STATE_EMBEDDED\x10\x02\x12!\n" +
-	"\x1dEGRESS_BROKER_STATE_REMOTE_OK\x10\x03\x12*\n" +
-	"&EGRESS_BROKER_STATE_REMOTE_UNREACHABLE\x10\x04*\xce\x01\n" +
+	"\x1cEGRESS_BROKER_STATE_EMBEDDED\x10\x02\x12 \n" +
+	"\x1cEGRESS_BROKER_STATE_LOCAL_OK\x10\x05\x12)\n" +
+	"%EGRESS_BROKER_STATE_LOCAL_UNREACHABLE\x10\x06\"\x04\b\x03\x10\x03\"\x04\b\x04\x10\x04*\x1dEGRESS_BROKER_STATE_REMOTE_OK*&EGRESS_BROKER_STATE_REMOTE_UNREACHABLE*\xce\x01\n" +
 	"\x10SandboxEventType\x12\"\n" +
 	"\x1eSANDBOX_EVENT_TYPE_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_CREATE\x10\x01\x12\x1d\n" +

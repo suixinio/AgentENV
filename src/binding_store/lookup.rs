@@ -541,6 +541,116 @@ mod tests {
         assert_eq!(rotation, vec!["node-a", "node-b", "node-a"]);
     }
 
+    fn heartbeat_with_broker(
+        node_id: &str,
+        state: crate::proto::scheduler::EgressBrokerState,
+    ) -> HeartbeatRequest {
+        let mut request = heartbeat(node_id);
+        if let Some(snapshot) = request.snapshot.as_mut() {
+            snapshot.egress_broker = state as i32;
+        }
+        request
+    }
+
+    fn new_sandbox_hint(requires_egress_broker: bool) -> ScheduleRequestHint {
+        ScheduleRequestHint {
+            kind: Some(
+                crate::proto::scheduler::schedule_request_hint::Kind::NewSandbox(
+                    crate::proto::scheduler::NewSandboxHint {
+                        requires_egress_broker,
+                        ..Default::default()
+                    },
+                ),
+            ),
+        }
+    }
+
+    #[test]
+    fn a_preferred_node_without_a_broker_is_skipped_rather_than_preferred() {
+        use crate::proto::scheduler::EgressBrokerState;
+
+        let registry = AtomicNodeRegistry::new(
+            vec![node("node-a"), node("node-b")],
+            DEFAULT_OBSERVED_REPORT_TTL,
+        );
+        let now = SystemTime::now();
+        registry
+            .heartbeat(
+                &heartbeat_with_broker("node-a", EgressBrokerState::LocalUnreachable),
+                now,
+            )
+            .expect("node-a is discovered");
+        registry
+            .heartbeat(
+                &heartbeat_with_broker("node-b", EgressBrokerState::LocalOk),
+                now,
+            )
+            .expect("node-b is discovered");
+
+        let strategy = RoundRobinStrategy::new();
+        let shadow = ShadowPlacement::default();
+        let deps = ScheduleDeps {
+            node_registry: &registry,
+            strategy: &strategy,
+            shadow: &shadow,
+        };
+
+        // The preference names the node whose broker is down; a sandbox with
+        // rules would fail on its first connection there.
+        let hint = new_sandbox_hint(true);
+        let placement = select_node(
+            &deps,
+            Some(&hint),
+            "node-a",
+            &[],
+            ShadowSource::Schedule,
+            now,
+        )
+        .expect("node-b can broker");
+        assert_eq!(placement.node.id, "node-b");
+        assert_eq!(placement.eligible, 1);
+
+        // Without the requirement the same preference is honoured.
+        let hint = new_sandbox_hint(false);
+        let placement = select_node(
+            &deps,
+            Some(&hint),
+            "node-a",
+            &[],
+            ShadowSource::Schedule,
+            now,
+        )
+        .expect("both nodes are schedulable");
+        assert_eq!(placement.node.id, "node-a");
+    }
+
+    #[test]
+    fn a_fleet_with_no_broker_refuses_rather_than_placing_anywhere() {
+        use crate::proto::scheduler::EgressBrokerState;
+
+        let registry = AtomicNodeRegistry::new(vec![node("node-a")], DEFAULT_OBSERVED_REPORT_TTL);
+        let now = SystemTime::now();
+        registry
+            .heartbeat(
+                &heartbeat_with_broker("node-a", EgressBrokerState::Disabled),
+                now,
+            )
+            .expect("node-a is discovered");
+
+        let strategy = RoundRobinStrategy::new();
+        let shadow = ShadowPlacement::default();
+        let deps = ScheduleDeps {
+            node_registry: &registry,
+            strategy: &strategy,
+            shadow: &shadow,
+        };
+
+        let hint = new_sandbox_hint(true);
+        let err = select_node(&deps, Some(&hint), "", &[], ShadowSource::Schedule, now)
+            .expect_err("no node reports a broker");
+        assert!(matches!(err, SelectNodeError::NoEgressBrokerNode));
+    }
+
     /// node-a reporting one sandbox, exactly as `roster_from_heartbeat` reads
     /// a node's `list_sandbox_roster`.
     fn node_a_reporting(

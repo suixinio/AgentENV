@@ -72,7 +72,8 @@ fn node_status(node: &NodeSnapshot) -> models::NodeStatus {
 impl From<NodeSnapshot> for models::Node {
     fn from(node: NodeSnapshot) -> Self {
         let status = node_status(&node);
-        models::Node::new(
+        let egress_broker = node.egress_broker.as_str().to_string();
+        let mut model = models::Node::new(
             node.version,
             node.commit,
             node.node_id,
@@ -86,8 +87,24 @@ impl From<NodeSnapshot> for models::Node {
             node.create_fails,
             node.sandbox_starting_count,
             0,
-        )
+        );
+        model.egress_broker = Some(egress_broker);
+        model
     }
+}
+
+/// The broker state as `/nodes` spells it. A wire value this build does not
+/// know is left absent rather than rendered as a state that does not exist.
+fn observed_egress_broker(snapshot: &scheduler_proto::NodeSnapshot) -> Option<String> {
+    use scheduler_proto::EgressBrokerState as Wire;
+    let label = match snapshot.egress_broker() {
+        Wire::Disabled => "disabled",
+        Wire::Embedded => "embedded",
+        Wire::LocalOk => "local_ok",
+        Wire::LocalUnreachable => "local_unreachable",
+        Wire::Unspecified => return None,
+    };
+    Some(label.to_string())
 }
 
 /// Renders the optional `clusterID` filter the way the registry reads it.
@@ -171,7 +188,8 @@ fn observed_metrics(snapshot: &scheduler_proto::NodeSnapshot) -> models::NodeMet
 /// Renders one cluster-observed node as a collection entry.
 fn observed_node_model(observed: scheduler_proto::ObservedNode) -> models::Node {
     let snapshot = observed.snapshot.unwrap_or_default();
-    models::Node::new(
+    let egress_broker = observed_egress_broker(&snapshot);
+    let mut model = models::Node::new(
         observed.version,
         observed.commit,
         observed.node_id,
@@ -185,7 +203,9 @@ fn observed_node_model(observed: scheduler_proto::ObservedNode) -> models::Node 
         snapshot.create_fails,
         snapshot.sandbox_starting_count,
         0,
-    )
+    );
+    model.egress_broker = egress_broker;
+    model
 }
 
 /// Renders one cluster-observed node as its detail view.

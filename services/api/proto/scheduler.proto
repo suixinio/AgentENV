@@ -154,17 +154,25 @@ message NodeSnapshot {
   reserved 14, 15, 16;
   reserved "paused_sandbox_count", "paused_allocated_cpu", "paused_allocated_memory_bytes";
   // Whether this node can run sandboxes that declare network rules. The api
-  // half places such sandboxes only on nodes reporting EMBEDDED or REMOTE_OK.
+  // half places such sandboxes only on nodes reporting LOCAL_OK.
   EgressBrokerState egress_broker = 17;
 }
 
 // How a node reaches the egress broker, as the node itself reports it.
+//
+// 3 and 4 named the cluster-wide broker Deployment a node reached over TLS.
+// No build emits them; an api half that receives one decodes it as
+// UNSPECIFIED, which is not a placement target — which is the direction a
+// half-rolled fleet has to fail in.
 enum EgressBrokerState {
+  reserved 3, 4;
+  reserved "EGRESS_BROKER_STATE_REMOTE_OK", "EGRESS_BROKER_STATE_REMOTE_UNREACHABLE";
+
   EGRESS_BROKER_STATE_UNSPECIFIED = 0;
   EGRESS_BROKER_STATE_DISABLED = 1;
   EGRESS_BROKER_STATE_EMBEDDED = 2;
-  EGRESS_BROKER_STATE_REMOTE_OK = 3;
-  EGRESS_BROKER_STATE_REMOTE_UNREACHABLE = 4;
+  EGRESS_BROKER_STATE_LOCAL_OK = 5;
+  EGRESS_BROKER_STATE_LOCAL_UNREACHABLE = 6;
 }
 
 message P2pEndpoint {

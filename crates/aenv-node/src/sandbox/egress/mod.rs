@@ -193,9 +193,9 @@ impl EgressRuntime {
             EgressBrokerMode::Embedded => EgressBrokerState::Embedded,
             EgressBrokerMode::Local => {
                 if self.reachable.load(Ordering::Relaxed) {
-                    EgressBrokerState::RemoteOk
+                    EgressBrokerState::LocalOk
                 } else {
-                    EgressBrokerState::RemoteUnreachable
+                    EgressBrokerState::LocalUnreachable
                 }
             }
         }

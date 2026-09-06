@@ -1,4 +1,5 @@
 mod deps;
+mod egress_socket;
 mod kvm;
 mod network_capacity;
 pub mod overlaybd;
@@ -143,6 +144,10 @@ pub async fn ensure_environment(
     }
 
     network_capacity::check();
+
+    // 7. The directory the node and the broker DaemonSet share. The broker
+    //    binds inside it, so it needs a group that can write.
+    egress_socket::prepare(config)?;
 
     info!("environment setup complete");
 

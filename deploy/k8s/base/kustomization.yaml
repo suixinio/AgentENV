@@ -23,13 +23,13 @@ resources:
   - agentenv-api-deployment.yaml
   - agentenv-api-service.yaml
   - agentenv-api-pdb.yaml
-  # The egress broker for sandboxes with network.rules. Its four Secrets are
-  # not generated here, nor is the api half's fifth:
+  # The egress broker for sandboxes with network.rules, one per node. Its two
+  # Secrets are not generated here, nor is the api half's third:
   # aenv-egress-secrets.example.yaml says how to mint all of them, and the
-  # Deployment applies without them (its volumes are optional) so the process,
-  # not the apply, is what fails until they exist.
-  - aenv-egress-deployment.yaml
-  - aenv-egress-service.yaml
+  # DaemonSet applies without them (its volumes are optional) so the process,
+  # not the apply, is what fails until they exist. There is no Service: the
+  # node reaches its own machine's broker over a Unix socket.
+  - aenv-egress-daemonset.yaml
   - aenv-egress-networkpolicy.yaml
 
 configMapGenerator:

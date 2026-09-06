@@ -30,6 +30,11 @@ struct Args {
     /// TOML configuration; defaults to $AENV_EGRESS_CONFIG_PATH or /etc/aenv-egress/config.toml.
     #[arg(long)]
     config: Option<PathBuf>,
+    /// Probe the configured socket and exit: 0 when a broker read the probe,
+    /// 1 otherwise. The readiness probe of the DaemonSet runs this, because a
+    /// listening port says the process is up and not that it is serving.
+    #[arg(long)]
+    ready: bool,
 }
 
 #[derive(Config)]
@@ -179,6 +184,10 @@ async fn main() -> Result<()> {
         .load()
         .with_context(|| format!("load {}", config_path.display()))?;
 
+    if args.ready {
+        return probe_readiness(&config.listen.socket_path).await;
+    }
+
     if let Some(metrics_listen) = config.metrics_listen {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .with_http_listener(metrics_listen)
@@ -290,6 +299,15 @@ async fn main() -> Result<()> {
     let result = runtime::run(runtime, listener, shutdown).await;
     let _ = std::fs::remove_file(&config.listen.socket_path);
     result
+}
+
+/// The readiness probe: one empty frame the serving process reads and refuses.
+async fn probe_readiness(socket_path: &PathBuf) -> Result<()> {
+    aenv_egress::transport::LocalTransport::new(socket_path)
+        .with_connect_timeout(Duration::from_secs(2))
+        .probe()
+        .await
+        .map_err(|err| anyhow::anyhow!("{socket_path:?} is not serving: {err}"))
 }
 
 /// Binds the node-local socket, replacing a stale one a previous run left

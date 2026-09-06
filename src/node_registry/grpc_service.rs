@@ -537,10 +537,52 @@ impl NodeRegistryGrpcService {
         for (label, count) in counts {
             metrics::gauge!(OBSERVED_NODES_METRIC, "status" => label).set(f64::from(count));
         }
+        self.refresh_egress_broker_metric();
+    }
+
+    /// Publishes one series per node and broker state, so a node that changes
+    /// state does not leave the state it left behind reading 1.
+    fn refresh_egress_broker_metric(&self) {
+        for node in self.registry.list_observed("", SystemTime::now()) {
+            let reported = node
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.egress_broker());
+            for state in EGRESS_BROKER_LABELS {
+                let value = f64::from(u8::from(reported.map(egress_broker_label) == Some(state)));
+                metrics::gauge!(
+                    EGRESS_BROKER_METRIC,
+                    "node" => node.node_id.clone(),
+                    "state" => state,
+                )
+                .set(value);
+            }
+        }
+    }
+}
+
+/// Every state the gauge carries a series for. `unknown` is what a node
+/// reporting a value this build does not know reads as.
+const EGRESS_BROKER_LABELS: [&str; 5] = [
+    "disabled",
+    "embedded",
+    "local_ok",
+    "local_unreachable",
+    "unknown",
+];
+
+fn egress_broker_label(state: scheduler::EgressBrokerState) -> &'static str {
+    match state {
+        scheduler::EgressBrokerState::Disabled => "disabled",
+        scheduler::EgressBrokerState::Embedded => "embedded",
+        scheduler::EgressBrokerState::LocalOk => "local_ok",
+        scheduler::EgressBrokerState::LocalUnreachable => "local_unreachable",
+        scheduler::EgressBrokerState::Unspecified => "unknown",
     }
 }
 
 const OBSERVED_NODES_METRIC: &str = "agentenv_api_node_registry_observed_nodes";
+const EGRESS_BROKER_METRIC: &str = "agentenv_node_egress_broker";
 const SANDBOX_EVENT_METRIC: &str = "agentenv_api_sandbox_event_total";
 const PROJECTION_TTL_SOURCE_METRIC: &str = "agentenv_api_projection_ttl_source_total";
 const LOOKUP_NODE_METRIC: &str = "agentenv_api_lookup_node_total";

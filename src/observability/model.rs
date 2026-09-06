@@ -2,14 +2,14 @@ use super::DiskMetric;
 use crate::orchestrator::SandboxRosterEntry;
 
 /// How this node reaches the egress broker. The api half places a sandbox
-/// that declares network rules only on a `RemoteOk` node.
+/// that declares network rules only on a `LocalOk` node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EgressBrokerState {
     #[default]
     Disabled,
     Embedded,
-    RemoteOk,
-    RemoteUnreachable,
+    LocalOk,
+    LocalUnreachable,
 }
 
 impl EgressBrokerState {
@@ -18,15 +18,15 @@ impl EgressBrokerState {
     /// node's own integration tests use and nothing else, so it is not a
     /// placement target for public rules.
     pub fn can_broker(&self) -> bool {
-        matches!(self, Self::RemoteOk)
+        matches!(self, Self::LocalOk)
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
             Self::Embedded => "embedded",
-            Self::RemoteOk => "remote_ok",
-            Self::RemoteUnreachable => "remote_unreachable",
+            Self::LocalOk => "local_ok",
+            Self::LocalUnreachable => "local_unreachable",
         }
     }
 }
@@ -98,9 +98,9 @@ mod tests {
 
     #[test]
     fn only_a_reachable_remote_broker_can_serve_public_rules() {
-        assert!(EgressBrokerState::RemoteOk.can_broker());
+        assert!(EgressBrokerState::LocalOk.can_broker());
         assert!(!EgressBrokerState::Embedded.can_broker());
-        assert!(!EgressBrokerState::RemoteUnreachable.can_broker());
+        assert!(!EgressBrokerState::LocalUnreachable.can_broker());
         assert!(!EgressBrokerState::Disabled.can_broker());
     }
 }

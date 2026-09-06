@@ -1498,6 +1498,14 @@ components:
           type: integer
           format: uint32
           description: Number of sandboxes currently in the Paused state
+        egressBroker:
+          type: string
+          description: >
+            How this node reaches the egress broker, as it last reported:
+            `disabled`, `embedded`, `local_ok` or `local_unreachable`. A
+            sandbox declaring network rules is placed only on a node reporting
+            `local_ok`. Absent when the node has not reported yet, or when it
+            reports a value this build does not know.
 
     NodeDetail:
       required:

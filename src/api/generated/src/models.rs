@@ -3548,6 +3548,12 @@ pub struct Node {
     /// Number of sandboxes currently in the Paused state
     #[serde(rename = "sandboxPausedCount")]
     pub sandbox_paused_count: u32,
+
+    /// How this node reaches the egress broker, as it last reported: `disabled`, `embedded`, `local_ok` or `local_unreachable`. A sandbox declaring network rules is placed only on a node reporting `local_ok`. Absent when the node has not reported yet, or when it reports a value this build does not know.
+    #[serde(rename = "egressBroker")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_broker: Option<String>,
 }
 
 impl Node {
@@ -3581,6 +3587,7 @@ impl Node {
             create_fails,
             sandbox_starting_count,
             sandbox_paused_count,
+            egress_broker: None,
         }
     }
 }
@@ -3615,6 +3622,9 @@ impl std::fmt::Display for Node {
             Some(self.sandbox_starting_count.to_string()),
             Some("sandboxPausedCount".to_string()),
             Some(self.sandbox_paused_count.to_string()),
+            self.egress_broker.as_ref().map(|egress_broker| {
+                ["egressBroker".to_string(), egress_broker.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -3649,6 +3659,7 @@ impl std::str::FromStr for Node {
             pub create_fails: Vec<u64>,
             pub sandbox_starting_count: Vec<u32>,
             pub sandbox_paused_count: Vec<u32>,
+            pub egress_broker: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -3724,6 +3735,10 @@ impl std::str::FromStr for Node {
                     #[allow(clippy::redundant_clone)]
                     "sandboxPausedCount" => intermediate_rep.sandbox_paused_count.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "egressBroker" => intermediate_rep.egress_broker.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     _ => {
                         return std::result::Result::Err(
@@ -3804,6 +3819,7 @@ impl std::str::FromStr for Node {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "sandboxPausedCount missing in Node".to_string())?,
+            egress_broker: intermediate_rep.egress_broker.into_iter().next(),
         })
     }
 }

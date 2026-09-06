@@ -118,12 +118,30 @@ impl LocalTransport {
         })
     }
 
-    /// Opens and closes a connection without sending a header: the
-    /// heartbeat's reachability check.
+    /// The heartbeat's reachability check: an empty frame, which the broker
+    /// refuses and closes. Connecting alone would succeed against a broker
+    /// wedged behind its own backlog; a closed stream is proof that something
+    /// read the frame.
     pub async fn probe(&self) -> Result<(), TransportError> {
         let mut stream = self.connect().await?;
+        let exchange = async {
+            crate::framing::write_frame(&mut stream, &[])
+                .await
+                .map_err(|err| TransportError::Unavailable(format!("probing the broker: {err}")))?;
+            let mut byte = [0u8; 1];
+            match tokio::io::AsyncReadExt::read(&mut stream, &mut byte).await {
+                // The broker read the frame and refused it, either way.
+                Ok(_) => Ok(()),
+                Err(err) => Err(TransportError::Unavailable(format!(
+                    "probing the broker: {err}"
+                ))),
+            }
+        };
+        let answered = tokio::time::timeout(self.connect_timeout, exchange)
+            .await
+            .map_err(|_| TransportError::Unavailable("the broker did not read the probe".into()))?;
         let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
-        Ok(())
+        answered
     }
 }
 

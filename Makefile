@@ -58,7 +58,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-server build-server-release \
 	build-snapshot-image \
 	build-aenv build-aenv-release install-aenv uninstall-aenv \
-	build-ublk install-ublk \
+	build-ublk install-ublk build-egress \
 	fmt clippy check-crate-boundaries \
 	mutants coverage \
 	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
@@ -310,9 +310,12 @@ test-agent-integration: prepare-agent-test-state
 		--test integration \
 		--test orchestrator_integration \
 		-- --skip egress::
+	$(MAKE) build-egress
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
 	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
-	AENV_CONFIG_OVERLAY_PATH="$(CURDIR)/tests/fixtures/egress-embedded-overlay.toml" \
+	AENV_EGRESS_BINARY_PATH="$(DEBUG_PROFILE_DIR)/aenv-egress" \
+	AENV_EGRESS_BROKER_SOCKET_PATH="$(AENV_TEST_STATE_DIR)/run/aenv-egress/broker.sock" \
+	AENV_CONFIG_OVERLAY_PATH="$(CURDIR)/tests/fixtures/egress-local-overlay.toml" \
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p aenv-node \
 		--test integration \
 		egress::
@@ -322,6 +325,11 @@ test-agent-integration: prepare-agent-test-state
 
 build-ublk:
 	$(CARGO) build $(CARGO_PROFILE_FLAG) -p uvm-ublk -p uvm-ublk-daemon
+
+# The broker binary the egress integration tests start as a child. `bin` is
+# what carries the `http` handler, the resolver and the Unix listener.
+build-egress:
+	$(CARGO) build $(CARGO_PROFILE_FLAG) -p aenv-egress --features bin --bin aenv-egress
 
 install-ublk: build-ublk
 	$(AENV_INSTALL_SUDO) mkdir -p "$$(dirname "$(UVM_UBLK_DAEMON_INSTALL_PATH)")"

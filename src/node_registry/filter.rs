@@ -37,9 +37,11 @@ pub fn filter_without_egress_broker(nodes: Vec<RichNode>) -> Vec<RichNode> {
 impl EgressBrokerState {
     /// Whether a sandbox whose rules name the public `http` handler can run
     /// on a node in this state. An embedded broker dispatches only the
-    /// identity-echo handler the node's own integration tests use.
+    /// identity-echo handler the node's own integration tests use, and an
+    /// unrecognized value — what an older node's report decodes to — is not a
+    /// placement target either.
     pub fn can_broker(self) -> bool {
-        matches!(self, Self::RemoteOk)
+        matches!(self, Self::LocalOk)
     }
 }
 
@@ -163,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn the_broker_filter_keeps_only_nodes_that_report_a_reachable_remote_broker() {
+    fn the_broker_filter_keeps_only_nodes_that_report_a_reachable_local_broker() {
         let with = |id: &str, state: EgressBrokerState| {
             with_snapshot(
                 id,
@@ -176,13 +178,33 @@ mod tests {
         };
         let nodes = vec![
             with("embedded", EgressBrokerState::Embedded),
-            with("remote-ok", EgressBrokerState::RemoteOk),
-            with("unreachable", EgressBrokerState::RemoteUnreachable),
+            with("local-ok", EgressBrokerState::LocalOk),
+            with("unreachable", EgressBrokerState::LocalUnreachable),
             with("disabled", EgressBrokerState::Disabled),
             with("legacy", EgressBrokerState::Unspecified),
             no_snapshot("silent"),
         ];
         let result = filter_without_egress_broker(nodes);
-        assert_eq!(ids(&result), vec!["remote-ok"]);
+        assert_eq!(ids(&result), vec!["local-ok"]);
+    }
+
+    #[test]
+    fn a_node_reporting_a_retired_wire_value_is_not_a_placement_target() {
+        // 3 and 4 named the broker Deployment a node reached over TLS.
+        let nodes = vec![3, 4]
+            .into_iter()
+            .map(|wire| {
+                with_snapshot(
+                    "retired",
+                    NodeSnapshot {
+                        status: NodeStatus::Ready as i32,
+                        egress_broker: wire,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+
+        assert!(filter_without_egress_broker(nodes).is_empty());
     }
 }

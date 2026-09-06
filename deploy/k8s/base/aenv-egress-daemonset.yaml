@@ -1,0 +1,147 @@
+# The egress broker: sandboxes with `network.rules` reach their upstreams
+# through it. One per node, reached over a Unix socket in a hostPath both this
+# DaemonSet and `agentenv-node` mount.
+#
+# 🔴 A DaemonSet and not a sidecar of `agentenv-node`. Firecracker runs as a
+# child of `aenv-node`, so replacing that Pod kills every sandbox on the
+# machine; only a separate workload can be rolled without taking the sandboxes
+# with it. That is the whole reason this object exists.
+#
+# It holds the leaf-signing key and the bearer it presents at the api half's
+# resolve endpoint; neither ever reaches a node, and the bearer reads one
+# granted credential at a time rather than a store.
+#
+# Every Secret volume is `optional: true` so the object applies on a cluster
+# that has not created the Secrets yet; the process then refuses to start
+# naming the missing file, which is the loud failure this wants.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: aenv-egress
+  labels:
+    app.kubernetes.io/name: aenv-egress
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aenv-egress
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # One node at a time: a node whose broker is restarting reports
+      # `local_unreachable` and takes no new sandbox with rules, and the
+      # sandboxes already running on it keep their connections until the
+      # broker comes back.
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aenv-egress
+    spec:
+      serviceAccountName: aenv-egress
+      # 🔴 The same class as `agentenv-node`. A node whose broker was evicted
+      # under pressure serves no sandbox with rules, so evicting the broker to
+      # keep the node is not a trade that helps.
+      priorityClassName: system-node-critical
+      nodeSelector:
+        kubernetes.io/os: linux
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+      containers:
+        - name: aenv-egress
+          image: agentenv-egress:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AENV_EGRESS_CONFIG_PATH
+              value: /etc/aenv-egress/config.toml
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: metrics
+              containerPort: 9103
+          # Connecting to the socket is the only readiness that means anything:
+          # the port below says the process is up, not that it is serving.
+          readinessProbe:
+            exec:
+              command:
+                - /aenv-egress
+                - --ready
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          # 🔴 requests == limits. The broker is on the path of every brokered
+          # request on this machine, and a throttled or evicted broker looks to
+          # a sandbox exactly like an upstream that stopped answering. Revisit
+          # these from a load test, not from a guess.
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/aenv-egress/config.toml
+              subPath: aenv-egress.toml
+              readOnly: true
+            - name: egress-ca
+              mountPath: /etc/aenv-egress/ca
+              readOnly: true
+            - name: egress-resolver
+              mountPath: /etc/aenv-egress/resolver
+              readOnly: true
+            # The socket directory `agentenv-node` created and handed to this
+            # Pod's group. Not readOnly: binding the socket writes into it.
+            - name: broker-socket
+              mountPath: /run/aenv-egress
+            - name: api-token
+              mountPath: /var/run/secrets/aenv/api
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: aenv-egress-config
+        # CA certificate and key that sign leaf certificates for intercepted
+        # names. The certificate half is also what nodes hand to guests.
+        - name: egress-ca
+          secret:
+            secretName: egress-ca
+            optional: true
+        # The bearer the broker presents at the resolve endpoint. Named by
+        # [resolver].token_file; an unset [resolver].url leaves it unread.
+        - name: egress-resolver
+          secret:
+            secretName: egress-resolver
+            optional: true
+        # 🔴 The same path `agentenv-node` mounts. `DirectoryOrCreate` is a
+        # fallback only: the node creates it first and gives it this Pod's
+        # group, and a directory kubelet created instead is owned by root with
+        # no group write, which the broker fails to bind in — loudly, naming
+        # the path.
+        - name: broker-socket
+          hostPath:
+            path: /run/aenv-egress
+            type: DirectoryOrCreate
+        # This Pod's own identity at the api half's internal endpoints. The
+        # audience pins it to `aenv-api`: a token minted for the Kubernetes
+        # API is refused there, and this one is refused by the Kubernetes API.
+        - name: api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: aenv-api
+                  expirationSeconds: 3600

@@ -1,0 +1,38 @@
+# The egress broker's configuration for `deploy/docker-compose.yml`, one
+# container per node container. `deploy/k8s/base/config/aenv-egress.toml` is
+# the shape a real deployment uses; this one differs in exactly two ways, both
+# because compose has no Secrets and no hostPath:
+#
+#   * the CA is generated into the socket volume on first start (see the
+#     broker service's entrypoint), so it is a throwaway per stack;
+#   * `peer_uid = 0` and the broker runs as root, because a compose named
+#     volume is created root-owned with no way to hand it to another uid.
+#
+# There is no `[resolver]`: the stack keeps `[secrets].backend = "disabled"`,
+# so the broker has no credential source and every marker answers 502. What
+# this exercises is the socket, the identity frame and the intercept path.
+metrics_listen = "0.0.0.0:9103"
+admission_timeout_ms = 10000
+max_connections = 1024
+per_sandbox_connections = 256
+shutdown_drain_secs = 25
+
+[listen]
+socket_path = "/run/aenv-egress/broker.sock"
+peer_uid = 0
+
+[ca]
+cert_path = "/run/aenv-egress/ca.crt"
+key_path = "/run/aenv-egress/ca.key"
+leaf_ttl_secs = 86400
+cache_capacity = 256
+mints_per_sandbox_per_minute = 60
+
+[upstream]
+# Compose has no Service or Pod CIDR of its own to keep out of reach; the
+# built-in private ranges still apply to everything a guest addresses.
+denied_cidrs = []
+
+[handlers]
+# The identity-echo handler, which is what the node's own smoke path uses.
+echo = true

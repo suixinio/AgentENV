@@ -1,16 +1,14 @@
 # AENV_CONFIG_OVERLAY_PATH for `crates/aenv-node/tests/integration/egress.rs`.
 #
-# Those tests refuse to run in any other broker mode (`require_embedded_broker`
+# Those tests refuse to run in any other broker mode (`require_local_broker`
 # bails, and a `Result::Err` out of a `#[tokio::test]` is a failure, not a
 # skip), while `config/default.toml` ships `mode = "disabled"`. `make
 # test-agent-integration` names this file for the egress invocation only, so
 # every other integration test still sees the shipped config.
 #
-# `embedded` is refused unless node discovery is static with at most one node
-# (`EgressBrokerConfig::validate`); the empty list `config/default.toml`
-# already carries satisfies the count, so only the mode has to change here.
+# `socket_path` is not here: it belongs to the run, not to the tree. The
+# Makefile passes AENV_EGRESS_BROKER_SOCKET_PATH under the per-run test state
+# directory, so two runs on one machine never share a socket. Without it the
+# node refuses to start and says which key is missing.
 [egress_broker]
-mode = "embedded"
-
-[cluster]
-node_discovery_mode = "static"
+mode = "local"

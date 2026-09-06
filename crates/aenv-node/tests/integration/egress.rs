@@ -1,15 +1,21 @@
-//! Brokered egress with the embedded broker: the guest's 443 traffic is
-//! intercepted in its namespace, reaches the broker with the right identity
-//! and original destination, and the listeners follow the policy through
-//! updates, pause/resume and slot reuse.
+//! Brokered egress against a real `aenv-egress` process on this machine: the
+//! guest's 443 traffic is intercepted in its namespace, crosses the node-local
+//! Unix socket with the right identity and original destination, and the
+//! listeners follow the policy through updates, pause/resume and slot reuse.
 //!
-//! The embedded broker dispatches the `echo` identity handler alone, so a
-//! `rules`-derived policy names `echo` here where a public policy names
-//! `http`; everything between the guest and the broker is the production
-//! path. Requires root, `/dev/kvm`, and a node config with
-//! `[egress_broker].mode = "embedded"` and `[cluster].node_discovery_mode =
-//! "static"`. Passthrough of unmatched SNI and policy denial at the broker
-//! need the `http` handler and are covered when it lands.
+//! A `rules`-derived policy names `echo` here where a public policy names
+//! `http`, because the broker these tests start has no credential source;
+//! everything between the guest and the broker is the production path.
+//! Requires root, `/dev/kvm`, `openssl`, a node config with
+//! `[egress_broker].mode = "local"` and a `socket_path`, and a broker binary
+//! at `AENV_EGRESS_BINARY_PATH` — `make test-agent-integration` supplies all
+//! three. Passthrough of unmatched SNI and policy denial at the broker need a
+//! credential source and are covered when it lands.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use aenv_node::cfg::{ConfigManager, EgressBrokerMode};
 use aenv_node::sandbox::network::policy::{DomainRule, EndpointDeclaration, HeaderTransform};
@@ -28,13 +34,152 @@ const FAKE_UPSTREAM: &str = "203.0.113.10";
 const BROKER_LISTENER_IP: &str = "169.254.0.22";
 const ENDPOINT_PORT: u16 = 15432;
 
-fn require_embedded_broker() -> Result<()> {
-    let mode = ConfigManager::global_config().egress_broker.mode;
-    if mode != EgressBrokerMode::Embedded {
+/// Starts the node-local broker these tests relay through, once per process,
+/// and refuses to run against any other broker mode.
+///
+/// The child dies with this process: an orphaned broker would hold the socket
+/// the next run binds.
+fn require_local_broker() -> Result<()> {
+    let egress = &ConfigManager::global_config().egress_broker;
+    if egress.mode != EgressBrokerMode::Local {
         bail!(
-            "these tests need [egress_broker].mode = \"embedded\" in the node config; it is {}",
-            mode.as_str()
+            "these tests need [egress_broker].mode = \"local\" in the node config; it is {}",
+            egress.mode.as_str()
         );
+    }
+    let socket_path = egress
+        .socket_path
+        .clone()
+        .context("[egress_broker].socket_path is required in local mode")?;
+
+    static BROKER: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
+    let broker = BROKER.get_or_init(|| Mutex::new(None));
+    let mut held = broker.lock().expect("the broker handle is poisoned");
+    if held.is_some() {
+        return Ok(());
+    }
+    *held = Some(start_broker(&socket_path)?);
+    Ok(())
+}
+
+fn start_broker(socket_path: &Path) -> Result<Child> {
+    let binary = std::env::var_os("AENV_EGRESS_BINARY_PATH")
+        .map(PathBuf::from)
+        .context("AENV_EGRESS_BINARY_PATH must name an aenv-egress built with --features bin")?;
+    let directory = socket_path
+        .parent()
+        .context("the broker socket path names no directory")?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("create the broker socket directory {directory:?}"))?;
+    let _ = std::fs::remove_file(socket_path);
+
+    let (ca_cert, ca_key) = mint_broker_ca(directory)?;
+    let config_path = directory.join("aenv-egress.toml");
+    let mut config = std::fs::File::create(&config_path)
+        .with_context(|| format!("write the broker config {config_path:?}"))?;
+    write!(
+        config,
+        "admission_timeout_ms = 10000\n\
+         max_connections = 256\n\
+         per_sandbox_connections = 64\n\
+         shutdown_drain_secs = 2\n\
+         \n\
+         [listen]\n\
+         socket_path = {socket_path:?}\n\
+         peer_uid = {uid}\n\
+         \n\
+         [ca]\n\
+         cert_path = {ca_cert:?}\n\
+         key_path = {ca_key:?}\n\
+         \n\
+         [handlers]\n\
+         echo = true\n",
+        uid = unsafe { libc::getuid() },
+    )?;
+    drop(config);
+
+    let mut command = Command::new(&binary);
+    command
+        .arg("--config")
+        .arg(&config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // SAFETY: `prctl` here only arms a signal for this child; the closure
+    // allocates nothing and calls nothing that is not async-signal-safe.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut command, || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("spawn the broker at {binary:?}"))?;
+
+    for _ in 0..100 {
+        if std::os::unix::net::UnixStream::connect(socket_path).is_ok() {
+            return Ok(child);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    bail!("the broker never bound {socket_path:?}");
+}
+
+/// A throwaway CA for the broker to sign intercepted names with. No guest in
+/// these tests terminates TLS, so nothing has to trust it; the broker refuses
+/// to start without one.
+fn mint_broker_ca(directory: &Path) -> Result<(PathBuf, PathBuf)> {
+    let cert = directory.join("ca.crt");
+    let key = directory.join("ca.key");
+    if cert.exists() && key.exists() {
+        return Ok((cert, key));
+    }
+    run_openssl(
+        &[
+            "ecparam",
+            "-name",
+            "prime256v1",
+            "-genkey",
+            "-noout",
+            "-out",
+        ],
+        &key,
+    )?;
+    let status = Command::new("openssl")
+        .args(["req", "-x509", "-new", "-key"])
+        .arg(&key)
+        .args([
+            "-sha256",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=AgentENV Integration Egress CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+            "-out",
+        ])
+        .arg(&cert)
+        .status()
+        .context("run openssl req; these tests need the openssl CLI")?;
+    if !status.success() {
+        bail!("openssl req failed: {status}");
+    }
+    Ok((cert, key))
+}
+
+fn run_openssl(args: &[&str], out: &Path) -> Result<()> {
+    let status = Command::new("openssl")
+        .args(args)
+        .arg(out)
+        .status()
+        .context("run openssl; these tests need the openssl CLI")?;
+    if !status.success() {
+        bail!("openssl {args:?} failed: {status}");
     }
     Ok(())
 }
@@ -61,8 +206,9 @@ fn policy_with_rules(
         base,
         SandboxNetworkEgressPolicy::with_rules(None, deny_out, Some(rules))?,
     );
-    // `with_rules` names the `http` handler, which lives in the broker
-    // process; the embedded dispatcher would answer `unknown_handler`.
+    // `with_rules` names the `http` handler, which needs a credential source;
+    // the broker these tests start has none and would answer 502 on the first
+    // marker, so they relay through `echo` instead.
     for broker in &mut policy.egress.brokers {
         broker.handler = "echo".to_string();
     }
@@ -116,7 +262,7 @@ async fn echo_round_trip(sandbox: &mut FirecrackerSandbox, dest: &str) -> Result
 async fn a_443_connection_reaches_the_broker_with_the_sandbox_identity_and_original_destination(
 ) -> Result<()> {
     common::setup().await;
-    require_embedded_broker()?;
+    require_local_broker()?;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy =
         Some(policy_with_rules(BaseSandboxNetworkPolicy::Default, None)?);
@@ -141,7 +287,7 @@ async fn a_443_connection_reaches_the_broker_with_the_sandbox_identity_and_origi
 #[tokio::test]
 async fn removing_the_rules_stops_the_intercept_and_adding_them_back_restores_it() -> Result<()> {
     common::setup().await;
-    require_embedded_broker()?;
+    require_local_broker()?;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy =
         Some(policy_with_rules(BaseSandboxNetworkPolicy::Default, None)?);
@@ -176,7 +322,7 @@ async fn removing_the_rules_stops_the_intercept_and_adding_them_back_restores_it
 #[tokio::test]
 async fn rules_are_rebuilt_after_pause_and_resume_under_the_new_execution() -> Result<()> {
     common::setup().await;
-    require_embedded_broker()?;
+    require_local_broker()?;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy =
         Some(policy_with_rules(BaseSandboxNetworkPolicy::Default, None)?);
@@ -203,7 +349,7 @@ async fn rules_are_rebuilt_after_pause_and_resume_under_the_new_execution() -> R
 #[tokio::test]
 async fn a_sandbox_without_rules_gets_no_ca_and_no_intercept() -> Result<()> {
     common::setup().await;
-    require_embedded_broker()?;
+    require_local_broker()?;
     let mut sandbox = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
     sandbox.start().await?;
     assert!(brokered_banner(&mut sandbox, FAKE_UPSTREAM)
@@ -224,7 +370,7 @@ async fn a_sandbox_without_rules_gets_no_ca_and_no_intercept() -> Result<()> {
 #[tokio::test]
 async fn a_reused_slot_carries_no_intercept_from_its_previous_tenant() -> Result<()> {
     common::setup().await;
-    require_embedded_broker()?;
+    require_local_broker()?;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy =
         Some(policy_with_rules(BaseSandboxNetworkPolicy::Default, None)?);
@@ -269,7 +415,7 @@ fn policy_with_endpoint(intercept_port: bool) -> Result<SandboxNetworkPolicy> {
 #[tokio::test]
 async fn an_explicit_endpoint_answers_on_its_own_port_and_adds_no_trust_anchor() -> Result<()> {
     common::setup().await;
-    require_embedded_broker()?;
+    require_local_broker()?;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy = Some(policy_with_endpoint(false)?);
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
@@ -303,7 +449,7 @@ async fn an_explicit_endpoint_answers_on_its_own_port_and_adds_no_trust_anchor()
 #[tokio::test]
 async fn intercept_port_captures_any_host_and_stops_when_it_is_turned_off() -> Result<()> {
     common::setup().await;
-    require_embedded_broker()?;
+    require_local_broker()?;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy = Some(policy_with_endpoint(true)?);
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
@@ -340,7 +486,7 @@ async fn intercept_port_captures_any_host_and_stops_when_it_is_turned_off() -> R
 #[tokio::test]
 async fn rules_and_an_intercepting_endpoint_each_keep_their_own_redirect() -> Result<()> {
     common::setup().await;
-    require_embedded_broker()?;
+    require_local_broker()?;
     let mut policy = policy_with_rules(BaseSandboxNetworkPolicy::Default, None)?;
     policy
         .egress

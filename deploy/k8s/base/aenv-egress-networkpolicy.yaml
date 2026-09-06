@@ -1,7 +1,8 @@
 # The broker is the one process that connects to upstreams on a sandbox's
-# behalf from inside the cluster network, so its reach is pinned here: only
-# nodes may talk to it, and it may talk to its credential source, DNS and
-# public port 443.
+# behalf from inside the cluster network, so its reach is pinned here: nothing
+# reaches it over the network at all, and it may talk to its credential
+# source, DNS and public port 443. The node reaches it over a Unix socket,
+# which no NetworkPolicy sees or bounds.
 # The private ranges are excluded from the public egress block for the same
 # reason `[upstream].denied_cidrs` in its config refuses them: a rule must not
 # turn the broker into a path to cluster-internal services.
@@ -28,14 +29,7 @@ spec:
     - Ingress
     - Egress
   ingress:
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: agentenv-node
-      ports:
-        - protocol: TCP
-          port: 8443
-    # Scrapes from anything in the namespace.
+    # Scrapes, and nothing else. The brokered path is the socket.
     - from:
         - podSelector: {}
       ports:

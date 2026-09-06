@@ -20,13 +20,13 @@ default = ["core"]
 # `aenv-node` needs to run the broker in-process; nothing under it terminates
 # or originates TLS.
 core = []
-# The runtime's TLS client to a remote broker. native-tls is openssl on Linux
-# and is already in `aenv-node`'s dependency tree, so enabling this adds no
-# TLS stack to the node.
-remote = ["dep:native-tls", "dep:tokio-native-tls"]
-# Leaf certificate signing, the TLS listener and the `http` handler, openssl
-# only. The broker binary enables it; `make check-crate-boundaries` fails if
-# `aenv-node` does.
+# The node-local Unix socket, both ends: the runtime's transport to the broker
+# on this same machine and the broker's accept loop. No TLS, and the peer's
+# uid is the identity.
+local = ["dep:metrics"]
+# Leaf certificate signing, the upstream TLS client and the `http` handler,
+# openssl only. The broker binary enables it; `make check-crate-boundaries`
+# fails if `aenv-node` does.
 tls = [
     "dep:openssl",
     "dep:native-tls",
@@ -44,7 +44,7 @@ resolver = ["dep:reqwest"]
 bin = [
     "tls",
     "resolver",
-    "remote",
+    "local",
     "dep:clap",
     "dep:confique",
     "dep:tracing-subscriber",
@@ -83,4 +83,5 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 
 [dev-dependencies]
 axum = "0.8"
+tempfile = "3.22.0"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

@@ -459,11 +459,9 @@ How a node reaches the egress broker that serves sandboxes declaring `network.ru
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | string | `"disabled"` | `disabled`, `embedded` (the broker core runs inside `aenv-node`; only valid with `[cluster].node_discovery_mode = "static"` and at most one static node) or `remote` (TLS to the `aenv-egress` deployment). |
-| `endpoint` | string | unset | `host:port` of the broker. Required in `remote` mode. |
-| `ca_cert_path` | path | unset | PEM bundle that verifies the broker's server certificate. Required in `remote` mode. |
-| `guest_ca_cert_path` | path | unset | PEM bundle guests with rules trust for intercepted names, when the leaf-signing CA is a different one. Unset means the two are one CA, which is what a deployment that has not split them has. Splitting is what lets the leaf CA carry name constraints without invalidating the broker's own `*.svc` server certificate. |
-| `shared_secret` | string | unset | HMAC key the identity header is signed with. Required in `remote` mode; inject it from a Secret. |
+| `mode` | string | `"disabled"` | `disabled`, `embedded` (the broker core runs inside `aenv-node`; only valid with `[cluster].node_discovery_mode = "static"` and at most one static node) or `local` (a Unix socket to the `aenv-egress` DaemonSet on this same node). `remote` is refused at startup: the value no longer parses. |
+| `socket_path` | path | unset | The broker's Unix socket on this node. Required in `local` mode; both DaemonSets mount its directory as the same `hostPath`. |
+| `guest_ca_cert_path` | path | unset | PEM bundle guests with rules trust for intercepted names. It is the **root**, not this node's issuer: a sandbox that resumes on another node keeps the trust store it loaded before it moved. |
 | `per_sandbox_conns` | integer | `256` | Concurrent brokered connections one sandbox may hold; excess connections are closed. |
 | `node_conns` | integer | `20000` | Concurrent brokered connections across the node. |
 | `open_timeout_ms` | integer | `3000` | How long the runtime waits for the broker to accept one connection. |
@@ -492,22 +490,19 @@ Values in `aenv-api`'s own PostgreSQL, AES-256-GCM under one master key. Both ke
 The egress broker is a separate process with its own configuration file, not a section of the
 file above: `aenv-egress --config <path>`, defaulting to `$AENV_EGRESS_CONFIG_PATH` and then
 `/etc/aenv-egress/config.toml`. `deploy/k8s/base/config/aenv-egress.toml` is the shipped one, and
-every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.yaml` mounts. See
+every path in it names a volume the broker DaemonSet mounts. See
 [Egress Credentials](../concepts/egress-credentials.md).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `listen` | address | `0.0.0.0:8443` | Where runtimes connect. |
+| `listen.socket_path` | path | `/run/aenv-egress/broker.sock` | The Unix socket the node on this machine connects to. A stale socket from a previous run is unlinked; the bound one is chmodded `0660`. |
+| `listen.peer_uid` | integer | `0` | The uid `aenv-node` runs as. A connection from any other non-root process on this machine is closed before its header is read. It is not a boundary against root, which can reach the socket whatever its mode says. |
 | `metrics_listen` | address | unset | Prometheus scrape address; unset disables the exporter. |
-| `max_skew_ms` | integer | `30000` | Identity headers issued outside this window are refused. |
-| `replay_capacity` | integer | `100000` | Nonces remembered inside the skew window. A full cache refuses rather than forgets. |
-| `admission_timeout_ms` | integer | `10000` | One deadline covering the TLS handshake and the identity frame behind it. Nothing on a connection is authenticated until both are done, so this is what bounds an unauthenticated peer. |
+| `admission_timeout_ms` | integer | `10000` | The deadline for the identity frame. Nothing on a connection is admitted until it arrives, so this is what bounds a peer that has not been admitted yet. |
 | `max_connections` | integer | `4096` | Connections held at once. The excess is closed, not queued. |
+| `per_sandbox_connections` | integer | `256` | Connections one sandbox holds at once, inside the limit above. |
 | `shutdown_drain_secs` | integer | `25` | How long a shutdown lets live sessions finish before it stops waiting. Keep it under the Pod's `terminationGracePeriodSeconds`. |
-| `tls.cert_path` | path | required | The broker's server certificate, the one nodes verify against `[egress_broker].ca_cert_path`. |
-| `tls.key_path` | path | required | Its PKCS#8 PEM private key. |
-| `hmac.key_files` | array of paths | `[]` | Files holding the shared secrets identity headers are signed with. Several files carry a rotation; any of them verifies. |
-| `ca.cert_path` | path | required | The CA that signs leaf certificates for intercepted names. Also what nodes hand guests as `caBundle`. |
+| `ca.cert_path` | path | required | The CA that signs leaf certificates for intercepted names. |
 | `ca.key_path` | path | required | Its private key — the one credential that makes the broker Pod worth attacking. |
 | `ca.leaf_ttl_secs` | integer | `86400` | Lifetime of a minted leaf certificate. |
 | `ca.cache_capacity` | integer | `4096` | How many minted leaves are kept before the oldest name is evicted. |

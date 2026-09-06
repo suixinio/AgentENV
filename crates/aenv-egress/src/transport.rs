@@ -28,8 +28,7 @@ pub trait BrokerTransport: Send + Sync {
     async fn open(&self, header: IdentityHeader) -> Result<Box<dyn AsyncStream>, TransportError>;
 }
 
-/// Runs the dispatcher in this process over an in-memory pipe. The header
-/// never leaves the process, so it is not signed or replay-checked here.
+/// Runs the dispatcher in this process over an in-memory pipe.
 pub struct EmbeddedTransport {
     dispatcher: Arc<Dispatcher>,
     buffer: usize,
@@ -72,52 +71,22 @@ impl BrokerTransport for EmbeddedTransport {
     }
 }
 
-/// The runtime's TLS client to the `aenv-egress` deployment: verifies the
-/// broker against the cluster CA, signs the header with the shared key and
-/// hands the stream back once the broker acknowledged it.
-#[cfg(feature = "remote")]
-pub struct RemoteTransport {
-    endpoint: String,
-    server_name: String,
-    connector: tokio_native_tls::TlsConnector,
-    key: zeroize::Zeroizing<Vec<u8>>,
+/// The runtime's way to the broker on this same node: a Unix socket the
+/// broker binds and only the node's uid may open. The header travels
+/// unauthenticated because the socket's peer credentials are the identity.
+#[cfg(feature = "local")]
+pub struct LocalTransport {
+    socket_path: std::path::PathBuf,
     connect_timeout: std::time::Duration,
 }
 
-#[cfg(feature = "remote")]
-impl RemoteTransport {
-    /// `endpoint` is `host:port`; the broker certificate is verified for
-    /// `host` unless `server_name` overrides it. `ca_pem` may hold several
-    /// certificates for a rotation.
-    pub fn new(
-        endpoint: &str,
-        server_name: Option<&str>,
-        ca_pem: &[u8],
-        shared_secret: &[u8],
-    ) -> anyhow::Result<Self> {
-        let host = endpoint
-            .rsplit_once(':')
-            .map(|(host, _)| host.trim_matches(['[', ']']))
-            .filter(|host| !host.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("egress broker endpoint must be host:port"))?;
-        let mut builder = native_tls::TlsConnector::builder();
-        builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
-        builder.disable_built_in_roots(true);
-        let mut added = 0;
-        for block in pem_blocks(ca_pem) {
-            builder.add_root_certificate(native_tls::Certificate::from_pem(block.as_bytes())?);
-            added += 1;
-        }
-        if added == 0 {
-            anyhow::bail!("egress broker CA bundle holds no certificate");
-        }
-        Ok(Self {
-            endpoint: endpoint.to_string(),
-            server_name: server_name.unwrap_or(host).to_string(),
-            connector: tokio_native_tls::TlsConnector::from(builder.build()?),
-            key: zeroize::Zeroizing::new(shared_secret.to_vec()),
+#[cfg(feature = "local")]
+impl LocalTransport {
+    pub fn new(socket_path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            socket_path: socket_path.into(),
             connect_timeout: std::time::Duration::from_secs(5),
-        })
+        }
     }
 
     pub fn with_connect_timeout(mut self, timeout: std::time::Duration) -> Self {
@@ -125,86 +94,61 @@ impl RemoteTransport {
         self
     }
 
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+    pub fn socket_path(&self) -> &std::path::Path {
+        &self.socket_path
     }
 
-    async fn connect(
-        &self,
-    ) -> Result<tokio_native_tls::TlsStream<tokio::net::TcpStream>, TransportError> {
-        let tcp = tokio::time::timeout(
+    async fn connect(&self) -> Result<tokio::net::UnixStream, TransportError> {
+        tokio::time::timeout(
             self.connect_timeout,
-            tokio::net::TcpStream::connect(&self.endpoint),
+            tokio::net::UnixStream::connect(&self.socket_path),
         )
         .await
         .map_err(|_| {
-            TransportError::Unavailable(format!("connecting to {} timed out", self.endpoint))
+            TransportError::Unavailable(format!(
+                "connecting to {} timed out",
+                self.socket_path.display()
+            ))
         })?
         .map_err(|err| {
-            TransportError::Unavailable(format!("connecting to {}: {err}", self.endpoint))
-        })?;
-        tokio::time::timeout(
-            self.connect_timeout,
-            self.connector.connect(&self.server_name, tcp),
-        )
-        .await
-        .map_err(|_| TransportError::Unavailable("tls handshake with the broker timed out".into()))?
-        .map_err(|err| TransportError::Unavailable(format!("tls handshake with the broker: {err}")))
+            TransportError::Unavailable(format!(
+                "connecting to {}: {err}",
+                self.socket_path.display()
+            ))
+        })
     }
 
-    /// A TLS handshake and nothing else: the heartbeat's reachability check.
+    /// Opens and closes a connection without sending a header: the
+    /// heartbeat's reachability check.
     pub async fn probe(&self) -> Result<(), TransportError> {
-        let mut tls = self.connect().await?;
-        let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls).await;
+        let mut stream = self.connect().await?;
+        let _ = tokio::io::AsyncWriteExt::shutdown(&mut stream).await;
         Ok(())
     }
 }
 
-#[cfg(feature = "remote")]
+#[cfg(feature = "local")]
 #[async_trait]
-impl BrokerTransport for RemoteTransport {
-    async fn open(
-        &self,
-        mut header: IdentityHeader,
-    ) -> Result<Box<dyn AsyncStream>, TransportError> {
-        header.sign(&self.key);
-        let mut tls = self.connect().await?;
-        crate::framing::write_json(&mut tls, &header)
+impl BrokerTransport for LocalTransport {
+    async fn open(&self, header: IdentityHeader) -> Result<Box<dyn AsyncStream>, TransportError> {
+        let mut stream = self.connect().await?;
+        crate::framing::write_json(&mut stream, &header)
             .await
             .map_err(|err| {
                 TransportError::Unavailable(format!("sending the identity header: {err}"))
             })?;
-        let ack: crate::header::Ack = crate::framing::read_json(&mut tls).await.map_err(|err| {
-            TransportError::Unavailable(format!("reading the broker's answer: {err}"))
-        })?;
+        let ack: crate::header::Ack =
+            crate::framing::read_json(&mut stream)
+                .await
+                .map_err(|err| {
+                    TransportError::Unavailable(format!("reading the broker's answer: {err}"))
+                })?;
         if ack.accepted {
-            Ok(Box::new(tls))
+            Ok(Box::new(stream))
         } else {
             Err(TransportError::Rejected {
                 reason: ack.reason.unwrap_or_else(|| "unspecified".into()),
             })
         }
     }
-}
-
-/// Splits a PEM bundle into its certificate blocks.
-pub fn pem_blocks(bundle: &[u8]) -> Vec<String> {
-    let text = String::from_utf8_lossy(bundle);
-    let mut blocks = Vec::new();
-    let mut current: Option<String> = None;
-    for line in text.lines() {
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            current = Some(String::new());
-        }
-        if let Some(block) = current.as_mut() {
-            block.push_str(line);
-            block.push('\n');
-        }
-        if line.starts_with("-----END CERTIFICATE-----") {
-            if let Some(block) = current.take() {
-                blocks.push(block);
-            }
-        }
-    }
-    blocks
 }

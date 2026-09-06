@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use aenv_egress::credential::NoCredentials;
 use aenv_egress::handlers::echo::IdentityEchoHandler;
-use aenv_egress::transport::RemoteTransport;
+use aenv_egress::transport::LocalTransport;
 use aenv_egress::{
     BrokerDenyList, BrokerTransport, Dispatcher, EgressPolicySummary, EmbeddedTransport,
     IdentityHeader, TransportError, UpstreamGuard,
@@ -56,13 +56,13 @@ pub struct EgressRuntime {
     per_sandbox_conns: usize,
     open_timeout: Duration,
     ca_bundle: Option<String>,
-    /// Whether the last probe of a remote broker succeeded; always true for
-    /// the embedded transport.
+    /// Whether the last probe of the node-local broker succeeded; always true
+    /// for the embedded transport.
     reachable: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// How often a remote broker is probed for the heartbeat.
-const REMOTE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// How often the node-local broker is probed for the heartbeat.
+const LOCAL_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 impl EgressRuntime {
     /// The process-wide runtime, or `None` when `[egress_broker].mode` is
@@ -103,48 +103,31 @@ impl EgressRuntime {
                 );
                 Arc::new(EmbeddedTransport::new(dispatcher))
             }
-            EgressBrokerMode::Remote => {
-                let endpoint = egress
-                    .endpoint
-                    .as_deref()
-                    .context("egress_broker.endpoint is required in remote mode")?;
-                let ca_path = egress
-                    .ca_cert_path
+            EgressBrokerMode::Local => {
+                let socket_path = egress
+                    .socket_path
                     .as_ref()
-                    .context("egress_broker.ca_cert_path is required in remote mode")?;
-                let ca_pem = std::fs::read(ca_path).with_context(|| {
-                    format!("read egress_broker.ca_cert_path {}", ca_path.display())
-                })?;
-                let secret = egress
-                    .shared_secret
-                    .as_deref()
-                    .context("egress_broker.shared_secret is required in remote mode")?;
+                    .context("egress_broker.socket_path is required in local mode")?;
                 Arc::new(
-                    RemoteTransport::new(endpoint, None, &ca_pem, secret.trim().as_bytes())
-                        .context("configure the remote broker transport")?
+                    LocalTransport::new(socket_path)
                         .with_connect_timeout(Duration::from_millis(egress.open_timeout_ms)),
                 )
             }
         };
-        // Guests trust the CA that signs intercepted-name leaves, which is the
-        // same CA that verifies the broker's server certificate only when the
-        // operator has not split them.
-        let (guest_ca_key, guest_ca_path) = match egress.guest_ca_cert_path.as_ref() {
-            Some(path) => ("egress_broker.guest_ca_cert_path", Some(path)),
-            None => ("egress_broker.ca_cert_path", egress.ca_cert_path.as_ref()),
-        };
-        let ca_bundle = match guest_ca_path {
-            Some(path) => Some(
-                std::fs::read_to_string(path)
-                    .with_context(|| format!("read {guest_ca_key} {}", path.display()))?,
-            ),
+        // Guests trust the root that signs the intercepted-name chain, not
+        // this node's own issuer: a sandbox that resumes elsewhere keeps the
+        // trust store it loaded before it moved.
+        let ca_bundle = match egress.guest_ca_cert_path.as_ref() {
+            Some(path) => Some(std::fs::read_to_string(path).with_context(|| {
+                format!("read egress_broker.guest_ca_cert_path {}", path.display())
+            })?),
             None => None,
         };
         let reachable = Arc::new(std::sync::atomic::AtomicBool::new(
             egress.mode == EgressBrokerMode::Embedded,
         ));
-        if egress.mode == EgressBrokerMode::Remote {
-            Self::spawn_remote_probe(Arc::clone(&reachable), egress);
+        if egress.mode == EgressBrokerMode::Local {
+            Self::spawn_local_probe(Arc::clone(&reachable), egress);
         }
         info!(mode = egress.mode.as_str(), "egress broker runtime ready");
         Ok(Some(Self {
@@ -160,13 +143,13 @@ impl EgressRuntime {
     }
 
     // Runs on its own thread and runtime so `global()` works from any thread.
-    fn spawn_remote_probe(
+    fn spawn_local_probe(
         reachable: Arc<std::sync::atomic::AtomicBool>,
         egress: &crate::cfg::EgressBrokerConfig,
     ) {
-        let endpoint = egress.endpoint.clone().unwrap_or_default();
-        let ca_path = egress.ca_cert_path.clone();
-        let secret = egress.shared_secret.clone().unwrap_or_default();
+        let Some(socket_path) = egress.socket_path.clone() else {
+            return;
+        };
         let timeout = Duration::from_millis(egress.open_timeout_ms);
         let spawned = std::thread::Builder::new()
             .name("egress-broker-probe".into())
@@ -179,29 +162,22 @@ impl EgressRuntime {
                     return;
                 };
                 runtime.block_on(async move {
-                    let Some(ca_pem) = ca_path.and_then(|path| std::fs::read(path).ok()) else {
-                        return;
-                    };
-                    let Ok(probe) =
-                        RemoteTransport::new(&endpoint, None, &ca_pem, secret.trim().as_bytes())
-                    else {
-                        return;
-                    };
-                    let probe = probe.with_connect_timeout(timeout);
+                    let probe = LocalTransport::new(&socket_path).with_connect_timeout(timeout);
+                    let socket_path = socket_path.display().to_string();
                     loop {
                         let ok = probe.probe().await.is_ok();
                         let was = reachable.swap(ok, Ordering::Relaxed);
                         if was != ok {
                             if ok {
-                                info!(endpoint, "egress broker reachable");
+                                info!(socket_path, "egress broker reachable");
                             } else {
                                 warn!(
-                                    endpoint,
+                                    socket_path,
                                     "egress broker unreachable; brokered connections fail fast"
                                 );
                             }
                         }
-                        tokio::time::sleep(REMOTE_PROBE_INTERVAL).await;
+                        tokio::time::sleep(LOCAL_PROBE_INTERVAL).await;
                     }
                 });
             });
@@ -215,7 +191,7 @@ impl EgressRuntime {
         match self.mode {
             EgressBrokerMode::Disabled => EgressBrokerState::Disabled,
             EgressBrokerMode::Embedded => EgressBrokerState::Embedded,
-            EgressBrokerMode::Remote => {
+            EgressBrokerMode::Local => {
                 if self.reachable.load(Ordering::Relaxed) {
                     EgressBrokerState::RemoteOk
                 } else {
@@ -225,7 +201,7 @@ impl EgressRuntime {
         }
     }
 
-    /// False while a remote broker fails its probe; the accept loop then
+    /// False while the node-local broker fails its probe; the accept loop then
     /// closes new connections at once instead of waiting on the open timeout.
     pub fn is_reachable(&self) -> bool {
         self.reachable.load(Ordering::Relaxed)
@@ -240,7 +216,7 @@ impl EgressRuntime {
     /// configuration a node must carry to serve one.
     pub fn required() -> Result<Arc<Self>> {
         Self::global().context(
-            "the sandbox declares network rules but this node has no egress broker; set [egress_broker].mode (AENV_EGRESS_BROKER_MODE) to \"remote\" and point endpoint, ca_cert_path and shared_secret at aenv-egress",
+            "the sandbox declares network rules but this node has no egress broker; set [egress_broker].mode (AENV_EGRESS_BROKER_MODE) to \"local\" and point egress_broker.socket_path at the aenv-egress socket on this node",
         )
     }
 
@@ -267,7 +243,7 @@ pub fn mode_serves_handler(mode: EgressBrokerMode, handler: &str) -> bool {
     match mode {
         EgressBrokerMode::Disabled => false,
         EgressBrokerMode::Embedded => handler == IdentityEchoHandler::NAME,
-        EgressBrokerMode::Remote => true,
+        EgressBrokerMode::Local => true,
     }
 }
 
@@ -532,8 +508,6 @@ async fn relay(
         egress: ctx.egress.clone(),
         guest_addr: Some(peer),
         issued_at_unix_ms: IdentityHeader::now_unix_ms(),
-        nonce: IdentityHeader::fresh_nonce(),
-        hmac: String::new(),
     };
     let opened =
         tokio::time::timeout(ctx.runtime.open_timeout, ctx.runtime.transport.open(header)).await;
@@ -690,7 +664,7 @@ mod tests {
         let handler = policy.egress.brokers[0].handler.as_str();
 
         assert!(!mode_serves_handler(EgressBrokerMode::Embedded, handler));
-        assert!(mode_serves_handler(EgressBrokerMode::Remote, handler));
+        assert!(mode_serves_handler(EgressBrokerMode::Local, handler));
         assert!(!mode_serves_handler(EgressBrokerMode::Disabled, handler));
         assert!(mode_serves_handler(
             EgressBrokerMode::Embedded,

@@ -1,6 +1,6 @@
-//! `aenv-egress`: the broker deployment. Terminates the runtime's TLS,
-//! verifies identity headers, serves the `http` handler (and, when asked,
-//! the `tcp` echo handler) and resolves credentials one grant at a time
+//! `aenv-egress`: the broker DaemonSet. Accepts the node's connections on a
+//! Unix socket both share, serves the `http` handler (and, when asked, the
+//! `tcp` and `postgres` ones) and resolves credentials one grant at a time
 //! against the endpoint `[resolver].url` names.
 
 use std::net::SocketAddr;
@@ -34,31 +34,25 @@ struct Args {
 
 #[derive(Config)]
 struct EgressConfig {
-    /// Where the runtimes connect.
-    #[config(default = "0.0.0.0:8443", env = "AENV_EGRESS_LISTEN")]
-    listen: SocketAddr,
+    #[config(nested)]
+    listen: ListenConfig,
     /// Prometheus scrape address; unset disables the exporter.
     #[config(env = "AENV_EGRESS_METRICS_LISTEN")]
     metrics_listen: Option<SocketAddr>,
-    #[config(default = 30_000u64, env = "AENV_EGRESS_MAX_SKEW_MS")]
-    max_skew_ms: u64,
-    #[config(default = 100_000usize, env = "AENV_EGRESS_REPLAY_CAPACITY")]
-    replay_capacity: usize,
-    /// One deadline for the TLS handshake and the identity frame behind it;
-    /// nothing on the connection is authenticated until both are done.
+    /// The deadline for the identity frame; nothing on the connection is
+    /// admitted until it arrives.
     #[config(default = 10_000u64, env = "AENV_EGRESS_ADMISSION_TIMEOUT_MS")]
     admission_timeout_ms: u64,
     /// Connections held at once; the excess is closed, not queued.
     #[config(default = 4_096u32, env = "AENV_EGRESS_MAX_CONNECTIONS")]
     max_connections: u32,
+    /// Connections one sandbox holds at once, inside the limit above.
+    #[config(default = 256u32, env = "AENV_EGRESS_PER_SANDBOX_CONNECTIONS")]
+    per_sandbox_connections: u32,
     /// How long a shutdown lets live sessions finish before it stops waiting.
     /// Keep it under the pod's termination grace period.
     #[config(default = 25u64, env = "AENV_EGRESS_SHUTDOWN_DRAIN_SECS")]
     shutdown_drain_secs: u64,
-    #[config(nested)]
-    tls: TlsConfig,
-    #[config(nested)]
-    hmac: HmacConfig,
     #[config(nested)]
     ca: CaConfig,
     #[config(nested)]
@@ -69,22 +63,19 @@ struct EgressConfig {
     handlers: HandlersConfig,
 }
 
-/// The server certificate the runtimes verify, signed by the cluster CA.
+/// The node-local socket the runtime on this machine connects to, and whose
+/// uid the broker requires of every peer.
 #[derive(Config)]
-struct TlsConfig {
-    #[config(env = "AENV_EGRESS_TLS_CERT_PATH")]
-    cert_path: PathBuf,
-    /// PKCS#8 PEM.
-    #[config(env = "AENV_EGRESS_TLS_KEY_PATH")]
-    key_path: PathBuf,
-}
-
-/// Files holding the shared secrets runtimes sign identity headers with.
-/// Several files carry a rotation; any of them verifies.
-#[derive(Config)]
-struct HmacConfig {
-    #[config(default = [])]
-    key_files: Vec<PathBuf>,
+struct ListenConfig {
+    #[config(
+        default = "/run/aenv-egress/broker.sock",
+        env = "AENV_EGRESS_SOCKET_PATH"
+    )]
+    socket_path: PathBuf,
+    /// The uid `aenv-node` runs as. It closes a connection from any other
+    /// non-root process on this machine; it is not a boundary against root.
+    #[config(default = 0u32, env = "AENV_EGRESS_PEER_UID")]
+    peer_uid: u32,
 }
 
 /// The CA that signs leaf certificates for intercepted names.
@@ -195,16 +186,6 @@ async fn main() -> Result<()> {
             .context("install the prometheus exporter")?;
     }
 
-    let keys: Vec<Vec<u8>> = config
-        .hmac
-        .key_files
-        .iter()
-        .map(|path| read_secret_file(path, "hmac key"))
-        .collect::<Result<_>>()?;
-    if keys.is_empty() {
-        bail!("hmac.key_files names no key; every identity header would be refused");
-    }
-
     let ca_cert = std::fs::read(&config.ca.cert_path)
         .with_context(|| format!("read ca.cert_path {}", config.ca.cert_path.display()))?;
     let ca_key = read_secret_file(&config.ca.key_path, "ca key")?;
@@ -219,18 +200,6 @@ async fn main() -> Result<()> {
             },
         )
         .context("load the leaf signing CA")?,
-    );
-
-    let server_cert = std::fs::read(&config.tls.cert_path)
-        .with_context(|| format!("read tls.cert_path {}", config.tls.cert_path.display()))?;
-    let server_key = read_secret_file(&config.tls.key_path, "tls key")?;
-    let identity = native_tls::Identity::from_pkcs8(&server_cert, &server_key)
-        .context("tls.cert_path and tls.key_path do not form a PKCS#8 identity")?;
-    let acceptor = tokio_native_tls::TlsAcceptor::from(
-        native_tls::TlsAcceptor::builder(identity)
-            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-            .build()
-            .context("build the server tls acceptor")?,
     );
 
     let creds: Arc<dyn CredentialSource> = match config.resolver.url.as_deref() {
@@ -294,21 +263,17 @@ async fn main() -> Result<()> {
         Options {
             admission_timeout: Duration::from_millis(config.admission_timeout_ms),
             max_connections: config.max_connections,
+            per_sandbox_connections: config.per_sandbox_connections,
             shutdown_drain: Duration::from_secs(config.shutdown_drain_secs),
-            ..Options::new(
-                keys,
-                Duration::from_millis(config.max_skew_ms),
-                config.replay_capacity,
-            )
+            expected_peer_uid: Some(config.listen.peer_uid),
         },
         Arc::new(dispatcher),
     ));
 
-    let listener = tokio::net::TcpListener::bind(config.listen)
-        .await
-        .with_context(|| format!("bind {}", config.listen))?;
+    let listener = bind_socket(&config.listen.socket_path)?;
     info!(
-        listen = %config.listen,
+        socket_path = %config.listen.socket_path.display(),
+        peer_uid = config.listen.peer_uid,
         handlers = ?runtime.dispatcher().handler_names().collect::<Vec<_>>(),
         "aenv-egress listening"
     );
@@ -322,5 +287,32 @@ async fn main() -> Result<()> {
         }
         info!("shutting down");
     };
-    runtime::run(runtime, listener, acceptor, shutdown).await
+    let result = runtime::run(runtime, listener, shutdown).await;
+    let _ = std::fs::remove_file(&config.listen.socket_path);
+    result
+}
+
+/// Binds the node-local socket, replacing a stale one a previous run left
+/// behind. The mode lets the node's uid connect and nobody else's.
+fn bind_socket(socket_path: &PathBuf) -> Result<tokio::net::UnixListener> {
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create the socket directory {}", parent.display()))?;
+    }
+    match std::fs::remove_file(socket_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("remove the stale socket at {}", socket_path.display()))
+        }
+    }
+    let listener = tokio::net::UnixListener::bind(socket_path)
+        .with_context(|| format!("bind {}", socket_path.display()))?;
+    std::fs::set_permissions(
+        socket_path,
+        std::os::unix::fs::PermissionsExt::from_mode(0o660),
+    )
+    .with_context(|| format!("set the mode of {}", socket_path.display()))?;
+    Ok(listener)
 }

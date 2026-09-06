@@ -70,9 +70,8 @@ mod tests {
     use crate::header::test_support::sample_header;
 
     #[test]
-    fn the_context_is_the_header_minus_its_authentication_and_observability_fields() {
-        let mut header = sample_header();
-        header.sign(b"key");
+    fn the_context_is_the_header_minus_its_observability_fields() {
+        let header = sample_header();
         let ctx = ConnCtx::from(&header);
 
         assert_eq!(ctx.sandbox_id, header.sandbox_id);
@@ -85,8 +84,7 @@ mod tests {
         assert_eq!(ctx.egress, header.egress);
 
         let printed = format!("{ctx:?}");
-        assert!(!printed.contains(&header.hmac));
-        assert!(!printed.contains("nonce"));
         assert!(!printed.contains("guest_addr"));
+        assert!(!printed.contains("issued_at"));
     }
 }

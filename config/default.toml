@@ -157,15 +157,12 @@ peer_discovery_refresh_interval_secs = 5
 # placed here), "embedded" (the broker core runs inside aenv-node with the
 # echo handler only, for this crate's integration tests; single
 # static node, and sandboxes naming any other handler are not placed here
-# either) or "remote" (TLS to the aenv-egress deployment; endpoint,
-# ca_cert_path and shared_secret are then required).
+# either) or "local" (a Unix socket to the aenv-egress DaemonSet on this same
+# node; socket_path is then required).
 mode = "disabled"
-# endpoint = "aenv-egress.aenv.svc:8443"
-# ca_cert_path = "/etc/aenv/egress-transport-ca/ca.crt"
-# The CA guests trust for intercepted names, when the operator has split it
-# from the one above. Unset means the two are one CA.
+# socket_path = "/run/aenv-egress/broker.sock"
+# The root guests with rules trust for intercepted names.
 # guest_ca_cert_path = "/etc/aenv/egress-ca/ca.crt"
-# shared_secret = "replace-with-the-hmac-key-from-the-egress-hmac secret"
 # Concurrent brokered connections per sandbox and per node; excess is closed.
 per_sandbox_conns = 256
 node_conns = 20000

@@ -248,28 +248,22 @@ spec:
                   key: SANDBOX_PROXY_DOMAINS
                   optional: true
             # How this node reaches the egress broker for sandboxes with
-            # network.rules; `disabled` until the egress Secrets exist. Every
-            # reference is optional so the DaemonSet applies before they do.
+            # network.rules; `disabled` until the broker DaemonSet is up. Every
+            # reference is optional so this DaemonSet applies before it does.
             - name: AENV_EGRESS_BROKER_MODE
               valueFrom:
                 configMapKeyRef:
                   name: egress-broker-config
                   key: AENV_EGRESS_BROKER_MODE
                   optional: true
-            - name: AENV_EGRESS_BROKER_ENDPOINT
+            - name: AENV_EGRESS_BROKER_SOCKET_PATH
               valueFrom:
                 configMapKeyRef:
                   name: egress-broker-config
-                  key: AENV_EGRESS_BROKER_ENDPOINT
+                  key: AENV_EGRESS_BROKER_SOCKET_PATH
                   optional: true
-            - name: AENV_EGRESS_BROKER_CA_CERT_PATH
+            - name: AENV_EGRESS_BROKER_GUEST_CA_CERT_PATH
               value: /etc/agentenv/egress/ca.crt
-            - name: AENV_EGRESS_BROKER_SHARED_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: egress-hmac
-                  key: key
-                  optional: true
             # Not read by AgentENV's own code — it is what makes `regctl`, shelled
             # out to by every registry call this process makes, look under
             # `/root/.regctl/config.json` for the `regctl-config` volume mounted

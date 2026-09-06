@@ -1,29 +1,26 @@
 # The egress broker's configuration, mounted from the `aenv-egress-config`
-# ConfigMap. Paths name the Secret volumes aenv-egress-deployment.yaml mounts.
-listen = "0.0.0.0:8443"
+# ConfigMap. Paths name the volumes the broker DaemonSet mounts.
 metrics_listen = "0.0.0.0:9103"
-# Identity headers older or newer than this are refused.
-max_skew_ms = 30000
-# Nonces remembered inside the skew window; size it for the connections
-# expected in one window, a full cache refuses rather than forgets.
-replay_capacity = 100000
-# One deadline for the TLS handshake and the identity frame behind it. Nothing
-# on a connection is authenticated until both are done, so this bounds the work
-# an unauthenticated peer can hold open.
+# The deadline for the identity frame. Nothing on a connection is admitted
+# until it arrives, so this bounds the work an unadmitted peer can hold open.
 admission_timeout_ms = 10000
 # Connections held at once; the excess is closed at accept, not queued.
 max_connections = 4096
+# Connections one sandbox holds at once, inside the limit above.
+per_sandbox_connections = 256
 # How long SIGTERM lets live sessions finish before the process stops waiting.
 # Keep it under the pod's termination grace period, 30s by default.
 shutdown_drain_secs = 25
 
-[tls]
-cert_path = "/etc/aenv-egress/server/tls.crt"
-key_path = "/etc/aenv-egress/server/tls.key"
-
-[hmac]
-# Several files carry a rotation; any of them verifies a header.
-key_files = ["/etc/aenv-egress/hmac/key"]
+[listen]
+# The node-local socket aenv-node connects to. Both DaemonSets mount the
+# directory as the same hostPath, and the broker recreates the socket on every
+# start.
+socket_path = "/run/aenv-egress/broker.sock"
+# The uid aenv-node runs as. A connection from any other non-root process on
+# this machine is closed before its header is read; this is not a boundary
+# against root, which can reach the socket whatever its mode says.
+peer_uid = 0
 
 [ca]
 cert_path = "/etc/aenv-egress/ca/ca.crt"

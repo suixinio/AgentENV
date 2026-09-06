@@ -688,7 +688,6 @@ mod tests {
 
     mod broker {
         use std::sync::Arc;
-        use std::time::Duration;
 
         use http_body_util::Empty;
         use hyper::Request;
@@ -704,10 +703,8 @@ mod tests {
         use crate::policy::BrokerDenyList;
         use crate::runtime::{Options, Runtime};
         use crate::tls::{generate_test_ca, SignerOptions};
-        use crate::transport::{BrokerTransport, RemoteTransport};
+        use crate::transport::{BrokerTransport, LocalTransport};
         use crate::Dispatcher;
-
-        const KEY: &[u8] = b"broker-test-key";
 
         struct FixedResolver(std::net::IpAddr);
 
@@ -719,8 +716,9 @@ mod tests {
         }
 
         struct Broker {
-            transport: RemoteTransport,
+            transport: LocalTransport,
             ca_pem: Vec<u8>,
+            _dir: tempfile::TempDir,
         }
 
         async fn start_broker(
@@ -751,27 +749,30 @@ mod tests {
                     .with_handler(Arc::new(HttpHandler::new(Arc::clone(&signer)).unwrap()))
                     .with_handler(Arc::new(IdentityEchoHandler)),
             );
-            let runtime = Arc::new(Runtime::new(
-                Options::new(vec![KEY.to_vec()], Duration::from_secs(30), 1024),
-                dispatcher,
-            ));
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            let server_leaf = signer.leaf_for("localhost", "broker").unwrap();
+            let runtime = Arc::new(Runtime::new(Options::default(), dispatcher));
+            let dir = tempfile::tempdir().unwrap();
+            let socket_path = dir.path().join("broker.sock");
+            let listener = tokio::net::UnixListener::bind(&socket_path).unwrap();
             tokio::spawn(crate::runtime::run(
                 runtime,
                 listener,
-                server_leaf.acceptor.clone(),
                 std::future::pending(),
             ));
-            let transport =
-                RemoteTransport::new(&addr.to_string(), Some("localhost"), &ca_pem, KEY).unwrap();
+            let transport = LocalTransport::new(&socket_path);
             let policy = EgressPolicySummary {
                 allow_internet: !closed,
                 allowed_cidrs: vec![],
                 denied_cidrs: vec![],
             };
-            (Broker { transport, ca_pem }, rules, policy)
+            (
+                Broker {
+                    transport,
+                    ca_pem,
+                    _dir: dir,
+                },
+                rules,
+                policy,
+            )
         }
 
         fn header(
@@ -786,13 +787,12 @@ mod tests {
                 egress,
                 original_dst,
                 issued_at_unix_ms: IdentityHeader::now_unix_ms(),
-                nonce: IdentityHeader::fresh_nonce(),
                 ..sample_header()
             }
         }
 
         #[tokio::test]
-        async fn the_remote_transport_reaches_the_echo_handler_over_tls() {
+        async fn the_local_transport_reaches_the_echo_handler_over_the_socket() {
             let (broker, _, policy) = start_broker(serde_json::json!({}), false).await;
             let stream = broker
                 .transport
@@ -809,44 +809,20 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_tampered_key_is_rejected_by_the_remote_broker() {
+        async fn a_header_of_another_version_is_rejected_by_the_broker() {
             let (broker, _, policy) = start_broker(serde_json::json!({}), false).await;
-            let wrong = RemoteTransport::new(
-                &broker_addr(&broker).await,
-                Some("localhost"),
-                &broker.ca_pem,
-                b"another-key",
-            )
-            .unwrap();
-            let err = wrong
-                .open(header("echo", serde_json::json!({}), policy, None))
-                .await
-                .err()
-                .unwrap();
-            assert!(
-                matches!(err, crate::transport::TransportError::Rejected { reason } if reason == "bad_mac")
-            );
-        }
+            let stale = IdentityHeader {
+                v: crate::header::IDENTITY_HEADER_VERSION - 1,
+                ..header("echo", serde_json::json!({}), policy, None)
+            };
 
-        async fn broker_addr(broker: &Broker) -> String {
-            // The transport keeps the endpoint private; probe through it and
-            // read the address back off a fresh header round trip instead.
-            let stream = broker
-                .transport
-                .open(header(
-                    "echo",
-                    serde_json::json!({}),
-                    EgressPolicySummary {
-                        allow_internet: true,
-                        allowed_cidrs: vec![],
-                        denied_cidrs: vec![],
-                    },
-                    None,
-                ))
-                .await
-                .unwrap();
-            drop(stream);
-            broker.transport.endpoint().to_string()
+            let err = broker.transport.open(stale).await.err().unwrap();
+
+            assert!(matches!(
+                err,
+                crate::transport::TransportError::Rejected { reason }
+                    if reason == crate::header::UNSUPPORTED_VERSION_REASON
+            ));
         }
 
         async fn terminated_request(

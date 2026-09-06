@@ -442,13 +442,13 @@ configMapGenerator:
       - config/aenv-egress.toml
   # How nodes reach the broker. `disabled` ships: a node that reports no
   # broker takes no sandbox with rules, and creates with rules answer 503
-  # until this is flipped to `remote` and the DaemonSet is rolled. The
-  # endpoint is the Service above; the CA and HMAC key come from the
-  # `egress-ca` and `egress-hmac` Secrets the DaemonSet mounts optionally.
+  # until this is flipped to `local` and the DaemonSet is rolled. The socket
+  # is the shared hostPath both DaemonSets mount; the root guests trust for
+  # intercepted names comes from the `egress-ca` Secret, mounted optionally.
   - name: egress-broker-config
     literals:
       - AENV_EGRESS_BROKER_MODE=disabled
-      - AENV_EGRESS_BROKER_ENDPOINT=aenv-egress:8443
+      - AENV_EGRESS_BROKER_SOCKET_PATH=/run/aenv-egress/broker.sock
   # Where the api half keeps secret values and grants. `disabled` ships:
   # /secrets answers 503 and rules naming secrets are refused. `postgres`
   # keeps them in the database this half already holds; the two paths below

@@ -140,7 +140,7 @@ check-crate-boundaries:
 	  echo "aenv-egress links a database, the byte half, aenv-core or a second TLS stack; the broker contract is a leaf on openssl only."; \
 	  fail=1; \
 	fi; \
-	for feature in core resolver remote tls; do \
+	for feature in core resolver local tls; do \
 	  $(CARGO) check -q -p aenv-egress --no-default-features --features $$feature >/dev/null 2>&1 || { \
 	    echo "aenv-egress does not build with only its \"$$feature\" feature. Every build in the tree turns on either one feature or all of them, so a reference from one optional module into another compiles everywhere and fails for whoever enables just the one."; \
 	    fail=1; }; \

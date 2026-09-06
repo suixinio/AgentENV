@@ -7,15 +7,36 @@ use serde::{Deserialize, Serialize};
 
 use super::{ClusterConfig, ClusterNodeDiscoveryMode};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EgressBrokerMode {
     /// The node opens no brokered listeners; a sandbox with `rules` cannot be placed here.
     Disabled,
     /// The broker core runs inside `aenv-node` over an in-memory pipe. Single-node only.
     Embedded,
-    /// Brokered streams go over TLS to the `aenv-egress` deployment.
-    Remote,
+    /// Brokered streams go over a Unix socket to the `aenv-egress` DaemonSet
+    /// on this same node.
+    Local,
+}
+
+impl<'de> Deserialize<'de> for EgressBrokerMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        match raw.as_str() {
+            "disabled" => Ok(Self::Disabled),
+            "embedded" => Ok(Self::Embedded),
+            "local" => Ok(Self::Local),
+            "remote" => Err(serde::de::Error::custom(
+                "egress_broker.mode = \"remote\" no longer exists: the broker runs as a per-node \
+                 DaemonSet reached over a Unix socket. Set mode = \"local\" together with \
+                 egress_broker.socket_path, and see the removed AENV_EGRESS_BROKER_ENDPOINT row \
+                 in docs/src/configuration/env-vars.md",
+            )),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown egress_broker.mode {other:?}; expected \"disabled\", \"embedded\" or \"local\""
+            ))),
+        }
+    }
 }
 
 impl EgressBrokerMode {
@@ -23,7 +44,7 @@ impl EgressBrokerMode {
         match self {
             Self::Disabled => "disabled",
             Self::Embedded => "embedded",
-            Self::Remote => "remote",
+            Self::Local => "local",
         }
     }
 }
@@ -33,21 +54,12 @@ impl EgressBrokerMode {
 pub struct EgressBrokerConfig {
     #[config(default = "disabled", env = "AENV_EGRESS_BROKER_MODE")]
     pub mode: EgressBrokerMode,
-    /// `host:port` of the broker; required in `remote` mode.
-    #[config(env = "AENV_EGRESS_BROKER_ENDPOINT")]
-    pub endpoint: Option<String>,
-    /// PEM bundle that verifies the broker's server certificate.
-    #[config(env = "AENV_EGRESS_BROKER_CA_CERT_PATH")]
-    pub ca_cert_path: Option<PathBuf>,
-    /// PEM bundle guests with `rules` trust for intercepted names, when it is
-    /// a different CA from the one above. Unset means the two are one CA.
-    /// Splitting them is what lets the leaf-signing CA carry name constraints
-    /// without those constraints reaching the broker's own server certificate.
+    /// The broker's Unix socket on this node; required in `local` mode.
+    #[config(env = "AENV_EGRESS_BROKER_SOCKET_PATH")]
+    pub socket_path: Option<PathBuf>,
+    /// PEM bundle guests with `rules` trust for intercepted names.
     #[config(env = "AENV_EGRESS_BROKER_GUEST_CA_CERT_PATH")]
     pub guest_ca_cert_path: Option<PathBuf>,
-    /// HMAC key the identity header is signed with; required in `remote` mode.
-    #[config(env = "AENV_EGRESS_BROKER_SHARED_SECRET")]
-    pub shared_secret: Option<String>,
     #[config(default = 256u32, env = "AENV_EGRESS_BROKER_PER_SANDBOX_CONNS")]
     pub per_sandbox_conns: u32,
     #[config(default = 20_000u32, env = "AENV_EGRESS_BROKER_NODE_CONNS")]
@@ -60,13 +72,8 @@ impl fmt::Debug for EgressBrokerConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EgressBrokerConfig")
             .field("mode", &self.mode)
-            .field("endpoint", &self.endpoint)
-            .field("ca_cert_path", &self.ca_cert_path)
+            .field("socket_path", &self.socket_path)
             .field("guest_ca_cert_path", &self.guest_ca_cert_path)
-            .field(
-                "shared_secret",
-                &self.shared_secret.as_ref().map(|_| "[redacted]"),
-            )
             .field("per_sandbox_conns", &self.per_sandbox_conns)
             .field("node_conns", &self.node_conns)
             .field("open_timeout_ms", &self.open_timeout_ms)
@@ -86,24 +93,17 @@ impl EgressBrokerConfig {
                         "egress_broker.mode = \"embedded\" runs the broker inside one node process \
                          and is only valid with [cluster].node_discovery_mode = \"static\" and at \
                          most one static_discovery_nodes entry; a multi-node cluster needs \
-                         mode = \"remote\""
+                         mode = \"local\""
                     );
                 }
             }
-            EgressBrokerMode::Remote => {
-                for (name, missing) in [
-                    ("endpoint", is_blank(self.endpoint.as_deref())),
-                    (
-                        "ca_cert_path",
-                        self.ca_cert_path
-                            .as_ref()
-                            .is_none_or(|path| path.as_os_str().is_empty()),
-                    ),
-                    ("shared_secret", is_blank(self.shared_secret.as_deref())),
-                ] {
-                    if missing {
-                        bail!("egress_broker.mode = \"remote\" requires egress_broker.{name}");
-                    }
+            EgressBrokerMode::Local => {
+                if self
+                    .socket_path
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().is_empty())
+                {
+                    bail!("egress_broker.mode = \"local\" requires egress_broker.socket_path");
                 }
             }
         }
@@ -199,8 +199,30 @@ impl SecretsConfig {
     }
 }
 
-fn is_blank(value: Option<&str>) -> bool {
-    value.is_none_or(|value| value.trim().is_empty())
+#[cfg(test)]
+mod egress_broker_mode_tests {
+    use super::EgressBrokerMode;
+
+    #[test]
+    fn the_removed_mode_is_refused_with_the_name_of_its_replacement() {
+        let err = serde_json::from_value::<EgressBrokerMode>(serde_json::json!("remote"))
+            .expect_err("remote is gone");
+
+        let message = err.to_string();
+        assert!(message.contains("local"), "{message}");
+        assert!(message.contains("socket_path"), "{message}");
+        assert!(message.contains("env-vars.md"), "{message}");
+    }
+
+    #[test]
+    fn the_modes_this_build_serves_still_parse() {
+        for kept in ["disabled", "embedded", "local"] {
+            let parsed: EgressBrokerMode =
+                serde_json::from_value(serde_json::json!(kept)).expect("a mode this build serves");
+            assert_eq!(parsed.as_str(), kept);
+        }
+        assert!(serde_json::from_value::<EgressBrokerMode>(serde_json::json!("nonsense")).is_err());
+    }
 }
 
 #[cfg(test)]

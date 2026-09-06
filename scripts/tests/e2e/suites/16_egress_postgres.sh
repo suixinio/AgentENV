@@ -97,12 +97,6 @@ if [[ -z "$PG_SECRET" && -n "$PG_HOST" && -n "$PG_USER" ]]; then
       suite_summary "16_egress_postgres"
       exit 0
       ;;
-    400)
-      warn "this deployment's /secrets does not take a fields body: ${HTTP_BODY}"
-      _skip "brokered postgres, the store cannot hold a structured credential"
-      suite_summary "16_egress_postgres"
-      exit 0
-      ;;
     *)
       _fail "create a structured credential" "201" "$HTTP_STATUS ${HTTP_BODY}"
       suite_summary "16_egress_postgres"

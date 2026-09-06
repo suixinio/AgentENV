@@ -39,3 +39,6 @@ denied_cidrs = []
 [handlers]
 # The identity-echo handler, which is what the node's own smoke path uses.
 echo = true
+
+[audit]
+level = "metadata"

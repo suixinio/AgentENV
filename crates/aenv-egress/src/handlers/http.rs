@@ -165,6 +165,13 @@ impl HttpHandler {
     ) -> Result<(), HandlerError> {
         let Matched { name, headers } = matched;
         let Some(signer) = self.signer.load() else {
+            crate::audit::security_event(
+                &ctx,
+                &ctx.node_id,
+                "policy_denied",
+                &name,
+                NO_INTERMEDIATE,
+            );
             // Nothing to terminate with, and passing the bytes through would
             // send the guest's request to the real upstream without the
             // credentials the rule exists to add.
@@ -181,7 +188,11 @@ impl HttpHandler {
             .acceptor
             .accept(PrefixedStream::new(peeked, conn))
             .await
-            .map_err(|err| HandlerError::Protocol(format!("tls accept for {name}: {err}")))?;
+            .map_err(|err| {
+                crate::audit::tls_handshake(&ctx, &ctx.node_id, &name, "guest", &err.to_string());
+                HandlerError::Protocol(format!("tls accept for {name}: {err}"))
+            })?;
+        let guest_tls = guest_tls_of(&tls);
         let request_ctx = Arc::new(RequestContext {
             name,
             headers,
@@ -189,6 +200,7 @@ impl HttpHandler {
             creds,
             guard,
             upstream: self.upstream.clone(),
+            guest_tls,
         });
         let service = hyper::service::service_fn(move |req| {
             let request_ctx = Arc::clone(&request_ctx);
@@ -201,6 +213,19 @@ impl HttpHandler {
             .await
             .map_err(|err| HandlerError::Protocol(format!("serving intercepted http: {err}")))
     }
+}
+
+/// What the guest negotiated with this broker.
+///
+/// 🔴 Both fields come back empty today, and that is a fact about the TLS
+/// wrapper rather than about the connection: `native_tls::TlsStream` exposes
+/// the peer certificate and the ALPN protocol and nothing else — no protocol
+/// version, no cipher suite. Filling them means terminating the guest side
+/// with `openssl` directly instead, which is a change to how the broker
+/// accepts, not to how it audits. The fields stay in the record so a
+/// collector's schema does not move when that happens.
+fn guest_tls_of<S>(_stream: &tokio_native_tls::TlsStream<S>) -> GuestTls {
+    GuestTls::default()
 }
 
 /// The rule list a server name selected.
@@ -216,6 +241,148 @@ struct RequestContext {
     creds: Arc<dyn CredentialSource>,
     guard: Arc<UpstreamGuard>,
     upstream: tokio_native_tls::TlsConnector,
+    /// What the guest negotiated with this broker, for the audit trail.
+    guest_tls: GuestTls,
+}
+
+/// The guest-facing TLS parameters, read once per connection.
+#[derive(Clone, Default)]
+struct GuestTls {
+    version: String,
+    cipher: String,
+}
+
+/// Counts what passes through a body, so an audit line can say how much did.
+struct Counted<B> {
+    inner: B,
+    counter: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<B> Counted<B> {
+    fn new(inner: B, counter: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self { inner, counter }
+    }
+}
+
+impl<B> hyper::body::Body for Counted<B>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+{
+    type Data = Bytes;
+    type Error = B::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        if let std::task::Poll::Ready(Some(Ok(frame))) = &polled {
+            if let Some(data) = frame.data_ref() {
+                self.counter
+                    .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The response body, which writes the request's audit line when it ends —
+/// including when the guest hangs up part way, which is a fact the trail has
+/// to carry rather than lose.
+struct Audited {
+    inner: Body,
+    bytes_out: Arc<std::sync::atomic::AtomicU64>,
+    pending: Option<Pending>,
+}
+
+struct Pending {
+    rc: Arc<RequestContext>,
+    method: String,
+    path: String,
+    status: u16,
+    bytes_in: Arc<std::sync::atomic::AtomicU64>,
+    upstream_addr: Option<std::net::SocketAddr>,
+    injected: Vec<String>,
+    started: std::time::Instant,
+}
+
+impl Audited {
+    fn wrap(inner: Body, pending: Pending) -> Body {
+        let bytes_out = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        BodyExt::boxed(Self {
+            inner,
+            bytes_out,
+            pending: Some(pending),
+        })
+    }
+
+    fn emit(&mut self) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let ordering = std::sync::atomic::Ordering::Relaxed;
+        crate::audit::request(crate::audit::RequestRecord {
+            ctx: &pending.rc.ctx,
+            node_id: &pending.rc.ctx.node_id,
+            host: &pending.rc.name,
+            method: &pending.method,
+            path: &pending.path,
+            status: pending.status,
+            bytes_in: pending.bytes_in.load(ordering),
+            bytes_out: self.bytes_out.load(ordering),
+            latency_ms: pending.started.elapsed().as_millis() as u64,
+            tls_version: &pending.rc.guest_tls.version,
+            cipher: &pending.rc.guest_tls.cipher,
+            upstream_addr: pending.upstream_addr,
+            rule: &pending.rc.name,
+            injected_headers: &pending.injected,
+        });
+    }
+}
+
+impl Drop for Audited {
+    fn drop(&mut self) {
+        self.emit();
+    }
+}
+
+impl hyper::body::Body for Audited {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        let polled = std::pin::Pin::new(&mut self.inner).poll_frame(cx);
+        match &polled {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.bytes_out
+                        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            std::task::Poll::Ready(None) => self.emit(),
+            _ => {}
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 type Body = BoxBody<Bytes, hyper::Error>;
@@ -274,13 +441,46 @@ fn bind_to_name<B>(req: &mut Request<B>, name: &str) -> Result<(), (StatusCode, 
 }
 
 async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> Response<Body> {
+    let started = std::time::Instant::now();
+    let method = req.method().to_string();
+    let path = crate::audit::audited_path(req.uri());
+    // `kind` says whether the refusal is a policy decision — those get a
+    // security event beside the request line; an upstream that failed is not
+    // one, and recording it as one would bury the ones that are.
+    let ended = |status: StatusCode, reason: &'static str, kind: Option<&'static str>| {
+        crate::audit::request(crate::audit::RequestRecord {
+            ctx: &rc.ctx,
+            node_id: &rc.ctx.node_id,
+            host: &rc.name,
+            method: &method,
+            path: &path,
+            status: status.as_u16(),
+            bytes_in: 0,
+            bytes_out: 0,
+            latency_ms: started.elapsed().as_millis() as u64,
+            tls_version: &rc.guest_tls.version,
+            cipher: &rc.guest_tls.cipher,
+            upstream_addr: None,
+            rule: &rc.name,
+            injected_headers: &[],
+        });
+        if let Some(kind) = kind {
+            crate::audit::security_event(&rc.ctx, &rc.ctx.node_id, kind, &rc.name, reason);
+        }
+        synthesized(status, reason)
+    };
+
     if req.version() == Version::HTTP_2 {
-        return synthesized(StatusCode::HTTP_VERSION_NOT_SUPPORTED, "http2_unsupported");
+        return ended(
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+            "http2_unsupported",
+            None,
+        );
     }
     if let Some((status, reason)) = refuse_foreign_authority(&req, &rc.name) {
         metrics::counter!("egress_policy_denied_total", "reason" => reason).increment(1);
         debug!(name = %rc.name, reason, "request refused before any credential");
-        return synthesized(status, reason);
+        return ended(status, reason, Some("policy_denied"));
     }
 
     let mut resolved: BTreeMap<String, String> = BTreeMap::new();
@@ -308,7 +508,11 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
                             name = %rc.name,
                             "a rule named a secret that is pinned to other hosts"
                         );
-                        return synthesized(StatusCode::FORBIDDEN, "secret_host_not_allowed");
+                        return ended(
+                            StatusCode::FORBIDDEN,
+                            "secret_host_not_allowed",
+                            Some("policy_denied"),
+                        );
                     }
                     resolved.insert(
                         marker.name.to_string(),
@@ -332,11 +536,12 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
                     };
                     metrics::counter!("egress_policy_denied_total", "reason" => err.reason())
                         .increment(1);
-                    return synthesized(status, err.reason());
+                    return ended(status, err.reason(), Some("credential_denied"));
                 }
             }
         }
     }
+    let mut injected: Vec<String> = Vec::new();
     for (name, template) in &rc.headers {
         let value = substitute::<std::convert::Infallible>(template, |secret| {
             Ok(resolved.get(secret).cloned().unwrap_or_default())
@@ -346,19 +551,31 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
             HeaderName::from_bytes(name.as_bytes()),
             HeaderValue::from_str(&value),
         ) else {
-            return synthesized(StatusCode::BAD_GATEWAY, "header_not_representable");
+            return ended(StatusCode::BAD_GATEWAY, "header_not_representable", None);
         };
         req.headers_mut().insert(header, value);
+        // The name, never the value: the value is the whole thing this exists
+        // to keep in one process.
+        injected.push(name.clone());
+    }
+    if !injected.is_empty() {
+        crate::audit::security_event(
+            &rc.ctx,
+            &rc.ctx.node_id,
+            "credential_injected",
+            &rc.name,
+            &injected.join(","),
+        );
     }
     if let Err((status, reason)) = bind_to_name(&mut req, &rc.name) {
         warn!(name = %rc.name, reason, "the matched name does not fit a request");
-        return synthesized(status, reason);
+        return ended(status, reason, Some("policy_denied"));
     }
 
     let wants_upgrade = req.headers().contains_key(hyper::header::UPGRADE);
     let client_upgrade = wants_upgrade.then(|| hyper::upgrade::on(&mut req));
 
-    let (tcp, _) = match rc
+    let (tcp, upstream_addr) = match rc
         .guard
         .connect_checked(HttpHandler::NAME, &rc.name, HTTPS_PORT, &rc.ctx.egress)
         .await
@@ -368,14 +585,21 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
             let (status, reason) = denied_reason(&err);
             metrics::counter!("egress_policy_denied_total", "reason" => reason).increment(1);
             debug!(name = %rc.name, reason, "upstream refused");
-            return synthesized(status, reason);
+            return ended(status, reason, Some("policy_denied"));
         }
     };
     let tls = match rc.upstream.connect(&rc.name, tcp).await {
         Ok(tls) => tls,
         Err(err) => {
             warn!(name = %rc.name, error = %err, "upstream tls failed");
-            return synthesized(StatusCode::BAD_GATEWAY, "upstream_tls");
+            crate::audit::tls_handshake(
+                &rc.ctx,
+                &rc.ctx.node_id,
+                &rc.name,
+                "upstream",
+                &err.to_string(),
+            );
+            return ended(StatusCode::BAD_GATEWAY, "upstream_tls", None);
         }
     };
     let (mut sender, connection) =
@@ -383,7 +607,7 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
             Ok(parts) => parts,
             Err(err) => {
                 warn!(name = %rc.name, error = %err, "upstream http handshake failed");
-                return synthesized(StatusCode::BAD_GATEWAY, "upstream_error");
+                return ended(StatusCode::BAD_GATEWAY, "upstream_error", None);
             }
         };
     tokio::spawn(async move {
@@ -391,11 +615,13 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
             debug!(error = %err, "upstream connection ended with an error");
         }
     });
+    let bytes_in = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let req = req.map(|body| Counted::new(body, Arc::clone(&bytes_in)));
     let mut response = match sender.send_request(req).await {
         Ok(response) => response,
         Err(err) => {
             warn!(name = %rc.name, error = %err, "upstream request failed");
-            return synthesized(StatusCode::BAD_GATEWAY, "upstream_error");
+            return ended(StatusCode::BAD_GATEWAY, "upstream_error", None);
         }
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS {
@@ -423,7 +649,18 @@ async fn handle_request(mut req: Request<Incoming>, rc: Arc<RequestContext>) -> 
             });
         }
     }
-    response.map(|body| body.boxed())
+    let status = response.status().as_u16();
+    let pending = Pending {
+        rc: Arc::clone(&rc),
+        method,
+        path,
+        status,
+        bytes_in,
+        upstream_addr: Some(upstream_addr),
+        injected,
+        started,
+    };
+    response.map(|body| Audited::wrap(body.boxed(), pending))
 }
 
 async fn peek_client_hello(

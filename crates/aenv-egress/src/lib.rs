@@ -12,6 +12,8 @@
 //! transport; `local` adds the node-local Unix socket both halves speak over,
 //! and `tls` adds the openssl-backed pieces the broker binary needs.
 
+#[cfg(feature = "tls")]
+pub mod audit;
 pub mod credential;
 pub mod dispatch;
 pub mod framing;

@@ -288,7 +288,34 @@ which answers the sandbox's identity, and `tcp` — and proves the intercept and
 
 Metrics on the broker's `:9103`: `egress_conns_total{handler,outcome}`, `egress_active_conns`,
 `egress_policy_denied_total{reason}`, `egress_intercept_no_sni_total`,
-`egress_tls_leaf_minted_total`, `egress_replay_rejected_total`.
+`egress_tls_leaf_minted_total`, `egress_peer_rejected_total` (a connection whose peer was not the
+node's uid) and `egress_intermediate_expires_seconds` (how long this node's intermediate is still
+good for; zero means the broker holds none and rules domains are closed).
+`egress_sandbox_conns_total{sandbox}` is exported only while the broker runs at debug level — one
+series per sandbox is unbounded cardinality on a node that runs thousands a day.
+`egress_replay_rejected_total` is gone with the replay cache. On the api half's own `/metrics`,
+`agentenv_node_egress_broker{node,state}` carries what each node last reported.
+
+## The audit trail
+
+The broker writes one JSON line per brokered request to stdout, under the `egress.audit` tracing
+target, and two other kinds of line on the same target: `security_event` (a policy denial, a
+credential refused, a name the rules do not cover, a broker holding no intermediate, and the
+`credential_injected` line naming which headers a request had set) and `tls_handshake` (a
+handshake that did not complete, on either side).
+
+A request line carries `ts`, `node_id`, `sandbox_id`, `execution_id`, `dst_ip`, `dst_port`,
+`scheme`, `host`, `method`, `path`, `status`, `bytes_in`, `bytes_out`, `latency_ms`,
+`tls_version`, `cipher`, `upstream_addr`, `rule` and `injected_headers`.
+
+What it never carries is a value. `injected_headers` is a list of **names**; the query string is
+not recorded at all, because that is where an API that takes credentials in the URL puts them; and
+`path` is truncated at 1 KiB. `tls_version` and `cipher` come back empty today: the TLS wrapper the
+guest side terminates with exposes neither, and filling them is a change to how the broker accepts
+rather than to how it audits.
+
+`[audit].level = "none"` turns the whole trail off, security events included — a deployment that
+sets it is saying it collects them somewhere else.
 
 ## Not covered
 

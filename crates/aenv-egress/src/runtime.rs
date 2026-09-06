@@ -231,9 +231,18 @@ pub async fn run(
         tokio::spawn(async move {
             let _permit = permit;
             metrics::gauge!("egress_active_conns").increment(1.0);
-            let (handler, outcome) = admit_and_serve(&runtime, stream, admission).await;
+            let (handler, outcome, sandbox_id) = admit_and_serve(&runtime, stream, admission).await;
             metrics::counter!("egress_conns_total", "handler" => handler, "outcome" => outcome)
                 .increment(1);
+            // 🔴 One series per sandbox, and only while debug is on: a node
+            // runs thousands of sandboxes a day and each one would leave a
+            // series behind it forever.
+            if let Some(sandbox_id) =
+                sandbox_id.filter(|_| tracing::enabled!(tracing::Level::DEBUG))
+            {
+                metrics::counter!("egress_sandbox_conns_total", "sandbox" => sandbox_id)
+                    .increment(1);
+            }
             metrics::gauge!("egress_active_conns").decrement(1.0);
         });
     }
@@ -263,14 +272,14 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream, expected: u32) -> bool {
     }
 }
 
-/// The metric labels the connection ends with: the handler side, then the
-/// outcome.
+/// The metric labels the connection ends with: the handler side, the outcome,
+/// and the sandbox it belonged to once one is known.
 #[cfg(feature = "local")]
 async fn admit_and_serve(
     runtime: &Runtime,
     stream: tokio::net::UnixStream,
     admission: Duration,
-) -> (&'static str, &'static str) {
+) -> (&'static str, &'static str, Option<String>) {
     let deadline = tokio::time::Instant::now() + admission;
     let admitted =
         match tokio::time::timeout_at(deadline, runtime.admit_stream(Box::new(stream))).await {
@@ -278,18 +287,19 @@ async fn admit_and_serve(
             Ok(Err(err)) => {
                 let outcome = err.outcome();
                 tracing::debug!(error = %err, "connection refused before any handler");
-                return ("runtime", outcome);
+                return ("runtime", outcome, None);
             }
             Err(_) => {
                 tracing::debug!("the identity header did not arrive inside the deadline");
-                return ("none", "admission_timeout");
+                return ("none", "admission_timeout", None);
             }
         };
+    let sandbox_id = Some(admitted.header.sandbox_id.clone());
     match runtime.serve(admitted).await {
-        Ok(()) => ("runtime", "ok"),
+        Ok(()) => ("runtime", "ok", sandbox_id),
         Err(err) => {
             tracing::debug!(error = %err, "connection ended with an error");
-            ("runtime", err.outcome())
+            ("runtime", err.outcome(), sandbox_id)
         }
     }
 }

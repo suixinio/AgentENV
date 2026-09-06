@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aenv_egress::audit::AuditLevel;
 use aenv_egress::credential::{CachingSource, NoCredentials};
 use aenv_egress::handlers::echo::IdentityEchoHandler;
 use aenv_egress::handlers::http::HttpHandler;
@@ -67,6 +68,16 @@ struct EgressConfig {
     resolver: ResolverSourceConfig,
     #[config(nested)]
     handlers: HandlersConfig,
+    #[config(nested)]
+    audit: AuditConfig,
+}
+
+/// What the audit trail records. Node-level, because the broker is.
+#[derive(Config)]
+struct AuditConfig {
+    /// `metadata` (every request and event, values never) or `none`.
+    #[config(default = "metadata", env = "AENV_EGRESS_AUDIT_LEVEL")]
+    level: String,
 }
 
 /// The node-local socket the runtime on this machine connects to, and whose
@@ -200,6 +211,14 @@ async fn main() -> Result<()> {
     if args.ready {
         return probe_readiness(&config.listen.socket_path).await;
     }
+
+    let audit_level = AuditLevel::parse(&config.audit.level).with_context(|| {
+        format!(
+            "audit.level {:?} is neither \"metadata\" nor \"none\"",
+            config.audit.level
+        )
+    })?;
+    aenv_egress::audit::set_level(audit_level);
 
     if let Some(metrics_listen) = config.metrics_listen {
         metrics_exporter_prometheus::PrometheusBuilder::new()
@@ -342,6 +361,7 @@ async fn main() -> Result<()> {
     info!(
         socket_path = %config.listen.socket_path.display(),
         peer_uid = config.listen.peer_uid,
+        audit = audit_level.as_str(),
         handlers = ?runtime.dispatcher().handler_names().collect::<Vec<_>>(),
         "aenv-egress listening"
     );

@@ -90,3 +90,12 @@ allowed_cidrs = []
 # belongs here.
 enabled = false
 allowed_cidrs = []
+
+[audit]
+# One JSON line per brokered request on stdout, under the `egress.audit`
+# tracing target, plus the security and handshake events that are not
+# requests. Metadata only: a header the broker injected is recorded by name,
+# never by value, and the query string is not recorded at all. `none` turns
+# the whole trail off, including the security events — a deployment that sets
+# it is saying it collects them somewhere else.
+level = "metadata"

@@ -12,6 +12,10 @@ use crate::transport::AsyncStream;
 /// authentication material and nothing that lives in the runtime's process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnCtx {
+    /// The node the runtime that opened this connection runs on. Not a
+    /// credential — the peer's uid is what admits the stream — but what the
+    /// audit trail names the machine by.
+    pub node_id: String,
     pub sandbox_id: String,
     pub execution_id: String,
     pub template_id: String,
@@ -25,6 +29,7 @@ pub struct ConnCtx {
 impl From<&IdentityHeader> for ConnCtx {
     fn from(header: &IdentityHeader) -> Self {
         Self {
+            node_id: header.node_id.clone(),
             sandbox_id: header.sandbox_id.clone(),
             execution_id: header.execution_id.clone(),
             template_id: header.template_id.clone(),

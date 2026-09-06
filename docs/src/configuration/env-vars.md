@@ -110,7 +110,8 @@ holds a signing key, and setting either name on the wrong process does nothing a
 | `AENV_EGRESS_CA_KEY_PATH` | from file | `ca.key_path`: that CA's private key. Held by this process alone; it never reaches a node. |
 | ~~`AENV_EGRESS_VAULT_ADDR`~~, ~~`AENV_EGRESS_VAULT_TOKEN_FILE`~~, ~~`AENV_EGRESS_VAULT_MOUNT`~~, ~~`AENV_EGRESS_VAULT_NAMESPACE`~~ | — | **Removed.** They pointed the broker's Vault credential source at the store the api half's `vault` backend wrote to. That backend is gone, and with it the broker's `vault` cargo feature and `[vault]` config section: the broker now has one credential source, an HTTP resolve endpoint. **Setting them today does nothing:** no field declares the names, so they are read by nothing and refused by nothing, and a `[vault]` section in `aenv-egress.toml` is ignored the same way. A broker with no `resolver.url` warns once at startup and answers every credential lookup 502. |
 | `AENV_EGRESS_RESOLVER_URL` | unset | `resolver.url`: where the broker resolves one `(sandbox, execution, name)` at a time. With `[secrets].backend = "postgres"` this is the api half itself — `http://agentenv-api:8000/internal` — and the NetworkPolicy has to admit that port. Unset leaves the broker with no credential source and every marker answers 502. |
-| `AENV_EGRESS_RESOLVER_TOKEN_FILE` | from file | `resolver.token_file`: a file holding the bearer token, not the token itself. |
+| `AENV_EGRESS_RESOLVER_TOKEN_FILE` | from file | `resolver.token_file`: a file holding the bearer token, not the token itself. Read on every call, because it may be a projected token kubelet rotates in place. |
+| `AENV_EGRESS_AUDIT_LEVEL` | `metadata` | `audit.level`: `metadata` or `none`. See [`aenv-egress.toml`](reference.md#aenv-egresstoml). |
 
 `ca.leaf_ttl_secs`, `ca.cache_capacity`, `ca.mints_per_sandbox_per_minute`,
 `upstream.denied_cidrs`, `resolver.timeout_ms`, `resolver.cache_ttl_secs`, `resolver.cache_capacity`, `handlers.echo` and

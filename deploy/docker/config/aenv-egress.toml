@@ -22,6 +22,9 @@ socket_path = "/run/aenv-egress/broker.sock"
 peer_uid = 0
 
 [ca]
+# The static pair, not `issuer_url`: this stack has no api half with a root to
+# issue against, so the broker signs with the throwaway CA its own entrypoint
+# minted.
 cert_path = "/run/aenv-egress/ca.crt"
 key_path = "/run/aenv-egress/ca.key"
 leaf_ttl_secs = 86400

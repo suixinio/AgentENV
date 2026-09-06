@@ -502,8 +502,10 @@ every path in it names a volume the broker DaemonSet mounts. See
 | `max_connections` | integer | `4096` | Connections held at once. The excess is closed, not queued. |
 | `per_sandbox_connections` | integer | `256` | Connections one sandbox holds at once, inside the limit above. |
 | `shutdown_drain_secs` | integer | `25` | How long a shutdown lets live sessions finish before it stops waiting. Keep it under the Pod's `terminationGracePeriodSeconds`. |
-| `ca.cert_path` | path | required | The CA that signs leaf certificates for intercepted names. |
-| `ca.key_path` | path | required | Its private key — the one credential that makes the broker Pod worth attacking. |
+| `ca.issuer_url` | string | unset | Base URL the api half issues this node's intermediate at — the same base `resolver.url` names. Set, it is where the signing key comes from and `ca.cert_path`/`ca.key_path` are unused. A broker that cannot reach it does not refuse to start: it serves the passthrough path and closes matched names, one node degraded rather than one node down. |
+| `ca.issuer_token_file` | path | unset | This Pod's projected ServiceAccount token, audience `aenv-api`. Required whenever `ca.issuer_url` is set; read on every call, because kubelet rotates a projected token in place. |
+| `ca.cert_path` | path | unset | A static CA to sign leaf certificates with, for a stack that has no api half to ask (`deploy/docker/config/aenv-egress.toml`). Required together with `ca.key_path` when `ca.issuer_url` is unset; a broker configured with neither refuses to start. |
+| `ca.key_path` | path | unset | Its private key. |
 | `ca.leaf_ttl_secs` | integer | `86400` | Lifetime of a minted leaf certificate. |
 | `ca.cache_capacity` | integer | `4096` | How many minted leaves are kept before the oldest name is evicted. |
 | `ca.mints_per_sandbox_per_minute` | integer | `60` | Per-sandbox signing budget. With match-before-sign this is what bounds the leaves an unconstrained CA can be made to issue. |
@@ -511,7 +513,7 @@ every path in it names a volume the broker DaemonSet mounts. See
 | `resolver.url` | string | unset | Base URL the broker resolves credentials against. With `[secrets].backend = "postgres"` that base is `aenv-api` itself — `http://agentenv-api:8000/internal` — and the NetworkPolicy has to admit it. Unset leaves the broker with no credential source: it warns once at startup and every marker answers 502. |
 | `resolver.token_file` | path | unset | File holding the bearer token for resolver calls. Required whenever `resolver.url` is set: the endpoint checks a bearer on every call, so a broker without one would have every lookup refused, and startup fails instead. It holds the same value as the api half's `[secrets.pg].resolver_token_file`; a value that differs is answered 401, which the broker reports as an outage (502 to the guest) and both halves log. |
 | `resolver.timeout_ms` | integer | `5000` | Timeout for each resolver call. |
-| `resolver.cache_ttl_secs` | integer | `30` | How long a resolved credential is reused. It bounds how long a revocation takes to bite: a revoked grant is only noticed on the next lookup. |
+| `resolver.cache_ttl_secs` | integer | `10` | How long a resolved credential is reused. It bounds how long a revocation takes to bite, and it is the only bound there is: the api half has no reverse channel to a broker, so a revoked grant is noticed on the next lookup and not before. |
 | `resolver.cache_capacity` | integer | `4096` | Credentials held at once. Expired entries leave on every insert and the soonest to expire is dropped at capacity, so credential bytes are not retained past the TTL. |
 | `handlers.echo` | boolean | `false` | The `echo` identity handler, for smoke tests. Off in production. |
 | `handlers.tcp.enabled` | boolean | `false` | The `tcp` byte relay, which endpoint declarations name. |

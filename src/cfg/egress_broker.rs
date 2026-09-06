@@ -142,6 +142,13 @@ impl SecretsBackendKind {
 pub struct SecretsConfig {
     #[config(default = "disabled", env = "AENV_SECRETS_BACKEND")]
     pub backend: SecretsBackendKind,
+    /// RFC 3339 instant after which the broker's shared bearer stops being
+    /// accepted at the internal endpoints, leaving each broker's own
+    /// ServiceAccount token as the only credential. Empty never closes the
+    /// window, which is what an un-migrated deployment leaves it at — and
+    /// while it is open, a caller presenting the bearer is scoped to no node.
+    #[config(default = "", env = "AENV_SECRETS_LEGACY_BEARER_UNTIL")]
+    pub legacy_bearer_until: String,
     #[config(nested)]
     pub pg: SecretsPgConfig,
 }
@@ -150,6 +157,7 @@ impl fmt::Debug for SecretsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretsConfig")
             .field("backend", &self.backend)
+            .field("legacy_bearer_until", &self.legacy_bearer_until)
             .field("pg", &self.pg)
             .finish()
     }
@@ -245,6 +253,36 @@ mod secrets_backend_tests {
             let parsed: SecretsBackendKind =
                 serde_json::from_value(serde_json::Value::String(kept.to_string())).unwrap();
             assert_eq!(parsed.as_str(), kept);
+        }
+    }
+}
+
+/// The root `aenv-api` signs per-node egress intermediates with. Only the api
+/// half reads it; a node never holds a signing key.
+#[derive(Debug, Config, Clone)]
+pub struct EgressCaConfig {
+    /// PEM certificate of the root guests trust. Unset leaves the
+    /// intermediate endpoint unmounted.
+    #[config(env = "AENV_EGRESS_CA_ROOT_CERT_PATH")]
+    pub root_cert_path: Option<PathBuf>,
+    /// Its private key, as a path and never a value.
+    #[config(env = "AENV_EGRESS_CA_ROOT_KEY_PATH")]
+    pub root_key_path: Option<PathBuf>,
+}
+
+impl EgressCaConfig {
+    /// The pair, when both halves are configured. One without the other is a
+    /// startup error: an operator who set one meant to set both.
+    pub fn root_paths(&self) -> Result<Option<(&PathBuf, &PathBuf)>> {
+        match (self.root_cert_path.as_ref(), self.root_key_path.as_ref()) {
+            (Some(cert), Some(key)) => Ok(Some((cert, key))),
+            (None, None) => Ok(None),
+            (Some(_), None) => {
+                bail!("egress_ca.root_cert_path is set without egress_ca.root_key_path")
+            }
+            (None, Some(_)) => {
+                bail!("egress_ca.root_key_path is set without egress_ca.root_cert_path")
+            }
         }
     }
 }

@@ -82,10 +82,12 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "k8s-openapi",
  "kube",
  "libc",
  "metrics",
  "metrics-util",
+ "openssl",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -95,6 +97,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -175,6 +178,7 @@ name = "aenv-egress"
 version = "0.1.2"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.22.1",

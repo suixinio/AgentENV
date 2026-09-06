@@ -7,7 +7,8 @@ pub mod network;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::Config;
 pub use egress_broker::{
-    EgressBrokerConfig, EgressBrokerMode, SecretsBackendKind, SecretsConfig, SecretsPgConfig,
+    EgressBrokerConfig, EgressBrokerMode, EgressCaConfig, SecretsBackendKind, SecretsConfig,
+    SecretsPgConfig,
 };
 pub use image::{
     ImageCacheConfig, ImageConfig, ImageRemoteBlocksCacheConfig, ImageResolverConfig,
@@ -157,6 +158,9 @@ pub struct AppConfig {
     /// The api half's secrets store; a node leaves it disabled.
     #[config(nested)]
     pub secrets: SecretsConfig,
+    /// The root the api half issues node egress intermediates from.
+    #[config(nested)]
+    pub egress_ca: EgressCaConfig,
     #[config(nested)]
     pub api: ApiConfig,
     /// Routing/binding store configuration with an independent key space.

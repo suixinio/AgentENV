@@ -29,11 +29,15 @@ use crate::handler::{ConnCtx, Handler, HandlerError};
 use crate::marker::{secret_markers, substitute};
 use crate::policy::{UpstreamError, UpstreamGuard};
 use crate::sni::{parse_sni, SniError, MAX_CLIENT_HELLO_BYTES};
-use crate::tls::CaSigner;
+use crate::tls::SignerSlot;
 use crate::transport::AsyncStream;
 
 /// Carried on every response the broker synthesizes.
 pub const REASON_HEADER: &str = "x-aenv-egress-reason";
+
+/// Why a matched name is closed rather than terminated: this broker has not
+/// been issued the intermediate it would sign the leaf with.
+pub const NO_INTERMEDIATE: &str = "no-intermediate";
 pub const HTTPS_PORT: u16 = 443;
 
 #[derive(Deserialize, Default)]
@@ -51,7 +55,7 @@ struct TransformJson {
 type Rules = BTreeMap<String, Vec<RuleJson>>;
 
 pub struct HttpHandler {
-    signer: Arc<CaSigner>,
+    signer: Arc<SignerSlot>,
     upstream: tokio_native_tls::TlsConnector,
     peek_timeout: Duration,
 }
@@ -59,8 +63,10 @@ pub struct HttpHandler {
 impl HttpHandler {
     pub const NAME: &'static str = "http";
 
-    /// Upstreams are verified against the system trust store.
-    pub fn new(signer: Arc<CaSigner>) -> Result<Self, native_tls::Error> {
+    /// Upstreams are verified against the system trust store. The slot may be
+    /// empty: a broker that has not been issued an intermediate closes a
+    /// matched name rather than relaying it without its credentials.
+    pub fn new(signer: Arc<SignerSlot>) -> Result<Self, native_tls::Error> {
         let connector = native_tls::TlsConnector::builder()
             .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
             .build()?;
@@ -158,8 +164,17 @@ impl HttpHandler {
         guard: Arc<UpstreamGuard>,
     ) -> Result<(), HandlerError> {
         let Matched { name, headers } = matched;
-        let leaf = self
-            .signer
+        let Some(signer) = self.signer.load() else {
+            // Nothing to terminate with, and passing the bytes through would
+            // send the guest's request to the real upstream without the
+            // credentials the rule exists to add.
+            metrics::counter!("egress_policy_denied_total", "reason" => NO_INTERMEDIATE)
+                .increment(1);
+            return Err(HandlerError::Protocol(format!(
+                "{NO_INTERMEDIATE}: this broker holds no signing key for {name}"
+            )));
+        };
+        let leaf = signer
             .leaf_for(&name, &ctx.sandbox_id)
             .map_err(|err| HandlerError::Protocol(format!("leaf for {name}: {err}")))?;
         let tls = leaf
@@ -726,8 +741,9 @@ mod tests {
             closed: bool,
         ) -> (Broker, serde_json::Value, EgressPolicySummary) {
             let (ca_pem, ca_key) = generate_test_ca("broker test ca").unwrap();
-            let signer =
-                Arc::new(CaSigner::from_pem(&ca_pem, &ca_key, SignerOptions::default()).unwrap());
+            let signer = Arc::new(SignerSlot::holding(Arc::new(
+                crate::tls::CaSigner::from_pem(&ca_pem, &ca_key, SignerOptions::default()).unwrap(),
+            )));
             let creds = Arc::new(
                 StaticSource::default()
                     .with("sbx-1", "exec-1", "openai", b"sk-test")

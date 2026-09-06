@@ -169,6 +169,14 @@ node_conns = 20000
 # How long the runtime waits for the broker to accept one connection.
 open_timeout_ms = 3000
 
+[egress_ca]
+# The root aenv-api issues per-node egress intermediates from, and the root
+# guests with rules trust. Only the api half reads it; a node never holds a
+# signing key. Unset leaves the intermediate endpoint unmounted, and every
+# broker then closes the rules domains it cannot terminate.
+# root_cert_path = "/etc/agentenv/egress-ca/ca.crt"
+# root_key_path = "/etc/agentenv/egress-ca/ca.key"
+
 [secrets]
 # Where aenv-api keeps secret values and grants: "disabled" or "postgres".
 # `disabled` ships: /secrets answers 503 and rules naming secrets are refused.
@@ -176,6 +184,11 @@ open_timeout_ms = 3000
 # versions, encrypted under a master key this half reads from a file, and
 # serves the broker's credential lookups itself. A node reads none of this.
 backend = "disabled"
+# RFC 3339 instant after which the broker's shared bearer stops being accepted
+# at the internal endpoints, leaving each broker's own ServiceAccount token as
+# the only credential. Empty never closes the window; while it is open, a
+# caller presenting the bearer is scoped to no node.
+legacy_bearer_until = ""
 
 [secrets.pg]
 # Both are paths, never the values: an environment variable holding a master

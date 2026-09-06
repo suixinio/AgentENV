@@ -13,14 +13,15 @@ use aenv_egress::handlers::echo::IdentityEchoHandler;
 use aenv_egress::handlers::http::HttpHandler;
 use aenv_egress::handlers::postgres::PostgresHandler;
 use aenv_egress::handlers::tcp::TcpRelayHandler;
+use aenv_egress::issuer::{keep_current, IntermediateIssuer};
 use aenv_egress::resolver::ResolverSource;
 use aenv_egress::runtime::{self, Options, Runtime};
-use aenv_egress::tls::{CaSigner, SignerOptions};
+use aenv_egress::tls::{CaSigner, SignerOptions, SignerSlot};
 use aenv_egress::{BrokerDenyList, CredentialSource, Dispatcher, UpstreamGuard};
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use confique::Config;
-use tracing::info;
+use tracing::{info, warn};
 
 const CONFIG_PATH_ENV: &str = "AENV_EGRESS_CONFIG_PATH";
 
@@ -83,13 +84,23 @@ struct ListenConfig {
     peer_uid: u32,
 }
 
-/// The CA that signs leaf certificates for intercepted names.
+/// Where the key that signs leaf certificates for intercepted names comes
+/// from. Either the api half issues this node one — the shape a cluster has —
+/// or a static pair on disk, which is what a stack with no api half to ask
+/// runs on.
 #[derive(Config)]
 struct CaConfig {
+    /// Base URL the api half issues this node's intermediate at, the same one
+    /// `[resolver].url` names. Set, it wins over the static pair below.
+    #[config(env = "AENV_EGRESS_CA_ISSUER_URL")]
+    issuer_url: Option<String>,
+    /// This Pod's projected ServiceAccount token, audience `aenv-api`.
+    #[config(env = "AENV_EGRESS_CA_ISSUER_TOKEN_FILE")]
+    issuer_token_file: Option<PathBuf>,
     #[config(env = "AENV_EGRESS_CA_CERT_PATH")]
-    cert_path: PathBuf,
+    cert_path: Option<PathBuf>,
     #[config(env = "AENV_EGRESS_CA_KEY_PATH")]
-    key_path: PathBuf,
+    key_path: Option<PathBuf>,
     #[config(default = 86_400u64)]
     leaf_ttl_secs: u64,
     #[config(default = 4096usize)]
@@ -121,8 +132,10 @@ struct ResolverSourceConfig {
     #[config(default = 5_000u64)]
     timeout_ms: u64,
     /// How long a resolved credential is reused before the resolver is asked
-    /// again. It bounds how long a revocation takes to bite.
-    #[config(default = 30u64)]
+    /// again. It bounds how long a revocation takes to bite, and it is the
+    /// only bound there is: the api half has no way to reach a broker, so a
+    /// revoked grant is noticed on the next lookup and not before.
+    #[config(default = 10u64)]
     cache_ttl_secs: u64,
     #[config(default = 4_096usize)]
     cache_capacity: usize,
@@ -195,21 +208,60 @@ async fn main() -> Result<()> {
             .context("install the prometheus exporter")?;
     }
 
-    let ca_cert = std::fs::read(&config.ca.cert_path)
-        .with_context(|| format!("read ca.cert_path {}", config.ca.cert_path.display()))?;
-    let ca_key = read_secret_file(&config.ca.key_path, "ca key")?;
-    let signer = Arc::new(
-        CaSigner::from_pem(
-            &ca_cert,
-            &ca_key,
-            SignerOptions {
-                leaf_ttl: Duration::from_secs(config.ca.leaf_ttl_secs),
-                cache_capacity: config.ca.cache_capacity,
-                mints_per_sandbox_per_minute: config.ca.mints_per_sandbox_per_minute,
-            },
-        )
-        .context("load the leaf signing CA")?,
-    );
+    let signer_options = SignerOptions {
+        leaf_ttl: Duration::from_secs(config.ca.leaf_ttl_secs),
+        cache_capacity: config.ca.cache_capacity,
+        mints_per_sandbox_per_minute: config.ca.mints_per_sandbox_per_minute,
+    };
+    let signer = Arc::new(SignerSlot::empty());
+    let renewal = match config.ca.issuer_url.as_deref() {
+        Some(url) => {
+            let Some(token_file) = config.ca.issuer_token_file.clone() else {
+                bail!(
+                    "ca.issuer_url is set but ca.issuer_token_file is not: the issuing endpoint \
+                     identifies this node by its projected ServiceAccount token, and without one \
+                     no intermediate can be asked for"
+                );
+            };
+            let issuer = Arc::new(
+                IntermediateIssuer::new(url, token_file, Duration::from_millis(5_000))
+                    .context("configure the intermediate issuer")?,
+            );
+            // 🔴 Not a startup failure. A broker that cannot reach the api
+            // half serves the passthrough path and closes matched names; one
+            // that refuses to start would take that node's sandboxes with it.
+            match issuer.issue(signer_options.clone()).await {
+                Ok(issued) => {
+                    info!(not_after = ?issued.not_after(), "took this node's egress intermediate");
+                    signer.store(Arc::new(issued));
+                }
+                Err(err) => warn!(
+                    error = %format_args!("{err:#}"),
+                    "could not take an egress intermediate at startup; rules domains are closed \
+                     until one is issued"
+                ),
+            }
+            Some((Arc::clone(&signer), issuer, signer_options.clone()))
+        }
+        None => {
+            let (Some(cert_path), Some(key_path)) =
+                (config.ca.cert_path.as_ref(), config.ca.key_path.as_ref())
+            else {
+                bail!(
+                    "the broker needs a leaf-signing key: either ca.issuer_url and \
+                     ca.issuer_token_file, or a static ca.cert_path and ca.key_path"
+                );
+            };
+            let ca_cert = std::fs::read(cert_path)
+                .with_context(|| format!("read ca.cert_path {}", cert_path.display()))?;
+            let ca_key = read_secret_file(key_path, "ca key")?;
+            signer.store(Arc::new(
+                CaSigner::from_pem(&ca_cert, &ca_key, signer_options.clone())
+                    .context("load the leaf signing CA")?,
+            ));
+            None
+        }
+    };
 
     let creds: Arc<dyn CredentialSource> = match config.resolver.url.as_deref() {
         Some(url) => {
@@ -219,10 +271,13 @@ async fn main() -> Result<()> {
                      requires a bearer, and without one every lookup would be refused"
                 );
             };
-            let token = String::from_utf8(read_secret_file(token_path, "resolver token")?)?;
+            // Read once here so an unreadable or empty file fails startup,
+            // and then again by the source on every call: this may be a
+            // projected token that kubelet rotates in place.
+            read_secret_file(token_path, "resolver token")?;
             let source = ResolverSource::new(
                 url,
-                &token,
+                token_path.clone(),
                 Duration::from_millis(config.resolver.timeout_ms),
             )
             .context("configure the credential resolver")?;
@@ -278,6 +333,10 @@ async fn main() -> Result<()> {
         },
         Arc::new(dispatcher),
     ));
+
+    if let Some((slot, issuer, options)) = renewal {
+        tokio::spawn(keep_current(slot, issuer, options));
+    }
 
     let listener = bind_socket(&config.listen.socket_path)?;
     info!(

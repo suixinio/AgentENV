@@ -25,3 +25,24 @@ rules:
       - get
       - list
       - watch
+---
+# 🔴 Cluster-scoped, and it has to be: `TokenReview` is a non-namespaced
+# subresource of the authentication API, so no Role can grant it.
+#
+# `create` on `tokenreviews` is the narrowest permission that answers "is this
+# token genuine, and whose is it" — it reads nothing and mutates nothing. It is
+# what the internal endpoints the egress broker calls establish a caller's node
+# with; without it those endpoints answer 503 and no broker is issued an
+# intermediate. The `pods` `get` they also need is already in the namespaced
+# Role above.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: agentenv-api-token-review
+rules:
+  - apiGroups:
+      - authentication.k8s.io
+    resources:
+      - tokenreviews
+    verbs:
+      - create

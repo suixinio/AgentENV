@@ -1,26 +1,26 @@
 //! The broker's resolve endpoint, served by the api half for
 //! `[secrets].backend = "postgres"`.
 //!
-//! Deliberately not in `src/api/openapi.yml`: a route declared there is
-//! counted as part of the user-facing surface by the role gate, generated
-//! into every client and printed in the public API reference. It is mounted
-//! through the extra-routes seam instead, and carries its own bearer check —
-//! the generated API-key authentication does not reach it, and a broker
-//! holding a user API key would hold the whole REST surface.
+//! The credential layer is `crate::internal_api`'s, shared with the
+//! intermediate endpoint. What is this route's own is the node scope: a
+//! broker asks only about sandboxes bound to the machine it runs on, so a
+//! compromised broker on one node reads nothing about another's.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
-use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use aenv_core::binding_store::BindingStore;
+use axum::extract::{Extension, State};
+use axum::http::StatusCode;
+use axum::response::Response;
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::warn;
-use zeroize::Zeroizing;
+
+use crate::internal_api::{answer, CallerNodeId};
 
 use super::values::{PgSecretValues, ResolveError, ResolvedCredential};
 
@@ -28,14 +28,13 @@ use super::values::{PgSecretValues, ResolveError, ResolvedCredential};
 /// `/internal`.
 pub const RESOLVE_PATH: &str = "/internal/credentials/resolve";
 
-/// A request is three short identifiers; the bearer check runs before the
-/// body is read, and a body past this is refused unread.
-const MAX_REQUEST_BYTES: usize = 4096;
-
 #[derive(Clone)]
 struct ResolveState {
     values: Arc<PgSecretValues>,
-    token: Arc<Zeroizing<String>>,
+    /// Where a sandbox is running, as the routing table records it. Absent
+    /// leaves the answer unscoped, which is what a deployment without a
+    /// binding store has.
+    bindings: Option<Arc<dyn BindingStore>>,
 }
 
 #[derive(Deserialize)]
@@ -46,63 +45,59 @@ struct ResolveRequest {
     name: String,
 }
 
-/// The routes `new_control_plane_only` merges for this backend.
-pub fn router(values: Arc<PgSecretValues>, token: Zeroizing<String>) -> Router {
-    let state = ResolveState {
-        values,
-        token: Arc::new(token),
-    };
+/// The routes `crate::internal_api::router` merges for this backend.
+pub fn router(values: Arc<PgSecretValues>, bindings: Option<Arc<dyn BindingStore>>) -> Router {
     Router::new()
         .route(RESOLVE_PATH, post(resolve))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            require_bearer,
-        ))
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
-        .with_state(state)
+        .with_state(ResolveState { values, bindings })
 }
 
-fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
+/// Whether the sandbox this question is about is running on the machine that
+/// asked. Three answers, and the middle one is why this is not a bool: a
+/// routing table that cannot be read is an outage, and reading it as "no"
+/// would turn every Redis blip into a sandbox losing its credentials.
+enum NodeScope {
+    Admitted,
+    Refused,
+    Undecidable(String),
 }
 
-/// Answers 401 before any extractor touches the body. The line it logs is
-/// the only place a bearer mismatch between the two halves shows up on this
-/// side; the broker turns the 401 into an outage rather than a denial.
-async fn require_bearer(
-    State(state): State<ResolveState>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let presented = bearer(request.headers());
-    if !presented.is_some_and(|presented| {
-        aenv_core::api::constant_time_eq(presented.as_bytes(), state.token.as_bytes())
-    }) {
-        warn!(
-            "a credential resolve request presented no valid bearer; the broker's \
-             resolver.token_file and secrets.pg.resolver_token_file must hold the same value"
-        );
-        return answer(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+async fn scope_to_caller(
+    state: &ResolveState,
+    caller: Option<&CallerNodeId>,
+    sandbox_id: &str,
+    execution_id: &str,
+) -> NodeScope {
+    // The legacy bearer names no machine. Its whole window is the migration,
+    // and closing it is what turns this check on for every caller.
+    let Some(CallerNodeId(node_id)) = caller else {
+        return NodeScope::Admitted;
+    };
+    let Some(bindings) = state.bindings.as_ref() else {
+        return NodeScope::Admitted;
+    };
+    match bindings.get(sandbox_id, SystemTime::now()).await {
+        Ok(Some(binding)) => {
+            if &binding.node.id != node_id {
+                return NodeScope::Refused;
+            }
+            // An empty execution id is a binding that predates the run; it
+            // says nothing, so it refuses nothing.
+            if !binding.execution_id.is_empty() && binding.execution_id != execution_id {
+                return NodeScope::Refused;
+            }
+            NodeScope::Admitted
+        }
+        // No binding is no claim that this sandbox is elsewhere: a create's
+        // reservation lands before the sandbox does.
+        Ok(None) => NodeScope::Admitted,
+        Err(err) => NodeScope::Undecidable(err.to_string()),
     }
-    next.run(request).await
-}
-
-fn answer(status: StatusCode, body: serde_json::Value) -> Response {
-    (
-        status,
-        // The broker caches on its own clock; nothing between the two may.
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(body),
-    )
-        .into_response()
 }
 
 async fn resolve(
     State(state): State<ResolveState>,
+    caller: Option<Extension<CallerNodeId>>,
     body: Result<Json<ResolveRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let request = match body {
@@ -127,6 +122,33 @@ async fn resolve(
         || request.execution_id.is_empty()
     {
         return answer(StatusCode::NOT_FOUND, json!({"error": "not found"}));
+    }
+
+    let caller = caller.map(|Extension(caller)| caller);
+    match scope_to_caller(
+        &state,
+        caller.as_ref(),
+        &request.sandbox_id,
+        &request.execution_id,
+    )
+    .await
+    {
+        NodeScope::Admitted => {}
+        NodeScope::Refused => {
+            warn!(
+                sandbox_id = %request.sandbox_id,
+                node_id = caller.as_ref().map(|CallerNodeId(id)| id.as_str()).unwrap_or_default(),
+                "a broker asked about a sandbox that is not bound to its node"
+            );
+            return answer(StatusCode::NOT_FOUND, json!({"error": "not found"}));
+        }
+        NodeScope::Undecidable(err) => {
+            warn!(error = %err, "could not read where a sandbox is bound");
+            return answer(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error": "the routing table is unavailable"}),
+            );
+        }
     }
 
     match state
@@ -168,13 +190,26 @@ mod tests {
     use aenv_core::secrets::SecretsBackend;
     use aenv_core::secrets::{SecretMetadata, SecretRefStore, SecretString, SecretValue};
 
+    use aenv_core::binding_store::{
+        Binding, BindingState, BindingStoreSettings, InMemoryBindingStore,
+    };
+    use aenv_core::node_registry::types::Node;
+    use axum::http::header;
+    use zeroize::Zeroizing;
+
     use super::*;
+    use crate::internal_api::{InternalAuth, MAX_REQUEST_BYTES};
+    use crate::internal_auth::StaticCallerNode;
     use crate::pg::harness::isolated_schema_pool_or_skip;
     use crate::secrets::envelope::Envelope;
     use crate::secrets::PgSecretRefStore;
     use crate::snapshot::repository::backends::postgres::migrate::migrate;
 
+    /// The bearer that predates per-node identity, still accepted here.
     const TOKEN: &str = "broker-bearer";
+    /// What a broker on `node-a` presents instead.
+    const NODE_A_TOKEN: &str = "sa-token-node-a";
+    const NODE_B_TOKEN: &str = "sa-token-node-b";
 
     struct Endpoint {
         base: String,
@@ -197,10 +232,71 @@ mod tests {
             )
             .await
         }
+
+        async fn resolve_as(
+            &self,
+            token: &str,
+            sandbox: &str,
+            execution: &str,
+            name: &str,
+        ) -> reqwest::Response {
+            self.post(
+                Some(&format!("Bearer {token}")),
+                json!({"sandboxId": sandbox, "executionId": execution, "name": name}),
+            )
+            .await
+        }
+    }
+
+    fn serve(values: Arc<PgSecretValues>, bindings: Option<Arc<dyn BindingStore>>) -> Router {
+        crate::internal_api::router(
+            InternalAuth {
+                caller: Arc::new(StaticCallerNode::new([
+                    (NODE_A_TOKEN, "node-a"),
+                    (NODE_B_TOKEN, "node-b"),
+                ])),
+                legacy_bearer: Some(Arc::new(Zeroizing::new(TOKEN.to_string()))),
+                legacy_bearer_until: None,
+                enabled: true,
+            },
+            None,
+            router(values, bindings),
+        )
+    }
+
+    fn bound_to(node_id: &str, sandbox_id: &str, execution_id: &str) -> Arc<dyn BindingStore> {
+        let store = Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default()));
+        let recorded = Arc::clone(&store);
+        let node_id = node_id.to_string();
+        let sandbox_id = sandbox_id.to_string();
+        let execution_id = execution_id.to_string();
+        futures::executor::block_on(async move {
+            recorded
+                .record(
+                    &sandbox_id,
+                    Binding {
+                        node: Node {
+                            id: node_id,
+                            endpoint: String::new(),
+                            pod_name: String::new(),
+                        },
+                        execution_id,
+                        projection_ttl: std::time::Duration::ZERO,
+                        state: BindingState::Confirmed,
+                    },
+                    SystemTime::now(),
+                )
+                .await
+                .expect("the in-memory store records");
+        });
+        store
     }
 
     macro_rules! endpoint_or_skip {
-        ($name:literal) => {{
+        ($name:literal) => {
+            endpoint_or_skip!($name, None)
+        };
+        ($name:literal, $bindings:expr) => {{
             let pool = isolated_schema_pool_or_skip!($name);
             migrate(&pool).await.expect("migration should succeed");
             let refs = PgSecretRefStore::new(pool.clone());
@@ -210,7 +306,7 @@ mod tests {
             ));
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
-            let app = router(Arc::clone(&values), Zeroizing::new(TOKEN.to_string()));
+            let app = serve(Arc::clone(&values), $bindings);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.unwrap();
             });
@@ -359,6 +455,73 @@ mod tests {
             let body = response.text().await.unwrap();
             assert!(!body.contains("sk-live"), "{body}");
         }
+        assert_eq!(
+            endpoint.resolve("sbx-1", "exec-1", "openai").await.status(),
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn a_broker_reads_only_the_sandboxes_bound_to_its_own_node() {
+        let bindings = bound_to("node-a", "sbx-1", "exec-1");
+        let (endpoint, values, refs) =
+            endpoint_or_skip!("resolve_route_node_scope", Some(Arc::clone(&bindings)));
+        seed(&refs, &values, "openai", opaque("sk-live")).await;
+        values
+            .grant("sbx-1", "exec-1", &["openai".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            endpoint
+                .resolve_as(NODE_A_TOKEN, "sbx-1", "exec-1", "openai")
+                .await
+                .status(),
+            200,
+            "the node the sandbox is bound to"
+        );
+        let response = endpoint
+            .resolve_as(NODE_B_TOKEN, "sbx-1", "exec-1", "openai")
+            .await;
+        assert_eq!(response.status(), 404, "another node's broker");
+        let body = response.text().await.unwrap();
+        assert!(!body.contains("sk-live"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_binding_naming_another_execution_refuses_the_run_that_is_gone() {
+        let bindings = bound_to("node-a", "sbx-1", "exec-2");
+        let (endpoint, values, refs) =
+            endpoint_or_skip!("resolve_route_execution_scope", Some(Arc::clone(&bindings)));
+        seed(&refs, &values, "openai", opaque("sk-live")).await;
+        values
+            .grant("sbx-1", "exec-1", &["openai".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            endpoint
+                .resolve_as(NODE_A_TOKEN, "sbx-1", "exec-1", "openai")
+                .await
+                .status(),
+            404,
+            "the routing table names a different run of this sandbox"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_legacy_bearer_is_scoped_to_no_node_while_its_window_is_open() {
+        let bindings = bound_to("node-a", "sbx-1", "exec-1");
+        let (endpoint, values, refs) =
+            endpoint_or_skip!("resolve_route_legacy_scope", Some(Arc::clone(&bindings)));
+        seed(&refs, &values, "openai", opaque("sk-live")).await;
+        values
+            .grant("sbx-1", "exec-1", &["openai".to_string()])
+            .await
+            .unwrap();
+
+        // The cost of the migration window, stated: a caller with no node
+        // identity is bounded by the grant alone.
         assert_eq!(
             endpoint.resolve("sbx-1", "exec-1", "openai").await.status(),
             200

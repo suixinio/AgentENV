@@ -116,6 +116,83 @@ fn spawn_pg_singleton_tasks(
     .collect()
 }
 
+/// The credential layer the broker's endpoints share.
+///
+/// Kubernetes is what establishes a caller's node, so a deployment discovering
+/// nodes any other way has nothing to ask and the endpoints close rather than
+/// admit an unscoped caller.
+async fn internal_auth(
+    config: &AppConfig,
+    secrets: Option<&aenv_api::secrets::SecretsAssembly>,
+) -> anyhow::Result<aenv_api::internal_api::InternalAuth> {
+    use aenv_api::cfg::ClusterNodeDiscoveryMode;
+    use aenv_api::internal_auth::{CallerNode, KubernetesCallerNode, NoCallerNode};
+
+    let legacy_bearer_until = parse_legacy_bearer_until(&config.secrets.legacy_bearer_until)?;
+    let (caller, enabled): (Arc<dyn CallerNode>, bool) = match config.cluster.node_discovery_mode {
+        ClusterNodeDiscoveryMode::Kubernetes => {
+            let namespace = config.cluster.kubernetes_discovery.namespace.trim();
+            let client = kube::Client::try_default()
+                .await
+                .context("build the Kubernetes client the internal endpoints authenticate with")?;
+            (
+                Arc::new(KubernetesCallerNode::new(client, namespace.to_string())),
+                true,
+            )
+        }
+        ClusterNodeDiscoveryMode::Static => {
+            warn!(
+                "[cluster].node_discovery_mode = \"static\": the internal endpoints the broker \
+                 calls are closed, because there is no Kubernetes to establish which node a \
+                 caller runs on"
+            );
+            (Arc::new(NoCallerNode), false)
+        }
+    };
+
+    Ok(aenv_api::internal_api::InternalAuth {
+        caller,
+        legacy_bearer: secrets.map(|secrets| Arc::new(secrets.resolver_token.clone())),
+        legacy_bearer_until,
+        enabled,
+    })
+}
+
+/// `[secrets].legacy_bearer_until`, as an instant. Empty never closes.
+fn parse_legacy_bearer_until(raw: &str) -> anyhow::Result<Option<std::time::SystemTime>> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw).with_context(|| {
+        format!("[secrets].legacy_bearer_until {raw:?} is not an RFC 3339 instant")
+    })?;
+    Ok(Some(std::time::SystemTime::from(parsed)))
+}
+
+/// The root this half issues node intermediates from, when one is configured.
+fn egress_root_ca(
+    config: &AppConfig,
+) -> anyhow::Result<Option<Arc<aenv_api::egress_ca::EgressRootCa>>> {
+    let Some((cert_path, key_path)) = config.egress_ca.root_paths()? else {
+        return Ok(None);
+    };
+    let certificate = std::fs::read(cert_path)
+        .with_context(|| format!("read egress_ca.root_cert_path {cert_path:?}"))?;
+    let key = zeroize::Zeroizing::new(
+        std::fs::read(key_path)
+            .with_context(|| format!("read egress_ca.root_key_path {key_path:?}"))?,
+    );
+    info!(
+        cert_path = %cert_path.display(),
+        "issuing per-node egress intermediates from the configured root"
+    );
+    Ok(Some(Arc::new(
+        aenv_api::egress_ca::EgressRootCa::from_pem(&certificate, &key)
+            .context("load the egress root")?,
+    )))
+}
+
 async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let identity = NodeIdentity::from_config(&config.node_identity);
     let store_config = cluster_store_config(&config.orchestrator.store)?;
@@ -272,13 +349,18 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let credential_routes = match secrets.as_ref() {
         Some(secrets) => aenv_api::secrets::pg::resolve_route::router(
             Arc::clone(&secrets.values),
-            secrets.resolver_token.clone(),
+            Some(Arc::clone(&binding_store_handle)),
         ),
         None => axum::Router::new(),
     };
+    let internal_routes = aenv_api::internal_api::router(
+        internal_auth(config, secrets.as_ref()).await?,
+        egress_root_ca(config)?,
+        credential_routes,
+    );
 
     Ok(Assembly {
-        app: server::new_control_plane_only(api_impl, credential_routes),
+        app: server::new_control_plane_only(api_impl, internal_routes),
         orchestration,
         upkeep,
         pg_singleton_tasks,

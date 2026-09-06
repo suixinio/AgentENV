@@ -490,6 +490,13 @@ spec:
                   name: secrets-store-config
                   key: AENV_SECRETS_PG_RESOLVER_TOKEN_FILE
                   optional: true
+            # The root this half issues per-node egress intermediates from.
+            # Unset leaves the intermediate endpoint unmounted and every
+            # broker unable to terminate a rules domain.
+            - name: AENV_EGRESS_CA_ROOT_CERT_PATH
+              value: /etc/agentenv/egress-ca/ca.crt
+            - name: AENV_EGRESS_CA_ROOT_KEY_PATH
+              value: /etc/agentenv/egress-ca/ca.key
             # The credential this half presents at a node's gRPC gate. It is
             # the node's own key of the shared Secret, read from the same file
             # the node reads, so one value opens the gate and passes it. The
@@ -602,6 +609,11 @@ spec:
             - name: control-plane-token
               mountPath: /etc/agentenv/control-plane
               readOnly: true
+            # 🔴 The signing key, and the only workload that mounts it. A
+            # broker holds an intermediate issued from it, never this.
+            - name: egress-ca
+              mountPath: /etc/agentenv/egress-ca
+              readOnly: true
             - name: scratch
               mountPath: /workspace/env
       volumes:
@@ -645,6 +657,13 @@ spec:
             items:
               - key: node-gate-token
                 path: token
+        # `optional: true` so the Deployment applies before the Secret is
+        # minted; the process then finds no file, leaves the intermediate
+        # endpoint unmounted and says so once at startup.
+        - name: egress-ca
+          secret:
+            secretName: egress-ca
+            optional: true
         # 🔴 The object-storage credentials, as a mounted file rather than a
         # `secretKeyRef`, and not because of refresh: `[backend.oss]` is
         # `Option<OssBackendConfig>` and confique reads a non-`nested`

@@ -67,9 +67,47 @@ pub struct CaSigner {
     key: PKey<Private>,
     cert: X509,
     cert_pem: Vec<u8>,
+    not_before: SystemTime,
+    not_after: SystemTime,
     options: SignerOptions,
     cache: Mutex<LeafCache>,
     budgets: Mutex<HashMap<String, (u64, u32)>>,
+}
+
+/// How long a leaf must still outlive its issuer. A leaf that outlived the
+/// intermediate that signed it would fail verification for the rest of its
+/// own life, and the cache would keep serving it.
+const ISSUER_MARGIN: Duration = Duration::from_secs(3600);
+
+/// The signer the handler mints from, replaceable while connections are open.
+///
+/// Empty is a state a broker runs in: one that could not reach the issuer
+/// serves the passthrough path and answers a matched name 502 rather than
+/// refusing to start. Replacing the signer replaces its leaf cache with it,
+/// so no leaf signed by a retired issuer can be served afterwards.
+#[derive(Default)]
+pub struct SignerSlot {
+    current: arc_swap::ArcSwapOption<CaSigner>,
+}
+
+impl SignerSlot {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    pub fn holding(signer: Arc<CaSigner>) -> Self {
+        let slot = Self::default();
+        slot.store(signer);
+        slot
+    }
+
+    pub fn load(&self) -> Option<Arc<CaSigner>> {
+        self.current.load_full()
+    }
+
+    pub fn store(&self, signer: Arc<CaSigner>) {
+        self.current.store(Some(signer));
+    }
 }
 
 /// A leaf still worth serving has to outlive the connection about to use it.
@@ -96,10 +134,14 @@ impl CaSigner {
     ) -> Result<Self, SignError> {
         let cert = X509::from_pem(ca_cert_pem)?;
         let key = PKey::private_key_from_pem(ca_key_pem)?;
+        let not_before = asn1_to_system_time(cert.not_before())?;
+        let not_after = asn1_to_system_time(cert.not_after())?;
         Ok(Self {
             key,
             cert,
             cert_pem: ca_cert_pem.to_vec(),
+            not_before,
+            not_after,
             options,
             cache: Mutex::new(LeafCache {
                 by_name: HashMap::new(),
@@ -113,6 +155,19 @@ impl CaSigner {
     /// The CA certificate as guests receive it.
     pub fn ca_cert_pem(&self) -> &[u8] {
         &self.cert_pem
+    }
+
+    /// When this issuer stops being usable.
+    pub fn not_after(&self) -> SystemTime {
+        self.not_after
+    }
+
+    /// The whole window this issuer was signed for, which is what a renewal
+    /// schedule is a fraction of.
+    pub fn lifetime(&self) -> Duration {
+        self.not_after
+            .duration_since(self.not_before)
+            .unwrap_or(Duration::ZERO)
     }
 
     /// A leaf for `name`, from the cache when one is live, otherwise minted
@@ -160,6 +215,14 @@ impl CaSigner {
         Ok(leaf)
     }
 
+    /// A leaf lives for its TTL, or until an hour before its issuer stops
+    /// being usable, whichever comes first.
+    fn leaf_expiry(&self, now: SystemTime) -> SystemTime {
+        let by_ttl = now + self.options.leaf_ttl;
+        let by_issuer = self.not_after.checked_sub(ISSUER_MARGIN).unwrap_or(now);
+        by_ttl.min(by_issuer).max(now)
+    }
+
     fn charge_budget(&self, sandbox_id: &str, now: SystemTime) -> Result<(), SignError> {
         let minute = now
             .duration_since(UNIX_EPOCH)
@@ -196,7 +259,7 @@ impl CaSigner {
         builder.set_pubkey(&leaf_key)?;
         builder
             .set_not_before(Asn1Time::from_unix(unix_secs(now).saturating_sub(300))?.as_ref())?;
-        let expires_at = now + self.options.leaf_ttl;
+        let expires_at = self.leaf_expiry(now);
         builder.set_not_after(Asn1Time::from_unix(unix_secs(expires_at))?.as_ref())?;
         builder.append_extension(BasicConstraints::new().critical().build()?)?;
         builder.append_extension(
@@ -227,6 +290,19 @@ impl CaSigner {
             expires_at,
         })
     }
+}
+
+/// An X.509 timestamp as a `SystemTime`, by asking OpenSSL for its distance
+/// from the epoch — the only portable way out of an `Asn1Time`.
+fn asn1_to_system_time(at: &openssl::asn1::Asn1TimeRef) -> Result<SystemTime, SignError> {
+    let epoch = Asn1Time::from_unix(0)?;
+    let difference = epoch.diff(at)?;
+    let seconds = i64::from(difference.days) * 86_400 + i64::from(difference.secs);
+    Ok(if seconds >= 0 {
+        UNIX_EPOCH + Duration::from_secs(seconds as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_secs(seconds.unsigned_abs())
+    })
 }
 
 fn unix_secs(at: SystemTime) -> i64 {
@@ -284,6 +360,64 @@ pub fn generate_test_ca(common_name: &str) -> Result<(Vec<u8>, Vec<u8>), SignErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leaf_never_outlives_the_issuer_that_signed_it() {
+        let (cert, key) = generate_test_ca("issuer margin").unwrap();
+        // A leaf TTL longer than the issuer's own remaining life.
+        let signer = CaSigner::from_pem(
+            &cert,
+            &key,
+            SignerOptions {
+                leaf_ttl: Duration::from_secs(100 * 365 * 24 * 3600),
+                ..SignerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let leaf = signer.leaf_for("api.test", "sbx-1").unwrap();
+
+        assert!(
+            leaf.expires_at <= signer.not_after() - ISSUER_MARGIN,
+            "a leaf outliving its issuer would fail verification for the rest of its life"
+        );
+    }
+
+    #[test]
+    fn a_leaf_shorter_than_its_issuer_keeps_its_own_ttl() {
+        let (cert, key) = generate_test_ca("issuer margin").unwrap();
+        let leaf_ttl = Duration::from_secs(3600);
+        let signer = CaSigner::from_pem(
+            &cert,
+            &key,
+            SignerOptions {
+                leaf_ttl,
+                ..SignerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let leaf = signer.leaf_for("api.test", "sbx-1").unwrap();
+        let now = SystemTime::now();
+
+        let lived = leaf.expires_at.duration_since(now).unwrap();
+        assert!(
+            lived.abs_diff(leaf_ttl) < Duration::from_secs(60),
+            "{lived:?} is not the configured {leaf_ttl:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_slot_holds_nothing_and_a_stored_signer_is_the_one_that_comes_back() {
+        let slot = SignerSlot::empty();
+        assert!(slot.load().is_none());
+
+        let (cert, key) = generate_test_ca("slot").unwrap();
+        let signer = Arc::new(CaSigner::from_pem(&cert, &key, SignerOptions::default()).unwrap());
+        slot.store(Arc::clone(&signer));
+
+        assert!(Arc::ptr_eq(&slot.load().unwrap(), &signer));
+    }
 
     fn signer(options: SignerOptions) -> CaSigner {
         let (cert, key) = generate_test_ca("AgentENV Egress Test CA").unwrap();

@@ -97,9 +97,9 @@ spec:
               mountPath: /etc/aenv-egress/config.toml
               subPath: aenv-egress.toml
               readOnly: true
-            - name: egress-ca
-              mountPath: /etc/aenv-egress/ca
-              readOnly: true
+            # While the api half still accepts the shared bearer, this is
+            # what `[resolver].token_file` may point at instead of the
+            # projected token above.
             - name: egress-resolver
               mountPath: /etc/aenv-egress/resolver
               readOnly: true
@@ -114,12 +114,9 @@ spec:
         - name: config
           configMap:
             name: aenv-egress-config
-        # CA certificate and key that sign leaf certificates for intercepted
-        # names. The certificate half is also what nodes hand to guests.
-        - name: egress-ca
-          secret:
-            secretName: egress-ca
-            optional: true
+        # 🔴 No `egress-ca` volume, and that is the point of the intermediate:
+        # the root's key stays in the api half's own mount, and this Pod holds
+        # a key that expires in a week and cannot sign a cluster-internal name.
         # The bearer the broker presents at the resolve endpoint. Named by
         # [resolver].token_file; an unset [resolver].url leaves it unread.
         - name: egress-resolver

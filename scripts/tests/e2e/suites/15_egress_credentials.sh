@@ -171,40 +171,111 @@ brokered_auth_within() {
   printf '%s' "$auth"
 }
 
+# The certificate chain the guest is served for a rule domain, one PEM subject
+# per line, leaf first. `-showcerts` prints the whole chain the broker sent.
+guest_chain_subjects() {
+  local sandbox_id="$1"
+  run_in_sandbox "$sandbox_id" \
+    "echo | timeout 20 openssl s_client -showcerts -servername ${EGRESS_UPSTREAM} \
+     -connect ${EGRESS_UPSTREAM}:443 2>/dev/null | grep -E '^ *[0-9]+ s:' || true"
+}
+
 # -- 5 and 7. Broker restart and outage (Kubernetes only) --------------------------
 if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
-   && kubectl -n "${K8S_NAMESPACE:-agentenv-system}" get deploy/aenv-egress >/dev/null 2>&1; then
+   && kubectl -n "${K8S_NAMESPACE:-agentenv-system}" get ds/aenv-egress >/dev/null 2>&1; then
   ns="${K8S_NAMESPACE:-agentenv-system}"
-  kubectl -n "$ns" rollout restart deploy/aenv-egress >/dev/null
-  kubectl -n "$ns" rollout status deploy/aenv-egress --timeout=180s >/dev/null
+
+  # 🔴 The chain a rule domain presents is leaf + this node's intermediate, and
+  # the guest trusts neither of them directly — it trusts the root they chain
+  # to. Recorded before the rollout so the comparison after it means something.
+  chain_before=$(guest_chain_subjects "$sandbox_id")
+  chain_depth=$(printf '%s\n' "$chain_before" | grep -c 's:' || true)
+  if [[ "${chain_depth:-0}" -ge 2 ]]; then
+    _pass "a rule domain is served leaf + intermediate (${chain_depth} certificates)"
+  else
+    _fail "brokered chain depth" ">= 2" "${chain_depth:-0}"
+  fi
+  issuer_before=$(printf '%s\n' "$chain_before" | grep -o 'AgentENV Egress Node [^,/]*' | head -n 1 || true)
+  assert_not_empty "$issuer_before" "the chain names the node that issued it"
+
+  kubectl -n "$ns" rollout restart ds/aenv-egress >/dev/null
+  kubectl -n "$ns" rollout status ds/aenv-egress --timeout=180s >/dev/null
   state=$(get_sandbox_state "$sandbox_id")
   assert_eq "$state" "running" "sandbox survives a broker rollout"
   after_roll=$(brokered_auth_within 60)
   assert_eq "$after_roll" "Bearer ${secret_value}" "brokered requests resume after the rollout"
+  # The restarted broker took a fresh intermediate and re-minted the leaf under
+  # it; the guest's trust store never changed, so the handshake still verifies.
+  chain_after=$(guest_chain_subjects "$sandbox_id")
+  assert_not_empty \
+    "$(printf '%s\n' "$chain_after" | grep -o 'AgentENV Egress Node [^,/]*' | head -n 1 || true)" \
+    "a cached name still handshakes after the intermediate is replaced"
 
-  replicas=$(kubectl -n "$ns" get deploy/aenv-egress -o jsonpath='{.spec.replicas}')
-  # Registered before the scale-down, not after it: an interrupt or a runner
-  # timeout between the two would otherwise leave the broker at zero replicas
-  # for every tenant of a shared cluster. Chained onto the harness's own EXIT
-  # trap (`_cleanup_e2e`, scripts/tests/e2e/lib/helpers.sh) rather than
-  # replacing it.
-  _restore_egress_replicas() {
-    kubectl -n "$ns" scale deploy/aenv-egress --replicas="${replicas:-2}" >/dev/null 2>&1 || true
+  # A DaemonSet has no replica count to take to zero. Selecting a label no node
+  # carries is the same statement, and it is reversible by the same trap.
+  #
+  # Registered before the patch, not after it: an interrupt or a runner timeout
+  # between the two would otherwise leave every node without a broker. Chained
+  # onto the harness's own EXIT trap (`_cleanup_e2e`) rather than replacing it.
+  _restore_egress_daemonset() {
+    kubectl -n "$ns" patch ds/aenv-egress --type=json \
+      -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector/aenv-egress"}]' \
+      >/dev/null 2>&1 || true
   }
-  trap '_restore_egress_replicas; _cleanup_e2e' EXIT
-  kubectl -n "$ns" scale deploy/aenv-egress --replicas=0 >/dev/null
-  kubectl -n "$ns" rollout status deploy/aenv-egress --timeout=120s >/dev/null || true
-  sleep 12
+  trap '_restore_egress_daemonset; _cleanup_e2e' EXIT
+  kubectl -n "$ns" patch ds/aenv-egress --type=merge \
+    -p '{"spec":{"template":{"spec":{"nodeSelector":{"aenv-egress":"parked"}}}}}' >/dev/null
+  for _ in $(seq 1 40); do
+    remaining=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=aenv-egress \
+      --no-headers 2>/dev/null | wc -l)
+    [[ "${remaining:-1}" -eq 0 ]] && break
+    sleep 3
+  done
   outage_code=$(guest_http_code "$sandbox_id" "https://${EGRESS_UPSTREAM}/anything" 10)
   if [[ "$outage_code" == "000" ]]; then
     _pass "guest connection fails fast while the broker is down"
   else
     _fail "broker outage visible to the guest" "connection failure" "HTTP ${outage_code}"
   fi
-  kubectl -n "$ns" scale deploy/aenv-egress --replicas="${replicas:-2}" >/dev/null
-  kubectl -n "$ns" rollout status deploy/aenv-egress --timeout=180s >/dev/null
+  _restore_egress_daemonset
+  kubectl -n "$ns" rollout status ds/aenv-egress --timeout=180s >/dev/null
   recovered=$(brokered_auth_within 60)
   assert_eq "$recovered" "Bearer ${secret_value}" "brokered requests recover after the broker returns"
+
+  # -- A broker asks only about the sandboxes on its own machine ------------------
+  #
+  # The broker image carries no HTTP client, so its own projected token is read
+  # out of it and presented from a node Pod, which does carry curl (its preStop
+  # hook uses it). Both Pods are the deployment's own; nothing here mints a
+  # credential the cluster would not otherwise have.
+  sandbox_node=$(api_get "/registry/sandboxes" >/dev/null 2>&1; \
+    echo "$HTTP_BODY" | jq -r --arg id "$sandbox_id" \
+      '.sandboxes[]? | select(.sandboxID == $id) | .nodeID // empty' 2>/dev/null | head -n 1 || true)
+  other_broker=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=aenv-egress \
+    -o jsonpath="{range .items[?(@.spec.nodeName!='${sandbox_node}')]}{.metadata.name}{'\n'}{end}" \
+    2>/dev/null | head -n 1 || true)
+  node_pod=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=agentenv-node \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+  if [[ -n "$sandbox_node" && -n "$other_broker" && -n "$node_pod" ]]; then
+    foreign_token=$(kubectl -n "$ns" exec "$other_broker" -- \
+      cat /var/run/secrets/aenv/api/token 2>/dev/null || true)
+    if [[ -n "$foreign_token" ]]; then
+      body=$(jq -nc --arg s "$sandbox_id" --arg n "$secret_name" \
+        '{sandboxId: $s, executionId: "unknown", name: $n}')
+      foreign_code=$(kubectl -n "$ns" exec "$node_pod" -- \
+        curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+        -X POST http://agentenv-api:8000/internal/credentials/resolve \
+        -H "Authorization: Bearer ${foreign_token}" \
+        -H 'content-type: application/json' -d "$body" 2>/dev/null || true)
+      assert_eq "${foreign_code:-000}" "404" \
+        "a broker on another node is told nothing about this sandbox"
+    else
+      _skip "skipped: the other node's broker token is unreadable"
+    fi
+  else
+    warn "no second node with its own broker; skipping the cross-node resolve check"
+    _skip "skipped: cross-node resolve check needs two nodes"
+  fi
 else
   warn "not a Kubernetes run with kubectl; skipping broker rollout and outage checks"
   _skip "skipped: broker rollout/outage checks"

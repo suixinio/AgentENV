@@ -23,6 +23,8 @@
 3. **协议与凭据归一个可替换的组件，契约与放置无关。** 契约是"一条字节流加一段身份头"，
    生产走 TLS 到集群里的 `aenv-egress` Deployment，单机与开发把同一个 lib 的核心部分链接进
    `aenv-node`。
+   > 后半句被第三版（`_egress-per-node-implementation.md`）推翻：broker 是每节点 DaemonSet，
+   > 契约走同节点 Unix socket，集群级 `remote` 形态删除。
 4. **公开面是 E2B 的 `network.rules` 与 `${aenv.secrets.NAME}` 标记；透明拦截是 v1 的原语。**
    产品跑未经改造的任意代码，硬编码目标的 SDK、git、包管理器不改一行配置也要拿到凭据。
    显式本地端点与非 HTTP 协议是同一机制上的扩展，排在 v1.1。
@@ -180,6 +182,9 @@ v1 唯一的公开面，字段级对齐 E2B（`spec/openapi.yml:457-528`）：
 
 ### 4.4 接缝 1：运行时 ↔ broker
 
+> 本节被第三版（`_egress-per-node-implementation.md`）推翻：传输是同节点 Unix socket，
+> 身份是 `SO_PEERCRED` 的 uid，TLS、HMAC、nonce、时钟窗口全部删除。
+
 传输：**TLS**，不是明文 TCP。第一版写"不引入 PKI"在 CA 已经存在的前提下不成立：透明模式下这条
 链路上跑的是被解密的上游请求体。broker 的服务端证书由同一集群 CA 签发，运行时用工作区已有的
 openssl 栈校验（C3）。身份头仍带 HMAC：TLS 证明"这是 broker"，HMAC 证明"这是某个运行时"，
@@ -307,6 +312,10 @@ broker 或 store 不可用是 `502 + reason`；CA 未到达是创建失败，不
 
 ### 4.10 部署
 
+> 本节被第三版（`_egress-per-node-implementation.md`）推翻：`aenv-egress` 是每节点 DaemonSet，
+> 没有 Service，节点侧配置是 `mode = "local"` 与 `socket_path`，心跳枚举是
+> `local_ok | local_unreachable`。
+
 - `aenv-egress`：Deployment + Service，多副本无状态，不特权；Secret `egress-ca`（CA 私钥与证书）、
   Secret 里的 HMAC key；NetworkPolicy（§4.5）。
 - `aenv-node`：`[egress_broker] { mode, endpoint, ca_cert_path, shared_secret, max_skew_ms,
@@ -320,6 +329,8 @@ broker 或 store 不可用是 `502 + reason`；CA 未到达是创建失败，不
 
 - **5.1 DNAT 到 Pod netns + sidecar。** 违反 C1、C2；身份靠源 IP。
 - **5.2 节点 DaemonSet + unix socket 传 fd。** 违反 C2；不能水平扩缩。
+  > 被第三版（`_egress-per-node-implementation.md`）推翻：C2 作废（边界改为"值不进 guest"），
+  > 每节点形态被采纳，容量随节点扩展。
 - **5.3 同进程作为唯一形态。** 违反 C1；降为 `embedded`，且只有 `core`。
 - **5.4 CubeSandbox 式 TPROXY 独立代理。** 密钥明文经控制面推进代理；拦截点不归运行时。
 - **5.5 自造 `brokers` 作为公开面。** 与 E2B SDK 不兼容，`handler`/`params` 把实现泄进 API 且
@@ -328,6 +339,8 @@ broker 或 store 不可用是 `502 + reason`；CA 未到达是创建失败，不
   HTTPS。改为拦截整端口、按 SNI 分流、不匹配透传。
 - **5.7 只做显式端点。** 被 G7 否掉。
 - **5.8 明文 TCP 到 broker 加"不引入 PKI"。** CA 已经存在，链路上是解密后的请求体。
+  > 被第三版（`_egress-per-node-implementation.md`）推翻：链路不再横穿集群，同节点 Unix socket
+  > 上没有可窃听的明文，传输 PKI 与 HMAC 一并删除。
 - **5.9 租户所有权作为授权模型。** C5 说没有租户。改为授权记录。
 - **5.10 创建请求内联值。** 无法打码、孤儿、名字绑定沙箱 id。移出 v1。
 
@@ -401,6 +414,8 @@ Name Constraints）。
 - 生产形态下运行时不做协议解析或 TLS 终止；运行时只转发字节。
 - 本功能不在节点上新增 sidecar、DaemonSet、hostPath socket，也不新增任何进入沙箱 netns 的
   外部进程（自定义扩展现有的 `networkNamespacePath` 契约不受影响）。
+  > 被第三版（`_egress-per-node-implementation.md`）推翻：正是新增了一个每节点 DaemonSet 与一条
+  > hostPath socket。进沙箱 netns 的仍然只有运行时自己。
 - 不提供"只拦截部分域名"的声明；DNAT 是端口粒度，分流在 broker。
 - 不解证书固定的客户端；不支持透明 Postgres 的 `sslmode=verify-full`。
 - 不做 broker 滚动时的连接热接管。

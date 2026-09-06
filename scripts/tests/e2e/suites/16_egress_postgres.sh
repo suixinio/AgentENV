@@ -119,9 +119,12 @@ if ! python3 -c 'import e2b' >/dev/null 2>&1; then
   exit 0
 fi
 
-# A 503 is "no node reports a usable broker", which is also what the seconds
-# after a broker rollout look like -- and the suite before this one rolls the
-# broker on purpose. Give it a bounded chance to come back before believing it.
+# A 503 is "**every** node reports no usable broker", not "one is busy": the
+# api half places a sandbox with rules only on a node whose heartbeat says
+# `local_ok`, so this answer means no broker on any node is being read right
+# now. It is also what the seconds after a broker rollout look like -- and the
+# suite before this one rolls the broker DaemonSet on purpose, one node at a
+# time. Give it a bounded chance to come back before believing it.
 sandbox_id=$(create_sandbox "$AENV_TEMPLATE_ID" 180 "$(endpoint_json)"); _sync_http
 broker_wait=0
 while [[ "$HTTP_STATUS" == "503" && "$broker_wait" -lt 90 ]]; do

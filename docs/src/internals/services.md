@@ -69,6 +69,41 @@ Deployment model:
   KVM/PVM mode, and hostPath
 - `agentenv-api`: Deployment answering the `Scheduler` RPCs
 - `agentenv-nodes`: headless Service for Kubernetes-mode node discovery
+- `aenv-egress`: unprivileged DaemonSet, one broker per node, reached over the
+  `/run/aenv-egress` hostPath both it and `agentenv-node` mount. No Service:
+  nothing reaches it over the network.
+
+### Rolling the egress broker back
+
+Three workloads, three answers. What each one needs *in place* to run is what
+decides whether it can be rolled back on its own.
+
+**`aenv-egress` (the broker)** — rolling its image back is free, and it takes
+no sandbox with it. That is the whole reason it is not a sidecar.
+
+| Needs to be there | Why |
+|---|---|
+| `/run/aenv-egress`, group-writable by uid 65532 | the node creates it; a broker started before the node has ever run on that machine finds nothing to bind in |
+| `POST /internal/egress/intermediate` answering | without it the broker holds no signing key and closes every rule domain (it still starts, and still serves passthrough) |
+| the `egress-resolver` Secret **or** an open `legacy_bearer_until` | an image that predates per-node identity presents the shared bearer and nothing else |
+
+**`agentenv-node`** — rolling it back is **not** free: it destroys every
+sandbox on every node it touches. Combine it with a planned node roll.
+
+| Needs to be there | Why |
+|---|---|
+| `AENV_EGRESS_BROKER_MODE` the image understands | an image from before the per-node move refuses to start on `local`; one from after refuses on `remote`. Set the ConfigMap to `disabled` before rolling between the two, and creates with rules answer `503` for that window |
+| `/run/aenv-egress` in the Pod spec | a node image expecting `local` with no such volume can never reach a broker |
+
+**`agentenv-api`** — rolling it back is an image change, no flags, and it takes
+no sandbox with it. It is also the half that must roll **first** on the way
+forward and **last** on the way back.
+
+| Needs to be there | Why |
+|---|---|
+| the `agentenv-api-token-review` ClusterRole | without it both internal endpoints answer 503, and every broker loses its intermediate at its next renewal |
+| the `egress-ca` Secret with `ca.key` | an api half that cannot read the root issues nothing |
+| `EGRESS_BROKER_STATE_LOCAL_OK` in its proto | an older api half decodes a node's `local_ok` as unspecified, places no sandbox with rules, and answers `503` |
 
 ## gRPC API
 

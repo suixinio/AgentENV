@@ -165,16 +165,17 @@ and the sandbox's own policy apply to it exactly as before.
 A sandbox with rules gets a listener inside its own network namespace and a DNAT of its
 outbound port 443 onto that listener; UDP 443 is rejected so HTTP/3 falls back to TCP. Every
 connection accepted there is the sandbox's by construction, so the node attaches the sandbox's
-identity and relays the bytes to the broker over TLS. The broker reads the ClientHello:
+identity and relays the bytes over a Unix socket to the broker on this same machine, which admits
+the connection only because its peer uid is the node's. The broker reads the ClientHello:
 
 - The server name matches a rule: the broker answers with a leaf certificate signed by the
-  cluster CA, terminates TLS, replaces the headers, and opens its own TLS connection to the real
-  upstream, verified against the system trust store.
+  node's intermediate, terminates TLS, replaces the headers, and opens its own TLS connection to
+  the real upstream, verified against the system trust store.
 - The name matches nothing, or there is no name: the bytes are relayed to the original
   destination untouched, after the same policy check. This is the path `pip`, `npm` and
   `git clone` take.
 
-The guest trusts the cluster CA because every envd `init` for a sandbox with rules carries it as
+The guest trusts the root because every envd `init` for a sandbox with rules carries it as
 `caBundle`, along with `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
 `NODE_EXTRA_CA_CERTS` and `GIT_SSL_CAINFO` for runtimes that do not read the system store (a
 user-provided value of the same name wins). A sandbox without rules gets an empty `caBundle`.
@@ -187,10 +188,27 @@ values in the body:
 | Symptom | Reason |
 |---|---|
 | `403` | the sandbox policy denies the destination, the secret is not granted to this sandbox, its value is gone, or the secret's `allowedHosts` does not cover this name (`secret_host_not_allowed`) |
+| `405` | `CONNECT` or `TRACE` to an intercepted name; neither is brokered (`connect_unsupported`, `method-not-brokered`) |
 | `502` | the upstream is unreachable or unresolvable, its TLS failed, or the secrets store is down |
 | `505` | HTTP/2 to an intercepted name; use HTTP/1.1 |
-| connection closed at once | the broker is unreachable, or the sandbox exceeded its connection budget |
+| TLS fails on a rule domain, the broker logging `no-intermediate` | this node's broker has not been issued its intermediate. It cannot mint a leaf, and it closes rather than relaying the request to the real upstream without the credentials the rule exists to add |
+| connection closed at once | the broker is unreachable, or the sandbox exceeded its per-sandbox connection budget |
+| create answers `503` | no node reports `local_ok` — every broker is down, or none has been rolled onto `mode = "local"` yet |
 | create fails with a CA probe error | the guest's envd does not support `caBundle` |
+
+### What a guest sees that it did not before
+
+The chain a rule domain presents is **two certificates**, not one: the leaf, and the node's
+intermediate. The intermediate's issuer CN reads `AgentENV Egress Node <node>`, so a guest that
+prints the chain sees which machine served it.
+
+What does not change is the anchor. A guest trusts the **root**, and only the root. That is what
+lets a sandbox pause on one node and resume on another: a process that loaded its trust store at
+startup — Node.js, Go, the JVM all do — carries that store across the move, and a guest pinned to
+the node it started on would keep working until it moved and then fail with nothing to say why.
+
+A leaf also never outlives its issuer: it expires at its own TTL or an hour before the
+intermediate does, whichever comes first.
 
 ## Authorization
 
@@ -252,39 +270,69 @@ does not recover it.
 
 ## Deployment
 
-Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egress_broker) and
+Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egress_broker),
+[`[egress_ca]`](../configuration/reference.md#egress_broker) and
 [`[secrets]`](../configuration/reference.md#secrets):
 
-- `aenv-egress` (`deploy/k8s/base/aenv-egress-deployment.yaml`, image
-  `deploy/docker/Dockerfile.aenv-egress`): the broker, reading
-  `deploy/k8s/base/config/aenv-egress.toml`. It needs the `egress-ca`, `egress-server`,
-  `egress-hmac` and `egress-resolver` Secrets; `aenv-egress-secrets.example.yaml` says how to mint
-  them. `aenv-egress-networkpolicy.yaml` lets only nodes in and only the api half, DNS and port
-  443 of public addresses out.
-- Nodes: `[egress_broker].mode = "remote"`, `endpoint = "aenv-egress:8443"`, the CA certificate
-  and the HMAC key. Two CAs where the operator has split them: `ca_cert_path` verifies the
-  broker's server certificate and `guest_ca_cert_path` is what guests trust for intercepted
-  names, which is what lets the second one carry name constraints without invalidating the
-  broker's own `*.svc` certificate. A node reports its broker state in every heartbeat, and the api half places a
-  sandbox with rules only on a node that reports `remote_ok`; when none does the create answers
-  `503`.
-- The api half: `[secrets].backend = "postgres"` and two mounted files,
-  `[secrets.pg].key_file` (base64 of 32 bytes, the `agentenv-secrets-key` Secret) and
-  `[secrets.pg].resolver_token_file` (the `egress-resolver` Secret, the same bearer the broker
-  mounts). PostgreSQL gains `secret_values` and `secret_grants` beside `secret_refs`. The broker
-  points its `[resolver].url` at `http://agentenv-api:8000/internal`, and its NetworkPolicy has
-  to admit that port. Losing the master key loses every stored value; it is not recoverable from
-  a database backup, which is the point.
+- `aenv-egress` (`deploy/k8s/base/aenv-egress-daemonset.yaml`, image
+  `deploy/docker/Dockerfile.aenv-egress`): the broker, **one per node**, reading
+  `deploy/k8s/base/config/aenv-egress.toml`. It binds a Unix socket in `/run/aenv-egress`, a
+  hostPath it shares with `agentenv-node` and nothing else, and admits only connections whose
+  peer uid is the node's. It holds no CA key of its own: it asks the api half for a seven-day
+  intermediate against its own projected ServiceAccount token.
+  `aenv-egress-networkpolicy.yaml` lets nothing in but Prometheus — there is no network path to
+  the broker at all — and lets the api half, DNS and port 443 of public addresses out.
+- Nodes: `[egress_broker].mode = "local"`, `socket_path = "/run/aenv-egress/broker.sock"`, and
+  `guest_ca_cert_path` pointing at the **root** guests trust. The node creates the socket
+  directory at startup and hands it to the broker's group. A node reports its broker state in
+  every heartbeat, and the api half places a sandbox with rules only on a node reporting
+  `local_ok`; when none does the create answers `503`.
+- The api half: `[secrets].backend = "postgres"` with `[secrets.pg].key_file` (base64 of 32
+  bytes, the `agentenv-secrets-key` Secret) and `[secrets.pg].resolver_token_file`, plus
+  `[egress_ca].root_cert_path` / `root_key_path` (the `egress-ca` Secret) — **the only workload
+  that mounts the root's key**. PostgreSQL gains `secret_values` and `secret_grants` beside
+  `secret_refs`. The broker points `[resolver].url` and `[ca].issuer_url` at
+  `http://agentenv-api:8000/internal`, and its NetworkPolicy has to admit that port. Losing the
+  master key loses every stored value; it is not recoverable from a database backup, which is the
+  point.
+
+Both internal endpoints check the broker's projected token through Kubernetes: `TokenReview` says
+whose it is, the Pod says which machine it runs on, and a resolve is then answered only for
+sandboxes bound to that machine. That needs the `agentenv-api-token-review` ClusterRole, and it is
+why `[cluster].node_discovery_mode = "static"` closes both endpoints with a `503` — there is no
+Kubernetes to ask. `[secrets].legacy_bearer_until` keeps the shared bearer working beside the
+token during a migration; while it is open, a caller presenting it is scoped to no node.
 
 `AENV_EGRESS_BROKER_MODE` and `AENV_SECRETS_BACKEND` are both read once at process startup, so
-editing either ConfigMap changes nothing until the process that reads it restarts:
-`kubectl rollout restart ds/agentenv-node deploy/agentenv-api`, or `make k8s-redeploy` for all
-four workloads.
+editing either ConfigMap changes nothing until the process that reads it restarts. 🔴 Rolling
+`ds/agentenv-node` destroys every sandbox on every node — the Firecracker processes are its
+children. Rolling `ds/aenv-egress` does not, which is the whole reason the broker is its own
+workload.
 
 `mode = "embedded"` runs the broker core inside `aenv-node` for a single static node: it has no
-credential source and no TLS stack, so it carries the two handlers that need neither — `echo`,
-which answers the sandbox's identity, and `tcp` — and proves the intercept and identity path
-(`docker-compose.yml` uses it) without brokering HTTPS or Postgres.
+credential source and no TLS stack, so it carries the one handler that needs neither — `echo`,
+which answers the sandbox's identity — and proves the intercept and identity path without
+brokering HTTPS or Postgres.
+
+### When a rule domain stops working
+
+In this order, because each step rules out everything below it:
+
+1. **`GET /nodes`** — does the sandbox's node report `egressBroker: "local_ok"`? `disabled` means
+   its ConfigMap was never flipped; `local_unreachable` means the socket is not being read.
+2. **`kubectl -n <ns> get pods -l app.kubernetes.io/name=aenv-egress -o wide`** — is there a
+   broker Pod on that node, and is it `Ready`? Its readiness probe connects to its own socket, so
+   `Ready` means it is serving and not merely up.
+3. **The broker's log on that node** — `no-intermediate` means it never got a signing key: check
+   that the api half has `[egress_ca]` set, that the `agentenv-api-token-review` ClusterRole
+   exists, and that discovery is not `static`.
+4. **`egress_intermediate_expires_seconds`** on that broker — zero means it holds none; a small
+   number means renewal has been failing for days and the log says why.
+5. **The audit trail** (`egress.audit` on the broker's stdout) — a `security_event` names what was
+   refused and why; a request line with a `502` and no security event is an upstream problem, not
+   a policy one.
+6. **Only then the sandbox's own policy**: `allowOut`, `denyOut`, `allow_internet_access`, and
+   whether the secret the rule names still exists and is granted to this run.
 
 Metrics on the broker's `:9103`: `egress_conns_total{handler,outcome}`, `egress_active_conns`,
 `egress_policy_denied_total{reason}`, `egress_intercept_no_sni_total`,

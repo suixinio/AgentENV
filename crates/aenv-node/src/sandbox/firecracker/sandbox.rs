@@ -1148,6 +1148,19 @@ impl FirecrackerSandbox {
             .map(|slot| slot.host_interaction_ip)
     }
 
+    /// The node-side address of this sandbox's veth pair: what a guest packet
+    /// addressed at the node itself would carry as its destination.
+    pub fn veth_host_ip(&self) -> Option<std::net::Ipv4Addr> {
+        self.network_slot.as_ref().map(|slot| slot.veth_host_ip)
+    }
+
+    /// The resolver this sandbox's guest was booted with.
+    pub fn guest_dns_server(&self) -> Option<std::net::Ipv4Addr> {
+        self.network_slot
+            .as_ref()
+            .map(|slot| slot.guest_dns_server())
+    }
+
     pub fn firecracker_binary_path(&self) -> &Path {
         &self.launch.common().firecracker_binary
     }

@@ -85,10 +85,17 @@ impl EgressRuntime {
         let transport: Arc<dyn BrokerTransport> = match egress.mode {
             EgressBrokerMode::Disabled => return Ok(None),
             EgressBrokerMode::Embedded => {
-                let denied = config.network.egress.always_denied_cidrs.to_vec();
+                let denied: Vec<String> = config
+                    .network
+                    .egress
+                    .effective_denied_cidrs()
+                    .context("egress_broker: the always-denied table is unusable")?
+                    .into_iter()
+                    .map(|network| network.to_string())
+                    .collect();
                 let guard = UpstreamGuard::new(
                     BrokerDenyList::with_extra(&denied)
-                        .context("egress_broker: always_denied_cidrs are not all cidrs")?,
+                        .context("egress_broker: the always-denied table is not all cidrs")?,
                 );
                 let dispatcher = Arc::new(
                     Dispatcher::new(Arc::new(NoCredentials), Arc::new(guard))

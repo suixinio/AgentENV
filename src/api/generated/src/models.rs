@@ -6962,18 +6962,18 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLifec
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxNetworkConfig {
-    /// Specify if the sandbox URLs should be accessible only with authentication.
+    /// Whether the sandbox's non-envd ports are reachable without a token. `false` is rejected with 400 until the traffic access token lands.
     #[serde(rename = "allowPublicTraffic")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_public_traffic: Option<bool>,
 
-    /// List of allowed destinations for egress traffic. Each entry can be a CIDR block (e.g. \"8.8.8.8/32\"), a bare IP address (e.g. \"8.8.8.8\"), or a domain name (e.g. \"example.com\", \"*.example.com\"). Allowed entries always take precedence over denied entries.
+    /// List of allowed destinations for egress traffic. Each entry is a CIDR block (e.g. \"8.8.8.8/32\") or a bare IPv4 address (e.g. \"8.8.8.8\"); allowed entries always take precedence over denied entries. A domain name is rejected with 400 until the TCP egress proxy lands, and an IPv6 entry is rejected with 400 in both fields.
     #[serde(rename = "allowOut")]
     #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_out: Option<Vec<String>>,
 
-    /// List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
+    /// List of denied CIDR blocks or IPv4 addresses for egress traffic. Domain names and IPv6 entries are rejected with 400.
     #[serde(rename = "denyOut")]
     #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -7439,13 +7439,13 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxNetwo
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxNetworkUpdateConfig {
-    /// List of allowed destinations for egress traffic. Each entry can be a CIDR block (e.g. \"8.8.8.8/32\"), a bare IP address (e.g. \"8.8.8.8\"), or a domain name (e.g. \"example.com\", \"*.example.com\"). Allowed entries always take precedence over denied entries.
+    /// List of allowed destinations for egress traffic. Each entry is a CIDR block (e.g. \"8.8.8.8/32\") or a bare IPv4 address (e.g. \"8.8.8.8\"); allowed entries always take precedence over denied entries. A domain name is rejected with 400 until the TCP egress proxy lands, and an IPv6 entry is rejected with 400 in both fields.
     #[serde(rename = "allowOut")]
     #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_out: Option<Vec<String>>,
 
-    /// List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
+    /// List of denied CIDR blocks or IPv4 addresses for egress traffic. Domain names and IPv6 entries are rejected with 400.
     #[serde(rename = "denyOut")]
     #[validate(custom(function = "check_xss_vec_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]

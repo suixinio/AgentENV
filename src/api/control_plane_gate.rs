@@ -58,7 +58,7 @@ pub enum GateDecision {
 }
 
 impl GateDecision {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
             Self::Exempt => "exempt",
@@ -171,12 +171,24 @@ impl ControlPlaneGate {
             return GateDecision::Exempt;
         }
 
+        self.admits(presented)
+    }
+
+    /// The credential this process presents to another node's gate: the first
+    /// one it accepts itself, re-read whenever the credential file changes.
+    pub fn presented(&self) -> Option<String> {
+        self.accepted().into_iter().next()
+    }
+
+    /// Decides one credential with no route exemption. Never answers
+    /// [`GateDecision::Exempt`]; surfaces are free to exempt before asking.
+    pub fn admits(&self, presented: Option<&str>) -> GateDecision {
         let accepted = self.accepted();
         if accepted.is_empty() {
             if !self.announced_disabled.swap(true, Ordering::Relaxed) {
                 info!(
-                    "no control-plane credential is configured; the node's REST API accepts any \
-                     caller that can reach it"
+                    "no control-plane credential is configured; the node's control-plane \
+                     surfaces accept any caller that can reach them"
                 );
             }
 

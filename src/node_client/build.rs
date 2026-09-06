@@ -6,7 +6,7 @@ use prost::Message as _;
 use tonic::transport::Endpoint;
 use tracing::info;
 
-use crate::proto::node::{self as pb, node_sandbox_service_client::NodeSandboxServiceClient};
+use crate::proto::node as pb;
 use crate::snapshot::repository::StagedSnapshot;
 use crate::snapshot::TemplateBuildErrorReason;
 use crate::types::{SandboxId, SandboxResources};
@@ -71,7 +71,7 @@ pub async fn build_template_on_a_node(
             ))
         })?;
 
-    let mut client = NodeSandboxServiceClient::new(channel);
+    let mut client = super::client(channel);
     let response = client
         .build_template(request)
         .await

@@ -229,6 +229,10 @@ fn refuse_foreign_authority<B>(req: &Request<B>, name: &str) -> Option<(StatusCo
     if req.method() == Method::CONNECT {
         return Some((StatusCode::METHOD_NOT_ALLOWED, "connect_unsupported"));
     }
+    // TRACE echoes the request the broker forwards, injected headers included.
+    if req.method() == Method::TRACE {
+        return Some((StatusCode::METHOD_NOT_ALLOWED, "method-not-brokered"));
+    }
     match req.uri().authority() {
         Some(authority) if !authority.host().eq_ignore_ascii_case(name) => {
             Some((StatusCode::BAD_REQUEST, "authority_mismatch"))
@@ -639,6 +643,21 @@ mod tests {
             assert_eq!(
                 refuse_foreign_authority(&req, "api.test"),
                 Some((StatusCode::METHOD_NOT_ALLOWED, "connect_unsupported"))
+            );
+        }
+    }
+
+    #[test]
+    fn trace_is_refused_whatever_authority_it_names() {
+        for target in ["/", "https://api.test/"] {
+            let req = Request::builder()
+                .method("TRACE")
+                .uri(target)
+                .body(())
+                .unwrap();
+            assert_eq!(
+                refuse_foreign_authority(&req, "api.test"),
+                Some((StatusCode::METHOD_NOT_ALLOWED, "method-not-brokered"))
             );
         }
     }

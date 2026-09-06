@@ -1749,6 +1749,101 @@ async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
 }
 
 #[tokio::test]
+async fn the_gate_refuses_a_node_rpc_that_carries_no_credential() {
+    crate::logging::init_for_tests();
+    let orchestrator = Orchestrator::new(
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        crate::image::DisabledRuntimeImageRefs::shared(),
+    )
+    .await
+    .expect("an in-memory orchestrator");
+    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a port");
+    let addr = listener.local_addr().expect("the bound address");
+    let (stop, stopped) = oneshot::channel::<()>();
+
+    let gate = crate::node_server::NodeGrpcGate::new(crate::api::ControlPlaneGate::new(
+        vec!["node-token".to_string()],
+        "",
+    ));
+    let serving = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(crate::node_server::server_with_gate(
+                orchestration,
+                Arc::new(resolvable_snapshot_manager()),
+                "node-under-test".to_string(),
+                Arc::new(crate::image::ImageResolver::new(
+                    &crate::cfg::AppConfig::default(),
+                )),
+                Arc::new(crate::template::TemplateBuilder::new()),
+                gate,
+            ))
+            .serve_with_incoming_shutdown(
+                tonic::transport::server::TcpIncoming::from(listener),
+                async {
+                    let _ = stopped.await;
+                },
+            )
+            .await
+    });
+
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("a valid endpoint")
+        .connect()
+        .await
+        .expect("the node service is listening");
+    let mut client = crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient::new(
+        channel.clone(),
+    );
+
+    let request = || crate::proto::node::SandboxNetworkRequest {
+        sandbox_id: crate::types::SandboxId::new().to_string(),
+        execution_id: ExecutionId::new().to_string(),
+        network_policy: None,
+    };
+
+    let refused = client
+        .update_network(request())
+        .await
+        .expect_err("an uncredentialed caller reaches no RPC");
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+
+    let mut wrong = tonic::Request::new(request());
+    wrong.metadata_mut().insert(
+        crate::api::CONTROL_PLANE_HEADER,
+        "gateway-token".parse().expect("a valid metadata value"),
+    );
+    let refused = client
+        .update_network(wrong)
+        .await
+        .expect_err("another half's credential is not this gate's");
+    assert_eq!(refused.code(), tonic::Code::Unauthenticated);
+
+    let mut allowed = tonic::Request::new(request());
+    allowed.metadata_mut().insert(
+        crate::api::CONTROL_PLANE_HEADER,
+        "node-token".parse().expect("a valid metadata value"),
+    );
+    let answered = client
+        .update_network(allowed)
+        .await
+        .expect_err("no such sandbox is running");
+    assert_ne!(
+        answered.code(),
+        tonic::Code::Unauthenticated,
+        "the credential passed the gate and the service answered: {answered:?}"
+    );
+
+    let _ = stop.send(());
+    let _ = serving.await;
+}
+
+#[tokio::test]
 async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     crate::logging::init_for_tests();
     let orchestrator = Orchestrator::new(
@@ -1811,16 +1906,19 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     assert_eq!(live.len(), 1);
     assert_eq!(live[0].sandbox_id, sandbox_id);
 
+    // The stub holds an open HTTP/2 connection to the port under test; the
+    // listener is only free of it once the client side is gone too.
+    drop(backend);
     drop(stop);
     let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), serving)
         .await
         .expect("the surface stops when the shutdown signal fires")
         .expect("the serving task did not panic");
     assert!(outcome.is_ok(), "{outcome:?}");
-    assert!(
-        tokio::net::TcpStream::connect(addr).await.is_err(),
-        "the port is still bound after the surface was told to stop"
-    );
+    // The returned future is the evidence that the surface stopped. The port
+    // is not: tonic closes the listener when the signal fires and only then
+    // drains, so by the time this line runs any other test in this binary may
+    // have been handed the same ephemeral port.
 }
 
 async fn paused_stub(

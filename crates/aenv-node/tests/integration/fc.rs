@@ -536,6 +536,32 @@ async fn microvm_can_access_internet() -> Result<()> {
 }
 
 #[tokio::test]
+async fn the_guest_reaches_neither_the_node_nor_the_resolver_beyond_dns() -> Result<()> {
+    common::setup().await;
+    let sandbox_config = common::default_sandbox_config()?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    sandbox.start().await?;
+
+    let node_ip = sandbox
+        .veth_host_ip()
+        .context("a started sandbox holds a network slot")?;
+    // The node's REST API, its gRPC surface and its metrics port.
+    for port in [8000, 8001, 9103] {
+        assert_tcp_connect(&mut sandbox, &format!("{node_ip}/{port}"), false).await?;
+    }
+
+    let resolver = sandbox
+        .guest_dns_server()
+        .context("a started sandbox holds a network slot")?;
+    for port in [22, 80, 443, 8000] {
+        assert_tcp_connect(&mut sandbox, &format!("{resolver}/{port}"), false).await?;
+    }
+
+    sandbox.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn microvm_network_policy_controls_egress() -> Result<()> {
     common::setup().await;
     let mut sandbox_config = common::default_sandbox_config()?;

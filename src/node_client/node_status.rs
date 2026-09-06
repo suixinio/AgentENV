@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use tonic::transport::Endpoint;
 
 use super::native_placement::rewrite_port;
-use crate::proto::node::{self as pb, node_sandbox_service_client::NodeSandboxServiceClient};
+use crate::proto::node as pb;
 
 /// Bounds the dial: an advertised address can be black-holed, and nothing
 /// above this call bounds the request.
@@ -55,7 +55,7 @@ async fn override_node_status_with_timeouts(
         .with_context(|| {
             format!("connect to node service at {endpoint} (connect timeout {connect_timeout:?})")
         })?;
-    let mut client = NodeSandboxServiceClient::new(channel);
+    let mut client = super::client(channel);
     client
         .override_status(pb::NodeStatusOverrideRequest {
             scheduling_disabled,

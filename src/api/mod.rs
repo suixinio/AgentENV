@@ -1,5 +1,7 @@
 mod control_plane_gate;
-pub use control_plane_gate::constant_time_eq;
+pub use control_plane_gate::{
+    constant_time_eq, ControlPlaneGate, GateDecision, CONTROL_PLANE_HEADER,
+};
 pub mod grpc;
 pub mod impls;
 /// The public pagination token's codec.

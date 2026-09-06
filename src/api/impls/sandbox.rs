@@ -569,6 +569,9 @@ fn network_policy_from_create(
     allow_internet_access: Option<bool>,
     network: Option<&models::SandboxNetworkConfig>,
 ) -> anyhow::Result<SandboxNetworkPolicy> {
+    if network.and_then(|network| network.allow_public_traffic) == Some(false) {
+        anyhow::bail!("allowPublicTraffic=false is not supported yet");
+    }
     let base_policy = base_policy_from_allow_internet_access(allow_internet_access);
     let allow_out = network.and_then(|network| network.allow_out.clone());
     let deny_out = network.and_then(|network| network.deny_out.clone());
@@ -2419,6 +2422,34 @@ mod paused_sandbox_rest_tests {
 
     fn host() -> Host {
         Host::from(http::uri::Authority::from_static("localhost"))
+    }
+
+    #[test]
+    fn locking_public_traffic_is_refused_until_the_token_exists() {
+        let mut network = models::SandboxNetworkConfig::new();
+        network.allow_public_traffic = Some(false);
+
+        let err = super::network_policy_from_create(None, Some(&network))
+            .expect_err("the token is not implemented yet");
+
+        assert!(
+            err.to_string().contains("allowPublicTraffic=false"),
+            "{err}"
+        );
+        network.allow_public_traffic = Some(true);
+        super::network_policy_from_create(None, Some(&network))
+            .expect("the default is still accepted");
+    }
+
+    #[test]
+    fn an_ipv6_egress_entry_is_refused_by_create() {
+        let mut network = models::SandboxNetworkConfig::new();
+        network.allow_out = Some(vec!["2001:db8::/32".to_string()]);
+
+        let err =
+            super::network_policy_from_create(None, Some(&network)).expect_err("IPv6 is refused");
+
+        assert!(format!("{err:#}").contains("IPv6"), "{err:#}");
     }
 
     fn detail(response: SandboxesSandboxIdGetResponse) -> models::SandboxDetail {

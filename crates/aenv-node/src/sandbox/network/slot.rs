@@ -25,8 +25,9 @@ use tracing::{debug, info, warn};
 
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::policy::{
-    initialize_namespace_egress_chain, install_namespace_intercept, remove_namespace_intercept,
-    set_namespace_egress_policy, InterceptTarget, SandboxNetworkPolicy,
+    initialize_namespace_egress_chain, install_namespace_intercept,
+    log_guest_to_node_probe_counters, remove_namespace_intercept, set_namespace_egress_policy,
+    InterceptTarget, SandboxNetworkPolicy,
 };
 use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS_PREFIX};
 
@@ -252,6 +253,10 @@ impl Slot {
         fs::write("/proc/sys/net/ipv4/ip_forward", "1")
             .context("Failed to enable IP forwarding in namespace")?;
 
+        // The namespace's egress chains are IPv4 only, so an IPv6 route out of
+        // it would be a path no policy inspects.
+        Self::disable_ipv6();
+
         // Reduce ARP retransmit delay for faster resume (issue #272)
         Self::tune_neigh_retrans_time_ms("tap0");
         Self::tune_neigh_retrans_time_ms("vpeer");
@@ -427,13 +432,15 @@ impl Slot {
         Ok(())
     }
 
-    /// Builds the kernel `ip=` boot argument for this slot's VM network configuration.
+    /// Builds this slot's guest network boot arguments.
     ///
-    /// Format: `ip=<vm_ip>::<tap_ip>:<netmask>:<hostname>:<iface>:<autoconf>:<dns>`
+    /// Format: `ip=<vm_ip>::<tap_ip>:<netmask>:<hostname>:<iface>:<autoconf>:<dns>`,
+    /// followed by `ipv6.disable=1`: the namespace filters only IPv4, so a guest
+    /// with an IPv6 stack could address destinations no chain inspects.
     pub fn build_ip_boot_arg(&self) -> String {
         let dns_ip = self.guest_dns_server();
         format!(
-            "ip={}::{}:{}:instance:eth0:off:{}",
+            "ip={}::{}:{}:instance:eth0:off:{} ipv6.disable=1",
             self.address_plan.vm_ip(),
             self.address_plan.tap_ip(),
             self.address_plan.vm_link_mask(),
@@ -575,6 +582,19 @@ impl Slot {
             vm_ip,
             internal_egress_denied_cidrs,
         )
+    }
+
+    fn disable_ipv6() {
+        for knob in ["all", "default"] {
+            let path = format!("/proc/sys/net/ipv6/conf/{knob}/disable_ipv6");
+            match fs::write(&path, "1") {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(path, "the kernel carries no IPv6 stack to disable");
+                }
+                Err(err) => warn!(path, error = %err, "failed to disable IPv6 in the namespace"),
+            }
+        }
     }
 
     fn tune_neigh_retrans_time_ms(interface: &str) {
@@ -844,6 +864,13 @@ impl Slot {
             return Ok(());
         }
 
+        // Reading the counter is the only chance to see it; the namespace is
+        // about to go away with the rule in it.
+        let _ = self.in_namespace("guest-to-node counters", || {
+            log_guest_to_node_probe_counters();
+            Ok(())
+        });
+
         // 1. Delete Host Veth Interface (this destroys the pair)
         let delete_result = if force_sync {
             Self::delete_host_veth_interface_sync(self.idx)
@@ -1050,9 +1077,9 @@ mod tests {
         assert_eq!(slot.host_interaction_ip.to_string(), "100.64.0.2");
         assert_eq!(slot.veth_host_ip.to_string(), "100.65.0.4");
         assert_eq!(slot.veth_vm_ip.to_string(), "100.65.0.5");
-        assert!(slot
-            .build_ip_boot_arg()
-            .starts_with("ip=169.254.0.21::169.254.0.22:255.255.255.252:"));
+        let boot_arg = slot.build_ip_boot_arg();
+        assert!(boot_arg.starts_with("ip=169.254.0.21::169.254.0.22:255.255.255.252:"));
+        assert!(boot_arg.ends_with(" ipv6.disable=1"), "{boot_arg}");
     }
 
     #[test]

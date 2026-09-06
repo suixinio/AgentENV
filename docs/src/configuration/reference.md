@@ -278,7 +278,14 @@ override them.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `always_denied_cidrs` | array of IPv4 CIDR strings | `["10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16"]` | Destination CIDRs that are always rejected from sandboxes before user egress policy is evaluated. Deployments can remove selected RFC1918 ranges when sandbox egress to those destinations is required. |
+| `allow_internal_cidrs` | array of CIDR strings | `[]` | Subnets of the always-denied table below that per-sandbox `allowOut`/`denyOut` decides about. Every entry must sit inside one table entry; anything else is refused at startup, and each accepted entry is logged at `info` when the process starts. |
+
+The always-denied table is a constant: `10.0.0.0/8`, `100.64.0.0/10`,
+`127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `::1/128`,
+`fc00::/7`, `fe80::/10`. Everything in it is rejected before user egress policy
+is evaluated, except for the subnets `allow_internal_cidrs` names. The IPv6
+entries never reach an iptables rule: sandbox namespaces run with IPv6 disabled
+and IPv6 entries in `allowOut`/`denyOut` are refused with 400.
 
 ## `[network.internal]`
 
@@ -292,7 +299,7 @@ overlap with host or deployment network ranges.
 
 The two configured CIDRs must not overlap each other or AgentENV's fixed VM tap
 link `169.254.0.20/30`. These networks are also treated as reserved sandbox
-egress destinations regardless of `always_denied_cidrs`.
+egress destinations regardless of `allow_internal_cidrs`.
 
 ## `[machine]`
 

@@ -490,6 +490,14 @@ spec:
                   name: secrets-store-config
                   key: AENV_SECRETS_PG_RESOLVER_TOKEN_FILE
                   optional: true
+            # The credential this half presents at a node's gRPC gate. It is
+            # the node's own key of the shared Secret, read from the same file
+            # the node reads, so one value opens the gate and passes it. The
+            # node's REST gate reads this variable too; on this half no gate is
+            # attached (see `assemble` in `src/api/server.rs`), so it only ever
+            # steers what the node client stamps outbound.
+            - name: AENV_API_CONTROL_PLANE_TOKEN_FILE
+              value: /etc/agentenv/control-plane/token
             # 🔴 AENV_STARTUP_RECLAIM_ENABLED is deliberately absent, here and
             # everywhere else in this tree. It makes a process sweep the host
             # for another process's leftover VMs, which is sound for
@@ -589,6 +597,11 @@ spec:
             - name: credential-store
               mountPath: /etc/agentenv/secrets
               readOnly: true
+            # The node-gate credential, projected by the one key this half
+            # reads — the same projection the DaemonSet makes.
+            - name: control-plane-token
+              mountPath: /etc/agentenv/control-plane
+              readOnly: true
             - name: scratch
               mountPath: /workspace/env
       volumes:
@@ -621,6 +634,17 @@ spec:
         - name: agentenv-config
           configMap:
             name: agentenv-k8s-config
+        # 🔴 `items` and `optional: true`, for the same reasons the DaemonSet
+        # gives: a Secret carrying only the gateway's `token` must not start
+        # this half stamping, and an absent key must leave the credential
+        # unset rather than fail the mount.
+        - name: control-plane-token
+          secret:
+            secretName: agentenv-control-plane-token
+            optional: true
+            items:
+              - key: node-gate-token
+                path: token
         # 🔴 The object-storage credentials, as a mounted file rather than a
         # `secretKeyRef`, and not because of refresh: `[backend.oss]` is
         # `Option<OssBackendConfig>` and confique reads a non-`nested`

@@ -353,16 +353,11 @@ control_plane_token_file = ""
 domains = []
 
 [network.egress]
-# Destinations denied before per-sandbox allowOut/denyOut rules are evaluated.
-# Remove selected private ranges only when sandbox access to them is required.
-always_denied_cidrs = [
-  "10.0.0.0/8",
-  "100.64.0.0/10",
-  "127.0.0.0/8",
-  "169.254.0.0/16",
-  "172.16.0.0/12",
-  "192.168.0.0/16",
-]
+# Subnets of the built-in always-denied table (10.0.0.0/8, 100.64.0.0/10,
+# 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, ::1/128,
+# fc00::/7, fe80::/10) that per-sandbox allowOut/denyOut rules decide about.
+# An entry outside the table is a startup error.
+allow_internal_cidrs = []
 
 [network.internal]
 # Internal address pools for sandbox network namespaces. Change them only when

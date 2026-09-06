@@ -6,6 +6,8 @@ use std::{
 };
 
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
+use tracing::{debug, warn};
+
 use crate::cfg::network::normalize_dns_name;
 use crate::secrets::SecretKind;
 
@@ -22,6 +24,16 @@ pub const INTERCEPT_CHAIN: &str = "AGENTENV-INTERCEPT";
 pub const HTTP_BROKER_HANDLER: &str = "http";
 /// The destination port the `rules` intercept captures.
 pub const HTTPS_PORT: u16 = 443;
+
+/// The only port the guest reaches its resolver on.
+const DNS_PORT: u16 = 53;
+
+/// Tags the counting rule for guest packets addressed to the node itself.
+const GUEST_TO_NODE_COMMENT: &str = "aenv-guest-to-node";
+
+/// Refusal text for an IPv6 egress entry. The sandbox namespace runs with IPv6
+/// disabled, so an accepted entry would be a rule nothing enforces.
+const IPV6_UNSUPPORTED: &str = "IPv6 entries are not supported in egress policy";
 
 /// A byte relay to the upstream its params name.
 pub const TCP_BROKER_HANDLER: &str = "tcp";
@@ -366,11 +378,63 @@ pub fn set_namespace_egress_policy(policy: Option<&SandboxNetworkPolicy>) -> Res
     apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
 }
 
-fn configured_always_denied_cidrs() -> &'static [String] {
-    &crate::cfg::ConfigManager::global_config()
+/// The always-denied table this node installs, in the one family the namespace
+/// carries; the table's IPv6 entries are covered by disabling IPv6 outright.
+fn configured_always_denied_cidrs() -> Vec<String> {
+    match crate::cfg::ConfigManager::global_config()
         .network
         .egress
-        .always_denied_cidrs
+        .effective_denied_cidrs()
+    {
+        Ok(denied) => denied
+            .into_iter()
+            .filter(|network| network.is_ipv4())
+            .map(|network| network.to_string())
+            .collect(),
+        Err(err) => {
+            // Validation refuses this configuration at startup; reaching it here
+            // means falling back to the whole table rather than to none of it.
+            warn!(error = %format_args!("{err:#}"), "using the unmodified always-denied table");
+            crate::cfg::network::ALWAYS_DENIED_CIDRS
+                .iter()
+                .filter(|cidr| !cidr.contains(':'))
+                .map(|cidr| (*cidr).to_string())
+                .collect()
+        }
+    }
+}
+
+/// Logs how many guest packets this namespace addressed to the node itself.
+/// Must run inside the sandbox namespace; does nothing unless debug is on.
+pub fn log_guest_to_node_probe_counters() {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+
+    let counters = crate::privileges::run_with_scoped_capabilities(
+        &[crate::privileges::CAP_NET_ADMIN],
+        || {
+            let output = std::process::Command::new("iptables")
+                .args(["-t", "filter", "-L", EGRESS_CHAIN, "-v", "-x", "-n"])
+                .output()
+                .context("list the namespace egress chain")?;
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        },
+    );
+
+    match counters {
+        Ok(listing) => {
+            for line in listing
+                .lines()
+                .filter(|line| line.contains(GUEST_TO_NODE_COMMENT))
+            {
+                debug!(rule = line.trim(), "guest packets addressed to the node");
+            }
+        }
+        Err(err) => {
+            debug!(error = %format_args!("{err:#}"), "cannot read the guest-to-node counter")
+        }
+    }
 }
 
 /// Installs the namespace FORWARD egress chains and the anti-spoofing DROP.
@@ -386,7 +450,7 @@ pub fn initialize_namespace_egress_chain(
         guest_dns_ip,
         vm_ip,
         internal_egress_denied_cidrs,
-        configured_always_denied_cidrs(),
+        &configured_always_denied_cidrs(),
     );
 
     apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
@@ -554,9 +618,17 @@ fn build_static_egress_commands(
         "-i tap0 -o vpeer -j {INTERCEPT_CHAIN}"
     ))];
 
-    for cidr in [format!("{veth_host_ip}/32"), format!("{guest_dns_ip}/32")] {
+    // The node's own address is not an egress destination: brokered traffic is
+    // DNATed in nat PREROUTING before this chain runs. The rule names no target
+    // so it only counts, and a guest that still needs the node shows up as a
+    // non-zero counter rather than as a working connection.
+    commands.push(append_egress_command(format!(
+        "-i tap0 -o vpeer -d {veth_host_ip}/32 -m comment --comment \"{GUEST_TO_NODE_COMMENT}\""
+    )));
+
+    for protocol in ["udp", "tcp"] {
         commands.push(append_egress_command(format!(
-            "-i tap0 -o vpeer -d {cidr} -j ACCEPT"
+            "-i tap0 -o vpeer -d {guest_dns_ip}/32 -p {protocol} --dport {DNS_PORT} -j ACCEPT"
         )));
     }
 
@@ -630,14 +702,15 @@ fn append_user_egress_command(rule: String) -> IptablesRestoreCommand {
 
 fn try_normalize_ip_or_cidr(s: &str) -> Result<Option<String>> {
     if let Ok(ip) = s.parse::<IpAddr>() {
-        return Ok(Some(match ip {
-            IpAddr::V4(ip) => format!("{ip}/32"),
-            IpAddr::V6(ip) => format!("{ip}/128"),
-        }));
+        return match ip {
+            IpAddr::V4(ip) => Ok(Some(format!("{ip}/32"))),
+            IpAddr::V6(_) => bail!("{IPV6_UNSUPPORTED}: {s:?}"),
+        };
     }
 
     match s.parse::<ipnetwork::IpNetwork>() {
-        Ok(network) => Ok(Some(network.to_string())),
+        Ok(ipnetwork::IpNetwork::V4(network)) => Ok(Some(network.to_string())),
+        Ok(ipnetwork::IpNetwork::V6(_)) => bail!("{IPV6_UNSUPPORTED}: {s:?}"),
         Err(err) if s.contains('/') => {
             Err(err).with_context(|| format!("invalid IP or CIDR entry {s:?}"))
         }
@@ -1071,9 +1144,90 @@ mod tests {
         ));
     }
 
+    fn static_commands() -> Vec<IptablesRestoreCommand> {
+        let denied_cidrs: Vec<String> = NetworkConfig::default()
+            .egress
+            .effective_denied_cidrs()
+            .unwrap()
+            .into_iter()
+            .filter(|network| network.is_ipv4())
+            .map(|network| network.to_string())
+            .collect();
+        build_static_egress_commands(
+            Ipv4Addr::new(10, 12, 0, 2),
+            Ipv4Addr::new(10, 1, 2, 1),
+            &[],
+            &denied_cidrs,
+        )
+    }
+
+    #[test]
+    fn the_node_address_is_counted_and_never_accepted() {
+        let commands = static_commands();
+        let rules: Vec<&str> = commands.iter().filter_map(append_rule).collect();
+
+        let probe = rules
+            .iter()
+            .find(|rule| rule.contains(GUEST_TO_NODE_COMMENT))
+            .expect("the node address is still counted");
+        assert!(probe.contains("-d 10.12.0.2/32"), "{probe}");
+        assert!(
+            !probe.contains("-j "),
+            "the counter names no target: {probe}"
+        );
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.contains("10.12.0.2/32") && rule.contains("ACCEPT")),
+            "no rule accepts traffic to the node: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn only_port_53_reaches_the_resolver() {
+        let commands = static_commands();
+        let accepts: Vec<&str> = commands
+            .iter()
+            .filter_map(append_rule)
+            .filter(|rule| rule.contains("-j ACCEPT"))
+            .collect();
+
+        assert_eq!(
+            accepts,
+            [
+                "-i tap0 -o vpeer -d 10.1.2.1/32 -p udp --dport 53 -j ACCEPT",
+                "-i tap0 -o vpeer -d 10.1.2.1/32 -p tcp --dport 53 -j ACCEPT",
+            ]
+        );
+        assert!(
+            accepts.iter().all(|rule| rule.contains("--dport 53")),
+            "an ACCEPT without --dport 53 reopens the resolver address: {accepts:?}"
+        );
+    }
+
+    #[test]
+    fn an_ipv6_egress_entry_is_refused() {
+        for entry in ["2001:db8::1", "2001:db8::/32", "::1"] {
+            let err = SandboxNetworkEgressPolicy::new(Some(vec![entry.to_string()]), None)
+                .expect_err("IPv6 is refused");
+            assert!(
+                format!("{err:#}").contains("IPv6"),
+                "{entry}: {}",
+                format_args!("{err:#}")
+            );
+        }
+    }
+
     #[test]
     fn build_static_rules_include_baseline_in_order() {
-        let denied_cidrs = NetworkConfig::default().egress.always_denied_cidrs;
+        let denied_cidrs: Vec<String> = NetworkConfig::default()
+            .egress
+            .effective_denied_cidrs()
+            .unwrap()
+            .into_iter()
+            .filter(|network| network.is_ipv4())
+            .map(|network| network.to_string())
+            .collect();
         let internal_egress_denied_cidrs = Vec::new();
         let commands = build_static_egress_commands(
             Ipv4Addr::new(10, 12, 0, 2),
@@ -1085,12 +1239,9 @@ mod tests {
         let host_allow_pos = commands
             .iter()
             .position(|command| {
-                append_rule(command) == Some("-i tap0 -o vpeer -d 10.12.0.2/32 -j ACCEPT")
+                append_rule(command).is_some_and(|rule| rule.contains(GUEST_TO_NODE_COMMENT))
             })
             .unwrap();
-        assert!(commands.iter().any(
-            |command| append_rule(command) == Some("-i tap0 -o vpeer -d 10.1.2.1/32 -j ACCEPT")
-        ));
         let hard_deny_pos = commands
             .iter()
             .position(|command| {

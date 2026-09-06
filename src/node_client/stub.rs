@@ -12,11 +12,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Endpoint;
 use tracing::{info, warn};
 
 use crate::proto::node as pb;
-use crate::proto::node::node_sandbox_service_client::NodeSandboxServiceClient;
 use crate::sandbox::{
     CapturedSandboxSnapshot, CustomExtensionParams, ResolvedImageFacts, RuntimeArtifactSet,
     RuntimeConfirmedGone, SandboxBackend, SandboxCaptureError, SandboxCaptureResult,
@@ -67,7 +66,7 @@ pub struct RemoteSandboxStub {
 
 struct Placed {
     node: NodeEndpoint,
-    client: NodeSandboxServiceClient<Channel>,
+    client: super::NodeClient,
     host_interaction_ip: Option<Ipv4Addr>,
     rootfs_virtual_size: Option<u64>,
     /// Image facts learned from an image-source create reply.
@@ -107,7 +106,7 @@ impl RemoteSandboxStub {
         resources: SandboxResources,
         placement: Arc<dyn NodePlacement>,
         node: NodeEndpoint,
-        client: NodeSandboxServiceClient<Channel>,
+        client: super::NodeClient,
         ack: &pb::SandboxCreateResponse,
     ) -> Self {
         Self {
@@ -211,7 +210,7 @@ impl RemoteSandboxStub {
     ///
     /// `NotFound` is an empty answer; transport failure remains an error.
     async fn live_facts(
-        client: &mut NodeSandboxServiceClient<Channel>,
+        client: &mut super::NodeClient,
         node_id: &str,
         sandbox_id: SandboxId,
     ) -> Result<LiveFacts> {
@@ -303,7 +302,7 @@ impl RemoteSandboxStub {
         resources: SandboxResources,
         placement: &Arc<dyn NodePlacement>,
         node: &NodeEndpoint,
-        client: &NodeSandboxServiceClient<Channel>,
+        client: &super::NodeClient,
     ) -> Result<RemoteSandboxStub> {
         if result.sandbox_id != requested.sandbox_id.to_string() {
             bail!(
@@ -402,14 +401,14 @@ impl RemoteSandboxStub {
     }
 
     /// Connects with [`STUB_CONNECT_TIMEOUT`], which also bounds tonic reconnects.
-    pub async fn connect(endpoint: &str) -> Result<NodeSandboxServiceClient<Channel>> {
+    pub async fn connect(endpoint: &str) -> Result<super::NodeClient> {
         let channel = Endpoint::from_shared(endpoint.to_string())
             .with_context(|| format!("node endpoint {endpoint:?} is not a URI"))?
             .connect_timeout(STUB_CONNECT_TIMEOUT)
             .connect()
             .await
             .with_context(|| format!("connect to node service at {endpoint}"))?;
-        Ok(NodeSandboxServiceClient::new(channel))
+        Ok(super::client(channel))
     }
 
     /// Re-resolves the same node through discovery after its cached address fails.
@@ -450,7 +449,7 @@ impl RemoteSandboxStub {
     ) -> Result<tonic::Response<T>, tonic::Status>
     where
         F: for<'a> FnMut(
-            &'a mut NodeSandboxServiceClient<Channel>,
+            &'a mut super::NodeClient,
         ) -> Pin<
             Box<dyn Future<Output = Result<tonic::Response<T>, tonic::Status>> + Send + 'a>,
         >,
@@ -554,7 +553,7 @@ impl RemoteSandboxStub {
     async fn retry_after_reresolve<T, F>(&mut self, attempt: &mut F) -> Result<tonic::Response<T>>
     where
         F: for<'a> FnMut(
-            &'a mut NodeSandboxServiceClient<Channel>,
+            &'a mut super::NodeClient,
         ) -> Pin<
             Box<dyn Future<Output = Result<tonic::Response<T>, tonic::Status>> + Send + 'a>,
         >,

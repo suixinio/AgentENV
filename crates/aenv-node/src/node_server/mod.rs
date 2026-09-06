@@ -5,6 +5,7 @@
 //! `aenv-node` serves this surface on its dedicated node-service listener.
 
 mod convert;
+mod gate;
 mod ownership;
 mod service;
 
@@ -23,6 +24,14 @@ use crate::proto::node::node_sandbox_service_server::NodeSandboxServiceServer;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
 
+pub use gate::NodeGrpcGate;
+
+/// The node service as it is served: every RPC passes the credential gate.
+pub type GatedNodeService = tonic::service::interceptor::InterceptedService<
+    NodeSandboxServiceServer<NodeSandboxService>,
+    NodeGrpcGate,
+>;
+
 pub use service::NodeSandboxService;
 
 // Keep quiet long-running template-build RPCs alive; clients use matching bounds.
@@ -33,17 +42,38 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 pub use ownership::owned_by_control_plane;
 
-/// Builds the node gRPC server with template-building support.
+/// Builds the node gRPC server with template-building support, behind the
+/// credential gate: the surface is reachable from inside a sandbox namespace.
 pub fn server(
     orchestration: Arc<dyn SandboxOrchestration>,
     snapshots: Arc<SnapshotManager>,
     node_id: String,
     image_resolver: Arc<ImageResolver>,
     template_builder: Arc<TemplateBuilder>,
-) -> NodeSandboxServiceServer<NodeSandboxService> {
-    NodeSandboxServiceServer::new(
+) -> GatedNodeService {
+    server_with_gate(
+        orchestration,
+        snapshots,
+        node_id,
+        image_resolver,
+        template_builder,
+        NodeGrpcGate::from_global_config(),
+    )
+}
+
+/// The same server behind credentials the caller resolved itself.
+pub fn server_with_gate(
+    orchestration: Arc<dyn SandboxOrchestration>,
+    snapshots: Arc<SnapshotManager>,
+    node_id: String,
+    image_resolver: Arc<ImageResolver>,
+    template_builder: Arc<TemplateBuilder>,
+    gate: NodeGrpcGate,
+) -> GatedNodeService {
+    NodeSandboxServiceServer::with_interceptor(
         NodeSandboxService::new(orchestration, snapshots, node_id)
             .with_template_build(image_resolver, template_builder),
+        gate,
     )
 }
 

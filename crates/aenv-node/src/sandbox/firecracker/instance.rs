@@ -31,6 +31,20 @@ use super::socket::UnixSocketClient;
 const MMDS_SIZE_LIMIT: usize = 1_048_576;
 const HTTP_API_MAX_PAYLOAD_SIZE: usize = MMDS_SIZE_LIMIT;
 
+/// The full argument vector of a Firecracker child. Everything the VM's
+/// isolation depends on that is not an API call is decided here, so the seccomp
+/// filter stays on by never naming `--no-seccomp`.
+fn firecracker_args(socket_path: &Path) -> Vec<std::ffi::OsString> {
+    vec![
+        "--api-sock".into(),
+        socket_path.as_os_str().to_os_string(),
+        "--mmds-size-limit".into(),
+        MMDS_SIZE_LIMIT.to_string().into(),
+        "--http-api-max-payload-size".into(),
+        HTTP_API_MAX_PAYLOAD_SIZE.to_string().into(),
+    ]
+}
+
 pub struct FirecrackerInstance {
     client: UnixSocketClient,
     work_dir: PathBuf,
@@ -99,12 +113,7 @@ impl FirecrackerInstance {
         let mut cmd = Command::new(&firecracker_binary);
         cmd.process_group(0);
 
-        cmd.arg("--api-sock")
-            .arg(&self.socket_path)
-            .arg("--mmds-size-limit")
-            .arg(MMDS_SIZE_LIMIT.to_string())
-            .arg("--http-api-max-payload-size")
-            .arg(HTTP_API_MAX_PAYLOAD_SIZE.to_string())
+        cmd.args(firecracker_args(&self.socket_path))
             .stdin(Stdio::null());
 
         // Set Current Working Directory to the workspace
@@ -726,6 +735,18 @@ mod tests {
         assert_eq!(fs::read_to_string(&log_path)?, "firstsecond");
 
         Ok(())
+    }
+
+    #[test]
+    fn the_firecracker_child_never_turns_seccomp_off() {
+        let args = firecracker_args(Path::new("/run/aenv/fc.socket"));
+
+        assert!(
+            !args.iter().any(|arg| arg == "--no-seccomp"),
+            "{args:?} disables the Firecracker seccomp filter"
+        );
+        assert_eq!(args[0], "--api-sock");
+        assert_eq!(args[1], "/run/aenv/fc.socket");
     }
 
     #[test]

@@ -447,6 +447,7 @@ where
             network_policy,
             custom_extension_params,
             secure,
+            traffic_access_token,
             control_plane_config,
             execution_id,
             preferred_node_id,
@@ -473,6 +474,7 @@ where
                         timeout_action,
                         auto_resume,
                         secure,
+                        traffic_access_token: traffic_access_token.clone(),
                         control_plane_config,
                         preferred_node_id: preferred_node_id.clone(),
                     },
@@ -511,6 +513,7 @@ where
                         timeout_action,
                         auto_resume,
                         secure,
+                        traffic_access_token: traffic_access_token.clone(),
                         control_plane_config,
                         preferred_node_id: preferred_node_id.clone(),
                     },
@@ -556,6 +559,7 @@ where
                     extra_mmds,
                     custom_extension_params: custom_extension_params.clone(),
                     envd_access_token,
+                    traffic_access_token: traffic_access_token.clone(),
                     control_plane_config: None,
                     preferred_node_id: preferred_node_id.clone(),
                 };
@@ -612,6 +616,7 @@ where
                     extra_mmds: serde_json::Map::new(),
                     custom_extension_params: custom_extension_params.clone(),
                     envd_access_token,
+                    traffic_access_token: traffic_access_token.clone(),
                     control_plane_config: None,
                     preferred_node_id: preferred_node_id.clone(),
                 };
@@ -896,18 +901,21 @@ where
             metadata.restart_lifetime_clock(now);
             metadata.update_timeout(new_timeout);
 
-            let proxy_target = match Self::proxy_target_from_sandbox(backend.as_ref()) {
-                Ok(proxy_target) => proxy_target,
-                Err(err) => {
-                    Self::stop_failed_fork(backend, sandbox_id).await;
-                    self.revoke_secrets(sandbox_id, spec.execution_id).await;
-                    outcomes.push(Err(Self::fork_child_error(
-                        sandbox_id,
-                        anyhow::Error::new(err),
-                    )));
-                    continue;
-                }
-            };
+            let proxy_target =
+                match Self::proxy_target_from_sandbox(backend.as_ref()).map(|target| {
+                    target.with_traffic_access_token(metadata.traffic_access_token.clone())
+                }) {
+                    Ok(proxy_target) => proxy_target,
+                    Err(err) => {
+                        Self::stop_failed_fork(backend, sandbox_id).await;
+                        self.revoke_secrets(sandbox_id, spec.execution_id).await;
+                        outcomes.push(Err(Self::fork_child_error(
+                            sandbox_id,
+                            anyhow::Error::new(err),
+                        )));
+                        continue;
+                    }
+                };
             if let Err(err) = self.store.add(metadata.clone()).await {
                 warn!(%sandbox_id, error = ?err, "failed to register forked sandbox");
                 Self::stop_failed_fork(backend, sandbox_id).await;
@@ -2705,7 +2713,9 @@ where
 
         let proxy_target = {
             let sandbox = handle.lock().await;
-            match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
+            match Self::proxy_target_from_sandbox(sandbox.as_ref()).map(|target| {
+                target.with_traffic_access_token(final_metadata.traffic_access_token.clone())
+            }) {
                 Ok(proxy_target) => proxy_target,
                 Err(err) => {
                     warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
@@ -3390,6 +3400,7 @@ struct SnapshotCreateInputs {
     timeout_action: super::SandboxTimeoutAction,
     auto_resume: bool,
     secure: bool,
+    traffic_access_token: Option<String>,
     control_plane_config: Option<crate::orchestrator::ControlPlaneConfig>,
     preferred_node_id: Option<String>,
 }
@@ -3414,6 +3425,7 @@ fn snapshot_create_parts(
         timeout_action,
         auto_resume,
         secure,
+        traffic_access_token,
         control_plane_config,
         preferred_node_id,
     } = inputs;
@@ -3450,6 +3462,7 @@ fn snapshot_create_parts(
         extra_mmds,
         custom_extension_params: effective_custom_extension_params.clone(),
         envd_access_token,
+        traffic_access_token: traffic_access_token.clone(),
         // Stamped after the encoded record is complete.
         control_plane_config: None,
         preferred_node_id,
@@ -3471,6 +3484,7 @@ fn snapshot_create_parts(
         network_policy,
         custom_extension_params: effective_custom_extension_params,
         secure,
+        traffic_access_token,
         control_plane_config,
         max_lifetime: configured_max_sandbox_lifetime(),
         ..Default::default()

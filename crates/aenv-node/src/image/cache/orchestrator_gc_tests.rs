@@ -29,6 +29,7 @@ fn create_request(
     _user_metadata: &[(&str, &str)],
 ) -> CreateSandboxRequest {
     CreateSandboxRequest {
+        traffic_access_token: None,
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
         expiry: match timeout_secs {
             Some(secs) => SandboxExpiry::After(Duration::from_secs(secs)),

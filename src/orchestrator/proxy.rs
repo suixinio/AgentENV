@@ -6,6 +6,10 @@ use crate::types::{ExecutionId, SandboxId};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyTarget {
     pub ip: Ipv4Addr,
+    /// The token a client must present to reach a non-envd port of this
+    /// sandbox. It rides with the route so the check costs the lookup the
+    /// proxy already does, rather than a second read of the record.
+    pub traffic_access_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,10 +34,18 @@ pub struct ProxyRouteTable {
 }
 
 impl ProxyTarget {
+    /// An open sandbox: every port it serves is reachable by whoever can
+    /// route to it.
     pub fn new(host_interaction_ip: Ipv4Addr) -> Self {
         Self {
             ip: host_interaction_ip,
+            traffic_access_token: None,
         }
+    }
+
+    pub fn with_traffic_access_token(mut self, token: Option<String>) -> Self {
+        self.traffic_access_token = token;
+        self
     }
 }
 

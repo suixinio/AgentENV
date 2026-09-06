@@ -31,6 +31,10 @@ pub struct PausedSandboxConfig {
     pub network_policy: SandboxNetworkPolicy,
     #[serde(default)]
     pub secure: bool,
+    /// Survives the pause: a sandbox its owner locked must come back locked,
+    /// and with the same token its clients already hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_access_token: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -63,6 +67,7 @@ impl PausedSandboxConfig {
             user_metadata: metadata.user_metadata.clone(),
             network_policy: metadata.network_policy.clone(),
             secure: metadata.secure,
+            traffic_access_token: metadata.traffic_access_token.clone(),
             control_plane_config: metadata.control_plane_config.clone(),
             max_lifetime_secs: metadata.max_lifetime.map(|lifetime| lifetime.as_secs()),
             running_elapsed_secs: metadata.running_elapsed_at(now).as_secs(),

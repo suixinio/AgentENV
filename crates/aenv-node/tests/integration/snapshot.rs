@@ -372,6 +372,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
         .enumerate()
     {
         let launch_config = SandboxLaunchConfig {
+            traffic_access_token: None,
             sandbox_id: SandboxId::new(),
             snapshot_id: runnable.record().id.to_string(),
             env_vars: None,
@@ -576,6 +577,7 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                         .await?;
                     let sandbox_id = SandboxId::new();
                     let launch_config = SandboxLaunchConfig {
+                        traffic_access_token: None,
                         sandbox_id,
                         snapshot_id: runnable.record().id.to_string(),
                         env_vars: None,

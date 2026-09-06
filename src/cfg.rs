@@ -189,6 +189,17 @@ pub struct ApiConfig {
         parse_env = parse_trimmed_string
     )]
     pub control_plane_token_file: String,
+    #[config(nested)]
+    pub proxy: ApiProxyConfig,
+}
+
+/// The data-plane reverse proxy, on the half that serves one.
+#[derive(Debug, Config, Clone)]
+pub struct ApiProxyConfig {
+    /// Requests one sandbox may have in flight through the proxy at once.
+    /// `0` does not limit: a sandbox's own service decides what it can take.
+    #[config(default = 0u32, env = "AENV_API_PROXY_MAX_INCOMING_PER_SANDBOX")]
+    pub max_incoming_per_sandbox: u32,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]

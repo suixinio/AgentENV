@@ -1123,6 +1123,7 @@ fn create_request(
     };
 
     CreateSandboxRequest {
+        traffic_access_token: None,
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
         expiry: match timeout_secs {
             Some(secs) => SandboxExpiry::After(Duration::from_secs(secs)),
@@ -1163,6 +1164,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     };
     let created = orchestrator
         .create_sandbox(CreateSandboxRequest {
+            traffic_access_token: None,
             source: SandboxLaunchSource::Image {
                 image_ref: "ubuntu:24.04".to_string(),
                 overlaybd_config_path: PathBuf::from("/tmp/ubuntu-image.json"),
@@ -2559,6 +2561,7 @@ async fn the_evictor_takes_the_deadlines_this_orchestrator_keeps_and_no_others()
     let orchestrator =
         make_orchestrator_without_background_with_default_timeout(CONFIGURED_DEFAULT);
     let with = |expiry| CreateSandboxRequest {
+        traffic_access_token: None,
         expiry,
         ..create_request(None, &[])
     };
@@ -2630,6 +2633,7 @@ async fn a_fork_of_a_sandbox_with_no_deadline_gives_its_children_none() -> Resul
         make_orchestrator_without_background_with_default_timeout(Duration::from_secs(15));
     let source = orchestrator
         .create_sandbox(CreateSandboxRequest {
+            traffic_access_token: None,
             expiry: SandboxExpiry::NotKeptHere,
             ..create_request(None, &[])
         })
@@ -4637,6 +4641,7 @@ async fn a_marker_the_caller_supplied_survives_the_stamp() {
         .expect("a non-empty marker");
     let created = orchestrator
         .create_sandbox(CreateSandboxRequest {
+            traffic_access_token: None,
             control_plane_config: Some(supplied.clone()),
             ..create_request(Some(60), &[])
         })

@@ -349,6 +349,7 @@ pub fn in_memory_snapshot_manager() -> (SnapshotManager, Arc<InMemorySnapshotCat
 /// template `tpl-paused` with no timeout of its own.
 pub fn mock_paused_sandbox_config() -> PausedSandboxConfig {
     PausedSandboxConfig {
+        traffic_access_token: None,
         template_id: "tpl-paused".to_string(),
         template_alias: None,
         created_at_unix_ms: 1_700_000_000_000,

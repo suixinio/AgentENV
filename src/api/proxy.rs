@@ -60,6 +60,10 @@ struct HostProxyRoute {
 
 #[derive(Debug)]
 enum ProxyRequestError {
+    /// The sandbox is locked and the request presented no accepted token.
+    TrafficTokenRequired(SandboxId),
+    /// An envd control path, which the proxy never carries.
+    EnvdInternalPath,
     MissingSandboxId,
     InvalidSandboxId,
     MissingTargetPort,
@@ -73,6 +77,23 @@ enum ProxyRequestError {
 
 const PROXY_ROUTE: &str = "/proxy";
 const ENVD_STREAM_INPUT_PATH: &str = "/process.Process/StreamInput";
+/// Why the proxy refused, for a client that has no body to read it from.
+const PROXY_REASON_HEADER: &str = "x-aenv-proxy-reason";
+/// The token a locked sandbox's clients present, in E2B's spelling and ours.
+const E2B_TRAFFIC_TOKEN_HEADER: &str = "e2b-traffic-access-token";
+const TRAFFIC_TOKEN_HEADER: &str = "x-agentenv-traffic-access-token";
+/// envd's own control paths. They start, freeze and upgrade the sandbox, and
+/// none of them is a thing a client of the sandbox's own services asks for —
+/// so the proxy does not carry them, whatever port they are asked on.
+const ENVD_INTERNAL_PATHS: [&str; 7] = [
+    "/init",
+    "/collapse",
+    "/freeze",
+    "/fsfreeze",
+    "/fsthaw",
+    "/unfreeze",
+    "/upgrade",
+];
 /// Header carrying the target sandbox chosen by the client.
 const SANDBOX_ID_HEADER: &str = "x-agentenv-sandbox-id";
 /// E2B-compatible alias for the sandbox routing header.
@@ -414,6 +435,24 @@ async fn proxy_request(
             Ok(resolved) => resolved,
             Err(response) => return echo_execution(response, live_execution),
         };
+
+    let _incoming = match claim_incoming(resolved.sandbox_id) {
+        Ok(slot) => slot,
+        Err(()) => {
+            debug!(sandbox_id = %resolved.sandbox_id, "proxy request rejected: too many in flight");
+            return echo_execution(
+                Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header(
+                        PROXY_REASON_HEADER,
+                        HeaderValue::from_static("too-many-incoming"),
+                    )
+                    .body(Body::from("too many requests in flight for this sandbox"))
+                    .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response()),
+                live_execution,
+            );
+        }
+    };
 
     let served_by = execution_that_served(api_impl, resolved.sandbox_id, live_execution).await;
 
@@ -819,6 +858,12 @@ async fn resolve_proxy_request(
     let target_port =
         parse_target_port_header(&parts.headers).map_err(|err| proxy_error_response(&err))?;
 
+    // Whatever port it is asked on: envd's control surface is not something a
+    // client of the sandbox reaches through here.
+    if is_envd_internal_path(proxy_path) {
+        return Err(proxy_error_response(&ProxyRequestError::EnvdInternalPath));
+    }
+
     let target = match api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await {
         Ok(ProxyLookupResult::Ready(target)) => target,
         Ok(ProxyLookupResult::NotFound) => {
@@ -847,6 +892,12 @@ async fn resolve_proxy_request(
         }
     };
 
+    if !traffic_token_admits(&target, target_port, &parts.headers) {
+        return Err(proxy_error_response(
+            &ProxyRequestError::TrafficTokenRequired(sandbox_id),
+        ));
+    }
+
     let upstream_uri = if is_websocket_request {
         build_upstream_uri_with_scheme("ws", &target, target_port, proxy_path, parts.uri.query())
     } else {
@@ -859,6 +910,88 @@ async fn resolve_proxy_request(
         upstream_uri,
         original_host: parts.headers.get(header::HOST).cloned(),
     })
+}
+
+/// Requests one sandbox has in flight through this proxy.
+///
+/// A cap the sandbox itself cannot raise: a guest that stops reading would
+/// otherwise hold as many of this process's tasks as clients cared to open.
+#[derive(Default)]
+struct IncomingLimit {
+    in_flight: std::sync::Mutex<std::collections::HashMap<SandboxId, u32>>,
+}
+
+/// Holds one sandbox's slot for the life of the request.
+struct IncomingSlot {
+    limit: &'static IncomingLimit,
+    sandbox_id: SandboxId,
+}
+
+impl Drop for IncomingSlot {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .limit
+            .in_flight
+            .lock()
+            .unwrap_or_else(|held| held.into_inner());
+        if let Some(count) = in_flight.get_mut(&self.sandbox_id) {
+            *count -= 1;
+            if *count == 0 {
+                in_flight.remove(&self.sandbox_id);
+            }
+        }
+    }
+}
+
+static INCOMING: std::sync::OnceLock<IncomingLimit> = std::sync::OnceLock::new();
+
+/// Claims a slot, or `None` when this sandbox already holds its share.
+/// An unconfigured limit claims nothing and counts nothing.
+fn claim_incoming(sandbox_id: SandboxId) -> Result<Option<IncomingSlot>, ()> {
+    let max = ConfigManager::global_config()
+        .api
+        .proxy
+        .max_incoming_per_sandbox;
+    if max == 0 {
+        return Ok(None);
+    }
+    let limit = INCOMING.get_or_init(IncomingLimit::default);
+    let mut in_flight = limit
+        .in_flight
+        .lock()
+        .unwrap_or_else(|held| held.into_inner());
+    let count = in_flight.entry(sandbox_id).or_insert(0);
+    if *count >= max {
+        return Err(());
+    }
+    *count += 1;
+    Ok(Some(IncomingSlot { limit, sandbox_id }))
+}
+
+/// Whether the path is one of envd's own control routes.
+fn is_envd_internal_path(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
+    let trimmed = path.trim_end_matches('/');
+    ENVD_INTERNAL_PATHS
+        .iter()
+        .any(|internal| trimmed.eq_ignore_ascii_case(internal))
+}
+
+/// Whether a request may reach this sandbox's port.
+///
+/// An open sandbox admits everything. A locked one admits envd's own port —
+/// envd has its own credential and a token here would be a second one for the
+/// same door — and any other port only with the token it was created with.
+fn traffic_token_admits(target: &ProxyTarget, target_port: u16, headers: &HeaderMap) -> bool {
+    let Some(expected) = target.traffic_access_token.as_deref() else {
+        return true;
+    };
+    if target_port == ConfigManager::global_config().tools.control_plane_port {
+        return true;
+    }
+    first_header_value(headers, &[E2B_TRAFFIC_TOKEN_HEADER, TRAFFIC_TOKEN_HEADER]).is_some_and(
+        |presented| crate::api::constant_time_eq(presented.as_bytes(), expected.as_bytes()),
+    )
 }
 
 fn parse_sandbox_id_header(headers: &HeaderMap) -> Result<SandboxId, ProxyRequestError> {
@@ -908,6 +1041,13 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         ProxyRequestError::InvalidUpstreamUri => {
             (StatusCode::BAD_REQUEST, "failed to construct upstream URI")
         }
+        ProxyRequestError::TrafficTokenRequired(_) => (
+            StatusCode::FORBIDDEN,
+            "this sandbox requires a traffic access token",
+        ),
+        ProxyRequestError::EnvdInternalPath => {
+            (StatusCode::FORBIDDEN, "envd control paths are not proxied")
+        }
     };
 
     match error {
@@ -928,16 +1068,114 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         ProxyRequestError::MissingRuntimeRoute(sandbox_id) => {
             warn!(sandbox_id = %sandbox_id, status = %status, message, "sandbox route missing for running sandbox")
         }
+        // 🔴 The token never appears, presented or expected. A refusal that
+        // printed what was offered would put it in the log of whoever guessed.
+        ProxyRequestError::TrafficTokenRequired(sandbox_id) => {
+            debug!(sandbox_id = %sandbox_id, status = %status, message, "proxy request rejected")
+        }
+        ProxyRequestError::EnvdInternalPath => {
+            debug!(status = %status, message, "proxy request rejected")
+        }
     }
 
-    Response::builder()
-        .status(status)
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        )
+    // A reason a client can read without a body: a preflight has none, and a
+    // WebSocket upgrade's failure is not a page.
+    let reason = match error {
+        ProxyRequestError::TrafficTokenRequired(_) => Some("traffic-token-required"),
+        ProxyRequestError::EnvdInternalPath => Some("envd-internal-path"),
+        _ => None,
+    };
+    let mut builder = Response::builder().status(status).header(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if let Some(reason) = reason {
+        builder = builder.header(PROXY_REASON_HEADER, HeaderValue::from_static(reason));
+    }
+    builder
         .body(Body::from(message))
         .unwrap_or_else(|_| status.into_response())
+}
+
+#[cfg(test)]
+mod traffic_token_tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn locked(token: &str) -> ProxyTarget {
+        ProxyTarget::new(std::net::Ipv4Addr::LOCALHOST)
+            .with_traffic_access_token(Some(token.to_string()))
+    }
+
+    #[test]
+    fn an_open_sandbox_admits_every_port_without_a_token() {
+        let open = ProxyTarget::new(std::net::Ipv4Addr::LOCALHOST);
+
+        for port in [80, 8080, 49983] {
+            assert!(traffic_token_admits(&open, port, &HeaderMap::new()));
+        }
+    }
+
+    #[test]
+    fn a_locked_sandbox_admits_only_the_token_it_was_created_with() {
+        let target = locked("the-token");
+
+        assert!(traffic_token_admits(
+            &target,
+            8080,
+            &headers(&[("e2b-traffic-access-token", "the-token")])
+        ));
+        assert!(traffic_token_admits(
+            &target,
+            8080,
+            &headers(&[("x-agentenv-traffic-access-token", "the-token")])
+        ));
+        for presented in ["", "the-toke", "the-tokens", "another"] {
+            assert!(
+                !traffic_token_admits(
+                    &target,
+                    8080,
+                    &headers(&[("e2b-traffic-access-token", presented)])
+                ),
+                "{presented:?} must not be admitted"
+            );
+        }
+        assert!(!traffic_token_admits(&target, 8080, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn envds_own_port_is_not_bound_by_this_token() {
+        let envd_port = ConfigManager::global_config().tools.control_plane_port;
+
+        assert!(traffic_token_admits(
+            &locked("the-token"),
+            envd_port,
+            &HeaderMap::new()
+        ));
+    }
+
+    #[test]
+    fn envd_control_paths_are_never_proxied() {
+        for path in ENVD_INTERNAL_PATHS {
+            assert!(is_envd_internal_path(path), "{path}");
+            assert!(is_envd_internal_path(&path.to_ascii_uppercase()), "{path}");
+            assert!(is_envd_internal_path(&format!("{path}/")), "{path}");
+            assert!(is_envd_internal_path(&format!("{path}?a=b")), "{path}");
+        }
+        for path in ["/", "/initialize", "/api/init", "/freezer", "/health"] {
+            assert!(!is_envd_internal_path(path), "{path}");
+        }
+    }
 }
 
 fn first_header_value<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
@@ -1863,6 +2101,7 @@ mod tests {
     #[test]
     fn build_upstream_uri_preserves_path_and_query() {
         let target = ProxyTarget {
+            traffic_access_token: None,
             ip: std::net::Ipv4Addr::LOCALHOST,
         };
 

@@ -198,6 +198,9 @@ impl ApiImpl {
             env_vars: None,
             network_policy: paused.network_policy.clone(),
             secure: paused.secure,
+            // A sandbox its owner locked comes back locked, with the token its
+            // clients already hold.
+            traffic_access_token: paused.traffic_access_token.clone(),
             // The row's own params travel inside the record; nothing overrides them.
             custom_extension_params: None,
             control_plane_config: paused.control_plane_config.clone(),

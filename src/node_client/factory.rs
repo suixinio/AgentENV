@@ -87,6 +87,10 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             timeout_action: pb::TimeoutAction::Pause as i32,
             auto_resume: false,
             secure: launch_config.envd_access_token.is_some(),
+            traffic_access_token: launch_config
+                .traffic_access_token
+                .clone()
+                .unwrap_or_default(),
             user_metadata: Default::default(),
             env_vars: launch_config.env_vars.clone().unwrap_or_default(),
             network_policy: launch_config
@@ -162,6 +166,10 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             timeout_action: pb::TimeoutAction::Pause as i32,
             auto_resume: false,
             secure: launch_config.envd_access_token.is_some(),
+            traffic_access_token: launch_config
+                .traffic_access_token
+                .clone()
+                .unwrap_or_default(),
             user_metadata: Default::default(),
             env_vars: launch_config.env_vars.clone().unwrap_or_default(),
             network_policy: launch_config

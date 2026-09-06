@@ -313,7 +313,10 @@ components:
           default: true
           description: >
             Whether the sandbox's non-envd ports are reachable without a token.
-            `false` is rejected with 400 until the traffic access token lands.
+            `false` mints a `trafficAccessToken`, returned once in the create
+            response, and requires `secure: true` — without it envd stays
+            reachable without a credential and the sandbox is not locked.
+            envd's own port is not bound by this token; it has its own.
         allowOut:
           type: array
           description: List of allowed destinations for egress traffic. Each entry is a CIDR block (e.g. "8.8.8.8/32") or a bare IPv4 address (e.g. "8.8.8.8"); allowed entries always take precedence over denied entries. A domain name is rejected with 400 until the TCP egress proxy lands, and an IPv6 entry is rejected with 400 in both fields.
@@ -645,7 +648,13 @@ components:
         trafficAccessToken:
           type: string
           nullable: true
-          description: Token required for accessing sandbox via proxy.
+          description: >
+            Token required to reach this sandbox's non-envd ports through the
+            proxy, in the `e2b-traffic-access-token` or
+            `x-agentenv-traffic-access-token` header. Carried by the create
+            that minted it and by a resume of the same sandbox, both of which
+            already need the control-plane credential; no listing or detail
+            response carries it.
         domain:
           type: string
           nullable: true

@@ -215,6 +215,11 @@ pub struct SandboxMetadata {
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
     pub secure: bool,
+    /// The token a client must present to reach a non-envd port through the
+    /// data-plane proxy. Older records deserialize with none, which is the
+    /// open default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_access_token: Option<String>,
     /// Opaque ownership marker stored and returned verbatim by the node.
     /// Absence means the control plane does not own this sandbox.
     #[serde(
@@ -264,6 +269,7 @@ impl Default for SandboxMetadata {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             secure: false,
+            traffic_access_token: None,
             // Default fixtures are not control-plane owned.
             control_plane_config: None,
             max_lifetime: None,
@@ -512,6 +518,7 @@ mod tests {
 
     fn uncapped(base: SystemTime) -> SandboxMetadata {
         SandboxMetadata {
+            traffic_access_token: None,
             created_at: base,
             max_lifetime: None,
             running_since: Some(base),
@@ -995,6 +1002,7 @@ mod golden {
         custom_extension_params.insert("retries".to_string(), json!(3));
 
         SandboxMetadata {
+            traffic_access_token: None,
             id: SandboxId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07").unwrap(),
             execution_id: ExecutionId::parse_str("0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c08").unwrap(),
             snapshot_id: "0199c8ff-1122-7000-8000-aabbccddeeff".to_string(),

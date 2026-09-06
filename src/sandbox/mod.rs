@@ -85,6 +85,10 @@ pub struct SandboxLaunchConfig {
     /// Runtime-only credential used by envd. The token is never serialized and
     /// its Debug representation is redacted.
     pub envd_access_token: Option<EnvdAccessToken>,
+    /// The token a client must present to reach a non-envd port through the
+    /// data-plane proxy. It travels because the proxy that enforces it runs on
+    /// the node.
+    pub traffic_access_token: Option<String>,
     /// Opaque control-plane ownership marker.
     ///
     /// `None` means unowned; producers must never emit an empty value.
@@ -104,6 +108,7 @@ impl SandboxLaunchConfig {
             extra_mmds: serde_json::Map::new(),
             custom_extension_params: None,
             envd_access_token: None,
+            traffic_access_token: None,
             control_plane_config: None,
             preferred_node_id: None,
         }

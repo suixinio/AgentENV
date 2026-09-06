@@ -2467,6 +2467,7 @@ mod tests {
         };
         let snapshot = RunnableSnapshot::from_test_manifest(record, Vec::new());
         let launch_config = SandboxLaunchConfig {
+            traffic_access_token: None,
             env_vars: Some(HashMap::from([
                 ("FROM_LAUNCH".to_string(), "true".to_string()),
                 ("SHARED_KEY".to_string(), "launch".to_string()),

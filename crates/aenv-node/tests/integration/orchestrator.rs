@@ -80,6 +80,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let case_id = Uuid::now_v7().to_string();
 
         let request = CreateSandboxRequest {
+            traffic_access_token: None,
             source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
             expiry: SandboxExpiry::After(Duration::from_secs(30)),
             timeout_action: SandboxTimeoutAction::Pause,
@@ -185,6 +186,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             .restore_sandbox(
                 sandbox_id,
                 CreateSandboxRequest {
+                    traffic_access_token: None,
                     source: SandboxLaunchSource::Snapshot(Box::new(paused_runnable)),
                     expiry: SandboxExpiry::After(Duration::from_secs(120)),
                     timeout_action: SandboxTimeoutAction::Pause,
@@ -265,6 +267,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             Orchestrator::with_in_memory_store(FirecrackerSandboxFactory::new()).await;
         let created = orchestrator
             .create_sandbox(CreateSandboxRequest {
+                traffic_access_token: None,
                 source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
                 expiry: SandboxExpiry::After(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
@@ -363,6 +366,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         let captured_runnable = snapshot_manager.resolve_runnable(published).await?;
         let relaunched = orchestrator
             .create_sandbox(CreateSandboxRequest {
+                traffic_access_token: None,
                 source: SandboxLaunchSource::Snapshot(Box::new(captured_runnable)),
                 expiry: SandboxExpiry::After(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,

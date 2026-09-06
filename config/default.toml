@@ -357,6 +357,11 @@ control_plane_tokens = []
 # kubelet, and a mounted volume is.
 control_plane_token_file = ""
 
+[api.proxy]
+# Requests one sandbox may have in flight through the data-plane proxy at
+# once. 0 does not limit: the sandbox's own service decides what it can take.
+max_incoming_per_sandbox = 0
+
 [sandbox_proxy]
 # DNS suffixes accepted for host-based routes such as
 # {port}-{sandboxID}.{domain}. The first entry is advertised to clients.

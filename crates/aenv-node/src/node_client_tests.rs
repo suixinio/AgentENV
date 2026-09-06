@@ -2185,6 +2185,7 @@ async fn local_half() -> Arc<Orchestrator<InMemoryMetadataStore, MockBackendFact
 
 fn cluster_create_request() -> crate::orchestrator::CreateSandboxRequest {
     crate::orchestrator::CreateSandboxRequest {
+        traffic_access_token: None,
         source: crate::orchestrator::SandboxLaunchSource::Snapshot(Box::new(
             RunnableSnapshot::mock(),
         )),

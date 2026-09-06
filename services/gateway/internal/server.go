@@ -26,8 +26,11 @@ const (
 	headerSandboxID    = "x-agentenv-sandbox-id"
 	headerE2BSandboxID = "e2b-sandbox-id"
 	headerTargetPort   = "x-agentenv-target-port"
-	// The caller's envd access token. The gateway does not check it — it has no
-	// record to check against — it forwards it to the half that does.
+	// The caller's envd access token, and the token a locked sandbox's clients
+	// present. The gateway checks neither — it has no record to check against —
+	// it forwards them to the half that does, which is the node's own proxy.
+	// Whatever this file grows into, that stays true: a second place deciding
+	// whether a request may reach a sandbox is a second place to get it wrong.
 	headerEnvdAccessToken = "x-access-token"
 	headerE2BTargetPort   = "e2b-sandbox-port"
 	headerNodeID          = "x-agentenv-node-id"

@@ -650,6 +650,9 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             env_vars: (!request.env_vars.is_empty()).then_some(request.env_vars),
             network_policy,
             secure: request.secure,
+            // Empty means the sandbox's ports are open, which is the default.
+            traffic_access_token: Some(request.traffic_access_token.clone())
+                .filter(|token| !token.is_empty()),
             custom_extension_params,
             // Ownership markers are set only at create.
             control_plane_config: convert::control_plane_config(&request.control_plane_config),

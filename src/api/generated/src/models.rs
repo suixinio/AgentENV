@@ -5432,7 +5432,7 @@ pub struct Sandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub envd_access_token: Option<String>,
 
-    /// Token required for accessing sandbox via proxy.
+    /// Token required to reach this sandbox's non-envd ports through the proxy, in the `e2b-traffic-access-token` or `x-agentenv-traffic-access-token` header. Carried by the create that minted it and by a resume of the same sandbox, both of which already need the control-plane credential; no listing or detail response carries it.
     #[serde(rename = "trafficAccessToken")]
     #[serde(deserialize_with = "deserialize_optional_nullable")]
     #[serde(default = "default_optional_nullable")]
@@ -6978,7 +6978,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLifec
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxNetworkConfig {
-    /// Whether the sandbox's non-envd ports are reachable without a token. `false` is rejected with 400 until the traffic access token lands.
+    /// Whether the sandbox's non-envd ports are reachable without a token. `false` mints a `trafficAccessToken`, returned once in the create response, and requires `secure: true` — without it envd stays reachable without a credential and the sandbox is not locked. envd's own port is not bound by this token; it has its own.
     #[serde(rename = "allowPublicTraffic")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_public_traffic: Option<bool>,

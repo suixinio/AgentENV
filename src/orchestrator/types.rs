@@ -56,6 +56,10 @@ pub struct CreateSandboxRequest {
     pub env_vars: Option<HashMap<String, String>>,
     pub network_policy: crate::sandbox::SandboxNetworkPolicy,
     pub secure: bool,
+    /// The token a client must present to reach a non-envd port through the
+    /// data-plane proxy. `None` leaves those ports open to whoever can route
+    /// to them, which is the default.
+    pub traffic_access_token: Option<String>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     pub custom_extension_params: Option<CustomExtensionParams>,
     /// Opaque control-plane ownership marker, supplied only by the control plane.

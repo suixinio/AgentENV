@@ -437,6 +437,15 @@ message SandboxCreateRequest {
   // direction, because the unsafe one is a listing that reports a sandbox
   // something else then deletes.
   bytes control_plane_config = 13;
+
+  // The token a client must present to reach a non-envd port of this sandbox
+  // through the data-plane proxy. Empty means the sandbox's ports are open to
+  // whoever can route to them, which is the default.
+  //
+  // 🔴 It travels because the proxy that enforces it runs on the node: the
+  // api half mints it, and a node that never received it would serve a
+  // sandbox its owner asked to be locked.
+  string traffic_access_token = 17;
 }
 
 // What the node knows about a sandbox once it is running.

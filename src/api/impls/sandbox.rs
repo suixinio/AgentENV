@@ -161,11 +161,36 @@ impl From<SandboxMetadata> for models::Sandbox {
             client_id: "".to_string(), // Deprecated field, only reserved for E2B Python SDK.
             envd_version: m.runtime_versions.envd_version.clone(),
             envd_access_token: None,
-            traffic_access_token: None,
+            // The create that minted it and a resume of the same sandbox —
+            // both of which already carry the control-plane credential. No
+            // listing or detail response is built from this model.
+            traffic_access_token: m.traffic_access_token.map(Nullable::Present),
             domain: None,
             execution_id: Some(m.execution_id.to_string()),
         }
     }
+}
+
+/// The token a create mints when its caller asked for a locked sandbox.
+///
+/// `secure` is required with it because the two lock different doors and one
+/// without the other is a sandbox that reads as locked and is not: this token
+/// bounds the ports the guest serves, and `secure` bounds envd itself.
+fn traffic_access_token_for(
+    secure: Option<bool>,
+    network: Option<&models::SandboxNetworkConfig>,
+) -> Result<Option<String>, String> {
+    if network.and_then(|network| network.allow_public_traffic) != Some(false) {
+        return Ok(None);
+    }
+    if secure != Some(true) {
+        return Err(
+            "allowPublicTraffic=false requires secure=true: without it envd stays reachable \
+             without a credential and the sandbox is not locked"
+                .to_string(),
+        );
+    }
+    Ok(Some(uuid::Uuid::new_v4().to_string()))
 }
 
 impl From<&SandboxNetworkPolicy> for models::SandboxNetworkConfig {
@@ -569,9 +594,6 @@ fn network_policy_from_create(
     allow_internet_access: Option<bool>,
     network: Option<&models::SandboxNetworkConfig>,
 ) -> anyhow::Result<SandboxNetworkPolicy> {
-    if network.and_then(|network| network.allow_public_traffic) == Some(false) {
-        anyhow::bail!("allowPublicTraffic=false is not supported yet");
-    }
     let base_policy = base_policy_from_allow_internet_access(allow_internet_access);
     let allow_out = network.and_then(|network| network.allow_out.clone());
     let deny_out = network.and_then(|network| network.deny_out.clone());
@@ -655,6 +677,15 @@ impl Sandboxes<()> for ApiImpl {
                 Self::error(400, err.to_string()),
             ));
         }
+        let traffic_access_token =
+            match traffic_access_token_for(body.secure, body.network.as_ref()) {
+                Ok(token) => token,
+                Err(err) => {
+                    return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                        Self::error(400, err),
+                    ));
+                }
+            };
 
         // Keep image references unresolved for the target node that owns registry access.
         let attached_drives =
@@ -696,6 +727,7 @@ impl Sandboxes<()> for ApiImpl {
                 .filter(|env_vars| !env_vars.is_empty()),
             network_policy,
             secure: body.secure == Some(true),
+            traffic_access_token,
             custom_extension_params: custom_params,
             // User REST creates are not control-plane-owned.
             control_plane_config: None,
@@ -839,6 +871,15 @@ impl Sandboxes<()> for ApiImpl {
                 err.to_string(),
             )));
         }
+        let traffic_access_token =
+            match traffic_access_token_for(body.secure, body.network.as_ref()) {
+                Ok(token) => token,
+                Err(err) => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                        400, err,
+                    )));
+                }
+            };
 
         let request = CreateSandboxRequest {
             source,
@@ -855,6 +896,7 @@ impl Sandboxes<()> for ApiImpl {
                 .filter(|env_vars| !env_vars.is_empty()),
             network_policy,
             secure: body.secure == Some(true),
+            traffic_access_token,
             custom_extension_params: custom_params,
             // User REST creates are not control-plane-owned.
             control_plane_config: None,
@@ -2425,20 +2467,51 @@ mod paused_sandbox_rest_tests {
     }
 
     #[test]
-    fn locking_public_traffic_is_refused_until_the_token_exists() {
+    fn locking_public_traffic_mints_a_token_and_needs_a_secure_sandbox() {
         let mut network = models::SandboxNetworkConfig::new();
         network.allow_public_traffic = Some(false);
 
-        let err = super::network_policy_from_create(None, Some(&network))
-            .expect_err("the token is not implemented yet");
-
+        let err = super::traffic_access_token_for(None, Some(&network))
+            .expect_err("a locked sandbox with a wide-open envd is not locked");
+        assert!(err.contains("secure=true"), "{err}");
         assert!(
-            err.to_string().contains("allowPublicTraffic=false"),
-            "{err}"
+            super::traffic_access_token_for(Some(false), Some(&network)).is_err(),
+            "an explicit secure=false is not secure=true"
+        );
+
+        let token = super::traffic_access_token_for(Some(true), Some(&network))
+            .expect("secure=true mints one")
+            .expect("a locked sandbox has a token");
+        assert!(
+            uuid::Uuid::parse_str(&token).is_ok(),
+            "{token} is not a UUID"
+        );
+        assert_ne!(
+            token,
+            super::traffic_access_token_for(Some(true), Some(&network))
+                .unwrap()
+                .unwrap(),
+            "two sandboxes must not share a token"
+        );
+    }
+
+    #[test]
+    fn an_open_sandbox_mints_no_token_at_all() {
+        let mut network = models::SandboxNetworkConfig::new();
+
+        assert_eq!(
+            super::traffic_access_token_for(Some(true), None).unwrap(),
+            None
+        );
+        assert_eq!(
+            super::traffic_access_token_for(Some(true), Some(&network)).unwrap(),
+            None
         );
         network.allow_public_traffic = Some(true);
-        super::network_policy_from_create(None, Some(&network))
-            .expect("the default is still accepted");
+        assert_eq!(
+            super::traffic_access_token_for(Some(true), Some(&network)).unwrap(),
+            None
+        );
     }
 
     #[test]

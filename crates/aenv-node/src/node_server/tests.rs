@@ -83,6 +83,7 @@ async fn service_with_catalog() -> (
 
 fn launch(marker: Option<&[u8]>) -> CreateSandboxRequest {
     CreateSandboxRequest {
+        traffic_access_token: None,
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
         expiry: SandboxExpiry::After(Duration::from_secs(60)),
         timeout_action: SandboxTimeoutAction::Pause,

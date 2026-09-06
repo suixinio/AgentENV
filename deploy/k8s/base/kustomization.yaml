@@ -436,7 +436,7 @@ configMapGenerator:
     files:
       - config.json=config/regctl.json
   # The broker's own configuration file; paths in it name the Secret volumes
-  # aenv-egress-deployment.yaml mounts.
+  # aenv-egress-daemonset.yaml mounts.
   - name: aenv-egress-config
     files:
       - config/aenv-egress.toml

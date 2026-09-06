@@ -557,6 +557,51 @@ G8 的闸门已满足。
 文档里那句"`AENV_SECRETS_BACKEND=vault` 现在会被拒"用一条测试钉住了（翻转断言变红、复原变绿），
 因为它是这批唯一一处**行为**承诺 —— 其余被删的变量都是"读它的人没了"，而这一个是主动拒绝。
 
+### review-2 修复批（2026-09-06）
+
+对 `dev..HEAD` 的整分支审查保留了 10 条，全部修复。每条先对照了 e2b（`packages/api/internal/handlers/secrets.go`、
+`shared/pkg/secretsstore`、`shared/pkg/networktransform`）的处理，采纳或有据偏离如下。
+
+| # | 缺陷 | e2b 的做法 | 我们的修法 |
+|---|------|-----------|-----------|
+| 1 | AAD 只绑 `name:version`，表写权限可以清空 `allowed_hosts` 或把 `fields` 改成 `opaque` 而密文照常打开 | 存储后端闭源，无可对照 | `Envelope::Binding` 把 `kind` 与排序后的 `allowed_hosts` 折进 AAD；`resolve` 只在 open 成功后才信任这两列 |
+| 2 | 凭据形状从不与策略用法核对，错配到首个连接才 502 | 只有一种形状（不透明 `value`），问题不存在 | 引入 `SecretKind`；`referenced_secrets()` 给每个名字标出用法形状；创建/改网络时 `ensure_usable` 以 400 拒绝错配；同一名字同时当 marker 与 `credential` 在归一化时就拒；`POST /secrets/{id}` 不允许翻转形状（`ShapeChanged` → 400） |
+| 3 | 401 无日志，broker 把 401 与 403/404 同映射为 `Denied` | 固定文案、有界状态码映射、`ConstantTimeCompare` | 401 分支打 `warn!`；`ResolverSource` 把 401 映射为 `Unavailable`（guest 看到 502 而不是"无授权"）；`token_matches` 换成 `aenv_core::api::constant_time_eq` |
+| 4 | `resolver.url` 有、`token_file` 无时静默启动 | `redis.go`："X is set but Y is not" 启动即拒 | `main.rs` 同款 `bail!`；`ResolverSource::new` 的 token 改为必填、空串拒绝 |
+| 5 | `fields` 凭据上的 `allowedHosts` 存了却没人执行 | 没有 pin 概念 | `validate_pin_fits`：`fields` + 非空 pin → 400；resolve 端点的 `fields` 响应不再带 `allowedHosts` |
+| 6 | `secret_grants` 无 FK/TTL/回收，撤销失败或记录在 Redis 过期后永久可解析 | node sync 的 `GetOrphanCandidates` + `store.Reconcile` 杀孤儿 | orchestrator 自动驱逐的每个 tick 追加 `reap_orphaned_grants`：取 10 分钟以上的 grant，逐条与 store 记录比对（记录不存在或 `execution_id` 不同即撤销）；store 出错则本轮停止，不在无法比对时撤销 |
+| 7 | e2e 16 把 `POST /secrets` 的 400 当 skip 并 exit 0 | — | 400 走 `_fail`；503 仍是"无 store"的 skip |
+| 8 | 先解析最多 2 MiB 请求体再查 bearer | — | bearer 检查移到 `route_layer` 中间件；`DefaultBodyLimit::max(4096)`；超限答 413 |
+| 9 | `put` 与 `set_current_version` 两个事务，中间失败时 broker 服务的版本领先 `currentVersion` | 后端闭源 | `put` 在同一事务里 `UPDATE secret_refs SET current_version = GREATEST(...)`；`set_current_version` 变成幂等的元数据写 |
+| 10 | openapi 说 "scalar" 但类型是 string；broker 留着永远不会触发的 Number 分支 | 值就是字节串 | 两处描述改为 "string（端口是 `"5432"`）"；`CredentialFields::from_json` 只收字符串，其它非 null 拒绝 |
+
+顺手清掉的：`SecretValue::kind()` 改返回 `SecretKind` 并成为 `values.rs` 的唯一形状来源；删了零调用的
+`From<SecretString> for SecretValue`；`values.rs` 复用 `pg/mod.rs` 的 `now_ms`/`unavailable`；
+`crates/aenv-api/Cargo.toml` 与 `src/secrets/mod.rs` 两处违反注释规则的段落。未动：`CATALOG_TABLES`
+第三份表清单、`grant_secrets` 在 API 层校验后的重复查询（wake 路径需要它）。
+
+**pve-mf 验收（同日，镜像 `mf-egress-8`）**：三轮 agent 验收（逐条修复 / 隔离与暂停漂移 / `/secrets` 补充
+八项）零缺陷，全量 e2e 141 PASS / 9 SKIP / 0 FAIL。验收顺手修掉的五条观察：`sec_` 保留名单独文案
+（`SecretsError::ReservedName`）、空 `fields` 单独文案（`EmptyFields`）、`GET /secrets` 的 `nextToken`
+不是本 API 签发的 id 时 400 而不是静默从头分页（`is_secret_id`）、broker 的 `http` 与 `postgres` handler
+在凭据 `Unavailable` 时各打一条 warn（原先只有 metric 和 api 侧日志）；第五条"拒绝原因只在
+`x-aenv-egress-reason` 头里、body 为空"是既有设计，文档已如此描述，未改。
+
+**两个部署后果：**
+
+1. **AAD 变了，旧行打不开。** 修复前写进 `secret_values` 的每一行在新镜像下 `resolve` 都是
+   `Unavailable`（guest 502，api 日志 `failed to open the stored value`）。分支未 push，pve-mf 上
+   `mf-egress-7` 的库里只有 e2e 每轮自建自删的凭据，所以滚动前不需要迁移；若有人手写过值，滚动后要用
+   `POST /secrets/{id}` 重写一版。这不是回滚问题，是前进问题：不加 `aad_version` 列是刻意的（§5.1 同理，
+   "谁能解密"只在一处）。
+2. **broker 配置更严。** `[resolver].url` 设了而 `token_file` 没设，broker 启动失败而不是每次取值 401。
+   `deploy/k8s/base/config/aenv-egress.toml` 两个都设了，不受影响。
+
+门禁：`cargo check --workspace --all-targets`、`--features bin`、`make clippy`、`make fmt`、
+`make check-crate-boundaries`、`make test-with-postgres`（77 passed，新增 4 条：改列不开、`put` 推
+`current_version`、`grants_before`、`kinds_of`）、`make test-unit` 全绿；`cargo adev codegen server` 重跑后只有
+`models.rs` 的描述文本变化。
+
 ---
 
 ## 8. 不做的事

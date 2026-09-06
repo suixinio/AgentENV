@@ -256,10 +256,8 @@ mod tests {
         );
     }
 
-    /// The other class: the guest chose the destination itself, so everything
-    /// it says about destinations still applies.
     #[test]
-    fn the_sandbox_policy_still_bounds_a_handler_the_guest_addressed() {
+    fn the_sandbox_policy_alone_bounds_a_handler_the_guest_addressed() {
         let guard = UpstreamGuard::new(BrokerDenyList::empty())
             .with_allowlist("http", &["198.51.100.0/24"])
             .unwrap();
@@ -271,6 +269,15 @@ mod tests {
         assert_eq!(
             guard.check("http", "198.51.100.7".parse().unwrap(), &closed),
             Err(DenyReason::InternetDisabled)
+        );
+        let open = EgressPolicySummary {
+            allow_internet: true,
+            allowed_cidrs: vec![],
+            denied_cidrs: vec![],
+        };
+        assert_eq!(
+            guard.check("http", "203.0.113.7".parse().unwrap(), &open),
+            Ok(())
         );
     }
 

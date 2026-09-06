@@ -155,7 +155,7 @@ peer_discovery_refresh_interval_secs = 5
 # How this node reaches the egress broker that serves sandboxes declaring
 # `network.rules` or explicit endpoints: "disabled" (such sandboxes are never
 # placed here), "embedded" (the broker core runs inside aenv-node with the
-# echo and tcp handlers only, for this crate's integration tests; single
+# echo handler only, for this crate's integration tests; single
 # static node, and sandboxes naming any other handler are not placed here
 # either) or "remote" (TLS to the aenv-egress deployment; endpoint,
 # ca_cert_path and shared_secret are then required).
@@ -166,17 +166,11 @@ mode = "disabled"
 # from the one above. Unset means the two are one CA.
 # guest_ca_cert_path = "/etc/aenv/egress-ca/ca.crt"
 # shared_secret = "replace-with-the-hmac-key-from-the-egress-hmac secret"
-# Identity headers older or newer than this are refused by the broker.
-max_skew_ms = 30000
 # Concurrent brokered connections per sandbox and per node; excess is closed.
 per_sandbox_conns = 256
 node_conns = 20000
 # How long the runtime waits for the broker to accept one connection.
 open_timeout_ms = 3000
-# Where the embedded broker's `tcp` handler may connect. Empty leaves it
-# reaching nothing; `remote` mode reads the broker's own [handlers.tcp]
-# instead.
-embedded_tcp_allowed_cidrs = []
 
 [secrets]
 # Where aenv-api keeps secret values and grants: "disabled" or "postgres".

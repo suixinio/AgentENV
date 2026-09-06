@@ -457,11 +457,9 @@ How a node reaches the egress broker that serves sandboxes declaring `network.ru
 | `ca_cert_path` | path | unset | PEM bundle that verifies the broker's server certificate. Required in `remote` mode. |
 | `guest_ca_cert_path` | path | unset | PEM bundle guests with rules trust for intercepted names, when the leaf-signing CA is a different one. Unset means the two are one CA, which is what a deployment that has not split them has. Splitting is what lets the leaf CA carry name constraints without invalidating the broker's own `*.svc` server certificate. |
 | `shared_secret` | string | unset | HMAC key the identity header is signed with. Required in `remote` mode; inject it from a Secret. |
-| `max_skew_ms` | integer | `30000` | Identity headers issued outside this window are refused by the broker. |
 | `per_sandbox_conns` | integer | `256` | Concurrent brokered connections one sandbox may hold; excess connections are closed. |
 | `node_conns` | integer | `20000` | Concurrent brokered connections across the node. |
 | `open_timeout_ms` | integer | `3000` | How long the runtime waits for the broker to accept one connection. |
-| `embedded_tcp_allowed_cidrs` | array of CIDR strings | `[]` | Where the embedded broker's `tcp` handler may connect. Empty leaves that handler reaching nothing. `remote` mode reads the broker's own `[handlers.tcp].allowed_cidrs` instead. **TOML-file-only — no `env =` binding.** |
 
 ## `[secrets]`
 
@@ -494,7 +492,7 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 |-----|------|---------|-------------|
 | `listen` | address | `0.0.0.0:8443` | Where runtimes connect. |
 | `metrics_listen` | address | unset | Prometheus scrape address; unset disables the exporter. |
-| `max_skew_ms` | integer | `30000` | Identity headers issued outside this window are refused. Keep equal to the nodes' `[egress_broker].max_skew_ms`. |
+| `max_skew_ms` | integer | `30000` | Identity headers issued outside this window are refused. |
 | `replay_capacity` | integer | `100000` | Nonces remembered inside the skew window. A full cache refuses rather than forgets. |
 | `admission_timeout_ms` | integer | `10000` | One deadline covering the TLS handshake and the identity frame behind it. Nothing on a connection is authenticated until both are done, so this is what bounds an unauthenticated peer. |
 | `max_connections` | integer | `4096` | Connections held at once. The excess is closed, not queued. |
@@ -518,7 +516,6 @@ every path in it names a Secret volume `deploy/k8s/base/aenv-egress-deployment.y
 | `handlers.tcp.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations `tcp` reaches. An enabled handler with an empty list reaches nothing: a declaration names the upstream, so the operator names where declarations may point. A range named here is reached even when it is private, because the upstream is the operator's choice and the guest never addressed it — neither the built-in private ranges nor the sandbox's own egress policy bounds it. It still cannot reach the broker's own host, link-local (cloud metadata), or anything in `upstream.denied_cidrs`. **TOML-file-only — no `env =` binding.** |
 | `handlers.postgres.enabled` | boolean | `false` | The `postgres` handler, which terminates the guest's startup exchange and authenticates upstream with the brokered credential. |
 | `handlers.postgres.allowed_cidrs` | array of CIDR strings | `[]` | The only destinations a `postgres` credential may point at, reading exactly as `handlers.tcp.allowed_cidrs` above. An enabled handler with an empty list reaches nothing; a tenant database on a private address belongs here. **TOML-file-only — no `env =` binding.** |
-| `handlers.http.allowed_cidrs` | array of CIDR strings | `[]` | Pins the `rules` handler further. Empty leaves it bounded by each sandbox's own egress policy, which is what already bounds an intercepted connection. **TOML-file-only — no `env =` binding.** |
 
 Environment variable overrides for this file are listed under
 [Egress Broker](env-vars.md#egress-broker-aenv-egress).

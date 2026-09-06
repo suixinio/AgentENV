@@ -2,8 +2,7 @@
 # ConfigMap. Paths name the Secret volumes aenv-egress-deployment.yaml mounts.
 listen = "0.0.0.0:8443"
 metrics_listen = "0.0.0.0:9103"
-# Identity headers older or newer than this are refused; keep it equal to
-# [egress_broker].max_skew_ms on the nodes.
+# Identity headers older or newer than this are refused.
 max_skew_ms = 30000
 # Nonces remembered inside the skew window; size it for the connections
 # expected in one window, a full cache refuses rather than forgets.
@@ -78,10 +77,4 @@ allowed_cidrs = []
 # means the handler reaches nothing. A tenant database on a private address
 # belongs here.
 enabled = false
-allowed_cidrs = []
-
-[handlers.http]
-# The `rules` handler is already bounded by each sandbox's own egress policy,
-# so an empty list leaves it bounded by that alone. A non-empty list pins it
-# further, and then every rules upstream must fall inside it.
 allowed_cidrs = []

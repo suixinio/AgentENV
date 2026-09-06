@@ -3,9 +3,9 @@
 //! and original destination, and the listeners follow the policy through
 //! updates, pause/resume and slot reuse.
 //!
-//! The embedded broker dispatches the `echo` identity handler and the `tcp`
-//! relay, so a `rules`-derived policy names `echo` here where a public policy
-//! names `http`; everything between the guest and the broker is the production
+//! The embedded broker dispatches the `echo` identity handler alone, so a
+//! `rules`-derived policy names `echo` here where a public policy names
+//! `http`; everything between the guest and the broker is the production
 //! path. Requires root, `/dev/kvm`, and a node config with
 //! `[egress_broker].mode = "embedded"` and `[cluster].node_discovery_mode =
 //! "static"`. Passthrough of unmatched SNI and policy denial at the broker

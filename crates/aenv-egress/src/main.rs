@@ -141,8 +141,6 @@ struct HandlersConfig {
     tcp: RelayHandlerConfig,
     #[config(nested)]
     postgres: RelayHandlerConfig,
-    #[config(nested)]
-    http: PinnedHandlerConfig,
 }
 
 /// A handler whose upstream comes from the endpoint declaration or the
@@ -153,14 +151,6 @@ struct HandlersConfig {
 struct RelayHandlerConfig {
     #[config(default = false)]
     enabled: bool,
-    #[config(default = [])]
-    allowed_cidrs: Vec<String>,
-}
-
-/// A handler the sandbox's own policy already bounds. An empty allowlist
-/// leaves it bounded by that policy alone; a non-empty one pins it further.
-#[derive(Config)]
-struct PinnedHandlerConfig {
     #[config(default = [])]
     allowed_cidrs: Vec<String>,
 }
@@ -273,11 +263,6 @@ async fn main() -> Result<()> {
         BrokerDenyList::with_extra(&config.upstream.denied_cidrs)
             .context("upstream.denied_cidrs are not all cidrs")?,
     );
-    if !config.handlers.http.allowed_cidrs.is_empty() {
-        guard = guard
-            .with_allowlist(HttpHandler::NAME, &config.handlers.http.allowed_cidrs)
-            .context("handlers.http.allowed_cidrs are not all cidrs")?;
-    }
     if config.handlers.tcp.enabled {
         guard = guard
             .with_allowlist(TcpRelayHandler::NAME, &config.handlers.tcp.allowed_cidrs)

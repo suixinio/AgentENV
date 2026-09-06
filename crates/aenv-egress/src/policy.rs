@@ -208,11 +208,11 @@ impl UpstreamGuard {
         }
     }
 
-    /// Pins `handler` to `cidrs`. A handler with no allowlist reaches
-    /// whatever the deny list and the sandbox policy allow, except for the
-    /// handlers in [`HANDLERS_REQUIRING_ALLOWLIST`], which then reach
-    /// nothing; an allowlist that parses to no range switches its handler off
-    /// the same way.
+    /// Names where `handler`, one of [`HANDLERS_REQUIRING_ALLOWLIST`], may
+    /// connect. Without one such a handler reaches nothing, and an allowlist
+    /// that parses to no range switches it off the same way. A handler
+    /// outside that set is bounded by the sandbox's own policy and consults
+    /// no allowlist.
     pub fn with_allowlist<S: AsRef<str>>(
         mut self,
         handler: &str,
@@ -253,18 +253,16 @@ impl UpstreamGuard {
         Ok(ips)
     }
 
-    /// The absolute deny list, then the handler's operator allowlist, then —
-    /// for a handler whose upstream the guest itself chose — the overridable
-    /// deny list and the sandbox's own allow list, deny list and base policy,
-    /// in the order the namespace's FORWARD chains apply them.
-    ///
-    /// A handler in [`HANDLERS_REQUIRING_ALLOWLIST`] is the other case: its
-    /// upstream comes from the endpoint declaration or the credential, the
-    /// guest never addressed it, and the operator's allowlist is what bounds
-    /// it. An address inside that allowlist is reached without consulting the
-    /// sandbox's CIDR policy, which would otherwise force the operator to
-    /// publish the upstream's address into the sandbox's own configuration —
-    /// the address the whole arrangement exists to keep out of it.
+    /// The absolute deny list first. A handler in
+    /// [`HANDLERS_REQUIRING_ALLOWLIST`] is then bounded by its operator
+    /// allowlist alone: its upstream comes from the endpoint declaration or
+    /// the credential, the guest never addressed it, and consulting the
+    /// sandbox's CIDR policy would force the operator to publish the
+    /// upstream's address into the sandbox's own configuration — the address
+    /// the whole arrangement exists to keep out of it. For a handler whose
+    /// upstream the guest itself chose, the overridable deny list and the
+    /// sandbox's own allow list, deny list and base policy follow, in the
+    /// order the namespace's FORWARD chains apply them.
     ///
     /// An IPv4-mapped IPv6 address is checked as the IPv4 address it maps.
     pub fn check(
@@ -277,16 +275,12 @@ impl UpstreamGuard {
         if self.deny.absolute_matches(ip) {
             return Err(DenyReason::BrokerDenied);
         }
-        let operator_chosen = HANDLERS_REQUIRING_ALLOWLIST.contains(&handler);
-        match self.allowlists.get(handler) {
-            Some(pinned) if pinned.iter().any(|net| net.contains(ip)) => {
-                if operator_chosen {
-                    return Ok(());
-                }
-            }
-            Some(_) => return Err(DenyReason::HandlerDenied),
-            None if operator_chosen => return Err(DenyReason::HandlerUnpinned),
-            None => {}
+        if HANDLERS_REQUIRING_ALLOWLIST.contains(&handler) {
+            return match self.allowlists.get(handler) {
+                Some(pinned) if pinned.iter().any(|net| net.contains(ip)) => Ok(()),
+                Some(_) => Err(DenyReason::HandlerDenied),
+                None => Err(DenyReason::HandlerUnpinned),
+            };
         }
         if self.deny.matches(ip) {
             return Err(DenyReason::BrokerDenied);

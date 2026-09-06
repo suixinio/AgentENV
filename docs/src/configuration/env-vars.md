@@ -30,14 +30,13 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_EGRESS_BROKER_CA_CERT_PATH` | unset | `[egress_broker].ca_cert_path`, required in `remote` mode. A node's copy of the broker's CA certificate — never its key. Not to be confused with the broker's own `AENV_EGRESS_CA_CERT_PATH` under [Egress Broker](#egress-broker-aenv-egress). |
 | `AENV_EGRESS_BROKER_GUEST_CA_CERT_PATH` | unset | `[egress_broker].guest_ca_cert_path`: the CA guests trust for intercepted names, when it is not the same one that verifies the broker. |
 | `AENV_EGRESS_BROKER_SHARED_SECRET` | unset | `[egress_broker].shared_secret`, required in `remote` mode; mount it from a Secret |
-| `AENV_EGRESS_BROKER_MAX_SKEW_MS` | `30000` | `[egress_broker].max_skew_ms` |
 | `AENV_EGRESS_BROKER_PER_SANDBOX_CONNS` | `256` | `[egress_broker].per_sandbox_conns` |
 | `AENV_EGRESS_BROKER_NODE_CONNS` | `20000` | `[egress_broker].node_conns` |
 | `AENV_EGRESS_BROKER_OPEN_TIMEOUT_MS` | `3000` | `[egress_broker].open_timeout_ms` |
-| — | `[]` | `[egress_broker].embedded_tcp_allowed_cidrs` is a list, so confique cannot bind it from the environment; set it in the config file or an overlay. |
 | `AENV_SECRETS_BACKEND` | `disabled` | `[secrets].backend`: `disabled` or `postgres`. Read by `aenv-api` only. Any other value is refused at startup. |
 | `AENV_SECRETS_PG_KEY_FILE` | unset | `[secrets.pg].key_file`: the file holding the base64 32-byte master key values are encrypted under. A path, not the key — an environment variable holding one is readable from `/proc` and `kubectl describe`. |
 | `AENV_SECRETS_PG_RESOLVER_TOKEN_FILE` | unset | `[secrets.pg].resolver_token_file`: the file holding the bearer the broker presents at the internal resolve endpoint. Read once at startup; the broker's `AENV_EGRESS_RESOLVER_TOKEN_FILE` names a file with the same value. |
+| ~~`AENV_EGRESS_BROKER_MAX_SKEW_MS`~~ | — | **Removed.** It declared `[egress_broker].max_skew_ms` on the node, and nothing on the node read it: the skew window is checked by the broker alone under its own `AENV_EGRESS_MAX_SKEW_MS`, and a node only stamps the header. **Setting it today does nothing:** no field declares the name, so it is read by nothing and refused by nothing, and `max_skew_ms` under `[egress_broker]` in a config file is ignored the same way. The TOML-only `[egress_broker].embedded_tcp_allowed_cidrs` went at the same time, with the `tcp` handler the embedded broker no longer dispatches; a file that still sets it is ignored. |
 | ~~`AENV_SECRETS_VAULT_ADDR`~~, ~~`AENV_SECRETS_VAULT_TOKEN`~~, ~~`AENV_SECRETS_VAULT_MOUNT`~~, ~~`AENV_SECRETS_VAULT_NAMESPACE`~~, ~~`AENV_SECRETS_VAULT_TIMEOUT_MS`~~ | — | **Removed.** They configured `[secrets].backend = "vault"`, which wrote values to `<mount>/secrets/<name>` and grants to `<mount>/grants/<execution_id>` in a HashiCorp Vault KV v2 store the broker read back. `postgres` keeps both in the database this half already holds, so a deployment needs no credential store beside AgentENV and the Vault backend, its config section and the `SecretsBackendKind::Vault` variant were deleted together. **Setting them today does nothing:** no field declares the names, so they are read by nothing and refused by nothing — but `AENV_SECRETS_BACKEND=vault` *is* refused, because the value no longer parses. The `egress-vault` and `secrets-vault-writer` Secrets are gone from `deploy/k8s/base`. |
 | ~~`AENV_SECRETS_RESOLVER_URL`~~, ~~`AENV_SECRETS_RESOLVER_TOKEN`~~, ~~`AENV_SECRETS_RESOLVER_TOKEN_FILE`~~, ~~`AENV_SECRETS_RESOLVER_TIMEOUT_MS`~~ | — | **Removed.** They configured `[secrets].backend = "external_resolver"`, where the credentials never entered AgentENV at all: this half posted grants and revocations to a service the operator ran, and the broker resolved values against the same base. It was the only backend whose values stayed outside this deployment, and removing it is the part of the move to `postgres` that costs something — see `docs/proposals/2026-09-04-api-owned-credential-store.md` §9. **Setting them today does nothing:** no field declares the names, so they are read by nothing and refused by nothing; `AENV_SECRETS_BACKEND=external_resolver` is refused, because the value no longer parses. The broker's own `AENV_EGRESS_RESOLVER_URL` is untouched and now points at this half. |
 | ~~`AENV_OBSERVABILITY_DUAL_REPORT_API_ENDPOINT`~~ | — | **Removed.** It was a Stage A/D5-only bridge (a second, best-effort heartbeat target dialled concurrently with `[cluster].scheduler_endpoint`) meant to feed `aenv-api`'s own node registry ahead of a wider cutover. Once the primary heartbeat itself could target `agentenv-api` directly (`node-heartbeat-config`), the bridge became redundant — a second, concurrent send to the same target would only double the request rate for no new coverage — and the field, its config struct member, and the reporter's dual-send machinery were deleted. **Setting it today does nothing:** no field declares the name, so it is read by nothing and refused by nothing. |
@@ -94,7 +93,7 @@ nothing at all.
 | `AENV_EGRESS_CONFIG_PATH` | `/etc/aenv-egress/config.toml` | Path to the broker's TOML configuration. `--config` wins over it. |
 | `AENV_EGRESS_LISTEN` | `0.0.0.0:8443` | `listen`: where runtimes connect. |
 | `AENV_EGRESS_METRICS_LISTEN` | unset | `metrics_listen`: Prometheus scrape address. Unset disables the exporter. |
-| `AENV_EGRESS_MAX_SKEW_MS` | `30000` | `max_skew_ms`: identity headers issued outside this window are refused. Keep equal to the nodes' `AENV_EGRESS_BROKER_MAX_SKEW_MS`. |
+| `AENV_EGRESS_MAX_SKEW_MS` | `30000` | `max_skew_ms`: identity headers issued outside this window are refused. |
 | `AENV_EGRESS_REPLAY_CAPACITY` | `100000` | `replay_capacity`: nonces remembered inside the skew window. |
 | `AENV_EGRESS_ADMISSION_TIMEOUT_MS` | `10000` | `admission_timeout_ms`: one deadline over the TLS handshake and the identity frame behind it — what bounds a peer that has not authenticated yet. |
 | `AENV_EGRESS_MAX_CONNECTIONS` | `4096` | `max_connections`: connections held at once; the excess is closed, not queued. |
@@ -109,8 +108,12 @@ nothing at all.
 
 `ca.leaf_ttl_secs`, `ca.cache_capacity`, `ca.mints_per_sandbox_per_minute`, `hmac.key_files`,
 `upstream.denied_cidrs`, `resolver.timeout_ms`, `resolver.cache_ttl_secs`, `resolver.cache_capacity`, `handlers.echo` and
-the `handlers.tcp` / `handlers.postgres` / `handlers.http` tables have no environment binding; set
-them in the file.
+the `handlers.tcp` / `handlers.postgres` tables have no environment binding; set them in the file.
+
+`[handlers.http].allowed_cidrs` is gone: the `rules` handler relays what the guest itself addressed,
+so each sandbox's own egress policy is what bounds it, and a broker-wide CIDR list on top only cut
+public 443 destinations — passthrough included — out from under every sandbox at once. A file that
+still carries the table is ignored.
 
 ## E2B SDK / CLI
 

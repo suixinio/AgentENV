@@ -969,12 +969,55 @@ fn claim_incoming(sandbox_id: SandboxId) -> Result<Option<IncomingSlot>, ()> {
 }
 
 /// Whether the path is one of envd's own control routes.
+///
+/// The comparison is on the decoded path: envd resolves `%2f` and `%69nit`
+/// the same way any HTTP server does, so a refusal that compared the raw
+/// bytes would refuse `/init` and carry `/%69nit` to the same handler. A path
+/// that cannot be decoded is treated as one of them — nothing legitimate
+/// addresses a sandbox with an invalid escape, and guessing is the wrong way
+/// to be wrong here.
+///
+/// This runs before the sandbox is looked up, so an undecodable path is a 403
+/// even for a sandbox that does not exist. Through the gateway it is not seen
+/// at all: Go's own URL parsing answers a malformed escape with 400 before
+/// the request reaches this half.
 fn is_envd_internal_path(path: &str) -> bool {
     let path = path.split('?').next().unwrap_or(path);
-    let trimmed = path.trim_end_matches('/');
+    let Some(decoded) = percent_decoded(path) else {
+        return true;
+    };
+    let trimmed = decoded.trim_end_matches('/');
     ENVD_INTERNAL_PATHS
         .iter()
         .any(|internal| trimmed.eq_ignore_ascii_case(internal))
+}
+
+/// The path with its percent escapes resolved, or `None` when an escape is
+/// malformed or the result is not UTF-8. Only for comparing: what the proxy
+/// forwards upstream is always the raw path it was given.
+fn percent_decoded(path: &str) -> Option<String> {
+    if !path.contains('%') {
+        return Some(path.to_string());
+    }
+    let raw = path.as_bytes();
+    let mut out = Vec::with_capacity(raw.len());
+    let mut index = 0;
+    while index < raw.len() {
+        if raw[index] == b'%' {
+            let hex = raw.get(index + 1..index + 3)?;
+            // Both digits, and only digits: `from_str_radix` would accept a
+            // leading sign, which no escape has.
+            if !hex.iter().all(u8::is_ascii_hexdigit) {
+                return None;
+            }
+            out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
+            index += 3;
+        } else {
+            out.push(raw[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Whether a request may reach this sandbox's port.
@@ -1068,7 +1111,7 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         ProxyRequestError::MissingRuntimeRoute(sandbox_id) => {
             warn!(sandbox_id = %sandbox_id, status = %status, message, "sandbox route missing for running sandbox")
         }
-        // 🔴 The token never appears, presented or expected. A refusal that
+        // The token never appears, presented or expected. A refusal that
         // printed what was offered would put it in the log of whoever guessed.
         ProxyRequestError::TrafficTokenRequired(sandbox_id) => {
             debug!(sandbox_id = %sandbox_id, status = %status, message, "proxy request rejected")
@@ -1175,6 +1218,32 @@ mod traffic_token_tests {
         for path in ["/", "/initialize", "/api/init", "/freezer", "/health"] {
             assert!(!is_envd_internal_path(path), "{path}");
         }
+    }
+
+    #[test]
+    fn an_escaped_control_path_is_refused_like_the_plain_one() {
+        for path in ["/%69nit", "/%49NIT", "/fs%66reeze", "/%75pgrade/"] {
+            assert!(
+                is_envd_internal_path(path),
+                "{path} decodes to a control path"
+            );
+        }
+        for path in ["/%68ealth", "/api/%69nit"] {
+            assert!(!is_envd_internal_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_path_that_does_not_decode_is_refused_rather_than_guessed() {
+        for path in ["/%", "/%zz", "/%2", "/%+1nit", "/init%ff%ff"] {
+            assert!(is_envd_internal_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn a_path_with_no_escapes_is_not_copied_through_the_decoder() {
+        assert_eq!(percent_decoded("/health"), Some("/health".to_string()));
+        assert_eq!(percent_decoded("/a%2fb"), Some("/a/b".to_string()));
     }
 }
 

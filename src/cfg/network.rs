@@ -1,7 +1,9 @@
+use std::net::Ipv4Addr;
+
 use anyhow::{bail, Context, Result};
 use confique::Config;
 use ipnetwork::{IpNetwork, Ipv4Network};
-use tracing::info;
+use tracing::{info, warn};
 
 pub const NETWORK_MAX_SLOTS: usize = 32768;
 
@@ -175,6 +177,34 @@ pub struct ResolvedNetworkInternalConfig {
     pub vm_link_cidr: Ipv4Network,
 }
 
+/// The IPv4 addresses this machine's interfaces carry. Best-effort: a host
+/// whose interfaces cannot be listed is warned about nothing, because the
+/// alternative is a startup that fails on a machine it cannot inspect.
+fn host_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let Ok(interfaces) = nix::ifaddrs::getifaddrs() else {
+        return Vec::new();
+    };
+    interfaces
+        .filter_map(|interface| Some(interface.address?.as_sockaddr_in()?.ip()))
+        .filter(|address| !address.is_loopback())
+        .collect()
+}
+
+/// Which of `addresses` each opened range covers. An IPv6 range matches
+/// nothing here, and does not need to: IPv6 is off in the sandbox namespace,
+/// so the only address a sandbox can reach this host at is an IPv4 one.
+fn addresses_inside(holes: &[IpNetwork], addresses: &[Ipv4Addr]) -> Vec<(Ipv4Addr, IpNetwork)> {
+    let mut inside = Vec::new();
+    for hole in holes {
+        for address in addresses {
+            if hole.contains(std::net::IpAddr::V4(*address)) {
+                inside.push((*address, *hole));
+            }
+        }
+    }
+    inside
+}
+
 impl NetworkConfig {
     pub fn validate(config: &Self) -> Result<()> {
         if config.egress.always_denied_cidrs.is_some() {
@@ -184,10 +214,19 @@ impl NetworkConfig {
                  network.egress.allow_internal_cidrs"
             );
         }
-        for hole in config.egress.parsed_allow_internal_cidrs()? {
+        let holes = config.egress.parsed_allow_internal_cidrs()?;
+        for hole in &holes {
             info!(
                 cidr = %hole,
                 "sandbox egress policy decides about this otherwise always-denied range"
+            );
+        }
+        for (address, hole) in addresses_inside(&holes, &host_ipv4_addresses()) {
+            warn!(
+                %address,
+                cidr = %hole,
+                "an address of this host is inside a range sandbox egress policy may open; a \
+                 sandbox whose allowOut names it reaches this machine"
             );
         }
 
@@ -297,6 +336,32 @@ fn is_valid_dns_label(label: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_opened_range_that_covers_a_host_address_is_reported() {
+        let holes = vec![
+            "10.42.0.0/16".parse::<IpNetwork>().unwrap(),
+            "192.168.9.0/24".parse::<IpNetwork>().unwrap(),
+        ];
+        let addresses = [
+            Ipv4Addr::new(10, 42, 0, 7),
+            Ipv4Addr::new(203, 0, 113, 4),
+            Ipv4Addr::new(192, 168, 9, 1),
+        ];
+
+        let inside = addresses_inside(&holes, &addresses);
+
+        assert_eq!(
+            inside,
+            vec![
+                (Ipv4Addr::new(10, 42, 0, 7), holes[0]),
+                (Ipv4Addr::new(192, 168, 9, 1), holes[1]),
+            ],
+            "a public address is not inside anything, and both host addresses are"
+        );
+        assert!(addresses_inside(&holes, &[]).is_empty());
+        assert!(addresses_inside(&[], &addresses).is_empty());
+    }
 
     #[test]
     fn validate_accepts_custom_network_config() -> Result<()> {

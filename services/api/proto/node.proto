@@ -442,7 +442,7 @@ message SandboxCreateRequest {
   // through the data-plane proxy. Empty means the sandbox's ports are open to
   // whoever can route to them, which is the default.
   //
-  // 🔴 It travels because the proxy that enforces it runs on the node: the
+  // It travels because the proxy that enforces it runs on the node: the
   // api half mints it, and a node that never received it would serve a
   // sandbox its owner asked to be locked.
   string traffic_access_token = 17;

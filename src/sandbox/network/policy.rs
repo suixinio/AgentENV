@@ -521,9 +521,6 @@ fn build_namespace_egress_chain_commands(
     commands
 }
 
-/// Routes the guest's traffic to `dports` onto the brokered listener at
-/// `listener` and rejects UDP to the same ports so HTTP/3 falls back to TCP.
-/// Replaces whatever intercept was installed before.
 /// One brokered listener and the guest destination ports DNATed onto it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InterceptTarget {
@@ -614,16 +611,29 @@ fn build_static_egress_commands(
     internal_egress_denied_cidrs: &[String],
     node_always_denied_cidrs: &[String],
 ) -> Vec<IptablesRestoreCommand> {
-    let mut commands = vec![append_egress_command(format!(
-        "-i tap0 -o vpeer -j {INTERCEPT_CHAIN}"
-    ))];
+    // First, and it is the reply path of every connection the node makes
+    // into the sandbox: envd's readiness poll, command execution and file
+    // injection all reach the guest through the slot's host-interaction
+    // address, and the guest answers to `veth_host_ip`. Nothing below accepts
+    // that, so without this line a sandbox never reaches `running`.
+    //
+    // It admits no new connection: the guest's own outbound traffic is `NEW`
+    // and still falls through to the rules below.
+    let mut commands = vec![append_egress_command(
+        "-i tap0 -o vpeer -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT".to_string(),
+    )];
 
-    // The node's own address is not an egress destination: brokered traffic is
-    // DNATed in nat PREROUTING before this chain runs. The rule names no target
-    // so it only counts, and a guest that still needs the node shows up as a
-    // non-zero counter rather than as a working connection.
     commands.push(append_egress_command(format!(
-        "-i tap0 -o vpeer -d {veth_host_ip}/32 -m comment --comment \"{GUEST_TO_NODE_COMMENT}\""
+        "-i tap0 -o vpeer -j {INTERCEPT_CHAIN}"
+    )));
+
+    // The node's own address is not an egress destination the guest may open:
+    // brokered traffic is DNATed in nat PREROUTING before this chain runs, and
+    // the reply path above has already been taken. The rule names no target so
+    // it only counts, and a guest that opens something new towards the node
+    // shows up as a non-zero counter rather than as a working connection.
+    commands.push(append_egress_command(format!(
+        "-i tap0 -o vpeer -d {veth_host_ip}/32 -m conntrack --ctstate NEW -m comment --comment \"{GUEST_TO_NODE_COMMENT}\""
     )));
 
     for protocol in ["udp", "tcp"] {
@@ -633,7 +643,10 @@ fn build_static_egress_commands(
     }
 
     // Internal AgentENV networks are denied before user rules so a sandbox
-    // cannot reach another sandbox's namespace or VM link addresses.
+    // cannot reach another sandbox's namespace or VM link addresses. The
+    // ranges are the address plan's own pools, whole rather than this slot's
+    // share of them (`AddressPlan::internal_egress_denied_cidrs`), so moving
+    // `[network.internal]` moves what this rejects with it.
     for cidr in internal_egress_denied_cidrs
         .iter()
         .chain(node_always_denied_cidrs.iter())
@@ -1172,6 +1185,10 @@ mod tests {
             .expect("the node address is still counted");
         assert!(probe.contains("-d 10.12.0.2/32"), "{probe}");
         assert!(
+            probe.contains("--ctstate NEW"),
+            "the counter must not count the reply path it no longer owns: {probe}"
+        );
+        assert!(
             !probe.contains("-j "),
             "the counter names no target: {probe}"
         );
@@ -1179,17 +1196,72 @@ mod tests {
             !rules
                 .iter()
                 .any(|rule| rule.contains("10.12.0.2/32") && rule.contains("ACCEPT")),
-            "no rule accepts traffic to the node: {rules:?}"
+            "no rule accepts a new connection to the node: {rules:?}"
         );
+    }
+
+    #[test]
+    fn the_reply_path_is_accepted_before_anything_else_in_the_chain() {
+        let commands = static_commands();
+        let rules: Vec<&str> = commands.iter().filter_map(append_rule).collect();
+
+        let established = rules
+            .iter()
+            .position(|rule| rule.contains("--ctstate ESTABLISHED,RELATED"))
+            .expect("the node's own connections into the sandbox answer through this chain");
+        assert_eq!(
+            rules[established],
+            "-i tap0 -o vpeer -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        );
+        assert_eq!(
+            established, 0,
+            "the reply path is the first rule: everything below it rejects by destination, and \
+             the node's address is one of the destinations they reject"
+        );
+
+        let intercept = rules
+            .iter()
+            .position(|rule| rule.contains(INTERCEPT_CHAIN))
+            .expect("the intercept jump is still installed");
+        assert!(
+            established < intercept,
+            "an established reply must not be re-examined by the intercept: {rules:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_connection_to_the_node_still_falls_through_to_a_reject() {
+        // The counter names no target, so what stops a guest-opened connection
+        // to the node is the range reject below it. Both have to be there, in
+        // that order, or the counter is the whole of the policy.
+        let rules: Vec<String> = static_commands()
+            .iter()
+            .filter_map(append_rule)
+            .map(ToString::to_string)
+            .collect();
+
+        let counted = rules
+            .iter()
+            .position(|rule| rule.contains(GUEST_TO_NODE_COMMENT))
+            .expect("the counter is installed");
+        let rejected = rules
+            .iter()
+            .position(|rule| rule == "-i tap0 -o vpeer -d 10.0.0.0/8 -j REJECT")
+            .expect("10.12.0.2 is inside the always-denied 10.0.0.0/8");
+
+        assert!(counted < rejected, "{rules:?}");
     }
 
     #[test]
     fn only_port_53_reaches_the_resolver() {
         let commands = static_commands();
+        // Every ACCEPT that decides a destination. The reply-path rule decides
+        // none: it matches on connection state and names no address.
         let accepts: Vec<&str> = commands
             .iter()
             .filter_map(append_rule)
             .filter(|rule| rule.contains("-j ACCEPT"))
+            .filter(|rule| !rule.contains("ESTABLISHED,RELATED"))
             .collect();
 
         assert_eq!(
@@ -1924,7 +1996,7 @@ mod tests {
     }
 
     #[test]
-    fn the_init_sequence_creates_both_intercept_chains_and_jumps_to_them_first() {
+    fn the_init_sequence_creates_both_intercept_chains_and_jumps_to_them_before_any_policy() {
         let commands = build_namespace_egress_chain_commands(
             Ipv4Addr::new(10, 12, 0, 2),
             Ipv4Addr::new(10, 1, 2, 1),
@@ -1947,9 +2019,9 @@ mod tests {
                 chain: INTERCEPT_CHAIN
             }
         )));
-        let first_egress_rule = commands
+        let egress_rules: Vec<&str> = commands
             .iter()
-            .find_map(|c| match c {
+            .filter_map(|c| match c {
                 IptablesRestoreCommand::Append {
                     table: "filter",
                     chain: EGRESS_CHAIN,
@@ -1957,8 +2029,15 @@ mod tests {
                 } => Some(rule.as_str()),
                 _ => None,
             })
-            .unwrap();
-        assert_eq!(first_egress_rule, "-i tap0 -o vpeer -j AGENTENV-INTERCEPT");
+            .collect();
+        // The reply path is ahead of the intercept — an established answer is
+        // not a connection to intercept — and the intercept is ahead of every
+        // rule that decides a policy.
+        assert_eq!(
+            egress_rules[0],
+            "-i tap0 -o vpeer -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+        );
+        assert_eq!(egress_rules[1], "-i tap0 -o vpeer -j AGENTENV-INTERCEPT");
         assert!(commands.iter().any(|c| matches!(
             c,
             IptablesRestoreCommand::Append { table: "nat", chain: "PREROUTING", rule }

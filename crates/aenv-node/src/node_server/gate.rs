@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::api::{ControlPlaneGate, GateDecision, CONTROL_PLANE_HEADER};
 use tonic::{Request, Status};
-use tracing::warn;
+use tracing::debug;
 
 /// Refuses gRPC calls that present no accepted credential. With no credential
 /// configured every caller is admitted, the way the REST gate behaves.
@@ -46,7 +46,7 @@ impl NodeGrpcGate {
         .increment(1);
 
         if decision == GateDecision::Refused {
-            warn!("refusing a node gRPC call that presented no accepted credential");
+            debug!("refusing a node gRPC call that presented no accepted credential");
             return Err(Status::unauthenticated("control plane credential required"));
         }
 

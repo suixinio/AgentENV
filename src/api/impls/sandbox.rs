@@ -193,26 +193,34 @@ fn traffic_access_token_for(
     Ok(Some(uuid::Uuid::new_v4().to_string()))
 }
 
-impl From<&SandboxNetworkPolicy> for models::SandboxNetworkConfig {
-    fn from(policy: &SandboxNetworkPolicy) -> Self {
-        let egress = &policy.egress;
-        Self {
-            allow_public_traffic: Some(true),
-            allow_out: (!egress.allowed_cidrs.is_empty() || !egress.allowed_domains.is_empty())
-                .then(|| {
-                    egress
-                        .allowed_cidrs
-                        .iter()
-                        .chain(egress.allowed_domains.iter())
-                        .cloned()
-                        .collect()
-                }),
-            deny_out: (!egress.denied_cidrs.is_empty()).then(|| egress.denied_cidrs.clone()),
-            rules: (!egress.rules.is_empty()).then(|| rules_model(&egress.rules)),
-            x_aenv_endpoints: (!egress.endpoints.is_empty())
-                .then(|| endpoints_model(&egress.endpoints)),
-            mask_request_host: None,
-        }
+/// The network block a detail response carries.
+///
+/// `locked` is the sandbox's own `allowPublicTraffic`, which the policy does
+/// not hold: the lock lives on the record, as the token minted with it. A
+/// response that answered `true` for a locked sandbox would describe a
+/// sandbox its own client cannot reach without a token.
+pub(in crate::api) fn network_config_model(
+    policy: &SandboxNetworkPolicy,
+    locked: bool,
+) -> models::SandboxNetworkConfig {
+    let egress = &policy.egress;
+    models::SandboxNetworkConfig {
+        allow_public_traffic: Some(!locked),
+        allow_out: (!egress.allowed_cidrs.is_empty() || !egress.allowed_domains.is_empty()).then(
+            || {
+                egress
+                    .allowed_cidrs
+                    .iter()
+                    .chain(egress.allowed_domains.iter())
+                    .cloned()
+                    .collect()
+            },
+        ),
+        deny_out: (!egress.denied_cidrs.is_empty()).then(|| egress.denied_cidrs.clone()),
+        rules: (!egress.rules.is_empty()).then(|| rules_model(&egress.rules)),
+        x_aenv_endpoints: (!egress.endpoints.is_empty())
+            .then(|| endpoints_model(&egress.endpoints)),
+        mask_request_host: None,
     }
 }
 
@@ -354,10 +362,9 @@ pub(super) fn allow_internet_access_from_base_policy(
 
 impl From<SandboxMetadata> for models::SandboxDetail {
     fn from(m: SandboxMetadata) -> Self {
-        let network = m
-            .network_policy
-            .has_explicit_egress_rules()
-            .then(|| models::SandboxNetworkConfig::from(&m.network_policy));
+        let locked = m.traffic_access_token.is_some();
+        let network = (m.network_policy.has_explicit_egress_rules() || locked)
+            .then(|| network_config_model(&m.network_policy, locked));
         let allow_internet_access = Some(allow_internet_access_from_base_policy(
             m.network_policy.base_policy,
         ));
@@ -2045,6 +2052,31 @@ mod routing_header_tests {
             .unwrap_or_else(|| panic!("{name} is not a schema in the spec"));
 
         block_after(&lines, index)
+    }
+
+    #[test]
+    fn a_locked_sandbox_reports_the_lock_it_was_created_with() {
+        let locked = SandboxMetadata {
+            traffic_access_token: Some("the-token".to_string()),
+            ..Default::default()
+        };
+        let open = SandboxMetadata::default();
+
+        let locked: models::SandboxDetail = locked.into();
+        let open: models::SandboxDetail = open.into();
+
+        assert_eq!(
+            locked
+                .network
+                .as_ref()
+                .and_then(|network| network.allow_public_traffic),
+            Some(false),
+            "a locked sandbox that declared no rules still has a lock to report"
+        );
+        assert!(
+            open.network.is_none(),
+            "an open sandbox with no rules has nothing to say about its network"
+        );
     }
 
     #[test]

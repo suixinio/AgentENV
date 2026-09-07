@@ -174,10 +174,19 @@ impl ControlPlaneGate {
         self.admits(presented)
     }
 
-    /// The credential this process presents to another node's gate: the first
-    /// one it accepts itself, re-read whenever the credential file changes.
+    /// The credential this process presents to another node's gate: the
+    /// credential file's first line, re-read whenever it changes, and a
+    /// static token only when there is no file.
+    ///
+    /// The file first because that is the half a rotation moves. A static
+    /// list keeps the retired credential in it so a node still accepts what
+    /// is in flight, so presenting the first static token is presenting the
+    /// one on its way out.
     pub fn presented(&self) -> Option<String> {
-        self.accepted().into_iter().next()
+        self.file_tokens()
+            .into_iter()
+            .next()
+            .or_else(|| self.static_tokens.first().cloned())
     }
 
     /// Decides one credential with no route exemption. Never answers

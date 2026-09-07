@@ -189,6 +189,19 @@ pub struct ApiConfig {
         parse_env = parse_trimmed_string
     )]
     pub control_plane_token_file: String,
+    /// The credential this half presents at another node's gate, when it is
+    /// not one of the credentials it accepts itself.
+    ///
+    /// Empty falls back to the first line of `control_plane_token_file`, and
+    /// to a static token only when there is no file: a rotation moves the
+    /// file, while the static list keeps the retired credential so nodes
+    /// still accept what is in flight.
+    #[config(
+        default = "",
+        env = "AENV_API_NODE_CLIENT_TOKEN_FILE",
+        parse_env = parse_trimmed_string
+    )]
+    pub node_client_token_file: String,
     #[config(nested)]
     pub proxy: ApiProxyConfig,
 }

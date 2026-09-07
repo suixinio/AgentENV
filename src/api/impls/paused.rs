@@ -255,10 +255,9 @@ pub(in crate::api) fn paused_sandbox_detail(
 ) -> Option<models::SandboxDetail> {
     let paused = record.paused_sandbox()?;
     let sandbox_id = paused_sandbox_id(record)?;
-    let network = paused
-        .network_policy
-        .has_explicit_egress_rules()
-        .then(|| models::SandboxNetworkConfig::from(&paused.network_policy));
+    let locked = paused.traffic_access_token.is_some();
+    let network = (paused.network_policy.has_explicit_egress_rules() || locked)
+        .then(|| super::sandbox::network_config_model(&paused.network_policy, locked));
     Some(models::SandboxDetail {
         template_id: paused.template_id.clone(),
         alias: paused.template_alias.clone(),

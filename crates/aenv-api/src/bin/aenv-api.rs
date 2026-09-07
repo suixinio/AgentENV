@@ -907,7 +907,11 @@ mod tests {
             "no comment line survived the strip, so this is scanning the raw body again"
         );
         let resume = at("ResumeWiring::cluster_in_process(node_registry_grpc_service.clone())");
-        for builder in [".with_binding_store(", ".with_artifact_store("] {
+        for builder in [
+            ".with_binding_store(",
+            ".with_artifact_store(",
+            ".with_orphan_reaper(",
+        ] {
             assert!(
                 at(builder) < resume,
                 "🔴 {builder} runs after the clone handed to resume placement, so the \

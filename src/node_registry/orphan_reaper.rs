@@ -17,10 +17,12 @@ use crate::types::{ExecutionId, SandboxId};
 
 /// A candidate has to be reported this long before it is deleted.
 ///
-/// At the 5 s heartbeat cadence this is several heartbeats, which is more than
-/// a launch needs between the node's create returning and the api half writing
-/// the record that answers for it.
-pub const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(20);
+/// A launch is a candidate for as long as this window: the node writes its own
+/// record when the VM starts and the api half writes its record only after the
+/// node's create returns, so the sandbox is on the roster with nothing naming
+/// it for a whole VM boot and envd readiness. This is many times that, and many
+/// times the 5 s heartbeat cadence.
+pub const ORPHAN_REAP_GRACE: Duration = Duration::from_secs(60);
 
 /// Consecutive heartbeats naming a candidate before it is deleted. One sighting
 /// is a snapshot; two are a node that still says the same thing.
@@ -309,7 +311,7 @@ mod tests {
         OrphanReaper::with_grace(Box::new(records), Box::new(deleter), grace)
     }
 
-    const GRACE: Duration = Duration::from_secs(20);
+    const GRACE: Duration = ORPHAN_REAP_GRACE;
 
     #[tokio::test]
     async fn one_sighting_reaps_nothing_however_old_the_clock_says_it_is() {

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use super::arbitration::{arbitrate_fenced, BindingDecision};
 use super::{
     Binding, BindingDeleteOutcome, BindingState, BindingStore, BindingStoreError,
-    BindingStoreSettings,
+    BindingStoreSettings, LAUNCH_RESERVATION_EXCLUSIVE_TTL,
 };
 use crate::node_registry::types::{Node, RosterEntry};
 
@@ -19,6 +19,21 @@ struct BindingRecord {
     execution_id: String,
     expires_at: SystemTime,
     state: BindingState,
+    /// Only a reservation carries one; it is what its age is measured from.
+    reserved_at: Option<SystemTime>,
+}
+
+impl BindingRecord {
+    fn still_launching(&self, now: SystemTime) -> bool {
+        if self.state != BindingState::Starting {
+            return false;
+        }
+        self.reserved_at.is_some_and(|reserved_at| {
+            now.duration_since(reserved_at)
+                .map(|age| age < LAUNCH_RESERVATION_EXCLUSIVE_TTL)
+                .unwrap_or(true)
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,7 +130,12 @@ impl InMemoryBindingStore {
             ""
         };
 
-        let (accept, decision) = arbitrate_fenced(incumbent, held, &binding.execution_id);
+        let incumbent_launching = held
+            && existing
+                .as_ref()
+                .is_some_and(|record| record.still_launching(now));
+        let (accept, decision) =
+            arbitrate_fenced(incumbent, held, &binding.execution_id, incumbent_launching);
         if !accept {
             return decision;
         }
@@ -141,6 +161,10 @@ impl InMemoryBindingStore {
                 execution_id: binding.execution_id.clone(),
                 expires_at,
                 state: binding.state,
+                reserved_at: match binding.state {
+                    BindingState::Starting => Some(now),
+                    BindingState::Confirmed => None,
+                },
             },
         );
         decision

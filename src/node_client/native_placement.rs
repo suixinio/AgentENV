@@ -14,9 +14,11 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tonic::Code;
 
+use crate::binding_store::BindingDecision;
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use crate::node_registry::warmup::WarmupGate;
+use crate::orchestrator::LaunchHeldElsewhere;
 use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::proto::scheduler::{self, ObservedNode};
 use crate::scheduler_endpoint::qualified;
@@ -283,6 +285,17 @@ impl NodePlacement for NativeNodePlacement {
             .map_err(|status| {
                 anyhow!("the local scheduler refused to reserve {sandbox_id}: {status}")
             })?;
+        if decision == BindingDecision::RejectedInflight {
+            // A launch of this sandbox is still running somewhere; the caller
+            // waits for it instead of starting a second one.
+            return Err(
+                anyhow::Error::new(LaunchHeldElsewhere { sandbox_id }).context(format!(
+                "the local scheduler refused to reserve {sandbox_id} on node {}: a launch of it \
+                 is still in flight",
+                node.node_id
+            )),
+            );
+        }
         if !decision.accepted() {
             bail!(
                 "the local scheduler refused to reserve {sandbox_id} on node {}: another \
@@ -458,9 +471,8 @@ mod tests {
         assert!(absent.is_none(), "nothing was ever recorded for this id");
     }
 
-    // Two creates of one sandbox id are unreachable — every id is a server-minted
-    // UUIDv7 and no request carries one — so a collision is refused outright
-    // rather than joined to the launch already in flight.
+    // An incarnation older than the one already holding the id names a launch
+    // that lost its race outright; it is refused, never joined.
     #[tokio::test]
     async fn a_colliding_reservation_is_refused_rather_than_joined() {
         let registry = Arc::new(AtomicNodeRegistry::new(
@@ -492,6 +504,44 @@ mod tests {
         assert!(
             err.to_string().contains("already holds it"),
             "the refusal did not say another incarnation holds the id: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_newer_launch_meeting_a_reservation_in_flight_is_told_to_wait_for_it() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![Node {
+                id: "node-a".to_string(),
+                endpoint: "http://10.0.0.1:8000".to_string(),
+                pod_name: String::new(),
+            }],
+            Duration::from_secs(30),
+        ));
+        let placement = placement_with_binding_store(
+            Arc::clone(&registry),
+            Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default())),
+        );
+        let node = NodeEndpoint::same_address("node-a", "http://10.0.0.1:8000");
+        let sandbox_id = SandboxId::new();
+
+        let holder = ExecutionId::parse_str("00000000-0000-7000-8000-000000000001").expect("uuid");
+        let newer = ExecutionId::parse_str("00000000-0000-7000-8000-000000000002").expect("uuid");
+        placement
+            .reserve_placement(sandbox_id, holder, &node)
+            .await
+            .expect("the first launch reserves");
+
+        let err = placement
+            .reserve_placement(sandbox_id, newer, &node)
+            .await
+            .expect_err("a newer launch must not supersede one that is still running");
+        assert!(
+            err.chain().any(|cause| cause.is::<LaunchHeldElsewhere>()),
+            "the refusal must be the one a caller waits on rather than retries: {err:#}"
+        );
+        assert!(
+            err.to_string().contains("still in flight"),
+            "the refusal did not say why it is not a plain collision: {err}"
         );
     }
 

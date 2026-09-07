@@ -17,7 +17,10 @@ use super::arbitration::BindingDecision;
 use super::record::{
     binding_key, marshal_record, node_index_key, parse_record, DEFAULT_KEY_PREFIX,
 };
-use super::{Binding, BindingDeleteOutcome, BindingStore, BindingStoreError, BindingStoreSettings};
+use super::{
+    Binding, BindingDeleteOutcome, BindingState, BindingStore, BindingStoreError,
+    BindingStoreSettings,
+};
 use crate::node_registry::types::{Node, RosterEntry};
 
 /// Redis-specific binding-store configuration.
@@ -55,6 +58,14 @@ fn backend(err: impl std::fmt::Display) -> BindingStoreError {
 
 fn ms(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// The caller's clock in Unix milliseconds. Both backends arbitrate on the
+/// clock they are handed, so a contract test can drive either one.
+fn unix_ms(now: SystemTime) -> i64 {
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 pub struct RedisBindingStore {
@@ -98,6 +109,7 @@ impl RedisBindingStore {
             "superseded" => BindingDecision::Superseded,
             "rejected_older" => BindingDecision::RejectedOlder,
             "rejected_unknown" => BindingDecision::RejectedUnknown,
+            "rejected_inflight" => BindingDecision::RejectedInflight,
             _ => BindingDecision::NotArbitrated,
         }
     }
@@ -154,13 +166,25 @@ impl BindingStore for RedisBindingStore {
         &self,
         sandbox_id: &str,
         binding: Binding,
-        _now: SystemTime,
+        now: SystemTime,
     ) -> Result<BindingDecision, BindingStoreError> {
         let sandbox_id = sandbox_id.trim();
         if sandbox_id.is_empty() {
             return Ok(BindingDecision::NotArbitrated);
         }
-        let value = marshal_record(&binding.node, &binding.execution_id, binding.state);
+        let now_ms = unix_ms(now);
+        // Only a reservation is stamped: it is the only record whose age
+        // decides anything.
+        let reserved_at_ms = match binding.state {
+            BindingState::Starting => Some(now_ms),
+            BindingState::Confirmed => None,
+        };
+        let value = marshal_record(
+            &binding.node,
+            &binding.execution_id,
+            binding.state,
+            reserved_at_ms,
+        );
         let mut connection = self.connection.clone();
         let result: Vec<(String, String)> = scripts::record_script()
             .key(self.binding_key(sandbox_id))
@@ -173,6 +197,8 @@ impl BindingStore for RedisBindingStore {
             .arg(ms(self.redis_config.node_index_ttl))
             .arg(&binding.execution_id)
             .arg(ms(binding.projection_ttl))
+            .arg(now_ms)
+            .arg(ms(super::LAUNCH_RESERVATION_EXCLUSIVE_TTL))
             .invoke_async(&mut connection)
             .await
             .map_err(backend)?;
@@ -186,7 +212,7 @@ impl BindingStore for RedisBindingStore {
         &self,
         node: Node,
         roster: Vec<RosterEntry>,
-        _now: SystemTime,
+        now: SystemTime,
     ) -> Result<Vec<(String, BindingDecision)>, BindingStoreError> {
         use std::collections::HashMap;
 
@@ -241,6 +267,11 @@ impl BindingStore for RedisBindingStore {
         for ttl in &projection_ttls {
             invocation.arg(ttl);
         }
+        // The clock and the exclusivity window trail the three roster arrays,
+        // whose length is what every earlier index is computed from.
+        invocation
+            .arg(unix_ms(now))
+            .arg(ms(super::LAUNCH_RESERVATION_EXCLUSIVE_TTL));
 
         let result: Vec<(String, String)> = invocation
             .invoke_async(&mut connection)

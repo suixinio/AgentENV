@@ -69,6 +69,16 @@ impl BindingDeleteOutcome {
     }
 }
 
+/// How long a `Starting` reservation excludes a newer incarnation.
+///
+/// Inside it a launch is assumed to still be running, and a newer one is
+/// refused rather than allowed to supersede it; past it the reservation is read
+/// as the residue of a replica that died mid-launch, and a newer launch takes
+/// the sandbox over. It must therefore exceed the slowest launch this process
+/// will wait out. The Lua `accepts` prelude in `redis/scripts.rs` is handed
+/// this same value as `inflight_ttl_ms`; the two must not drift.
+pub const LAUNCH_RESERVATION_EXCLUSIVE_TTL: Duration = Duration::from_secs(120);
+
 /// Store failures are never interpreted as absence.
 #[derive(Debug, Error)]
 #[error("binding store unavailable: {0}")]

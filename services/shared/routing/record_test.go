@@ -128,7 +128,7 @@ const (
 	// node, the same incarnation, no state — is `storedReservationConfirmed`,
 	// and the pair is what makes the state the only difference between a record
 	// this package routes and one it refuses.
-	storedReservationRecord = `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1","state":"starting"}`
+	storedReservationRecord = `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1","state":"starting","reserved_at_ms":1700000000000}`
 	// The confirmation of that same reservation.
 	storedReservationConfirmed = `{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1"}`
 )

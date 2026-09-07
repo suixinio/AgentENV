@@ -8,17 +8,17 @@ use redis::Script;
 const PARSE_BINDING: &str = r#"
 local function parse_binding(raw)
   if not raw then
-    return nil, nil, nil
+    return nil, nil, nil, nil
   end
   local ok, decoded = pcall(cjson.decode, raw)
   if not ok or not decoded or not decoded["node"] then
-    return nil, nil, nil
+    return nil, nil, nil, nil
   end
   local node_id = decoded["node"]["node_id"]
   if not node_id or node_id == "" then
-    return nil, nil, nil
+    return nil, nil, nil, nil
   end
-  return node_id, decoded["execution_id"], decoded["state"]
+  return node_id, decoded["execution_id"], decoded["state"], decoded["reserved_at_ms"]
 end
 
 local function is_reservation(raw)
@@ -27,16 +27,28 @@ local function is_reservation(raw)
 end
 "#;
 
+// inflight_ttl_ms is binding_store::LAUNCH_RESERVATION_EXCLUSIVE_TTL, handed in
+// by the caller; a reservation younger than it is not superseded, because
+// superseding it starts a second runtime under an id somebody is starting. A
+// reservation with no stamp is one an older writer left and is not exclusive.
 const ARBITRATION_FENCED: &str = r#"
-local function accepts(raw, challenger)
-  local _, incumbent = parse_binding(raw)
+local function accepts(raw, challenger, now_ms, inflight_ttl_ms)
+  local _, incumbent, state, reserved_at_ms = parse_binding(raw)
   if not raw then return true, (challenger ~= "" and "installed" or "installed_unknown") end
   if not incumbent or incumbent == "" then
     return true, (challenger ~= "" and "installed" or "installed_unknown")
   end
   if challenger == "" then return false, "rejected_unknown" end
   if challenger == incumbent then return true, "refreshed" end
-  if challenger > incumbent then return true, "superseded" end
+  if challenger > incumbent then
+    local reserved = tonumber(reserved_at_ms)
+    local now = tonumber(now_ms) or 0
+    local ttl = tonumber(inflight_ttl_ms) or 0
+    if state == "starting" and reserved and (now - reserved) < ttl then
+      return false, "rejected_inflight"
+    end
+    return true, "superseded"
+  end
   return false, "rejected_older"
 end
 "#;
@@ -64,11 +76,12 @@ fn deadline_prelude(projection_authoritative: bool) -> &'static str {
     }
 }
 
-// KEYS: binding, node index. ARGV: value, node, sandbox, TTLs, prefix, execution.
+// KEYS: binding, node index. ARGV: value, node, sandbox, TTLs, prefix, execution,
+// entry TTL, the caller's clock, and the reservation exclusivity window.
 // Assignment writes always set a fresh TTL.
 const RECORD_BODY: &str = r#"
 local raw = redis.call("GET", KEYS[1])
-local accept, decision = accepts(raw, ARGV[7])
+local accept, decision = accepts(raw, ARGV[7], ARGV[9], ARGV[10])
 if not accept then
   return { { ARGV[3], decision } }
 end
@@ -101,6 +114,8 @@ local ttl_ms = ARGV[3]
 local key_prefix = ARGV[4]
 local node_index_ttl_ms = ARGV[5]
 local desired_count = tonumber(ARGV[6]) or 0
+local now_ms = ARGV[6 + 3 * desired_count + 1]
+local inflight_ttl_ms = ARGV[6 + 3 * desired_count + 2]
 
 local function binding_key(sandbox_id)
   return key_prefix .. ":sandbox:" .. sandbox_id
@@ -140,7 +155,7 @@ for i = 1, desired_count do
   local sandbox_id = order[i]
   local execution_id = desired[sandbox_id]
   local raw = redis.call("GET", binding_key(sandbox_id))
-  local accept, decision = accepts(raw, execution_id)
+  local accept, decision = accepts(raw, execution_id, now_ms, inflight_ttl_ms)
   decisions[i] = { sandbox_id, decision }
   if accept then
     local old_node_id, incumbent = parse_binding(raw)
@@ -271,6 +286,24 @@ mod tests {
             ephemeral.get_hash(),
             authoritative.get_hash(),
             "the KEEPTTL fix must actually change the script text between modes"
+        );
+    }
+
+    #[test]
+    fn both_arbitrated_scripts_are_built_from_the_one_accepts_prelude() {
+        assert_eq!(
+            Script::new(&format!("{PARSE_BINDING}{ARBITRATION_FENCED}{RECORD_BODY}")).get_hash(),
+            record_script().get_hash(),
+            "the record script must be the shared preludes and nothing else"
+        );
+        assert_eq!(
+            Script::new(&format!(
+                "{PARSE_BINDING}{ARBITRATION_FENCED}{KEEPS_DEADLINE_EPHEMERAL}{RECONCILE_BODY}"
+            ))
+            .get_hash(),
+            reconcile_script(false).get_hash(),
+            "a reservation refused on the assignment path and superseded on the heartbeat path \
+             would be two different arbitrations under one name"
         );
     }
 

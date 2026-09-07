@@ -70,14 +70,26 @@ pub struct Record {
     /// written before this field existed and every reader agrees on it.
     #[serde(default, skip_serializing_if = "BindingState::is_confirmed")]
     pub state: BindingState,
+    /// When the reservation was written, in Unix milliseconds. Only a
+    /// reservation carries one, and a reservation without one is read as older
+    /// than any freshness window: a writer that predates this field must not be
+    /// able to hold a sandbox id forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_at_ms: Option<i64>,
 }
 
 /// Serializes a gateway-compatible routing record.
-pub fn marshal_record(node: &Node, execution_id: &str, state: BindingState) -> String {
+pub fn marshal_record(
+    node: &Node,
+    execution_id: &str,
+    state: BindingState,
+    reserved_at_ms: Option<i64>,
+) -> String {
     let record = Record {
         node: node.into(),
         execution_id: execution_id.to_string(),
         state,
+        reserved_at_ms,
     };
     // This string-only record shape is infallible to serialize.
     serde_json::to_string(&record).expect("Record serialization is infallible for this shape")
@@ -133,6 +145,7 @@ mod tests {
             &node,
             "0198f5c0-1234-7abc-8def-000000000001",
             BindingState::Confirmed,
+            None,
         );
         assert_eq!(
             json,
@@ -147,7 +160,7 @@ mod tests {
             endpoint: "http://10.0.0.1:8000".to_string(),
             pod_name: "agentenv-node-xk29f".to_string(),
         };
-        let json = marshal_record(&node, "", BindingState::Confirmed);
+        let json = marshal_record(&node, "", BindingState::Confirmed, None);
         assert_eq!(
             json,
             r#"{"node":{"node_id":"node-a","endpoint":"http://10.0.0.1:8000","pod_name":"agentenv-node-xk29f"}}"#
@@ -166,7 +179,7 @@ mod tests {
             pod_name: "agentenv-node-7f4c2".to_string(),
         };
         assert_eq!(
-            marshal_record(&with_pod_name, EXECUTION_ID, BindingState::Confirmed),
+            marshal_record(&with_pod_name, EXECUTION_ID, BindingState::Confirmed, None),
             STORED_RECORD_WITH_POD_NAME
         );
 
@@ -176,7 +189,12 @@ mod tests {
             pod_name: String::new(),
         };
         assert_eq!(
-            marshal_record(&without_pod_name, EXECUTION_ID, BindingState::Confirmed),
+            marshal_record(
+                &without_pod_name,
+                EXECUTION_ID,
+                BindingState::Confirmed,
+                None
+            ),
             STORED_RECORD_WITHOUT_POD_NAME
         );
     }
@@ -188,7 +206,7 @@ mod tests {
             endpoint: "http://10.0.0.1:8000".to_string(),
             pod_name: String::new(),
         };
-        let json = marshal_record(&node, "exec-1", BindingState::Confirmed);
+        let json = marshal_record(&node, "exec-1", BindingState::Confirmed, None);
         let record = parse_record(json.as_bytes()).expect("parses");
         assert_eq!(record.node.node_id, "node-a");
         assert_eq!(record.execution_id, "exec-1");
@@ -203,11 +221,16 @@ mod tests {
             pod_name: String::new(),
         };
         assert_eq!(
-            marshal_record(&node, "exec-1", BindingState::Starting),
-            r#"{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1","state":"starting"}"#
+            marshal_record(
+                &node,
+                "exec-1",
+                BindingState::Starting,
+                Some(1_700_000_000_000)
+            ),
+            r#"{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1","state":"starting","reserved_at_ms":1700000000000}"#
         );
         assert_eq!(
-            marshal_record(&node, "exec-1", BindingState::Confirmed),
+            marshal_record(&node, "exec-1", BindingState::Confirmed, None),
             r#"{"node":{"node_id":"node-a","endpoint":"http://node-a"},"execution_id":"exec-1"}"#,
             "a confirmed record must stay byte-identical to one written before the field existed"
         );
@@ -225,10 +248,21 @@ mod tests {
     #[test]
     fn parse_reads_back_a_reservation() {
         let record = parse_record(
+            br#"{"node":{"node_id":"a","endpoint":"http://a"},"execution_id":"e","state":"starting","reserved_at_ms":42}"#,
+        )
+        .expect("parses");
+        assert_eq!(record.state, BindingState::Starting);
+        assert_eq!(record.reserved_at_ms, Some(42));
+    }
+
+    #[test]
+    fn a_reservation_written_before_the_stamp_existed_carries_none() {
+        let record = parse_record(
             br#"{"node":{"node_id":"a","endpoint":"http://a"},"execution_id":"e","state":"starting"}"#,
         )
         .expect("parses");
         assert_eq!(record.state, BindingState::Starting);
+        assert_eq!(record.reserved_at_ms, None);
     }
 
     #[test]

@@ -526,6 +526,99 @@ pub async fn a_heartbeat_that_names_a_reservation_confirms_it<S: BindingStore>(s
     );
 }
 
+/// A reservation is exclusive for [`super::LAUNCH_RESERVATION_EXCLUSIVE_TTL`],
+/// which these tests straddle: `unix(60)` is inside it and `unix(200)` is past
+/// it, while the reservation's own 300s entry TTL keeps the record present for
+/// both.
+pub async fn a_newer_launch_does_not_supersede_a_reservation_still_in_flight<S: BindingStore>(
+    store: &S,
+) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+
+    let decision = store
+        .record("sbx-1", reservation("node-b", "exec-2"), unix(60))
+        .await
+        .unwrap();
+    assert_eq!(decision, BindingDecision::RejectedInflight);
+    assert!(!decision.accepted());
+
+    let binding = store.get("sbx-1", unix(60)).await.unwrap().expect("held");
+    assert_eq!(binding.execution_id, "exec-1");
+    assert_eq!(
+        binding.node.id, "node-a",
+        "the refused launch must not have moved the sandbox"
+    );
+}
+
+pub async fn a_newer_launch_supersedes_a_reservation_past_its_launch_window<S: BindingStore>(
+    store: &S,
+) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+
+    let decision = store
+        .record("sbx-1", reservation("node-b", "exec-2"), unix(200))
+        .await
+        .unwrap();
+    assert_eq!(
+        decision,
+        BindingDecision::Superseded,
+        "a reservation nobody finished has to be recoverable"
+    );
+    let binding = store.get("sbx-1", unix(200)).await.unwrap().expect("held");
+    assert_eq!(binding.execution_id, "exec-2");
+    assert_eq!(binding.node.id, "node-b");
+}
+
+pub async fn a_heartbeat_naming_a_newer_run_than_a_fresh_reservation_is_refused<S: BindingStore>(
+    store: &S,
+) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+
+    let decisions = store
+        .reconcile_node(node("node-b"), vec![roster("sbx-1", "exec-2")], unix(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        decisions,
+        vec![("sbx-1".to_string(), BindingDecision::RejectedInflight)]
+    );
+    let binding = store.get("sbx-1", unix(60)).await.unwrap().expect("held");
+    assert_eq!(binding.execution_id, "exec-1");
+    assert_eq!(binding.state, BindingState::Starting);
+}
+
+pub async fn a_heartbeat_naming_a_newer_run_than_a_stale_reservation_takes_it_over<
+    S: BindingStore,
+>(
+    store: &S,
+) {
+    store
+        .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
+        .await
+        .unwrap();
+
+    let decisions = store
+        .reconcile_node(node("node-b"), vec![roster("sbx-1", "exec-2")], unix(200))
+        .await
+        .unwrap();
+    assert_eq!(
+        decisions,
+        vec![("sbx-1".to_string(), BindingDecision::Superseded)]
+    );
+    let binding = store.get("sbx-1", unix(200)).await.unwrap().expect("held");
+    assert_eq!(binding.execution_id, "exec-2");
+    assert_eq!(binding.state, BindingState::Confirmed);
+}
+
 pub async fn releasing_a_reservation_removes_it<S: BindingStore>(store: &S) {
     store
         .record("sbx-1", reservation("node-a", "exec-1"), unix(0))
@@ -619,6 +712,10 @@ macro_rules! binding_store_contract {
             a_heartbeat_that_has_not_heard_of_a_reservation_leaves_it_alone,
             an_empty_roster_still_leaves_a_reservation_alone,
             a_heartbeat_that_names_a_reservation_confirms_it,
+            a_newer_launch_does_not_supersede_a_reservation_still_in_flight,
+            a_newer_launch_supersedes_a_reservation_past_its_launch_window,
+            a_heartbeat_naming_a_newer_run_than_a_fresh_reservation_is_refused,
+            a_heartbeat_naming_a_newer_run_than_a_stale_reservation_takes_it_over,
             releasing_a_reservation_removes_it,
             releasing_refuses_to_withdraw_a_confirmation,
             releasing_refuses_another_incarnations_reservation,

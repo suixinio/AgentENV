@@ -24,6 +24,10 @@ pub enum SandboxCaptureError {
     Recoverable(#[source] anyhow::Error),
     #[error("{0}")]
     Terminal(#[source] anyhow::Error),
+    /// Nobody said what happened to the runtime. Only a probe of the machine
+    /// that holds it settles this; nothing may be destroyed on it.
+    #[error("{0}")]
+    Unknown(#[source] anyhow::Error),
 }
 
 impl SandboxCaptureError {
@@ -35,8 +39,17 @@ impl SandboxCaptureError {
         Self::Terminal(err)
     }
 
+    /// The failure carried no classification of what it left behind.
+    pub fn unknown(err: anyhow::Error) -> Self {
+        Self::Unknown(err)
+    }
+
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Terminal(_))
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown(_))
     }
 }
 
@@ -196,6 +209,15 @@ pub trait SandboxBackend: Send + 'static {
     ///
     /// Idempotent: calling `stop` more than once must not return an error.
     async fn stop(&mut self) -> Result<()>;
+
+    /// Whether the runtime this handle names is still there.
+    ///
+    /// `Ok(true)` is running, `Ok(false)` is confirmed absent, and `Err` means
+    /// the question could not be answered. A backend whose runtime lives in
+    /// this process answers from the handle it already holds.
+    async fn is_still_running(&mut self) -> Result<bool> {
+        Ok(true)
+    }
 
     /// Obtain the IP address that the sandbox can use to interact with the host.
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr>;

@@ -1626,7 +1626,11 @@ async fn a_pause_that_joins_another_callers_pause_is_refused_the_staged_value() 
         .pause(Request::new(pause_request(&sandbox)))
         .await
         .expect_err("a pause somebody else is performing has no row for this caller");
-    assert_eq!(joined.code(), Code::FailedPrecondition, "{joined}");
+    assert_eq!(joined.code(), Code::Internal, "{joined}");
+    assert!(
+        !crate::node_client::wire::into_capture_error(joined).is_terminal(),
+        "a joiner that got nothing did not touch the runtime"
+    );
 
     let first = first
         .await

@@ -1919,6 +1919,69 @@ where
         Err(last)
     }
 
+    /// Settles a capture whose outcome the node did not classify.
+    ///
+    /// The runtime is asked directly: still running puts the record back and
+    /// keeps the handle, confirmed absent forgets the record, and an
+    /// unanswerable probe puts the record back so a later operation asks again.
+    /// Nothing is stopped or deleted on an unknown outcome.
+    async fn settle_unknown_capture(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        handle: &SandboxHandle,
+        transitional_state: SandboxState,
+    ) {
+        let probe = {
+            let mut sandbox = handle.lock().await;
+            sandbox.is_still_running().await
+        };
+        match probe {
+            Ok(false) => {
+                warn!(
+                    %sandbox_id,
+                    "the node holding this sandbox says it is no longer running it; \
+                     dropping its record"
+                );
+                self.detach_sandbox_handle_and_route(&sandbox_id).await;
+                if let Err(error) = self.forget_sandbox(sandbox_id, execution_id).await {
+                    warn!(%sandbox_id, error = ?error, "failed to remove the record of a sandbox its node no longer has");
+                }
+            }
+            Ok(true) => {
+                info!(
+                    %sandbox_id,
+                    "an unclassified capture failure left the sandbox running on its node; \
+                     putting its record back"
+                );
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[transitional_state],
+                    )
+                    .await;
+            }
+            Err(error) => {
+                warn!(
+                    %sandbox_id,
+                    error = %format_args!("{error:#}"),
+                    "could not ask the node what became of this sandbox; putting its record \
+                     back for a later operation to settle"
+                );
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[transitional_state],
+                    )
+                    .await;
+            }
+        }
+    }
+
     async fn rollback_pause_to_running(&self, sandbox_id: SandboxId) {
         let _ = self
             .store
@@ -2049,7 +2112,18 @@ where
             Ok(captured_snapshot) => captured_snapshot,
             Err(err) => {
                 warn!(error = ?err, "failed to capture sandbox snapshot");
-                if err.is_terminal() {
+                if err.is_unknown() {
+                    // Nobody said what the node did, so ask it. A running
+                    // sandbox is put back untouched; only a node that says the
+                    // sandbox is gone authorizes forgetting the record.
+                    self.settle_unknown_capture(
+                        sandbox_id,
+                        expected_execution_id,
+                        &handle,
+                        SandboxState::Snapshotting,
+                    )
+                    .await;
+                } else if err.is_terminal() {
                     self.detach_sandbox_handle_and_route(&sandbox_id).await;
                     let stop_result = {
                         let mut sandbox = handle.lock().await;

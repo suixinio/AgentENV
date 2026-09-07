@@ -5631,6 +5631,82 @@ async fn a_fork_child_that_never_started_does_not_keep_its_grant() -> Result<()>
     Ok(())
 }
 
+async fn snapshot_with_an_unclassified_failure(
+    liveness: crate::sandbox::mock::MockLiveness,
+) -> (Arc<TestOrchestrator>, SandboxId, Arc<MockBehavior>) {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Snapshot,
+        MockAction::FailUnknown {
+            message: "the node did not say what it did".to_string(),
+        },
+    );
+    behavior.set_liveness(liveness);
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(600), &[("team", "unknown-capture")]))
+        .await
+        .expect("create should work");
+
+    Arc::clone(&orchestrator)
+        .capture_snapshot(created.id)
+        .await
+        .expect_err("an unclassified capture failure is still a failure");
+
+    (orchestrator, created.id, behavior)
+}
+
+#[tokio::test]
+async fn an_unclassified_capture_leaves_a_running_sandbox_alone() -> Result<()> {
+    let (orchestrator, sandbox_id, behavior) =
+        snapshot_with_an_unclassified_failure(crate::sandbox::mock::MockLiveness::Running).await;
+
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("a sandbox its node is still running keeps its record");
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "a running sandbox must not be deleted on a guess"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unclassified_capture_forgets_a_sandbox_its_node_no_longer_has() -> Result<()> {
+    let (orchestrator, sandbox_id, behavior) =
+        snapshot_with_an_unclassified_failure(crate::sandbox::mock::MockLiveness::Gone).await;
+
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "a sandbox the node says it no longer has needs no delete"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unclassified_capture_nobody_can_settle_keeps_the_record_running() -> Result<()> {
+    let (orchestrator, sandbox_id, behavior) =
+        snapshot_with_an_unclassified_failure(crate::sandbox::mock::MockLiveness::Unanswerable)
+            .await;
+
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("an unanswerable probe is not permission to forget the record");
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_eq!(behavior.stop_calls(), 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_keepalive_that_lands_after_selection_stops_the_eviction() -> Result<()> {
     setup();

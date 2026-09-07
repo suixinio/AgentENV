@@ -193,10 +193,13 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let store = RedisMetadataStore::connect(store_config)
         .await
         .context("connect the cluster metadata store")?;
+    // The same store answers who owns a sandbox id when a node says it already
+    // holds one; the clone shares the connection rather than opening another.
+    let record_owner = aenv_api::node_client::StoreRecordOwner::shared(store.clone());
     let orchestrator = Orchestrator::new(
         aenv_api::sandbox::AccessTokenSeedPolicy::MustBeConfigured,
         store,
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement)),
+        RemoteSandboxBackendFactory::new(Arc::clone(&placement)).with_record_owner(record_owner),
         aenv_api::image::DisabledRuntimeImageRefs::shared(),
     )
     .await?;

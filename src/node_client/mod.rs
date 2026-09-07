@@ -9,6 +9,7 @@ pub mod factory;
 mod native_placement;
 mod node_status;
 pub mod placement;
+pub mod record_owner;
 pub mod stub;
 pub mod wire;
 
@@ -18,4 +19,5 @@ pub use factory::RemoteSandboxBackendFactory;
 pub use native_placement::NativeNodePlacement;
 pub use node_status::override_node_status;
 pub use placement::{FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement};
+pub use record_owner::{SandboxRecordOwner, StoreRecordOwner, UnknownRecordOwner};
 pub use stub::RemoteSandboxStub;

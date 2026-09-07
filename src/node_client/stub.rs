@@ -55,6 +55,9 @@ pub struct RemoteSandboxStub {
     resources: SandboxResources,
     placement: Arc<dyn NodePlacement>,
     pending: PendingLaunch,
+    /// Who the deciding half's record says owns this id, consulted only when a
+    /// node answers a create with a copy of its own.
+    record_owner: Arc<dyn super::record_owner::SandboxRecordOwner>,
     placed: Option<Placed>,
     /// Suppresses `Delete` after pause because the node's pause already stopped the VM
     /// and `Delete` would destroy its only capture.
@@ -94,6 +97,7 @@ impl RemoteSandboxStub {
             resources,
             placement,
             pending,
+            record_owner: super::record_owner::UnknownRecordOwner::shared(),
             placed: None,
             paused: false,
             projection_ttl_secs: 0,
@@ -115,6 +119,7 @@ impl RemoteSandboxStub {
             resources,
             placement,
             pending: PendingLaunch::AlreadyStarted,
+            record_owner: super::record_owner::UnknownRecordOwner::shared(),
             paused: false,
             projection_ttl_secs: 0,
             placed: Some(Placed {
@@ -126,6 +131,15 @@ impl RemoteSandboxStub {
                 resolved_image_facts: None,
             }),
         }
+    }
+
+    /// Names who to ask when a node answers a create with a copy of its own.
+    pub fn with_record_owner(
+        mut self,
+        record_owner: Arc<dyn super::record_owner::SandboxRecordOwner>,
+    ) -> Self {
+        self.record_owner = record_owner;
+        self
     }
 
     /// Builds a stub that resolves and attaches during `start`, without creating a VM.
@@ -294,6 +308,96 @@ impl RemoteSandboxStub {
                 | tonic::Code::FailedPrecondition
                 | tonic::Code::ResourceExhausted
         )
+    }
+
+    /// Clears a copy of this sandbox the node still holds, then creates again.
+    ///
+    /// The node's copy is an orphan only when the deciding half's own record is
+    /// absent or names this very launch. A record naming another incarnation
+    /// means a newer launch owns the id, and this one touches nothing.
+    async fn take_over_orphan(
+        &self,
+        node: &NodeEndpoint,
+        client: &mut super::NodeClient,
+        request: &pb::SandboxCreateRequest,
+    ) -> Result<pb::SandboxCreateResponse> {
+        let sandbox_id = self.sandbox_id;
+        let recorded = self
+            .record_owner
+            .recorded_execution(sandbox_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "read the record of sandbox {sandbox_id} after node {} answered that it \
+                     already holds it",
+                    node.node_id
+                )
+            })?;
+        if let Some(recorded) = recorded {
+            if recorded != self.execution_id {
+                bail!(
+                    "node {} already holds sandbox {sandbox_id}, and the record under that id \
+                     is incarnation {recorded}, not this launch's {}",
+                    node.node_id,
+                    self.execution_id
+                );
+            }
+        }
+
+        let held = client
+            .describe(pb::SandboxDescribeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            })
+            .await;
+        let held_execution_id = match held {
+            Ok(response) => response.into_inner().execution_id,
+            // The copy went away between the create and this call.
+            Err(status) if status.code() == tonic::Code::NotFound => String::new(),
+            Err(status) => {
+                return Err(wire::into_error(status)).with_context(|| {
+                    format!(
+                        "ask node {} which incarnation of sandbox {sandbox_id} it holds",
+                        node.node_id
+                    )
+                })
+            }
+        };
+
+        if !held_execution_id.is_empty() {
+            warn!(
+                %sandbox_id,
+                node = %node.node_id,
+                held_execution_id = %held_execution_id,
+                execution_id = %self.execution_id,
+                "the node holds a copy of this sandbox that nothing routes to; deleting it \
+                 before starting this launch"
+            );
+            client
+                .delete(pb::SandboxDeleteRequest {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: held_execution_id,
+                })
+                .await
+                .map_err(wire::into_error)
+                .with_context(|| {
+                    format!(
+                        "delete the orphaned copy of sandbox {sandbox_id} on node {}",
+                        node.node_id
+                    )
+                })?;
+        }
+
+        client
+            .create(request.clone())
+            .await
+            .map(|ack| ack.into_inner())
+            .map_err(wire::into_error)
+            .with_context(|| {
+                format!(
+                    "create sandbox {sandbox_id} on node {} after clearing its orphaned copy",
+                    node.node_id
+                )
+            })
     }
 
     fn fork_child(
@@ -655,6 +759,17 @@ impl SandboxBackend for RemoteSandboxStub {
             let (retryable, error) = match Self::connect(&node.endpoint).await {
                 Ok(mut client) => match client.create(request.clone()).await {
                     Ok(ack) => break (node, client, ack.into_inner()),
+                    // A node that already holds this id is either holding an
+                    // orphan of this launch's or serving a newer one.
+                    Err(status) if wire::is_sandbox_already_on_node(&status) => {
+                        match self.take_over_orphan(&node, &mut client, &request).await {
+                            Ok(ack) => break (node, client, ack),
+                            Err(error) => {
+                                self.withdraw_reservation().await;
+                                return Err(error);
+                            }
+                        }
+                    }
                     Err(status) => (
                         Self::refuses_the_launch(&status),
                         wire::into_error(status).context(format!(
@@ -965,6 +1080,28 @@ impl SandboxBackend for RemoteSandboxStub {
             // Unreachability cannot be treated as absence.
             Err(status) => Err(wire::into_error(status))
                 .with_context(|| format!("stop sandbox {sandbox_id} on node {node_id}")),
+        }
+    }
+
+    /// Asks the node whether it is still running this incarnation.
+    ///
+    /// A node that answers for another incarnation is not running this one.
+    async fn is_still_running(&mut self) -> Result<bool> {
+        let placed = self.placed()?;
+        let sandbox_id = self.sandbox_id;
+        let node_id = placed.node.node_id.clone();
+        let mut client = placed.client.clone();
+        match client
+            .describe(pb::SandboxDescribeRequest {
+                sandbox_id: sandbox_id.to_string(),
+            })
+            .await
+        {
+            Ok(response) => Ok(response.into_inner().execution_id == self.execution_id.to_string()),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(false),
+            Err(status) => Err(wire::into_error(status)).with_context(|| {
+                format!("ask node {node_id} whether it is still running sandbox {sandbox_id}")
+            }),
         }
     }
 

@@ -236,6 +236,8 @@ fn resolvable_snapshot_manager() -> SnapshotManager {
 #[derive(Default)]
 struct ScriptedNode {
     create: Mutex<Option<Result<pb::SandboxCreateResponse, Status>>>,
+    /// Answer to a create issued after the first one was refused.
+    create_again: Mutex<Option<Result<pb::SandboxCreateResponse, Status>>>,
     pause: Mutex<Option<Result<pb::SandboxPauseResponse, Status>>>,
     checkpoint: Mutex<Option<Result<pb::SandboxCheckpointResponse, Status>>>,
     fork: Mutex<Option<Result<pb::SandboxForkResponse, Status>>>,
@@ -280,7 +282,10 @@ impl NodeSandboxService for ScriptedNodeService {
             .lock()
             .expect("lock")
             .push(request.into_inner());
-        ScriptedNode::take(&self.create, "create")
+        if let Some(scripted) = self.create.lock().expect("lock").take() {
+            return scripted.map(Response::new);
+        }
+        ScriptedNode::take(&self.create_again, "create")
     }
 
     async fn delete(
@@ -579,6 +584,104 @@ async fn a_node_that_started_another_run_fails_the_start_and_is_told_to_stop() {
         started.to_string(),
         "the teardown named the wrong run"
     );
+}
+
+struct FixedRecordOwner(anyhow::Result<Option<ExecutionId>>);
+
+#[async_trait]
+impl crate::node_client::SandboxRecordOwner for FixedRecordOwner {
+    async fn recorded_execution(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+    ) -> anyhow::Result<Option<ExecutionId>> {
+        match &self.0 {
+            Ok(execution_id) => Ok(*execution_id),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
+        }
+    }
+}
+
+async fn start_against_a_node_that_already_holds_the_sandbox(
+    recorded: anyhow::Result<Option<ExecutionId>>,
+    held_by: ExecutionId,
+    launching: ExecutionId,
+) -> (Arc<ScriptedNode>, anyhow::Result<()>) {
+    let (script, node) = scripted_node().await;
+    *script.create.lock().expect("lock") = Some(Err(Status::already_exists(
+        "sandbox is already on this node",
+    )));
+    *script.describe.lock().expect("lock") = Some(Ok(pb::SandboxDescribeResponse {
+        execution_id: held_by.to_string(),
+        facts_from_handle: true,
+        ..Default::default()
+    }));
+    *script.create_again.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: launch_config().sandbox_id.to_string(),
+        execution_id: launching.to_string(),
+        ..Default::default()
+    }));
+
+    let factory = RemoteSandboxBackendFactory::new(node.placement())
+        .with_record_owner(Arc::new(FixedRecordOwner(recorded)));
+    let mut backend = factory
+        .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), launching)
+        .expect("building a stub should not fail");
+    let outcome = backend.start().await;
+    (script, outcome)
+}
+
+#[tokio::test]
+async fn a_node_holding_an_orphan_of_this_id_is_cleared_and_the_launch_retried() {
+    let held_by = ExecutionId::new();
+    let launching = ExecutionId::new();
+    let (script, outcome) =
+        start_against_a_node_that_already_holds_the_sandbox(Ok(None), held_by, launching).await;
+
+    outcome.expect("a copy nothing routes to must not stop the launch");
+    let deletes = script.seen_delete.lock().expect("lock").clone();
+    assert_eq!(deletes.len(), 1, "the orphan was left on the node");
+    assert_eq!(deletes[0].execution_id, held_by.to_string());
+    assert_eq!(
+        script.seen_create.lock().expect("lock").len(),
+        2,
+        "the launch retried once after clearing the orphan"
+    );
+}
+
+#[tokio::test]
+async fn a_node_holding_a_sandbox_a_newer_run_owns_fails_without_touching_it() {
+    let newer = ExecutionId::new();
+    let launching = ExecutionId::new();
+    let (script, outcome) =
+        start_against_a_node_that_already_holds_the_sandbox(Ok(Some(newer)), newer, launching)
+            .await;
+
+    let err = outcome.expect_err("a launch that lost the id must not take the winner's runtime");
+    assert!(err.to_string().contains(&newer.to_string()), "{err:#}");
+    assert!(
+        script.seen_delete.lock().expect("lock").is_empty(),
+        "a superseded launch must delete nothing"
+    );
+    assert_eq!(
+        script.seen_create.lock().expect("lock").len(),
+        1,
+        "a superseded launch must not create again"
+    );
+}
+
+#[tokio::test]
+async fn a_record_nobody_can_read_stops_the_launch_rather_than_clearing_the_node() {
+    let held_by = ExecutionId::new();
+    let (script, outcome) = start_against_a_node_that_already_holds_the_sandbox(
+        Err(anyhow::anyhow!("the store is unreachable")),
+        held_by,
+        ExecutionId::new(),
+    )
+    .await;
+
+    outcome.expect_err("an unreadable record is not permission to clear a node");
+    assert!(script.seen_delete.lock().expect("lock").is_empty());
+    assert_eq!(script.seen_create.lock().expect("lock").len(), 1);
 }
 
 #[tokio::test]
@@ -1420,11 +1523,9 @@ async fn a_capture_failure_keeps_its_classification_across_the_wire() {
             Err(err) => panic!("building a stub should not fail: {err:#}"),
         };
     backend.start().await.expect("start");
-    assert!(backend
-        .snapshot()
-        .await
-        .expect_err("the node refused")
-        .is_terminal());
+    let unclassified = backend.snapshot().await.expect_err("the node refused");
+    assert!(unclassified.is_unknown(), "{unclassified}");
+    assert!(!unclassified.is_terminal(), "{unclassified}");
 }
 
 fn staged_snapshot() -> StagedSnapshot {

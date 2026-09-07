@@ -24,6 +24,15 @@ use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::CustomExtensionParams;
 use crate::types::ExecutionId;
 
+/// What a liveness probe of a mock backend answers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MockLiveness {
+    #[default]
+    Running,
+    Gone,
+    Unanswerable,
+}
+
 #[derive(Debug)]
 pub struct MockCapturedSnapshot;
 
@@ -54,9 +63,20 @@ pub enum MockOperation {
 pub enum MockAction {
     Succeed,
     SucceedAfter(Duration),
-    Fail { message: String },
-    FailTerminal { message: String },
-    FailAfter { delay: Duration, message: String },
+    Fail {
+        message: String,
+    },
+    FailTerminal {
+        message: String,
+    },
+    /// A capture failure the node did not classify.
+    FailUnknown {
+        message: String,
+    },
+    FailAfter {
+        delay: Duration,
+        message: String,
+    },
 }
 
 #[derive(Default)]
@@ -72,6 +92,7 @@ pub struct MockBehavior {
     last_custom_extension_params: Mutex<Option<Option<CustomExtensionParams>>>,
     captures_are_stageable: AtomicBool,
     captures_are_staged: AtomicBool,
+    liveness: Mutex<MockLiveness>,
     holding_node_id: Mutex<Option<&'static str>>,
 }
 
@@ -88,6 +109,19 @@ impl MockBehavior {
     /// Makes every capture from here on something a repository can stage.
     pub fn make_captures_stageable(&self) {
         self.captures_are_stageable.store(true, Ordering::SeqCst);
+    }
+
+    /// What a liveness probe of this backend answers.
+    pub fn set_liveness(&self, liveness: MockLiveness) {
+        *self.liveness.lock().expect("mock behavior mutex poisoned") = liveness;
+    }
+
+    fn probe_liveness(&self) -> Result<bool> {
+        match *self.liveness.lock().expect("mock behavior mutex poisoned") {
+            MockLiveness::Running => Ok(true),
+            MockLiveness::Gone => Ok(false),
+            MockLiveness::Unanswerable => Err(anyhow!("the node could not be reached")),
+        }
     }
 
     /// Makes every capture from here on one another machine already staged,
@@ -236,7 +270,9 @@ impl MockBehavior {
                 sleep(delay).await;
                 Ok(())
             }
-            MockAction::Fail { message } => Err(fail(message)),
+            MockAction::Fail { message } | MockAction::FailUnknown { message } => {
+                Err(fail(message))
+            }
             MockAction::FailTerminal { message } => Err(fail_terminal(message)),
             MockAction::FailAfter { delay, message } => {
                 sleep(delay).await;
@@ -260,7 +296,9 @@ impl MockBehavior {
                 thread::sleep(delay);
                 Ok(())
             }
-            MockAction::Fail { message } => Err(fail(message)),
+            MockAction::Fail { message } | MockAction::FailUnknown { message } => {
+                Err(fail(message))
+            }
             MockAction::FailTerminal { message } => Err(fail_terminal(message)),
             MockAction::FailAfter { delay, message } => {
                 thread::sleep(delay);
@@ -271,8 +309,12 @@ impl MockBehavior {
 
     async fn apply_capture_result(&self, operation: MockOperation) -> SandboxCaptureResult<()> {
         self.run_operation_hook(operation);
+        let action = self.pop_action(operation);
+        if let MockAction::FailUnknown { message } = action {
+            return Err(SandboxCaptureError::unknown(anyhow!(message)));
+        }
         Self::run_async_action(
-            self.pop_action(operation),
+            action,
             |message| SandboxCaptureError::recoverable(anyhow!(message)),
             |message| SandboxCaptureError::terminal(anyhow!(message)),
         )
@@ -415,6 +457,10 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn stop(&mut self) -> Result<()> {
         self.behavior.apply_async(MockOperation::Stop).await
+    }
+
+    async fn is_still_running(&mut self) -> Result<bool> {
+        self.behavior.probe_liveness()
     }
 
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {

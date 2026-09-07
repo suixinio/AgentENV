@@ -465,6 +465,11 @@ fn orchestrator_status(err: &OrchestratorError) -> Status {
         OrchestratorError::ShuttingDown | OrchestratorError::NotAcceptingNewWork => {
             Status::unavailable(err.to_string())
         }
+        // A caller that finds its own sandbox id already here has to tell this
+        // apart from a node that is broken, so it gets its own code.
+        OrchestratorError::StoreOperationFailed(
+            aenv_core::orchestrator::StoreError::SandboxAlreadyExists { sandbox_id },
+        ) => Status::already_exists(format!("sandbox {sandbox_id} is already on this node")),
         other => Status::internal(other.to_string()),
     }
 }

@@ -98,6 +98,15 @@ pub struct RedisMetadataStore {
     inner: Arc<StoreInner>,
 }
 
+impl Clone for RedisMetadataStore {
+    /// Shares one connection and one set of caches; there is no second store.
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
 impl RedisMetadataStore {
     /// Validates configuration and connects.
     pub async fn connect(config: RedisStoreConfig) -> Result<Self> {

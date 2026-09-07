@@ -23,12 +23,13 @@ pub fn is_unreachable(status: &Status) -> bool {
     status.code() == tonic::Code::Unavailable && status.source().is_some()
 }
 
-/// Converts a capture failure, treating missing or undecodable classification as terminal.
+/// Converts a capture failure; missing or undecodable classification is unknown.
 pub fn into_capture_error(status: Status) -> SandboxCaptureError {
     let message = format!("{}: {}", status.code(), status.message());
     let unclassified = || {
-        SandboxCaptureError::terminal(anyhow!(
-            "{message} (no capture classification, so the sandbox is assumed unsafe to resume)"
+        SandboxCaptureError::unknown(anyhow!(
+            "{message} (no capture classification, so only the node holding the sandbox can \
+             say what became of it)"
         ))
     };
 
@@ -43,6 +44,15 @@ pub fn into_capture_error(status: Status) -> SandboxCaptureError {
         Ok(failure) => SandboxCaptureError::terminal(anyhow!("{message} ({})", failure.reason)),
         Err(_) => unclassified(),
     }
+}
+
+/// Whether a node's answer to a create says it already holds that sandbox.
+///
+/// A node that has not been rolled yet reports the store refusal as
+/// `Internal`, so the message is matched here and nowhere else.
+pub fn is_sandbox_already_on_node(status: &Status) -> bool {
+    status.code() == tonic::Code::AlreadyExists
+        || (status.code() == tonic::Code::Internal && status.message().contains("already exists"))
 }
 
 pub fn serialize<T: serde::Serialize>(value: &T, what: &str) -> Result<pb::SerializedValue> {
@@ -130,15 +140,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unclassified_failure_is_terminal() {
+    fn an_unclassified_failure_is_unknown_rather_than_terminal() {
         let err = into_capture_error(Status::internal("something went wrong"));
-        assert!(err.is_terminal(), "{err}");
+        assert!(err.is_unknown(), "{err}");
+        assert!(!err.is_terminal(), "{err}");
 
         let err = into_capture_error(Status::deadline_exceeded("the node did not answer"));
         assert!(
-            err.is_terminal(),
-            "a node that did not answer left a sandbox in an unknown state: {err}"
+            err.is_unknown(),
+            "a node that did not answer left a sandbox nobody may destroy on a guess: {err}"
         );
+    }
+
+    #[test]
+    fn a_node_that_already_holds_the_sandbox_is_recognised_at_either_code() {
+        assert!(is_sandbox_already_on_node(&Status::already_exists(
+            "sandbox 1 is already on this node"
+        )));
+        assert!(is_sandbox_already_on_node(&Status::internal(
+            "store operation failed: sandbox 1 already exists"
+        )));
+        assert!(!is_sandbox_already_on_node(&Status::internal(
+            "store operation failed: the store is unreachable"
+        )));
+        assert!(!is_sandbox_already_on_node(&Status::not_found(
+            "no such sandbox here"
+        )));
     }
 
     #[test]

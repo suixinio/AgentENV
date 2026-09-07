@@ -168,9 +168,9 @@ connection accepted there is the sandbox's by construction, so the node attaches
 identity and relays the bytes over a Unix socket to the broker on this same machine, which admits
 the connection only because its peer uid is the node's. The broker reads the ClientHello:
 
-- The server name matches a rule: the broker answers with a leaf certificate signed by the
-  node's intermediate, terminates TLS, replaces the headers, and opens its own TLS connection to
-  the real upstream, verified against the system trust store.
+- The server name matches a rule: the broker answers with a leaf certificate signed by the root
+  the guest already trusts, terminates TLS, replaces the headers, and opens its own TLS
+  connection to the real upstream, verified against the system trust store.
 - The name matches nothing, or there is no name: the bytes are relayed to the original
   destination untouched, after the same policy check. This is the path `pip`, `npm` and
   `git clone` take.
@@ -191,24 +191,23 @@ values in the body:
 | `405` | `CONNECT` or `TRACE` to an intercepted name; neither is brokered (`connect_unsupported`, `method-not-brokered`) |
 | `502` | the upstream is unreachable or unresolvable, its TLS failed, or the secrets store is down |
 | `505` | HTTP/2 to an intercepted name; use HTTP/1.1 |
-| TLS fails on a rule domain, the broker logging `no-intermediate` | this node's broker has not been issued its intermediate. It cannot mint a leaf, and it closes rather than relaying the request to the real upstream without the credentials the rule exists to add |
 | connection closed at once | the broker is unreachable, or the sandbox exceeded its per-sandbox connection budget |
 | create answers `503` | no node reports `local_ok` — every broker is down, or none has been rolled onto `mode = "local"` yet |
 | create fails with a CA probe error | the guest's envd does not support `caBundle` |
 
 ### What a guest sees that it did not before
 
-The chain a rule domain presents is **two certificates**, not one: the leaf, and the node's
-intermediate. The intermediate's issuer CN reads `AgentENV Egress Node <node>`, so a guest that
-prints the chain sees which machine served it.
+The chain a rule domain presents is **one certificate**: a leaf whose issuer is the root already
+in the guest's trust store. Nothing sits between them, and nothing on the wire names the machine
+that served it.
 
-What does not change is the anchor. A guest trusts the **root**, and only the root. That is what
-lets a sandbox pause on one node and resume on another: a process that loaded its trust store at
-startup — Node.js, Go, the JVM all do — carries that store across the move, and a guest pinned to
-the node it started on would keep working until it moved and then fail with nothing to say why.
+Every broker in a deployment signs under that same root, which is what lets a sandbox pause on
+one node and resume on another: a process that loaded its trust store at startup — Node.js, Go,
+the JVM all do — carries that store across the move, and a guest anchored to anything per-node
+would keep working until it moved and then fail with nothing to say why.
 
-A leaf also never outlives its issuer: it expires at its own TTL or an hour before the
-intermediate does, whichever comes first.
+A leaf never outlives its issuer either: it expires at its own TTL or an hour before the root
+does, whichever comes first.
 
 ## Authorization
 
@@ -271,15 +270,15 @@ does not recover it.
 ## Deployment
 
 Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egress_broker),
-[`[egress_ca]`](../configuration/reference.md#egress_broker) and
-[`[secrets]`](../configuration/reference.md#secrets):
+[`[secrets]`](../configuration/reference.md#secrets) and the broker's own
+[`aenv-egress.toml`](../configuration/reference.md#aenv-egresstoml):
 
 - `aenv-egress` (`deploy/k8s/base/aenv-egress-daemonset.yaml`, image
   `deploy/docker/Dockerfile.aenv-egress`): the broker, **one per node**, reading
   `deploy/k8s/base/config/aenv-egress.toml`. It binds a Unix socket in `/run/aenv-egress`, a
   hostPath it shares with `agentenv-node` and nothing else, and admits only connections whose
-  peer uid is the node's. It holds no CA key of its own: it asks the api half for a seven-day
-  intermediate against its own projected ServiceAccount token.
+  peer uid is the node's. It mounts the `egress-ca` Secret and signs each leaf with the root in
+  it — **the only workload that holds `ca.key`**.
   `aenv-egress-networkpolicy.yaml` lets nothing in but Prometheus — there is no network path to
   the broker at all — and lets the api half, DNS and port 443 of public addresses out.
 - Nodes: `[egress_broker].mode = "local"`, `socket_path = "/run/aenv-egress/broker.sock"`, and
@@ -289,10 +288,8 @@ Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egr
   every heartbeat, and the api half places a sandbox with rules only on a node reporting
   `local_ok`; when none does the create answers `503`.
 - The api half: `[secrets].backend = "postgres"` with `[secrets.pg].key_file` (base64 of 32
-  bytes, the `agentenv-secrets-key` Secret), plus
-  `[egress_ca].root_cert_path` / `root_key_path` (the `egress-ca` Secret) — **the only workload
-  that mounts the root's key**. PostgreSQL gains `secret_values` and `secret_grants` beside
-  `secret_refs`. The broker points `[resolver].url` and `[ca].issuer_url` at
+  bytes, the `agentenv-secrets-key` Secret). It holds no CA material at all. PostgreSQL gains
+  `secret_values` and `secret_grants` beside `secret_refs`. The broker points `[resolver].url` at
   `http://agentenv-api:8000/internal`, and its NetworkPolicy has to admit that port. Losing the
   master key loses every stored value; it is not recoverable from a database backup, which is the
   point.
@@ -317,20 +314,17 @@ credential source and no TLS stack, so it carries the one handler that needs nei
 which answers the sandbox's identity — and proves the intercept and identity path without
 brokering HTTPS or Postgres.
 
-A stack with no api half to issue an intermediate — `deploy/docker-compose.yml` is the one in
-this repository — mints its own with `aenv-egress gen-ca <dir>`: a root at `ca.crt` for the
-nodes' `guest_ca_cert_path`, and an intermediate at `intermediate.crt` for the broker's
-`[ca].cert_path` / `key_path`. It keeps a root that is already there and mints only the
-intermediate under it, because a second root would leave every trust store already loaded from
-the first trusting nothing the broker signs. The subcommand is the binary's own, so the image
-needs no certificate tooling.
+A stack with no `egress-ca` Secret to mount — `deploy/docker-compose.yml` is the one in this
+repository — mints its own with `aenv-egress gen-ca <dir>`: one root at `ca.crt` and `ca.key`,
+serving both the nodes' `guest_ca_cert_path` and the broker's `[ca].cert_path` / `key_path`. It
+keeps a root that is already there, because a second one would leave every trust store already
+loaded from the first trusting nothing the broker signs. The subcommand is the binary's own, so
+the image needs no certificate tooling.
 
-That intermediate lasts 30 days and **nothing renews it**: the renewal loop belongs to
-`[ca].issuer_url`, and a static pair spawns none. What a static pair does when its 30 days are
-up is not the closed-connection answer a cluster gives — the broker keeps signing, and a leaf it
-signs carries `notAfter = now`, so the guest's own verification fails the handshake. Renewing is
-"delete `intermediate.*` and restart the broker": `gen-ca` mints a new one under the same root,
-and no guest's trust store moves.
+That root lasts ten years. Replacing it — in compose or in a cluster — is not only a new Secret
+and a broker roll: a guest loaded its trust store when its envd initialized, so a sandbox
+running across the change keeps the old root and fails the handshake until it restarts or
+resumes. Append the new certificate to `ca.crt` and roll the nodes first, then swap `ca.key`.
 
 ### When a rule domain stops working
 
@@ -341,15 +335,13 @@ In this order, because each step rules out everything below it:
 2. **`kubectl -n <ns> get pods -l app.kubernetes.io/name=aenv-egress-node -o wide`** — is there a
    broker Pod on that node, and is it `Ready`? Its readiness probe connects to its own socket, so
    `Ready` means it is serving and not merely up.
-3. **The broker's log on that node** — `no-intermediate` means it never got a signing key: check
-   that the api half has `[egress_ca]` set, that the `agentenv-api-token-review` ClusterRole
-   exists, and that discovery is not `static`.
-4. **`egress_intermediate_expires_seconds`** on that broker — zero means it holds none; a small
-   number means renewal has been failing for days and the log says why.
-5. **The audit trail** (`egress.audit` on the broker's stdout) — a `security_event` names what was
+3. **The broker's log on that node** — it names the root it loaded and when that root expires.
+   A broker that could not read `ca.crt` or `ca.key` is not running at all, so a `CrashLoopBackOff`
+   here is a Secret or a mount mode, not a policy.
+4. **The audit trail** (`egress.audit` on the broker's stdout) — a `security_event` names what was
    refused and why; a request line with a `502` and no security event is an upstream problem, not
    a policy one.
-6. **Only then the sandbox's own policy**: `allowOut`, `denyOut`, `allow_internet_access`, and
+5. **Only then the sandbox's own policy**: `allowOut`, `denyOut`, `allow_internet_access`, and
    whether the secret the rule names still exists and is granted to this run.
 
 A broker at `max_connections` still answers both readiness probes — its own
@@ -360,10 +352,8 @@ load reports `local_ok` rather than losing every sandbox with rules to
 
 Metrics on the broker's `:9103`: `egress_conns_total{handler,outcome}`, `egress_active_conns`,
 `egress_policy_denied_total{reason}`, `egress_intercept_no_sni_total`,
-`egress_tls_leaf_minted_total`, `egress_peer_rejected_total` (a connection whose peer was not the
-node's uid) and `egress_intermediate_expires_seconds` (how long this node's intermediate is still
-good for; zero means the broker holds none and rules domains are closed).
-`egress_sandbox_conns_total{sandbox}` is exported only while the broker runs at debug level — one
+`egress_tls_leaf_minted_total` and `egress_peer_rejected_total` (a connection whose peer was not
+the node's uid). `egress_sandbox_conns_total{sandbox}` is exported only while the broker runs at debug level — one
 series per sandbox is unbounded cardinality on a node that runs thousands a day.
 `egress_replay_rejected_total` is gone with the replay cache. On the api half's own `/metrics`,
 `agentenv_node_egress_broker{node,state}` carries what each node last reported.
@@ -372,8 +362,8 @@ series per sandbox is unbounded cardinality on a node that runs thousands a day.
 
 The broker writes one JSON line per brokered request to stdout, under the `egress.audit` tracing
 target, and two other kinds of line on the same target: `security_event` (a policy denial, a
-credential refused, a name the rules do not cover, a broker holding no intermediate, and the
-`credential_injected` line naming which headers a request had set) and `tls_handshake` (a
+credential refused, a name the rules do not cover, and the `credential_injected` line naming
+which headers a request had set) and `tls_handshake` (a
 handshake that did not complete, on either side).
 
 A request line carries `ts`, `node_id`, `sandbox_id`, `execution_id`, `dst_ip`, `dst_port`,

@@ -105,11 +105,10 @@ sandboxes go either way:
    kubectl -n $NS delete ds/aenv-egress networkpolicy/aenv-egress --ignore-not-found
    ```
 
-   `egress-ca` stays: the api half signs each node's intermediate with it, and
-   the guests' trust store comes from it. So does `sa/aenv-egress` — the
-   broker's identity did not move with the object family, and the api half's
-   internal endpoints resolve a token to a Pod and a machine, never to a
-   ServiceAccount name.
+   `egress-ca` stays: every broker signs its leaves with it, and the guests'
+   trust store comes from it. So does `sa/aenv-egress` — the broker's identity
+   did not move with the object family, and the api half's resolve endpoint
+   resolves a token to a Pod and a machine, never to a ServiceAccount name.
 3. **Apply the end state.** `bash deploy/k8s/run.sh apply` — the file is not
    executable, which is why the Makefile invokes it the same way.
 4. **Wait for the three rollouts.**
@@ -147,7 +146,7 @@ no sandbox with it. That is the whole reason it is not a sidecar.
 |---|---|
 | a broker that answers the readiness probe | the node's own probe writes a zero-length frame and waits for a byte back. A broker from before that answer existed reads the frame and closes, and every node then reports `local_unreachable` and takes no sandbox with rules — free to roll back means free within the versions that answer it |
 | a broker that prepares `/run/aenv-egress` | its init container is what chowns the hostPath to gid 65532 with mode 0770. A broker image from before that init container leaves the directory as kubelet made it, and every node on the machine then refuses to start |
-| `POST /internal/egress/intermediate` answering | without it the broker holds no signing key and closes every rule domain (it still starts, and still serves passthrough) |
+| the `egress-ca` Secret mounted with `ca.key`, mode 0440 | it is the broker's only signing key and there is no other source: a Pod without it never starts. 0400 is not enough — `fsGroup` gives the file to root and the Pod's group, and the broker is neither root nor its owner |
 | its own projected ServiceAccount token | the only credential the internal endpoints accept. A broker image from before per-node identity presents a shared bearer this half no longer knows, and every lookup answers 401 |
 
 **`agentenv-node`** — rolling it back is **not** free: it destroys every
@@ -166,8 +165,7 @@ forward and **last** on the way back.
 | Needs to be there | Why |
 |---|---|
 | a ConfigMap that version can read | this half reads `secrets-store-config` and `agentenv-k8s-config`, neither of which changed shape across this move, so this row costs nothing here |
-| the `agentenv-api-token-review` ClusterRole | without it both internal endpoints answer 503, and every broker loses its intermediate at its next renewal |
-| the `egress-ca` Secret with `ca.key` | an api half that cannot read the root issues nothing |
+| the `agentenv-api-token-review` ClusterRole | without it the resolve endpoint answers 503, and every brokered credential lookup fails |
 | `EGRESS_BROKER_STATE_LOCAL_OK` in its proto | an older api half decodes a node's `local_ok` as unspecified, places no sandbox with rules, and answers `503` |
 
 ## gRPC API

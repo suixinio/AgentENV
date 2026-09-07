@@ -154,35 +154,10 @@ v1.1"；`src/api/impls/sandbox.rs:175` 写死的 `allow_public_traffic: Some(tru
 
 ## P3 CA 与身份，准入门槛（L）
 
-**P3.1 aenv-api 的 CA 模块**（`crates/aenv-api/src/egress_ca/`，新）：用 `openssl`（已在依赖树，
-`crates/aenv-api/Cargo.toml:27`）实现 `issue_node_intermediate(node_id) -> (cert, key)`：7 天有效、
-`basicConstraints CA:TRUE pathlen:0`、`nameConstraints` **排除集** `.svc`、`.cluster.local`、`.local`、`.internal`、
-`10/8`、`172.16/12`、`192.168/16`、`100.64/10`、`169.254/16`；根从 Secret `egress-ca` 读（复用，作根）。
-**不链接 aenv-egress 的 `tls` feature。**
-
-**P3.2 鉴权端点**：`POST /internal/egress/intermediate` 与现有 `POST /internal/credentials/resolve`
-（`crates/aenv-api/src/secrets/pg/resolve_route.rs:43-92`）共用一个鉴权层：请求带投影 SA token；api 用 `kube`
-（`Cargo.toml:39`）调 `TokenReview`，取 `authentication.kubernetes.io/pod-name` extra，再 `get pods` 读
-`spec.nodeName`，等于 `AENV_NODE_ID`（`agentenv-daemonset.yaml:149-152`）。RBAC：新增 ClusterRole
-`tokenreviews create` + ClusterRoleBinding 给 `agentenv-api` SA（`deploy/k8s/base/role.yaml:11-27` 只有 namespaced）。
-`static` 发现模式下这两个端点关闭（返回 503 `resolve disabled in static mode`），只允许 `embedded`。
-resolve 只认投影 token：每个被放行的调用方都指名一台机器（收口批删掉了共享 bearer 的并存窗口）。
-
-**P3.3 节点限定 resolve**：`resolve_route.rs` 接 `BindingStore::get(sandbox_id)`（`src/binding_store/mod.rs:87-92`）；
-`Binding.node.id != caller_node_id` ⇒ 404；binding 的 `execution_id` 非空且不等 ⇒ 404；store 不可判定 ⇒ 503，
-broker 读作 outage 合成 502（`crates/aenv-egress/src/resolver.rs:81,84` 的错误映射加 `Unavailable` 分支）。
-撤销时主动清 broker 缓存：api 在 `revoke` 后不能推送（无反向通道），改为缓存 TTL 从 30s 降到 10s，文档如实写。
-
-**P3.4 broker 自取与热替换**：`crates/aenv-egress/src/tls.rs:66-91,122-160` 的 `CaSigner` 改为
-`ArcSwap<CaSigner>`（`arc-swap` crate，无 TLS 依赖）；`main.rs:208-222` 启动时向 api 取中间证书，取不到 ⇒ 规则域名
-回 502 `no-intermediate`（不拒启）；剩余 1/3 时续期，换签清叶缓存；叶 `not_after = min(now + leaf_ttl,
-issuer.not_after − 1h)`（`tls.rs:129,199-200`）；叶缓存键加签发者序列号；剩余不足 24h 打 `warn!` 并置指标
-`egress_intermediate_expires_seconds`。握手链 = 叶 + 中间（`tls.rs:217-218` 已追加签发者证书，换成中间即可）。
-`sandbox.rs:696-700` 的 `assert_guest_trusts` 匹配根 PEM 不变。
-
-验收：单元测试覆盖签发（约束项存在、pathlen 0）、TokenReview 桩、绑定比对三种结果、叶 TTL 上限、缓存键；
-e2e 三条（写好，标"需 pve-mf"）：pause 后 resume 到另一节点，resume 前启动的长驻 Node.js 进程仍能经规则域名
-完成 TLS；节点 A 的 token 取节点 B 沙箱的 grant 得 404；中间轮换后已缓存的名字仍能握手。
+本节的两层 CA（api 半边签发每节点 7 天中间证书、broker 用 `ArcSwap` 热替换、握手链 = 叶 + 中间）
+**已改为单层**：每个 broker 挂 `egress-ca` 直接用根签叶，链上只有一张叶证书，api 半边不再持有任何 CA 材料。
+裁决与依据见 `docs/proposals/2026-09-07-egress-ca-single-layer.md`。P3.2 的鉴权层与 P3.3 的节点限定 resolve
+不受影响，仍是现状。
 
 ## P4 审计与观测（S 到 M）
 
@@ -191,8 +166,7 @@ e2e 三条（写好，标"需 pve-mf"）：pause 后 resume 到另一节点，re
 status, bytes_in, bytes_out, latency_ms, tls_version, cipher, upstream_addr, rule, injected_headers(只记名)`；
 `security_event`（default-deny、host/SNI 不符、G8 拒绝、inject 触发）与 `tls_handshake`（握手失败）两类事件同 target。
 `[audit].level = metadata | none`（节点级）。指标增删表进 `docs/src/concepts/egress-credentials.md`：
-删 `egress_replay_rejected_total`，新增 `egress_intermediate_expires_seconds`、`egress_peer_rejected_total`、
-`agentenv_node_egress_broker`。每沙箱出口计数 `egress_conns_total{sandbox}` 只在 debug 级别导出，避免基数爆炸。
+删 `egress_replay_rejected_total`，新增 `egress_peer_rejected_total`、`agentenv_node_egress_broker`。每沙箱出口计数 `egress_conns_total{sandbox}` 只在 debug 级别导出，避免基数爆炸。
 
 ## T1 入口令牌（M，与 P0 到 P5 并行，不依赖 broker 形态）
 
@@ -214,8 +188,7 @@ status, bytes_in, bytes_out, latency_ms, tls_version, cipher, upstream_addr, rul
 - `docs/proposals/2026-09-03-sandbox-egress-credential-brokering.md`：§1 决定 1 后半句、§4.4、§4.10、§5.2、§5.8、
   §8 各加一行"被第三版（`_egress-per-node-implementation.md`）推翻"，不删原文。
 - `CLAUDE.md` 第 102 与 112 行改写为每节点形态（改写不追加，保持 200 行内）；
-  `docs/src/concepts/egress-credentials.md` 部署章节、失败表、guest 可见差异（链长 2、issuer CN 为节点名）、
-  排障顺序一节；`docs/src/configuration/reference.md` 的 `[egress_broker]`、`[network.egress]`。
+  `docs/src/concepts/egress-credentials.md` 部署章节、失败表、guest 可见差异、排障顺序一节；`docs/src/configuration/reference.md` 的 `[egress_broker]`、`[network.egress]`。
 - e2e：`scripts/tests/e2e/suites/15_egress_credentials.sh` 的 `rollout restart deploy/aenv-egress` 改
   DaemonSet；停机注入几经修正，最终形态是**把沙箱所在节点的 broker socket 文件挪走**
   （删 Pod 的窗口被 DaemonSet 十秒补回；`kill -STOP 1` 对容器 PID 1 是空操作）。沙箱所在节点不查
@@ -238,7 +211,7 @@ status, bytes_in, bytes_out, latency_ms, tls_version, cipher, upstream_addr, rul
 | node gRPC | `crates/aenv-node/src/node_server/{mod,service}.rs`、`src/node_client/stub.rs`、`src/api/control_plane_gate.rs` |
 | broker | `crates/aenv-egress/{Cargo.toml,src/header.rs,src/transport.rs,src/runtime.rs,src/main.rs,src/tls.rs,src/resolver.rs,src/handlers/http.rs}` |
 | node 运行时 | `crates/aenv-node/{Cargo.toml,src/sandbox/egress/mod.rs,src/sandbox/firecracker/instance.rs}`、`src/cfg/egress_broker.rs` |
-| api | `crates/aenv-api/src/{egress_ca/,secrets/pg/resolve_route.rs}`、`src/api/{openapi.yml,impls/sandbox.rs,proxy.rs}`、`src/observability/model.rs`、`src/node_registry/filter.rs` |
+| api | `crates/aenv-api/src/{internal_api/,secrets/pg/resolve_route.rs}`、`src/api/{openapi.yml,impls/sandbox.rs,proxy.rs}`、`src/observability/model.rs`、`src/node_registry/filter.rs` |
 | proto | `services/api/proto/scheduler.proto` 及重生成产物 |
 | 部署 | `deploy/k8s/base/{aenv-egress-daemonset.yaml,aenv-egress-networkpolicy.yaml,agentenv-daemonset.yaml,kustomization.yaml,role.yaml,rolebinding.yaml}`、`deploy/k8s/overlays/pve-mf/kustomization.yaml`、`deploy/docker-compose.yml` |
 | 守卫 | `Makefile`、`services/shared/config/*_manifest_test.go` |

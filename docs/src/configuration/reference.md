@@ -471,15 +471,6 @@ The data-plane reverse proxy, on the half that serves one (`aenv-node`).
 |-----|------|---------|-------------|
 | `max_incoming_per_sandbox` | integer | `0` | Requests one sandbox may have in flight through the proxy at once; the excess is refused with 429. `0` does not limit — the sandbox's own service decides what it can take. |
 
-## `[egress_ca]`
-
-The root `aenv-api` signs per-node egress intermediates from, and the root guests with `rules` trust. Only the api half reads this section; a node never holds a signing key. Both halves of the pair are paths and never inline values.
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `root_cert_path` | path | unset | PEM certificate of the root. Unset leaves `POST /internal/egress/intermediate` unmounted, and every broker asking for an intermediate is answered 503 — which closes each node's rule domains rather than taking the node down. |
-| `root_key_path` | path | unset | Its private key. Setting one of the two without the other is a startup error: an operator who set one meant to set both. The intermediates it signs carry an excluded-set `nameConstraints` (`.svc`, `.cluster.local`, `.local`, `.internal` and the private address ranges), so no leaf under one can carry a name inside the cluster. |
-
 ## `[egress_broker]`
 
 How a node reaches the egress broker that serves sandboxes declaring `network.rules` or `network["x-aenv-endpoints"]`. A sandbox with rules is placed only on nodes whose heartbeat reports a usable broker; with `mode = "disabled"` this node reports none. See the proposal in `docs/proposals/2026-09-03-sandbox-egress-credential-brokering.md`.
@@ -529,10 +520,8 @@ every path in it names a volume the broker DaemonSet mounts. See
 | `max_connections` | integer | `4096` | Connections held at once. The excess is closed, not queued. |
 | `per_sandbox_connections` | integer | `256` | Connections one sandbox holds at once, inside the limit above. |
 | `shutdown_drain_secs` | integer | `25` | How long a shutdown lets live sessions finish before it stops waiting. Keep it under the Pod's `terminationGracePeriodSeconds`. |
-| `ca.issuer_url` | string | unset | Base URL the api half issues this node's intermediate at — the same base `resolver.url` names. Set, it is where the signing key comes from and `ca.cert_path`/`ca.key_path` are unused. A broker that cannot reach it does not refuse to start: it serves the passthrough path and closes matched names, one node degraded rather than one node down. |
-| `ca.issuer_token_file` | path | unset | This Pod's projected ServiceAccount token, audience `aenv-api`. Required whenever `ca.issuer_url` is set; read on every call, because kubelet rotates a projected token in place. |
-| `ca.cert_path` | path | unset | A static CA to sign leaf certificates with, for a stack that has no api half to ask (`deploy/docker/config/aenv-egress.toml`). Required together with `ca.key_path` when `ca.issuer_url` is unset; a broker configured with neither refuses to start. |
-| `ca.key_path` | path | unset | Its private key. |
+| `ca.cert_path` | path | unset | The root that signs every intercepted-name leaf, mounted from the `egress-ca` Secret. It is the same certificate each node hands its guests as `[egress_broker].guest_ca_cert_path`: the chain on the wire is one leaf, and what verifies it is already in the trust store. |
+| `ca.key_path` | path | unset | That root's private key. Required together with `ca.cert_path` — a broker holding half the pair refuses to start rather than serving certificates no guest trusts. |
 | `ca.leaf_ttl_secs` | integer | `86400` | Lifetime of a minted leaf certificate. |
 | `ca.cache_capacity` | integer | `4096` | How many minted leaves are kept before the oldest name is evicted. |
 | `ca.mints_per_sandbox_per_minute` | integer | `60` | Per-sandbox signing budget. With match-before-sign this is what bounds the leaves an unconstrained CA can be made to issue. |

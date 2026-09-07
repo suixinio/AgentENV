@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::Context;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::cfg::ConfigManager;
 use crate::image::{RuntimeImageOwner, RuntimeImageRefs};
@@ -31,8 +31,8 @@ use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
-    SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
+    PublishedPause, SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -52,6 +52,14 @@ const AUTO_EVICT_BATCH_LIMIT: usize = 256;
 /// nodes, so a fresh grant with no record yet is not an orphan.
 const GRANT_REAP_MIN_AGE: Duration = Duration::from_secs(10 * 60);
 const GRANT_REAP_BATCH_LIMIT: usize = 256;
+
+/// Commit attempts for a pause whose VM can no longer be resumed. The bytes
+/// are the only copy of the sandbox from the first attempt on, so the commit
+/// is retried rather than abandoned.
+const PAUSE_PUBLICATION_ATTEMPTS: u32 = 5;
+/// Delay before the second attempt; each further wait doubles it, so five
+/// attempts span about thirty seconds.
+const PAUSE_PUBLICATION_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
@@ -1704,6 +1712,13 @@ where
             }
         };
 
+        // A capture the node staged can be committed again; a local one cannot,
+        // because publishing consumes it.
+        let restageable = match &capture {
+            crate::snapshot::CapturedSandboxSnapshot::Staged(staged) => Some((**staged).clone()),
+            crate::snapshot::CapturedSandboxSnapshot::Local(_) => None,
+        };
+
         let published = match publisher.publish(&metadata, capture).await {
             Ok(published) => published,
             Err(source) => {
@@ -1723,32 +1738,77 @@ where
                         self.restore_proxy_route(sandbox_id, removed_proxy_route)
                             .await;
                         self.rollback_pause_to_running(sandbox_id).await;
-                    }
-                    Err(resume_err) => {
-                        // Nothing runnable is left: the capture was not
-                        // published and the VM cannot come back.
-                        warn!(error = ?resume_err, "failed to resume sandbox after a failed publication");
-                        self.stop_detached(&handle, "after a failed publication")
-                            .await;
-                        if let Err(error) =
-                            self.forget_sandbox(sandbox_id, metadata.execution_id).await
-                        {
-                            warn!(error = ?error, "failed to remove sandbox after pause failure");
-                        }
-                        return Err(OrchestratorError::SandboxOperationFailed {
+                        return Err(OrchestratorError::PausePublicationFailed {
                             sandbox_id,
-                            operation: SandboxOperation::Pause,
-                            source: crate::sandbox::SandboxCaptureError::terminal(source.context(
-                                format!(
-                                    "the capture could not be published and the sandbox could \
-                                     not be resumed: {resume_err:#}"
-                                ),
-                            ))
-                            .into(),
+                            source,
                         });
                     }
+                    Err(resume_err) => {
+                        // The VM cannot come back, so the staged capture is the
+                        // only copy of this sandbox. Commit it again before
+                        // giving up on it.
+                        warn!(error = ?resume_err, "failed to resume sandbox after a failed publication");
+                        // Only a capture the node staged can be committed
+                        // again; a local one was consumed by the attempt.
+                        let recovered = match restageable.as_ref() {
+                            Some(staged) => {
+                                self.retry_pause_publication(&publisher, &metadata, staged)
+                                    .await
+                            }
+                            None => Err(source),
+                        };
+                        match recovered {
+                            Ok(published) => {
+                                info!(
+                                    published = ?published,
+                                    "a retried commit published the pause capture of a sandbox \
+                                     that could not be resumed"
+                                );
+                                published
+                            }
+                            Err(retry_error) => {
+                                let snapshot_id = restageable
+                                    .as_ref()
+                                    .map(|staged| staged.commit.id.to_string())
+                                    .unwrap_or_default();
+                                let staged_commit = restageable
+                                    .as_ref()
+                                    .and_then(|staged| serde_json::to_string(staged).ok())
+                                    .unwrap_or_default();
+                                // The bytes stay where the node put them; this
+                                // line is what an operator re-commits from.
+                                error!(
+                                    %sandbox_id,
+                                    %snapshot_id,
+                                    %staged_commit,
+                                    error = %format_args!("{retry_error:#}"),
+                                    "the pause capture of this sandbox could not be committed \
+                                     and its sandbox cannot be resumed; the capture bytes were \
+                                     kept and only a commit of the staged snapshot recovers it"
+                                );
+                                self.stop_detached(&handle, "after a failed publication")
+                                    .await;
+                                if let Err(error) =
+                                    self.forget_sandbox(sandbox_id, metadata.execution_id).await
+                                {
+                                    warn!(error = ?error, "failed to remove sandbox after pause failure");
+                                }
+                                return Err(OrchestratorError::SandboxOperationFailed {
+                                    sandbox_id,
+                                    operation: SandboxOperation::Pause,
+                                    source: crate::sandbox::SandboxCaptureError::terminal(
+                                        retry_error.context(format!(
+                                            "the capture could not be committed and the sandbox \
+                                             could not be resumed ({resume_err:#}); its capture \
+                                             bytes were retained under snapshot {snapshot_id}"
+                                        )),
+                                    )
+                                    .into(),
+                                });
+                            }
+                        }
+                    }
                 }
-                return Err(OrchestratorError::PausePublicationFailed { sandbox_id, source });
             }
         };
 
@@ -1769,6 +1829,38 @@ where
             metadata,
             published: Some(published),
         })
+    }
+
+    /// Commits an already-staged pause capture again, with bounded backoff.
+    ///
+    /// Only reached when the VM is gone: the alternative to a retry is losing
+    /// the sandbox, so this waits rather than failing fast.
+    async fn retry_pause_publication(
+        &self,
+        publisher: &Arc<dyn PausePublisher>,
+        metadata: &SandboxMetadata,
+        staged: &crate::snapshot::repository::StagedSnapshot,
+    ) -> anyhow::Result<PublishedPause> {
+        let mut delay = PAUSE_PUBLICATION_RETRY_BACKOFF;
+        let mut last = anyhow::anyhow!("no commit was attempted");
+        for attempt in 2..=PAUSE_PUBLICATION_ATTEMPTS {
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2);
+            let capture = crate::snapshot::CapturedSandboxSnapshot::staged(staged.clone());
+            match publisher.publish(metadata, capture).await {
+                Ok(published) => return Ok(published),
+                Err(error) => {
+                    warn!(
+                        sandbox_id = %metadata.id,
+                        attempt,
+                        error = %format_args!("{error:#}"),
+                        "retrying the commit of a pause capture whose sandbox cannot be resumed"
+                    );
+                    last = error;
+                }
+            }
+        }
+        Err(last)
     }
 
     async fn rollback_pause_to_running(&self, sandbox_id: SandboxId) {

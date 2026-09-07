@@ -71,6 +71,7 @@ pub struct MockBehavior {
     fork_children_without_address: AtomicBool,
     last_custom_extension_params: Mutex<Option<Option<CustomExtensionParams>>>,
     captures_are_stageable: AtomicBool,
+    captures_are_staged: AtomicBool,
     holding_node_id: Mutex<Option<&'static str>>,
 }
 
@@ -89,7 +90,27 @@ impl MockBehavior {
         self.captures_are_stageable.store(true, Ordering::SeqCst);
     }
 
+    /// Makes every capture from here on one another machine already staged,
+    /// which is what a pause on a remote node answers with.
+    pub fn make_captures_staged(&self) {
+        self.captures_are_staged.store(true, Ordering::SeqCst);
+    }
+
     fn capture(&self) -> CapturedSandboxSnapshot {
+        if self.captures_are_staged.load(Ordering::SeqCst) {
+            return CapturedSandboxSnapshot::staged(
+                crate::snapshot::repository::interfaces::StagedSnapshot {
+                    commit: crate::snapshot::repository::interfaces::SnapshotCommit::new(
+                        &crate::snapshot::SnapshotPublishMetadata::mock(),
+                        Default::default(),
+                        0,
+                        Some("mock-node".to_string()),
+                    ),
+                    staged_at_unix_ms: 0,
+                    origin_node_id: "mock-node".to_string(),
+                },
+            );
+        }
         if self.captures_are_stageable.load(Ordering::SeqCst) {
             CapturedSandboxSnapshot::local(crate::snapshot::CallerOwnedArtifacts::new(
                 crate::types::FirecrackerSnapshotManifest::for_test(32768, &[]),

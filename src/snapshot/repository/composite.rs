@@ -115,7 +115,9 @@ impl SnapshotRepository {
 
     /// Commits a staged value without consulting local files or the artifact store.
     ///
-    /// Failure rolls back artifacts unless an earlier commit owns them.
+    /// A refused commit is re-read before anything is deleted: an error that
+    /// crossed a lost acknowledgement leaves a committed row, and its bytes are
+    /// the only thing that row points at.
     pub async fn commit_staged(&self, staged: StagedSnapshot) -> RepositoryResult<SnapshotRecord> {
         let id = staged.commit.id.clone();
         // The staged payload is the commit side's rollback description.
@@ -123,10 +125,40 @@ impl SnapshotRepository {
 
         match self.catalog.publish_commit(staged.commit).await {
             Ok(record) => Ok(record),
-            Err(error) => {
-                self.roll_back_publish(&id, &publications).await;
-                Err(error)
-            }
+            Err(error) => match self.probe_commit(&id).await {
+                CommitProbe::Landed(record) => {
+                    tracing::warn!(
+                        snapshot_id = %id,
+                        error = %error,
+                        "a commit reported failure and the catalog holds its committed row; \
+                         reporting the commit that happened"
+                    );
+                    Ok(record)
+                }
+                CommitProbe::NotLanded => {
+                    self.roll_back_publish(&id, &publications).await;
+                    Err(error)
+                }
+                CommitProbe::Unknown(because) => {
+                    self.retain_artifacts(&id, publications.len(), &because);
+                    Err(error)
+                }
+            },
+        }
+    }
+
+    /// Whether a refused commit nevertheless left a committed row behind.
+    async fn probe_commit(&self, id: &SnapshotId) -> CommitProbe {
+        match self
+            .catalog
+            .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+            .await
+        {
+            Ok(Some(record)) if record.committed.is_some() => CommitProbe::Landed(record),
+            Ok(_) => CommitProbe::NotLanded,
+            Err(error) => CommitProbe::Unknown(format!(
+                "the catalog could not say whether the commit landed: {error}"
+            )),
         }
     }
 
@@ -226,24 +258,41 @@ impl SnapshotRepository {
         id: &SnapshotId,
         publications: &[PersistedDiskImagePublication],
     ) {
-        // A failed retention check defaults to rollback, matching prior behavior.
-        let retained = self
-            .catalog
-            .retains_artifacts_on_publish_failure(id)
-            .await
-            .unwrap_or(false);
-        if retained {
-            crate::snapshot::repository::metrics::record_artifacts_retained();
-            tracing::warn!(
-                snapshot_id = %id,
-                artifact_count = publications.len(),
-                "a failed publish left this snapshot's artifacts in place because a catalog \
-                 still holds a committed row for it; nothing collects them"
-            );
-            return;
+        match self.catalog.retains_artifacts_on_publish_failure(id).await {
+            Ok(false) => self.artifacts.delete_artifacts(id, publications).await,
+            Ok(true) => self.retain_artifacts(
+                id,
+                publications.len(),
+                "a catalog still holds a committed row for it",
+            ),
+            // An unanswerable retention question is not permission to delete.
+            Err(error) => self.retain_artifacts(
+                id,
+                publications.len(),
+                &format!("the catalog could not say whether it still owns them: {error}"),
+            ),
         }
-        self.artifacts.delete_artifacts(id, publications).await;
     }
+
+    fn retain_artifacts(&self, id: &SnapshotId, artifact_count: usize, because: &str) {
+        crate::snapshot::repository::metrics::record_artifacts_retained();
+        tracing::warn!(
+            snapshot_id = %id,
+            artifact_count,
+            because,
+            "a failed publish left this snapshot's artifacts in place; nothing collects them"
+        );
+    }
+}
+
+/// What a re-read of a refused commit's row says about it.
+enum CommitProbe {
+    /// The row is committed: the commit happened and its error was the answer.
+    Landed(SnapshotRecord),
+    /// No committed row exists, and the read that says so was complete.
+    NotLanded,
+    /// The catalog could not answer; `String` says why.
+    Unknown(String),
 }
 
 fn now_unix_ms() -> i64 {
@@ -304,10 +353,21 @@ mod tests {
         }
     }
 
+    /// What the fake catalog's row read answers after a refused commit.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ProbeAnswer {
+        AsGet,
+        NoRow,
+        Committed,
+        Unreadable,
+    }
+
     struct FakeCatalog {
         journal: Arc<Journal>,
         commit_fails: bool,
         retains_artifacts: bool,
+        retention_unreadable: bool,
+        probe: ProbeAnswer,
     }
 
     impl FakeCatalog {
@@ -316,6 +376,18 @@ mod tests {
                 journal,
                 commit_fails: false,
                 retains_artifacts: false,
+                retention_unreadable: false,
+                probe: ProbeAnswer::AsGet,
+            }
+        }
+
+        fn refusing(journal: Arc<Journal>, probe: ProbeAnswer) -> Self {
+            Self {
+                journal,
+                commit_fails: true,
+                retains_artifacts: false,
+                retention_unreadable: false,
+                probe,
             }
         }
     }
@@ -361,6 +433,37 @@ mod tests {
             Ok(Some(record))
         }
 
+        async fn get_scoped(
+            &self,
+            id_or_alias: &str,
+            _scope: CatalogReadScope,
+        ) -> RepositoryResult<Option<SnapshotRecord>> {
+            match self.probe {
+                ProbeAnswer::AsGet => return self.get(id_or_alias).await,
+                _ => self.journal.record("catalog.get_scoped"),
+            }
+            match self.probe {
+                ProbeAnswer::AsGet => unreachable!("handled above"),
+                ProbeAnswer::NoRow => Ok(None),
+                ProbeAnswer::Committed => {
+                    let id = SnapshotId::parse(id_or_alias).expect("a probe asks by id");
+                    let mut record = SnapshotRecord::template_waiting(id, None, Default::default());
+                    record.mark_committed(
+                        None,
+                        Default::default(),
+                        CommittedSnapshot::mock(),
+                        SnapshotPublishSource::Template,
+                        0,
+                    );
+                    Ok(Some(record))
+                }
+                ProbeAnswer::Unreadable => Err(RepositoryError::Backend {
+                    message: "the catalog is unreachable".to_string(),
+                    source: None,
+                }),
+            }
+        }
+
         async fn list_page(
             &self,
             _filter: SnapshotListFilter,
@@ -402,6 +505,12 @@ mod tests {
             _id: &SnapshotId,
         ) -> RepositoryResult<bool> {
             self.journal.record("catalog.retains_artifacts");
+            if self.retention_unreadable {
+                return Err(RepositoryError::Backend {
+                    message: "the catalog is unreachable".to_string(),
+                    source: None,
+                });
+            }
             Ok(self.retains_artifacts)
         }
     }
@@ -542,6 +651,8 @@ mod tests {
                 journal: Arc::clone(&journal),
                 commit_fails: true,
                 retains_artifacts: false,
+                retention_unreadable: false,
+                probe: ProbeAnswer::NoRow,
             }),
             Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
         );
@@ -556,6 +667,7 @@ mod tests {
             vec![
                 "artifacts.import",
                 "catalog.publish_commit",
+                "catalog.get_scoped",
                 "catalog.retains_artifacts",
                 "artifacts.delete[rootfs]",
             ],
@@ -570,6 +682,8 @@ mod tests {
                 journal: Arc::clone(&journal),
                 commit_fails: true,
                 retains_artifacts: true,
+                retention_unreadable: false,
+                probe: ProbeAnswer::NoRow,
             }),
             Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
         );
@@ -584,6 +698,7 @@ mod tests {
             vec![
                 "artifacts.import",
                 "catalog.publish_commit",
+                "catalog.get_scoped",
                 "catalog.retains_artifacts",
             ],
             "no artifact deletion may follow a catalog that claims the bytes"
@@ -609,6 +724,8 @@ mod tests {
                 journal: Arc::clone(&journal),
                 commit_fails: true,
                 retains_artifacts: true,
+                retention_unreadable: false,
+                probe: ProbeAnswer::NoRow,
             }),
             Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
         );
@@ -648,6 +765,8 @@ mod tests {
                 journal: Arc::clone(&journal),
                 commit_fails: true,
                 retains_artifacts: false,
+                retention_unreadable: false,
+                probe: ProbeAnswer::NoRow,
             }),
             Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
         );
@@ -662,6 +781,92 @@ mod tests {
         });
 
         assert_eq!(counter_total(&snapshotter, ARTIFACTS_RETAINED_TOTAL), 0);
+    }
+
+    #[tokio::test]
+    async fn a_commit_whose_answer_was_lost_reports_the_row_it_actually_wrote() {
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::new(
+            Arc::new(FakeCatalog::refusing(
+                Arc::clone(&journal),
+                ProbeAnswer::Committed,
+            )),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+        );
+
+        let record = repository
+            .publish(metadata(), manifest())
+            .await
+            .expect("a committed row makes the commit a success whatever the call said");
+
+        assert!(record.committed.is_some());
+        assert_eq!(
+            journal.entries(),
+            vec![
+                "artifacts.import",
+                "catalog.publish_commit",
+                "catalog.get_scoped",
+            ],
+            "nothing may be deleted once the row that points at it exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_commit_nobody_can_read_back_keeps_its_bytes() {
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::new(
+            Arc::new(FakeCatalog::refusing(
+                Arc::clone(&journal),
+                ProbeAnswer::Unreadable,
+            )),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+        );
+
+        repository
+            .publish(metadata(), manifest())
+            .await
+            .expect_err("an unreadable catalog cannot turn into a successful publish");
+
+        assert_eq!(
+            journal.entries(),
+            vec![
+                "artifacts.import",
+                "catalog.publish_commit",
+                "catalog.get_scoped",
+            ],
+            "uncertainty is not permission to delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unanswerable_retention_check_keeps_the_bytes() {
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::new(
+            Arc::new(FakeCatalog {
+                journal: Arc::clone(&journal),
+                commit_fails: true,
+                retains_artifacts: false,
+                retention_unreadable: true,
+                probe: ProbeAnswer::NoRow,
+            }),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+        );
+
+        repository
+            .publish(metadata(), manifest())
+            .await
+            .expect_err("the commit was refused");
+
+        assert_eq!(
+            journal.entries(),
+            vec![
+                "artifacts.import",
+                "catalog.publish_commit",
+                "catalog.get_scoped",
+                "catalog.retains_artifacts",
+            ],
+            "a retention check that errored must not be read as permission to delete"
+        );
     }
 
     #[tokio::test]
@@ -747,6 +952,8 @@ mod tests {
                 journal: Arc::clone(&journal),
                 commit_fails: true,
                 retains_artifacts: false,
+                retention_unreadable: false,
+                probe: ProbeAnswer::NoRow,
             }),
             Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
             "node-a".to_string(),
@@ -766,6 +973,7 @@ mod tests {
             vec![
                 "artifacts.import",
                 "catalog.publish_commit",
+                "catalog.get_scoped",
                 "catalog.retains_artifacts",
                 "artifacts.delete[rootfs]",
             ],

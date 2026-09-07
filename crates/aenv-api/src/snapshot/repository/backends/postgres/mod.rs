@@ -195,6 +195,36 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
             writes::mark_build_error(&self.pool, self.cluster_id, id, reason).await,
         )
     }
+
+    /// A committed row owns the bytes it points at, and so does a question this
+    /// database could not answer.
+    async fn retains_artifacts_on_publish_failure(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<bool> {
+        let read = metrics::record_catalog_outcome(
+            "retains_artifacts_on_publish_failure",
+            reads::get_scoped(
+                &self.pool,
+                self.cluster_id,
+                &id.to_string(),
+                CatalogReadScope::AnyStatus,
+            )
+            .await,
+        );
+        match read {
+            Ok(record) => Ok(record.is_some_and(|record| record.committed.is_some())),
+            Err(error) => {
+                tracing::warn!(
+                    snapshot_id = %id,
+                    error = %error,
+                    "the catalog could not say whether it still owns this snapshot's \
+                     artifacts; keeping them"
+                );
+                Ok(true)
+            }
+        }
+    }
 }
 
 /// Builds the production PostgreSQL catalog from the process pool and config.
@@ -873,6 +903,33 @@ mod pg {
             .await
             .expect_err("committing an already-ready row must be refused");
         let _ = error;
+    }
+
+    #[tokio::test]
+    async fn a_committed_row_claims_its_artifacts_and_an_unknown_id_does_not() {
+        let catalog = catalog!("a_committed_row_claims_its_artifacts_and_an_unknown_id_does_not");
+        let id = SnapshotId::generate();
+
+        assert!(
+            !catalog
+                .retains_artifacts_on_publish_failure(&id)
+                .await
+                .expect("a complete read of a missing row is an answer"),
+            "bytes no row points at are the publisher's to roll back"
+        );
+
+        catalog
+            .publish_commit(commit_for(id.clone(), None))
+            .await
+            .expect("publish should succeed");
+
+        assert!(
+            catalog
+                .retains_artifacts_on_publish_failure(&id)
+                .await
+                .expect("reading a committed row must succeed"),
+            "a committed row owns the bytes it points at"
+        );
     }
 
     #[test]

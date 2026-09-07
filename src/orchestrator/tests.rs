@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::result::Result as StdResult;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::SystemTime;
 
@@ -119,6 +120,42 @@ fn make_orchestrator_without_publisher<S: MetadataStore + 'static, F: SandboxBac
 }
 
 struct FailingPausePublisher;
+
+/// Fails its first `failures` publications, then succeeds.
+struct FlakyPausePublisher {
+    failures: usize,
+    attempts: AtomicUsize,
+}
+
+impl FlakyPausePublisher {
+    fn new(failures: usize) -> Arc<Self> {
+        Arc::new(Self {
+            failures,
+            attempts: AtomicUsize::new(0),
+        })
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl PausePublisher for FlakyPausePublisher {
+    async fn publish(
+        &self,
+        _metadata: &SandboxMetadata,
+        _capture: CapturedSandboxSnapshot,
+    ) -> anyhow::Result<PublishedPause> {
+        let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+        if attempt < self.failures {
+            return Err(anyhow::anyhow!("the catalog is unreachable"));
+        }
+        Ok(PublishedPause::Committed(
+            crate::snapshot::SnapshotId::generate(),
+        ))
+    }
+}
 
 #[async_trait]
 impl PausePublisher for FailingPausePublisher {
@@ -1761,6 +1798,93 @@ async fn pause_publication_failure_with_a_vm_that_cannot_resume_removes_the_sand
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_eq!(behavior.stop_calls(), 1);
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_whose_vm_is_gone_retries_the_commit_of_the_bytes_the_node_staged() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.make_captures_staged();
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "the vm is gone".to_string(),
+        },
+    );
+    let publisher = FlakyPausePublisher::new(2);
+    let orchestrator = make_orchestrator_without_publisher(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        TEST_DEFAULT_SANDBOX_TIMEOUT,
+    );
+    orchestrator.set_pause_publisher(Arc::clone(&publisher) as Arc<dyn PausePublisher>);
+    let created = orchestrator
+        .create_sandbox(create_request(Some(600), &[("team", "pause-retry")]))
+        .await?;
+
+    let outcome = orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect("a retried commit must make the pause succeed");
+
+    assert!(outcome.published.is_some());
+    assert_eq!(
+        publisher.attempts(),
+        3,
+        "the commit that finally landed was the third attempt"
+    );
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_that_never_commits_says_where_its_bytes_were_kept() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.make_captures_staged();
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "the vm is gone".to_string(),
+        },
+    );
+    let publisher = FlakyPausePublisher::new(usize::MAX);
+    let orchestrator = make_orchestrator_without_publisher(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        TEST_DEFAULT_SANDBOX_TIMEOUT,
+    );
+    orchestrator.set_pause_publisher(Arc::clone(&publisher) as Arc<dyn PausePublisher>);
+    let created = orchestrator
+        .create_sandbox(create_request(
+            Some(600),
+            &[("team", "pause-retry-exhausted")],
+        ))
+        .await?;
+
+    let err = orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("every commit was refused");
+
+    assert_eq!(
+        publisher.attempts(),
+        5,
+        "the first commit plus four retries"
+    );
+    let OrchestratorError::SandboxOperationFailed { source, .. } = err else {
+        panic!("expected a pause failure, got {err:?}");
+    };
+    let causes = source
+        .chain()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" <- ");
+    assert!(
+        causes.contains("capture bytes were retained under snapshot"),
+        "the error must name where an operator can find the bytes: {causes}"
+    );
     Ok(())
 }
 

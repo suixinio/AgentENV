@@ -297,7 +297,7 @@ test-agent: prepare-agent-test-state
 # Two cargo invocations over the same test binaries, because the egress tests
 # need a different node config than every other integration test and the
 # config is read from the process environment. `integration/egress.rs` refuses
-# any mode but `embedded` (a `Result::Err` out of a `#[tokio::test]` is a
+# any mode but `local` (a `Result::Err` out of a `#[tokio::test]` is a
 # failure, not a skip) while `config/default.toml` ships `disabled`; the
 # overlay below flips the mode for that invocation only. The `--skip egress::`
 # on the first one is what keeps the overlay from becoming the config the

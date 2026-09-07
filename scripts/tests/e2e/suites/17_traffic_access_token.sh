@@ -74,10 +74,6 @@ for internal in /init /freeze /upgrade; do
 done
 
 # -- 6. Any other port needs the token --------------------------------------------
-#
-# Port 8080 has nothing listening in the default template, so a request that
-# passes the token check fails at the upstream instead — which is exactly what
-# separates "refused here" (403) from "carried and failed there" (502/504).
 _curl_do -s --max-time 10 \
   -H "X-API-Key: ${AENV_API_KEY}" \
   -H "x-agentenv-sandbox-id: ${locked_id}" \
@@ -93,6 +89,23 @@ _curl_do -s --max-time 10 \
   "${AENV_PROXY_URL}/"
 assert_status "$HTTP_STATUS" "403" "a locked port refuses a request with the wrong token"
 
+# The default template has nothing on 8080, and "not 403" alone would also
+# accept `000` — a request that never left this machine proves nothing about
+# the proxy. Put a listener there so the accepted request has a status of its
+# own to carry back.
+listener_up=0
+if python3 -c 'import e2b' >/dev/null 2>&1; then
+  start_listener='setsid nohup python3 -m http.server 8080 --bind 0.0.0.0 </dev/null >/tmp/http8080.log 2>&1 &
+sleep 2
+curl -sS -o /dev/null -w "%{http_code}" --max-time 5 http://127.0.0.1:8080/'
+  local_probe=$(E2B_API_URL="${AENV_URL}" E2B_SANDBOX_URL="${AENV_PROXY_URL}" \
+    E2B_API_KEY="${AENV_API_KEY}" \
+    python3 "${SUITE_DIR}/../egress_credentials_e2e.py" run "$locked_id" "$start_listener" \
+    2>/dev/null | tail -n 1 || true)
+  [[ "$local_probe" == 2* ]] && listener_up=1
+fi
+[[ "$listener_up" -eq 1 ]] || warn "no listener on 8080 in the sandbox; the accepted request has no upstream"
+
 for header in e2b-traffic-access-token x-agentenv-traffic-access-token; do
   _curl_do -s --max-time 10 \
     -H "X-API-Key: ${AENV_API_KEY}" \
@@ -100,10 +113,19 @@ for header in e2b-traffic-access-token x-agentenv-traffic-access-token; do
     -H "x-agentenv-target-port: 8080" \
     -H "${header}: ${token}" \
     "${AENV_PROXY_URL}/"
-  if [[ "$HTTP_STATUS" == "403" ]]; then
-    _fail "the token in ${header} is accepted" "not 403" "403"
-  else
+  if [[ "$listener_up" -eq 1 ]]; then
+    if [[ "$HTTP_STATUS" == 2* ]]; then
+      _pass "the token in ${header} reaches the listener (HTTP ${HTTP_STATUS})"
+    else
+      _fail "the token in ${header} reaches the listener" "2xx" "HTTP ${HTTP_STATUS}"
+    fi
+  elif [[ "$HTTP_STATUS" != "403" && "$HTTP_STATUS" != "000" ]]; then
+    # Carried and failed at the upstream, which is still the proxy's answer and
+    # not its refusal.
     _pass "the token in ${header} passes the proxy (HTTP ${HTTP_STATUS})"
+  else
+    _fail "the token in ${header} passes the proxy" "not 403 and not a connection failure" \
+      "HTTP ${HTTP_STATUS}"
   fi
 done
 

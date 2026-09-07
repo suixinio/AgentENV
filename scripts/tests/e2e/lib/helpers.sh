@@ -192,6 +192,16 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     _curl_do "${args[@]}" "${base_url}${path}"
   }
 
+  api_put() {
+    local path="$1"
+    local body="${2:-}"
+    local args=(-s -X PUT
+      -H "X-API-Key: ${AENV_API_KEY}"
+      -H "Content-Type: application/json")
+    [[ -n "$body" ]] && args+=(-d "$body")
+    _curl_do "${args[@]}" "${AENV_URL}${path}"
+  }
+
   api_delete() {
     local path="$1"
     _curl_do -s -X DELETE \

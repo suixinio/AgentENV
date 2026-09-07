@@ -482,6 +482,90 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     Ok(())
 }
 
+/// A listener on a port the kernel picks. A fixed port is a port something
+/// else on the machine may already hold — the harness's own ublk daemon holds
+/// 9103 — and this test is about where a packet may go, not about which port
+/// it was addressed to.
+fn listening_on_any_port(ip: std::net::Ipv4Addr) -> Result<std::net::TcpListener> {
+    let addr = std::net::SocketAddrV4::new(ip, 0);
+    let listener =
+        std::net::TcpListener::bind(addr).with_context(|| format!("bind a listener on {addr}"))?;
+    listener
+        .set_nonblocking(true)
+        .context("set the listener non-blocking")?;
+    Ok(listener)
+}
+
+/// The packet counters of the namespace egress chain, read from outside the
+/// guest. `-x` prints exact counts rather than the `1234K` shorthand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EgressCounters {
+    /// The target-less rule that counts guest-initiated connections to the
+    /// node's own address.
+    guest_to_node: u64,
+    /// Every REJECT in the chain, summed: which internal range refused a
+    /// packet is not this test's claim, only that one did.
+    rejected: u64,
+    /// The two `dport 53` ACCEPTs, summed.
+    dns_53: u64,
+}
+
+fn egress_counters(netns: &std::path::Path) -> Result<EgressCounters> {
+    let output = std::process::Command::new("nsenter")
+        .arg(format!("--net={}", netns.display()))
+        .args([
+            "--",
+            "iptables",
+            "-t",
+            "filter",
+            "-L",
+            "AGENTENV-EGRESS",
+            "-v",
+            "-x",
+            "-n",
+        ])
+        .output()
+        .context("read the namespace egress chain")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "iptables in {}: {}",
+            netns.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+    let mut counters = EgressCounters {
+        guest_to_node: 0,
+        rejected: 0,
+        dns_53: 0,
+    };
+    for line in listing.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(packets) = fields.first().and_then(|p| p.parse::<u64>().ok()) else {
+            continue;
+        };
+        let target = fields.get(2).copied().unwrap_or_default();
+        if line.contains("aenv-guest-to-node") {
+            counters.guest_to_node += packets;
+        }
+        if target == "REJECT" {
+            counters.rejected += packets;
+        }
+        if target == "ACCEPT" && line.contains("dpt:53") {
+            counters.dns_53 += packets;
+        }
+    }
+    Ok(counters)
+}
+
+/// Whether anything reached `listener` while the guest was trying.
+fn accepted_anything(listener: &std::net::TcpListener) -> bool {
+    !matches!(
+        listener.accept(),
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+    )
+}
+
 async fn assert_tcp_connect(
     sandbox: &mut FirecrackerSandbox,
     destination: &str,
@@ -542,20 +626,119 @@ async fn the_guest_reaches_neither_the_node_nor_the_resolver_beyond_dns() -> Res
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
+    // The sandbox reached `running`, which means the node polled envd through
+    // the slot's host-interaction address and the guest's replies came back —
+    // the reply path the egress chain accepts first. Prove it is still a live
+    // path rather than a one-off by running a command over it.
+    let echoed = sandbox
+        .run_command("bash", &["-lc", "printf node-to-guest-ok"])
+        .await?;
+    assert_eq!(
+        echoed.stdout.trim(),
+        "node-to-guest-ok",
+        "the node must still reach envd; exit={} stderr={}",
+        echoed.exit_code,
+        echoed.stderr
+    );
+
     let node_ip = sandbox
         .veth_host_ip()
         .context("a started sandbox holds a network slot")?;
-    // The node's REST API, its gRPC surface and its metrics port.
-    for port in [8000, 8001, 9103] {
-        assert_tcp_connect(&mut sandbox, &format!("{node_ip}/{port}"), false).await?;
-    }
-
     let resolver = sandbox
         .guest_dns_server()
         .context("a started sandbox holds a network slot")?;
-    for port in [22, 80, 443, 8000] {
-        assert_tcp_connect(&mut sandbox, &format!("{resolver}/{port}"), false).await?;
+    let netns = sandbox
+        .network_namespace_path()
+        .context("a started sandbox holds a network slot")?;
+
+    // Something listens on every address this test then fails to reach. A
+    // refusal on its own would prove nothing: nothing binds these ports in a
+    // harness, so an empty chain would refuse them too. The ports come from
+    // the kernel, not from this test — the node's own ports belong to
+    // processes this machine may already be running.
+    let mut listeners = Vec::new();
+    for _ in 0..3 {
+        let listener = listening_on_any_port(node_ip)?;
+        let port = listener
+            .local_addr()
+            .context("read the listener's port")?
+            .port();
+        listeners.push((port, listener));
     }
+
+    let before = egress_counters(&netns)?;
+    for (port, _) in &listeners {
+        assert_tcp_connect(&mut sandbox, &format!("{node_ip}/{port}"), false).await?;
+    }
+    for (port, listener) in &listeners {
+        assert!(
+            !accepted_anything(listener),
+            "a guest connection reached the listener on {node_ip}:{port}"
+        );
+    }
+
+    // Three connections, three SYNs: counted on the way past the target-less
+    // rule and refused by the range REJECT behind it. Counting them is what
+    // separates "the chain refused this" from "nothing was listening".
+    let after = egress_counters(&netns)?;
+    assert_eq!(
+        after.guest_to_node - before.guest_to_node,
+        3,
+        "the guest-to-node counter moved by {} for 3 connections ({before:?} -> {after:?})",
+        after.guest_to_node - before.guest_to_node
+    );
+    assert_eq!(
+        after.rejected - before.rejected,
+        3,
+        "the chain rejected {} packets for 3 connections ({before:?} -> {after:?})",
+        after.rejected - before.rejected
+    );
+
+    // The resolver is not this machine's address, so nothing here can listen
+    // on it; what the chain says about it is read from the counters instead.
+    // A loopback nameserver is one the guest never reaches at all, and a
+    // public one is outside the always-denied table this half is about.
+    if resolver.is_loopback() || !resolver.is_private() {
+        eprintln!(
+            "SKIPPED[resolver-half]: this node's nameserver is {resolver}, which the \
+             always-denied table does not cover; the guest-to-node half above still ran"
+        );
+        sandbox.stop().await?;
+        return Ok(());
+    }
+
+    let before_dns = egress_counters(&netns)?;
+    assert_tcp_connect(&mut sandbox, &format!("{resolver}/8080"), false).await?;
+    let after_8080 = egress_counters(&netns)?;
+    // Only the REJECT is asserted here. The guest resolves names on its own
+    // schedule — a timesync or an apt timer between two reads moves the
+    // port-53 counters by itself — so "8080 matched no ACCEPT" is the
+    // rejection below, not an equality that any background lookup breaks.
+    assert_eq!(
+        after_8080.rejected - before_dns.rejected,
+        1,
+        "the chain rejected {} packets for one connection to {resolver}:8080",
+        after_8080.rejected - before_dns.rejected
+    );
+
+    // Port 53 is the one port the chain lets through to it. Whether the
+    // resolver answers a TCP query is its own business; what this asserts is
+    // that the packet passed the ACCEPT rather than the REJECT.
+    let _ = sandbox
+        .run_command(
+            "bash",
+            &[
+                "-lc",
+                &format!("timeout 5 bash -lc ': </dev/tcp/{resolver}/53'"),
+            ],
+        )
+        .await?;
+    let after_53 = egress_counters(&netns)?;
+    assert!(
+        after_53.dns_53 > after_8080.dns_53,
+        "the port-53 ACCEPT counted nothing for a connection to {resolver}:53 \
+         ({after_8080:?} -> {after_53:?})"
+    );
 
     sandbox.stop().await?;
     Ok(())

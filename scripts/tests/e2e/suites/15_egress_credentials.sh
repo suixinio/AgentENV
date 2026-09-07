@@ -14,6 +14,7 @@ log "Suite: Egress Credentials (network.rules + /secrets)"
 EGRESS_UPSTREAM="${E2E_EGRESS_UPSTREAM:-httpbin.org}"
 UNDECLARED_UPSTREAM="${E2E_EGRESS_UNDECLARED_UPSTREAM:-github.com}"
 EGRESS_PY="${SUITE_DIR}/../egress_credentials_e2e.py"
+SPEAKS_PL_B64="$(base64 -w0 < "${SUITE_DIR}/../postgres_speaks_probe.pl")"
 
 run_in_sandbox() {
   # Prints the command's stdout; exit status is the command's.
@@ -171,25 +172,126 @@ brokered_auth_within() {
   printf '%s' "$auth"
 }
 
-# The certificate chain the guest is served for a rule domain, one PEM subject
-# per line, leaf first. `-showcerts` prints the whole chain the broker sent.
-guest_chain_subjects() {
+# What `openssl s_client` says about the chain the guest was served: the
+# subject of every certificate, and the verification verdict. The verdict is
+# the half that matters — a chain of the right shape that does not verify is a
+# guest that cannot use it.
+#
+# The verdict lines are matched unanchored: OpenSSL 3 indents `Verify return
+# code:` four spaces inside the session block and prints `Verification: OK`
+# above it, so a pattern anchored at the line start finds neither.
+guest_chain_report() {
   local sandbox_id="$1"
   run_in_sandbox "$sandbox_id" \
     "echo | timeout 20 openssl s_client -showcerts -servername ${EGRESS_UPSTREAM} \
-     -connect ${EGRESS_UPSTREAM}:443 2>/dev/null | grep -E '^ *[0-9]+ s:' || true"
+     -connect ${EGRESS_UPSTREAM}:443 2>/dev/null \
+     | grep -E '^ *[0-9]+ s:|Verify return code:|Verification:' || true"
 }
+
+# Whether that report says the guest's own trust store accepted the chain.
+chain_verifies() {
+  printf '%s\n' "$1" | grep -Eq '^[[:space:]]*Verify return code: 0 \(ok\)|^[[:space:]]*Verification: OK'
+}
+
+# -- 4b. An explicit endpoint across a PUT ----------------------------------------
+#
+# The rules listener above asks for port 0, so the namespace hands it a fresh
+# port every time and a `PUT` that rebuilt it would still succeed. An explicit
+# endpoint names its port, and that is where both halves of the update show:
+# rebuilding it asks the namespace for a port it is already holding (500), and
+# keeping it without taking the new spec leaves the intercept where it was
+# (204 and nothing happens).
+#
+# Whether the intercept is installed is read from the guest, by asking what
+# answers on the documentation address: only the broker speaks postgres there,
+# so a reply to a startup packet is the DNAT and nothing else.
+#
+# Whether the *connection completes* proves nothing: a network whose gateway
+# answers TEST-NET-3 on every port — which is what the cluster this runs on
+# does — completes both ways round, and that made the "turning it on" leg pass
+# with the intercept never installed. The peer saying postgres cannot be
+# faked by a network: it is the handler behind the listener.
+speaks_broker_on_port() {
+  local sandbox_id="$1" port="$2"
+  run_in_sandbox "$sandbox_id" \
+    "printf %s '${SPEAKS_PL_B64}' | base64 -d > /tmp/pgspeak.pl && \
+     (perl /tmp/pgspeak.pl 203.0.113.10 ${port} 3 2>/dev/null || true)" \
+    2>/dev/null | tail -n 1 || true
+}
+
+# `yes`, `no`, or whatever the guest said instead, so the caller can skip on it.
+intercepted_on_port() {
+  local said
+  said=$(speaks_broker_on_port "$1" "$2")
+  case "$said" in
+    bytes=*)                   echo yes ;;
+    silent|eof|connect_failed) echo no ;;
+    *)                         echo "${said:-nothing}" ;;
+  esac
+}
+
+endpoint_port=15433
+endpoint_secret="e2e-endpoint-$(date +%s)-$RANDOM"
+endpoint_secret_id=""
+endpoint_sandbox=""
+endpoint_network() {
+  jq -nc --argjson p "$endpoint_port" --arg c "$endpoint_secret" --argjson i "$1" \
+    '{network: {"x-aenv-endpoints": [{port: $p, handler: "postgres",
+                                      params: {credential: $c}, interceptPort: $i}]}}'
+}
+
+# An endpoint credential is a fields secret; the header marker above is not one
+# and no secret satisfies both shapes. Nothing here ever completes a session,
+# so the fields only have to exist.
+api_post "/secrets" "$(jq -nc --arg n "$endpoint_secret" \
+  '{name: $n, fields: {host: "203.0.113.20", port: "5432", user: "e2e", password: "e2e"}}')"
+if [[ "$HTTP_STATUS" == "201" ]]; then
+  endpoint_secret_id=$(echo "$HTTP_BODY" | jq -r '.secretID // empty')
+  endpoint_sandbox=$(create_sandbox "$AENV_TEMPLATE_ID" 120 "$(endpoint_network false)"); _sync_http
+fi
+if [[ -n "$endpoint_sandbox" && "$HTTP_STATUS" == "201" ]]; then
+  track_sandbox "$endpoint_sandbox"
+  wait_for_sandbox_state "$endpoint_sandbox" "running" 60
+  probe_kind=$(intercepted_on_port "$endpoint_sandbox" "$endpoint_port")
+
+  if [[ "$probe_kind" == "yes" || "$probe_kind" == "no" ]]; then
+    assert_eq "$probe_kind" "no" "an endpoint declared without interceptPort captures nothing"
+
+    api_put "/sandboxes/${endpoint_sandbox}/network" "$(endpoint_network false | jq -c '.network')"
+    assert_status "$HTTP_STATUS" "204" "re-sending the same explicit endpoint is accepted"
+
+    api_put "/sandboxes/${endpoint_sandbox}/network" "$(endpoint_network true | jq -c '.network')"
+    assert_status "$HTTP_STATUS" "204" "turning interceptPort on is accepted"
+    assert_eq "$(intercepted_on_port "$endpoint_sandbox" "$endpoint_port")" "yes" \
+      "turning interceptPort on installs the intercept"
+
+    api_put "/sandboxes/${endpoint_sandbox}/network" "$(endpoint_network false | jq -c '.network')"
+    assert_status "$HTTP_STATUS" "204" "turning interceptPort off is accepted"
+    assert_eq "$(intercepted_on_port "$endpoint_sandbox" "$endpoint_port")" "no" \
+      "turning interceptPort off removes the intercept"
+  else
+    warn "the guest answered ${probe_kind:-nothing} to the intercept probe; no perl in the template?"
+    _skip "skipped: explicit endpoint intercept checks"
+  fi
+  api_delete "/sandboxes/${endpoint_sandbox}" >/dev/null 2>&1 || true
+else
+  warn "no sandbox with an explicit endpoint (HTTP ${HTTP_STATUS}); the broker may serve no postgres handler"
+  _skip "skipped: explicit endpoint checks"
+fi
+if [[ -n "$endpoint_secret_id" ]]; then
+  api_delete "/secrets/${endpoint_secret_id}" >/dev/null 2>&1 || true
+fi
 
 # -- 5 and 7. Broker restart and outage (Kubernetes only) --------------------------
 if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
-   && kubectl -n "${K8S_NAMESPACE:-agentenv-system}" get ds/aenv-egress >/dev/null 2>&1; then
+   && kubectl -n "${K8S_NAMESPACE:-agentenv-system}" get ds/aenv-egress-node >/dev/null 2>&1; then
   ns="${K8S_NAMESPACE:-agentenv-system}"
 
-  # 🔴 The chain a rule domain presents is leaf + this node's intermediate, and
+  # The chain a rule domain presents is leaf + this node's intermediate, and
   # the guest trusts neither of them directly — it trusts the root they chain
   # to. Recorded before the rollout so the comparison after it means something.
-  chain_before=$(guest_chain_subjects "$sandbox_id")
-  chain_depth=$(printf '%s\n' "$chain_before" | grep -c 's:' || true)
+  chain_before=$(guest_chain_report "$sandbox_id")
+  chain_depth=$(printf '%s\n' "$chain_before" | grep -c ' s:' || true)
   if [[ "${chain_depth:-0}" -ge 2 ]]; then
     _pass "a rule domain is served leaf + intermediate (${chain_depth} certificates)"
   else
@@ -197,85 +299,189 @@ if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
   fi
   issuer_before=$(printf '%s\n' "$chain_before" | grep -o 'AgentENV Egress Node [^,/]*' | head -n 1 || true)
   assert_not_empty "$issuer_before" "the chain names the node that issued it"
+  if chain_verifies "$chain_before"; then
+    _pass "the guest verifies the brokered chain against its own trust store"
+  else
+    _fail "brokered chain verification" "Verify return code: 0 (ok)" \
+      "$(printf '%s' "$chain_before" | tr '\n' ' ')"
+  fi
 
-  kubectl -n "$ns" rollout restart ds/aenv-egress >/dev/null
-  kubectl -n "$ns" rollout status ds/aenv-egress --timeout=180s >/dev/null
+  kubectl -n "$ns" rollout restart ds/aenv-egress-node >/dev/null
+  kubectl -n "$ns" rollout status ds/aenv-egress-node --timeout=180s >/dev/null
   state=$(get_sandbox_state "$sandbox_id")
   assert_eq "$state" "running" "sandbox survives a broker rollout"
   after_roll=$(brokered_auth_within 60)
   assert_eq "$after_roll" "Bearer ${secret_value}" "brokered requests resume after the rollout"
   # The restarted broker took a fresh intermediate and re-minted the leaf under
   # it; the guest's trust store never changed, so the handshake still verifies.
-  chain_after=$(guest_chain_subjects "$sandbox_id")
+  chain_after=$(guest_chain_report "$sandbox_id")
   assert_not_empty \
     "$(printf '%s\n' "$chain_after" | grep -o 'AgentENV Egress Node [^,/]*' | head -n 1 || true)" \
-    "a cached name still handshakes after the intermediate is replaced"
-
-  # A DaemonSet has no replica count to take to zero. Selecting a label no node
-  # carries is the same statement, and it is reversible by the same trap.
-  #
-  # Registered before the patch, not after it: an interrupt or a runner timeout
-  # between the two would otherwise leave every node without a broker. Chained
-  # onto the harness's own EXIT trap (`_cleanup_e2e`) rather than replacing it.
-  _restore_egress_daemonset() {
-    kubectl -n "$ns" patch ds/aenv-egress --type=json \
-      -p '[{"op":"remove","path":"/spec/template/spec/nodeSelector/aenv-egress"}]' \
-      >/dev/null 2>&1 || true
-  }
-  trap '_restore_egress_daemonset; _cleanup_e2e' EXIT
-  kubectl -n "$ns" patch ds/aenv-egress --type=merge \
-    -p '{"spec":{"template":{"spec":{"nodeSelector":{"aenv-egress":"parked"}}}}}' >/dev/null
-  for _ in $(seq 1 40); do
-    remaining=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=aenv-egress \
-      --no-headers 2>/dev/null | wc -l)
-    [[ "${remaining:-1}" -eq 0 ]] && break
-    sleep 3
-  done
-  outage_code=$(guest_http_code "$sandbox_id" "https://${EGRESS_UPSTREAM}/anything" 10)
-  if [[ "$outage_code" == "000" ]]; then
-    _pass "guest connection fails fast while the broker is down"
+    "a cached name is re-signed after the intermediate is replaced"
+  if chain_verifies "$chain_after"; then
+    _pass "the re-signed chain still verifies against the same root"
   else
-    _fail "broker outage visible to the guest" "connection failure" "HTTP ${outage_code}"
+    _fail "chain verification after the rollout" "Verify return code: 0 (ok)" \
+      "$(printf '%s' "$chain_after" | tr '\n' ' ')"
   fi
-  _restore_egress_daemonset
-  kubectl -n "$ns" rollout status ds/aenv-egress --timeout=180s >/dev/null
-  recovered=$(brokered_auth_within 60)
-  assert_eq "$recovered" "Bearer ${secret_value}" "brokered requests recover after the broker returns"
 
-  # -- A broker asks only about the sandboxes on its own machine ------------------
+  # -- Which broker may resolve for this sandbox, and only that one --------------
   #
-  # The broker image carries no HTTP client, so its own projected token is read
-  # out of it and presented from a node Pod, which does carry curl (its preStop
-  # hook uses it). Both Pods are the deployment's own; nothing here mints a
-  # credential the cluster would not otherwise have.
-  sandbox_node=$(api_get "/registry/sandboxes" >/dev/null 2>&1; \
-    echo "$HTTP_BODY" | jq -r --arg id "$sandbox_id" \
-      '.sandboxes[]? | select(.sandboxID == $id) | .nodeID // empty' 2>/dev/null | head -n 1 || true)
-  other_broker=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=aenv-egress \
-    -o jsonpath="{range .items[?(@.spec.nodeName!='${sandbox_node}')]}{.metadata.name}{'\n'}{end}" \
-    2>/dev/null | head -n 1 || true)
+  # No node name is asked for and none is needed. `GET /registry/sandboxes` is
+  # the *paused* registry, so a running sandbox is never in it and every
+  # assertion that read a node name out of it skipped instead of running.
+  # Present each broker's own projected token in turn: exactly one of them may
+  # resolve this sandbox's grant, and that one names the machine it runs on.
+  #
+  # The broker image carries no HTTP client, so the tokens are read out of the
+  # broker Pods and presented from a node Pod, which does carry curl (its
+  # preStop hook uses it). Both Pods are the deployment's own; nothing here
+  # mints a credential the cluster would not otherwise have.
+  api_get "/sandboxes/${sandbox_id}"
+  execution_id=$(echo "$HTTP_BODY" | jq -r '.executionID // empty' 2>/dev/null || true)
+
+  resolve_as() {
+    local pod="$1" token="$2" sandbox="$3" execution="$4" body
+    body=$(jq -nc --arg s "$sandbox" --arg e "$execution" --arg n "$secret_name" \
+      '{sandboxId: $s, executionId: $e, name: $n}')
+    kubectl -n "$ns" exec "$pod" -- \
+      curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+      -X POST http://agentenv-api:8000/internal/credentials/resolve \
+      -H "Authorization: Bearer ${token}" \
+      -H 'content-type: application/json' -d "$body" 2>/dev/null || true
+  }
+  broker_token_of() {
+    kubectl -n "$ns" exec "$1" -- cat /var/run/secrets/aenv/api/token 2>/dev/null || true
+  }
+  # One line per broker: "<pod> <node> <status>".
+  resolve_matrix() {
+    local sandbox="$1" execution="$2" pod node token
+    while read -r pod node; do
+      [[ -z "$pod" ]] && continue
+      token=$(broker_token_of "$pod")
+      if [[ -z "$token" ]]; then
+        printf '%s %s no-token\n' "$pod" "$node"
+        continue
+      fi
+      printf '%s %s %s\n' "$pod" "$node" "$(resolve_as "$node_pod" "$token" "$sandbox" "$execution")"
+    done <<< "$broker_rows"
+  }
+
   node_pod=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=agentenv-node \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-  if [[ -n "$sandbox_node" && -n "$other_broker" && -n "$node_pod" ]]; then
-    foreign_token=$(kubectl -n "$ns" exec "$other_broker" -- \
-      cat /var/run/secrets/aenv/api/token 2>/dev/null || true)
-    if [[ -n "$foreign_token" ]]; then
-      body=$(jq -nc --arg s "$sandbox_id" --arg n "$secret_name" \
-        '{sandboxId: $s, executionId: "unknown", name: $n}')
-      foreign_code=$(kubectl -n "$ns" exec "$node_pod" -- \
-        curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
-        -X POST http://agentenv-api:8000/internal/credentials/resolve \
-        -H "Authorization: Bearer ${foreign_token}" \
-        -H 'content-type: application/json' -d "$body" 2>/dev/null || true)
-      assert_eq "${foreign_code:-000}" "404" \
-        "a broker on another node is told nothing about this sandbox"
+  # The label the per-node broker's Pods carry, which is also its object name.
+  broker_rows=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=aenv-egress-node \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' 2>/dev/null |
+    sed '/^$/d' || true)
+  broker_count=$(printf '%s' "$broker_rows" | grep -c . || true)
+
+  sandbox_broker=""
+  sandbox_node=""
+  if [[ -n "$execution_id" && -n "$node_pod" && "${broker_count:-0}" -ge 1 ]]; then
+    matrix=$(resolve_matrix "$sandbox_id" "$execution_id")
+    resolved=$(printf '%s\n' "$matrix" | awk '$3 == "200"' | wc -l | tr -d ' ')
+    refused=$(printf '%s\n' "$matrix" | awk '$3 == "404"' | wc -l | tr -d ' ')
+    assert_eq "$resolved" "1" "exactly one broker resolves this sandbox's grant"
+    if [[ "$broker_count" -ge 2 ]]; then
+      assert_eq "$refused" "$((broker_count - 1))" \
+        "every broker on another node is told nothing about it"
     else
-      _skip "skipped: the other node's broker token is unreadable"
+      warn "only one broker in this deployment; the cross-node half needs two"
+      _skip "skipped: cross-node resolve check needs two brokers"
     fi
+    sandbox_broker=$(printf '%s\n' "$matrix" | awk '$3 == "200" {print $1; exit}')
+    sandbox_node=$(printf '%s\n' "$matrix" | awk '$3 == "200" {print $2; exit}')
   else
-    warn "no second node with its own broker; skipping the cross-node resolve check"
-    _skip "skipped: cross-node resolve check needs two nodes"
+    warn "no executionID, node Pod or broker Pod; skipping the resolve scope checks"
+    _skip "skipped: resolve scope checks"
   fi
+
+  # -- A node whose broker stopped answering takes no new sandbox ----------------
+  #
+  # The outage is one node's, and it is the socket that goes away rather than
+  # the process. A deleted Pod is replaced in about ten seconds, which closes
+  # the window before anything can be observed in it; and a signal is no help
+  # either — PID 1 in a container carries `SIGNAL_UNKILLABLE`, so a SIGSTOP
+  # sent from inside its own namespace is discarded and the broker keeps
+  # serving. Renaming the socket file is what both probes actually read: the
+  # node's connect gets ENOENT, the readiness probe fails the same way, and
+  # the listener stays bound to the inode so nothing is lost when it comes
+  # back.
+  socket_dir=/run/aenv-egress
+  if [[ -n "$sandbox_broker" ]]; then
+    _restore_broker_socket() {
+      kubectl -n "$ns" exec "$sandbox_broker" -- \
+        sh -c "mv -f ${socket_dir}/broker.sock.hidden ${socket_dir}/broker.sock" \
+        >/dev/null 2>&1 || true
+    }
+    # Registered before the socket moves, not after: an interrupt in between
+    # would otherwise leave that node without a broker. Chained onto the
+    # harness's own EXIT trap rather than replacing it.
+    trap '_restore_broker_socket; _cleanup_e2e' EXIT
+    kubectl -n "$ns" exec "$sandbox_broker" -- \
+      sh -c "mv ${socket_dir}/broker.sock ${socket_dir}/broker.sock.hidden" >/dev/null 2>&1 \
+      || warn "could not move the broker socket aside"
+
+    outage_code=$(guest_http_code "$sandbox_id" "https://${EGRESS_UPSTREAM}/anything" 10)
+    if [[ "$outage_code" == "000" ]]; then
+      _pass "guest requests stop while its node's broker socket is gone"
+    else
+      _fail "broker outage visible to the guest" "connection failure" "HTTP ${outage_code}"
+    fi
+
+    reported=""
+    for _ in $(seq 1 15); do
+      api_admin_get "/nodes"
+      reported=$(echo "$HTTP_BODY" | jq -r --arg n "$sandbox_node" \
+        '.[]? | select(.id == $n) | .egressBroker // empty' 2>/dev/null | head -n 1 || true)
+      [[ "$reported" == "local_unreachable" ]] && break
+      sleep 2
+    done
+    assert_eq "$reported" "local_unreachable" \
+      "the node whose broker stopped answering reports it unreachable"
+
+    if [[ "$broker_count" -ge 2 ]]; then
+      elsewhere_id=$(create_sandbox "$AENV_TEMPLATE_ID" 120 "$rules_json"); _sync_http
+      if [[ "$HTTP_STATUS" == "201" ]]; then
+        track_sandbox "$elsewhere_id"
+        wait_for_sandbox_state "$elsewhere_id" "running" 60
+        api_get "/sandboxes/${elsewhere_id}"
+        elsewhere_execution=$(echo "$HTTP_BODY" | jq -r '.executionID // empty' 2>/dev/null || true)
+        landed=$(resolve_matrix "$elsewhere_id" "$elsewhere_execution" |
+          awk '$3 == "200" {print $2; exit}')
+        if [[ -n "$landed" && "$landed" != "$sandbox_node" ]]; then
+          _pass "a sandbox with rules is placed away from the node with no broker"
+        else
+          _fail "placement avoids the node with no broker" "a node other than ${sandbox_node}" \
+            "${landed:-nothing resolved it}"
+        fi
+        api_delete "/sandboxes/${elsewhere_id}"
+      else
+        _fail "create with rules while one node's broker is unreachable" "201" "$HTTP_STATUS"
+      fi
+    else
+      warn "one broker only; with none left to place on, this would be a 503 by design"
+      _skip "skipped: placement-away check needs two brokers"
+    fi
+
+    _restore_broker_socket
+    back=""
+    for _ in $(seq 1 15); do
+      api_admin_get "/nodes"
+      back=$(echo "$HTTP_BODY" | jq -r --arg n "$sandbox_node" \
+        '.[]? | select(.id == $n) | .egressBroker // empty' 2>/dev/null | head -n 1 || true)
+      [[ "$back" == "local_ok" ]] && break
+      sleep 2
+    done
+    assert_eq "$back" "local_ok" "the node reports its broker healthy again"
+    recovered=$(brokered_auth_within 60)
+    assert_eq "$recovered" "Bearer ${secret_value}" \
+      "brokered requests recover once the socket is back"
+  else
+    warn "no broker resolved this sandbox; skipping the outage check"
+    _skip "skipped: broker outage check"
+  fi
+
 else
   warn "not a Kubernetes run with kubectl; skipping broker rollout and outage checks"
   _skip "skipped: broker rollout/outage checks"

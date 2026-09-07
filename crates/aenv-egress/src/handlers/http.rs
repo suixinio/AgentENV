@@ -217,7 +217,7 @@ impl HttpHandler {
 
 /// What the guest negotiated with this broker.
 ///
-/// 🔴 Both fields come back empty today, and that is a fact about the TLS
+/// Both fields come back empty today, and that is a fact about the TLS
 /// wrapper rather than about the connection: `native_tls::TlsStream` exposes
 /// the peer certificate and the ALPN protocol and nothing else — no protocol
 /// version, no cipher suite. Filling them means terminating the guest side

@@ -67,6 +67,19 @@ impl RuntimeError {
 pub const UNSUPPORTED_VERSION: &str = crate::header::UNSUPPORTED_VERSION_REASON;
 /// Wire reason for a sandbox that already holds its share of connections.
 pub const PER_SANDBOX_FULL: &str = "per_sandbox_full";
+/// Wire reason, and metric outcome, for a session that arrived with no
+/// connection slot free. The same string on both sides on purpose: the label
+/// existed before the reason did, and a renamed label is a new series.
+pub const ADMISSION_FULL: &str = "admission_full";
+/// Metric outcome for a connection that was only a readiness probe.
+pub const PROBE: &str = "probe";
+/// Metric outcome for a connection whose peer is not the node. Never written
+/// to the wire: such a peer is closed unanswered.
+#[cfg(feature = "local")]
+const PEER_REJECTED: &str = "peer_rejected";
+/// What a readiness probe reads back. Its value carries nothing; that it
+/// arrives at all is the whole answer.
+pub const PROBE_ACK: &[u8] = b"\0";
 
 /// The broker side of one transport: reads the identity, applies the
 /// per-sandbox limit, acknowledges and dispatches every incoming stream.
@@ -110,18 +123,27 @@ impl Runtime {
         &self.dispatcher
     }
 
-    /// Reads the header frame, admits it, writes the [`Ack`] and, when
-    /// accepted, runs the handler to completion on the rest of the stream.
-    pub async fn dispatch(&self, stream: Box<dyn AsyncStream>) -> Result<(), RuntimeError> {
-        let admitted = self.admit_stream(stream).await?;
+    /// Reads the first frame and answers whichever of the two things it is:
+    /// an empty frame is a readiness probe, anything else an identity header
+    /// whose session runs to completion on the rest of the stream.
+    pub async fn dispatch(&self, mut stream: Box<dyn AsyncStream>) -> Result<(), RuntimeError> {
+        let frame = framing::read_frame(&mut stream).await?;
+        if frame.is_empty() {
+            answer_probe(&mut stream).await?;
+            return Err(RuntimeError::Refused(PROBE));
+        }
+        let admitted = self.admit_frame(&frame, stream).await?;
         self.serve(admitted).await
     }
 
-    async fn admit_stream(
+    /// Parses an identity frame, applies the version, handler and per-sandbox
+    /// checks and acknowledges. Past this the stream is a session.
+    async fn admit_frame(
         &self,
+        frame: &[u8],
         mut stream: Box<dyn AsyncStream>,
     ) -> Result<Admitted, RuntimeError> {
-        let header: IdentityHeader = framing::read_json(&mut stream).await?;
+        let header: IdentityHeader = serde_json::from_slice(frame).map_err(FramingError::from)?;
         let (handler, slot) = match self.admit(&header) {
             Ok(admitted) => admitted,
             Err(reason) => {
@@ -180,6 +202,19 @@ impl Runtime {
     }
 }
 
+/// One byte back, so the prober learns that something read its frame rather
+/// than that something was listening. It takes no permit and opens no
+/// session, which is why it is answered before anything else is asked of the
+/// connection.
+async fn answer_probe<S>(stream: &mut S) -> Result<(), FramingError>
+where
+    S: tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    tokio::io::AsyncWriteExt::write_all(stream, PROBE_ACK).await?;
+    tokio::io::AsyncWriteExt::flush(stream).await?;
+    Ok(())
+}
+
 /// A stream past admission, with the handler that will serve it.
 struct Admitted {
     handler: Arc<dyn crate::handler::Handler>,
@@ -214,27 +249,20 @@ pub async fn run(
             },
             _ = &mut shutdown => break,
         };
-        if let Some(expected) = expected_peer_uid {
-            if !peer_uid_matches(&stream, expected) {
-                metrics::counter!("egress_peer_rejected_total").increment(1);
-                drop(stream);
-                continue;
-            }
-        }
-        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-            tracing::debug!(max_connections, "closing: no connection slot is free");
-            metrics::counter!("egress_conns_total", "handler" => "none", "outcome" => "admission_full").increment(1);
-            drop(stream);
-            continue;
-        };
         let runtime = Arc::clone(&runtime);
+        let permits = Arc::clone(&permits);
         tokio::spawn(async move {
-            let _permit = permit;
             metrics::gauge!("egress_active_conns").increment(1.0);
-            let (handler, outcome, sandbox_id) = admit_and_serve(&runtime, stream, admission).await;
-            metrics::counter!("egress_conns_total", "handler" => handler, "outcome" => outcome)
-                .increment(1);
-            // 🔴 One series per sandbox, and only while debug is on: a node
+            let (handler, outcome, sandbox_id) =
+                admit_and_serve(&runtime, stream, expected_peer_uid, &permits, admission).await;
+            // A probe holds nothing and a peer that is not the node was never
+            // a connection to this broker; neither belongs on the session
+            // series, and each has a counter of its own.
+            if outcome != PROBE && outcome != PEER_REJECTED {
+                metrics::counter!("egress_conns_total", "handler" => handler, "outcome" => outcome)
+                    .increment(1);
+            }
+            // One series per sandbox, and only while debug is on: a node
             // runs thousands of sandboxes a day and each one would leave a
             // series behind it forever.
             if let Some(sandbox_id) =
@@ -251,14 +279,21 @@ pub async fn run(
     Ok(())
 }
 
-/// Whether the connecting process runs as the uid this broker serves. A peer
-/// whose credentials cannot be read is not that process.
+/// Whether this peer may open a session. `None` accepts any peer, which is
+/// only right in tests.
+///
+/// Nothing here gates a readiness probe: a probe is answered before this is
+/// asked, because it carries no identity, opens no session and learns
+/// nothing that the socket's own directory mode does not already grant.
 #[cfg(feature = "local")]
-fn peer_uid_matches(stream: &tokio::net::UnixStream, expected: u32) -> bool {
+fn peer_is_the_node(stream: &tokio::net::UnixStream, expected: Option<u32>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
     match stream.peer_cred() {
         Ok(cred) if cred.uid() == expected => true,
         Ok(cred) => {
-            tracing::warn!(
+            tracing::debug!(
                 uid = cred.uid(),
                 expected,
                 "closing: the peer is not the node process"
@@ -266,7 +301,7 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream, expected: u32) -> bool {
             false
         }
         Err(err) => {
-            tracing::warn!(error = %err, "closing: the peer's credentials are unreadable");
+            tracing::debug!(error = %err, "closing: the peer's credentials are unreadable");
             false
         }
     }
@@ -274,26 +309,67 @@ fn peer_uid_matches(stream: &tokio::net::UnixStream, expected: u32) -> bool {
 
 /// The metric labels the connection ends with: the handler side, the outcome,
 /// and the sandbox it belonged to once one is known.
+///
+/// The first frame is read before anything is spent on the connection. A
+/// readiness probe takes no permit, is counted on no session series and is
+/// answered whatever uid sent it; only a frame that claims to be a session is
+/// measured against the peer's uid and the connection budget. A full broker
+/// therefore still answers its probe, which is what keeps back-pressure from
+/// reading as an unreachable node.
 #[cfg(feature = "local")]
 async fn admit_and_serve(
     runtime: &Runtime,
-    stream: tokio::net::UnixStream,
+    mut stream: tokio::net::UnixStream,
+    expected_peer_uid: Option<u32>,
+    permits: &Arc<tokio::sync::Semaphore>,
     admission: Duration,
 ) -> (&'static str, &'static str, Option<String>) {
     let deadline = tokio::time::Instant::now() + admission;
-    let admitted =
-        match tokio::time::timeout_at(deadline, runtime.admit_stream(Box::new(stream))).await {
-            Ok(Ok(admitted)) => admitted,
-            Ok(Err(err)) => {
-                let outcome = err.outcome();
-                tracing::debug!(error = %err, "connection refused before any handler");
-                return ("runtime", outcome, None);
-            }
-            Err(_) => {
-                tracing::debug!("the identity header did not arrive inside the deadline");
-                return ("none", "admission_timeout", None);
-            }
-        };
+    let frame = match tokio::time::timeout_at(deadline, framing::read_frame(&mut stream)).await {
+        Ok(Ok(frame)) => frame,
+        Ok(Err(err)) => {
+            let err = RuntimeError::from(err);
+            tracing::debug!(error = %err, "connection refused before any handler");
+            return (refusal_handler(err.outcome()), err.outcome(), None);
+        }
+        Err(_) => {
+            tracing::debug!("the first frame did not arrive inside the deadline");
+            return ("none", "admission_timeout", None);
+        }
+    };
+    if frame.is_empty() {
+        if let Err(err) = answer_probe(&mut stream).await {
+            tracing::debug!(error = %err, "the readiness probe went unanswered");
+        }
+        return ("none", PROBE, None);
+    }
+    if !peer_is_the_node(&stream, expected_peer_uid) {
+        metrics::counter!("egress_peer_rejected_total").increment(1);
+        return ("none", PEER_REJECTED, None);
+    }
+    let Ok(_permit) = Arc::clone(permits).try_acquire_owned() else {
+        // Answering a refusal needs no slot, and the caller learns why
+        // instead of waiting out its own timeout.
+        tracing::debug!("refusing a session: no connection slot is free");
+        let _ = framing::write_json(&mut stream, &Ack::rejected(ADMISSION_FULL)).await;
+        return (refusal_handler(ADMISSION_FULL), ADMISSION_FULL, None);
+    };
+    let admitted = match tokio::time::timeout_at(
+        deadline,
+        runtime.admit_frame(&frame, Box::new(stream)),
+    )
+    .await
+    {
+        Ok(Ok(admitted)) => admitted,
+        Ok(Err(err)) => {
+            tracing::debug!(error = %err, "connection refused before any handler");
+            return (refusal_handler(err.outcome()), err.outcome(), None);
+        }
+        Err(_) => {
+            tracing::debug!("the acknowledgement did not get out inside the deadline");
+            return ("none", "admission_timeout", None);
+        }
+    };
     let sandbox_id = Some(admitted.header.sandbox_id.clone());
     match runtime.serve(admitted).await {
         Ok(()) => ("runtime", "ok", sandbox_id),
@@ -301,6 +377,20 @@ async fn admit_and_serve(
             tracing::debug!(error = %err, "connection ended with an error");
             ("runtime", err.outcome(), sandbox_id)
         }
+    }
+}
+
+/// The `handler` label a refusal before any handler is counted under.
+///
+/// `admission_full` keeps the `handler="none"` it was counted under while the
+/// refusal happened at the door: it is the same event seen one frame later,
+/// and a label that moves is a different series.
+#[cfg(feature = "local")]
+fn refusal_handler(outcome: &str) -> &'static str {
+    if outcome == ADMISSION_FULL {
+        "none"
+    } else {
+        "runtime"
     }
 }
 
@@ -492,10 +582,8 @@ mod tests {
 
         /// This process's uid, which is what a peer on its own socket carries.
         fn own_uid() -> u32 {
-            use std::os::unix::fs::MetadataExt as _;
-            std::fs::metadata("/proc/self")
-                .expect("procfs names this process")
-                .uid()
+            // SAFETY: `getuid` reads process state and cannot fail.
+            unsafe { libc::getuid() }
         }
 
         fn transport(broker: &Broker) -> LocalTransport {
@@ -513,18 +601,107 @@ mod tests {
             }
         }
 
-        #[tokio::test]
-        async fn a_peer_of_another_uid_is_closed_without_reading_its_header() {
-            let broker = start(Options {
+        /// A broker whose `expected_peer_uid` is somebody else's, so this
+        /// test process is any uid but the node's.
+        async fn start_expecting_another_uid() -> Broker {
+            start(Options {
                 expected_peer_uid: Some(own_uid() + 1),
+                ..options()
+            })
+            .await
+        }
+
+        #[tokio::test]
+        async fn a_probe_is_answered_whatever_uid_sent_it() {
+            let broker = start_expecting_another_uid().await;
+
+            transport(&broker)
+                .probe()
+                .await
+                .expect("a probe carries no identity and opens no session");
+        }
+
+        #[test]
+        fn a_full_broker_counts_its_refusals_on_the_series_it_always_used() {
+            assert_eq!(refusal_handler(ADMISSION_FULL), "none");
+            assert_eq!(refusal_handler(PER_SANDBOX_FULL), "runtime");
+        }
+
+        #[tokio::test]
+        async fn a_full_broker_answers_the_probe_and_refuses_the_session() {
+            // Not one connection slot, so no session can be admitted at all —
+            // and the probe still is. A broker that could not answer its
+            // readiness probe under load would be marked NotReady and its
+            // node `local_unreachable`, which turns back-pressure into an
+            // outage.
+            let broker = start(Options {
+                max_connections: 0,
+                expected_peer_uid: Some(own_uid()),
+                ..options()
+            })
+            .await;
+            let transport = transport(&broker);
+
+            transport
+                .probe()
+                .await
+                .expect("a probe takes no connection slot");
+
+            // The same connection shape carrying an identity frame is what
+            // gets refused instead, and with a reason rather than a close.
+            match transport.open(current_header()).await {
+                Err(crate::transport::TransportError::Rejected { reason }) => {
+                    assert_eq!(reason, ADMISSION_FULL)
+                }
+                Err(other) => panic!("expected a refusal with a reason, got {other:?}"),
+                Ok(_) => panic!("a session was admitted with no connection slot free"),
+            }
+        }
+
+        #[tokio::test]
+        async fn an_identity_frame_from_another_uid_is_closed_unanswered() {
+            let broker = start_expecting_another_uid().await;
+
+            match transport(&broker).open(current_header()).await {
+                Err(crate::transport::TransportError::Unavailable(_)) => {}
+                Err(other) => panic!("an identity header stays the node's alone, got {other:?}"),
+                Ok(_) => panic!("an identity header stays the node's alone"),
+            }
+        }
+
+        #[tokio::test]
+        async fn the_node_uid_may_open_a_session_and_probe() {
+            let broker = start(Options {
+                expected_peer_uid: Some(own_uid()),
                 ..options()
             })
             .await;
 
-            let mut refused = tokio::net::UnixStream::connect(&broker.socket_path)
+            transport(&broker)
+                .probe()
+                .await
+                .expect("the node may probe");
+            let _held = transport(&broker)
+                .open(current_header())
+                .await
+                .expect("the node opens sessions");
+        }
+
+        #[tokio::test]
+        async fn only_the_node_uid_may_open_a_session() {
+            let broker = start_expecting_another_uid().await;
+            // The listener cannot be reached from another uid inside a test,
+            // so the uid the broker expects is varied instead.
+            let stream = tokio::net::UnixStream::connect(&broker.socket_path)
                 .await
                 .unwrap();
-            expect_closed(&mut refused, "the listener admitted a foreign peer").await;
+
+            assert!(peer_is_the_node(&stream, Some(own_uid())));
+            assert!(!peer_is_the_node(&stream, Some(own_uid() + 1)));
+            assert!(
+                peer_is_the_node(&stream, None),
+                "an unset expectation admits any peer, which is only right in tests"
+            );
         }
 
         #[tokio::test]
@@ -560,22 +737,25 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_connection_past_the_limit_is_closed_at_the_door() {
+        async fn a_session_past_the_limit_is_refused_with_a_reason() {
+            // Refused after its frame rather than at the door: the reason
+            // reaches the node, and its own probe on the same socket is
+            // answered rather than swept up in the refusal.
             let broker = start(Options {
                 max_connections: 1,
+                expected_peer_uid: Some(own_uid()),
                 ..options()
             })
             .await;
             let _held = transport(&broker).open(current_header()).await.unwrap();
 
-            let mut refused = tokio::net::UnixStream::connect(&broker.socket_path)
-                .await
-                .unwrap();
-            expect_closed(
-                &mut refused,
-                "the listener admitted a connection past its limit",
-            )
-            .await;
+            match transport(&broker).open(current_header()).await {
+                Err(crate::transport::TransportError::Rejected { reason }) => {
+                    assert_eq!(reason, ADMISSION_FULL)
+                }
+                Err(other) => panic!("expected a refusal with a reason, got {other:?}"),
+                Ok(_) => panic!("the listener admitted a session past its limit"),
+            }
         }
 
         #[tokio::test]

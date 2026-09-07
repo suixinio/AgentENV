@@ -87,5 +87,8 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 
 [dev-dependencies]
 axum = "0.8"
+# `getuid`, so a test can say which uid this process is; nothing the broker
+# ships asks that question.
+libc = "0.2"
 tempfile = "3.22.0"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }

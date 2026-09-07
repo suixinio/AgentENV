@@ -118,10 +118,14 @@ impl LocalTransport {
         })
     }
 
-    /// The heartbeat's reachability check: an empty frame, which the broker
-    /// refuses and closes. Connecting alone would succeed against a broker
-    /// wedged behind its own backlog; a closed stream is proof that something
-    /// read the frame.
+    /// The reachability check both the node's heartbeat and the broker's own
+    /// readiness probe use: an empty frame, which the broker answers with one
+    /// byte. Connecting alone would succeed against a broker wedged behind its
+    /// own backlog, and a closed stream would succeed against one that died
+    /// mid-answer; a byte back is proof that something read the frame.
+    ///
+    /// An empty frame opens no session and carries no identity, which is why
+    /// the broker answers it for its own uid as well as the node's.
     pub async fn probe(&self) -> Result<(), TransportError> {
         let mut stream = self.connect().await?;
         let exchange = async {
@@ -130,8 +134,10 @@ impl LocalTransport {
                 .map_err(|err| TransportError::Unavailable(format!("probing the broker: {err}")))?;
             let mut byte = [0u8; 1];
             match tokio::io::AsyncReadExt::read(&mut stream, &mut byte).await {
-                // The broker read the frame and refused it, either way.
-                Ok(_) => Ok(()),
+                Ok(1) => Ok(()),
+                Ok(_) => Err(TransportError::Unavailable(
+                    "the broker closed the probe without answering it".into(),
+                )),
                 Err(err) => Err(TransportError::Unavailable(format!(
                     "probing the broker: {err}"
                 ))),

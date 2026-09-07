@@ -191,6 +191,7 @@ dependencies = [
  "hyper 1.9.0",
  "hyper-util",
  "ipnetwork",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "native-tls",

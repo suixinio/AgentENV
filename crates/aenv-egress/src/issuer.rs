@@ -26,6 +26,9 @@ pub const RENEWAL_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 /// to expiry means renewal has been failing for days.
 pub const EXPIRY_WARNING: Duration = Duration::from_secs(24 * 3600);
 
+/// The renewal reason that also empties the slot.
+const EXPIRED: &str = "expired";
+
 /// The api half's issuing endpoint.
 pub struct IntermediateIssuer {
     client: reqwest::Client,
@@ -95,6 +98,14 @@ pub async fn keep_current(
 ) {
     loop {
         if let Some(reason) = renewal_reason(slot.load().as_deref(), SystemTime::now()) {
+            if reason == EXPIRED {
+                // Leaves under an expired issuer are leaves no guest accepts,
+                // and minting them turns a closed name into a handshake that
+                // fails halfway. Empty the slot and answer the way a broker
+                // that was never issued one answers: closed.
+                slot.clear();
+                warn!("this node's egress intermediate expired; rules domains are closed");
+            }
             match issuer.issue(options.clone()).await {
                 Ok(signer) => {
                     let not_after = signer.not_after();
@@ -120,7 +131,7 @@ fn renewal_reason(signer: Option<&CaSigner>, now: SystemTime) -> Option<&'static
     };
     let remaining = remaining(signer, now);
     if remaining.is_zero() {
-        return Some("expired");
+        return Some(EXPIRED);
     }
     // A third of the window it was signed for: two renewal failures in a row
     // still leave days before anything stops working.
@@ -153,6 +164,25 @@ mod tests {
     fn signer() -> CaSigner {
         let (cert, key) = generate_test_ca("issuer test").unwrap();
         CaSigner::from_pem(&cert, &key, SignerOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn an_expired_intermediate_leaves_the_slot_empty_rather_than_minting_under_it() {
+        let slot = SignerSlot::holding(Arc::new(signer()));
+        let held = slot.load().expect("a signer is held");
+        let after_expiry = held.not_after() + Duration::from_secs(1);
+
+        assert_eq!(
+            renewal_reason(Some(&held), after_expiry),
+            Some(EXPIRED),
+            "the reason that empties the slot has to be the one this checks for"
+        );
+        slot.clear();
+
+        assert!(
+            slot.load().is_none(),
+            "a leaf under an expired issuer is one no guest accepts"
+        );
     }
 
     #[test]

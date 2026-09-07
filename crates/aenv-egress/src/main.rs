@@ -17,10 +17,10 @@ use aenv_egress::handlers::tcp::TcpRelayHandler;
 use aenv_egress::issuer::{keep_current, IntermediateIssuer};
 use aenv_egress::resolver::ResolverSource;
 use aenv_egress::runtime::{self, Options, Runtime};
-use aenv_egress::tls::{CaSigner, SignerOptions, SignerSlot};
+use aenv_egress::tls::{generate_ca_chain, CaSigner, SignerOptions, SignerSlot};
 use aenv_egress::{BrokerDenyList, CredentialSource, Dispatcher, UpstreamGuard};
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use confique::Config;
 use tracing::{info, warn};
 
@@ -37,6 +37,16 @@ struct Args {
     /// listening port says the process is up and not that it is serving.
     #[arg(long)]
     ready: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Mint a throwaway root and first intermediate into DIR, for a
+    /// deployment with no api half to issue one and no Secret to mount one
+    /// from. Keeps whatever is already there.
+    GenCa { dir: PathBuf },
 }
 
 #[derive(Config)]
@@ -198,6 +208,9 @@ async fn main() -> Result<()> {
         .json()
         .init();
     let args = Args::parse();
+    if let Some(Command::GenCa { dir }) = &args.command {
+        return gen_ca(dir);
+    }
     let config_path = args
         .config
         .or_else(|| std::env::var_os(CONFIG_PATH_ENV).map(PathBuf::from))
@@ -246,7 +259,7 @@ async fn main() -> Result<()> {
                 IntermediateIssuer::new(url, token_file, Duration::from_millis(5_000))
                     .context("configure the intermediate issuer")?,
             );
-            // 🔴 Not a startup failure. A broker that cannot reach the api
+            // Not a startup failure. A broker that cannot reach the api
             // half serves the passthrough path and closes matched names; one
             // that refuses to start would take that node's sandboxes with it.
             match issuer.issue(signer_options.clone()).await {
@@ -378,6 +391,61 @@ async fn main() -> Result<()> {
     let result = runtime::run(runtime, listener, shutdown).await;
     let _ = std::fs::remove_file(&config.listen.socket_path);
     result
+}
+
+const ROOT_CN: &str = "AgentENV Local Egress Root";
+const INTERMEDIATE_CN: &str = "AgentENV Local Egress Intermediate";
+
+fn present(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+}
+
+fn write_pem(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::write(path, bytes).with_context(|| format!("write {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .with_context(|| format!("set the mode of {}", path.display()))
+}
+
+/// Writes `ca.crt`/`ca.key` (the root guests trust) and
+/// `intermediate.crt`/`intermediate.key` (what this broker signs leaves with)
+/// into `dir`. A root already there is kept and only the intermediate is
+/// minted under it: replacing the root would leave every trust store already
+/// loaded from it trusting nothing this broker signs. Renewing is therefore
+/// "delete `intermediate.*` and run this again".
+fn gen_ca(dir: &PathBuf) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create the CA directory {}", dir.display()))?;
+    let (root_cert, root_key) = (dir.join("ca.crt"), dir.join("ca.key"));
+    let (int_cert, int_key) = (dir.join("intermediate.crt"), dir.join("intermediate.key"));
+
+    if present(&root_cert) && present(&root_key) {
+        if present(&int_cert) && present(&int_key) {
+            info!(dir = %dir.display(), "a root and an intermediate are already here");
+            return Ok(());
+        }
+        let (cert_pem, key_pem) = aenv_egress::tls::generate_intermediate(
+            &std::fs::read(&root_cert).with_context(|| format!("read {}", root_cert.display()))?,
+            &std::fs::read(&root_key).with_context(|| format!("read {}", root_key.display()))?,
+            INTERMEDIATE_CN,
+        )
+        .context("mint an intermediate under the root already here")?;
+        write_pem(&int_cert, &cert_pem, 0o644)?;
+        write_pem(&int_key, &key_pem, 0o600)?;
+        info!(dir = %dir.display(), "minted an intermediate under the root already here");
+        return Ok(());
+    }
+
+    let ca = generate_ca_chain(ROOT_CN, INTERMEDIATE_CN).context("mint the CA")?;
+    write_pem(&root_cert, &ca.root_cert_pem, 0o644)?;
+    write_pem(&root_key, &ca.root_key_pem, 0o600)?;
+    write_pem(&int_cert, &ca.intermediate_cert_pem, 0o644)?;
+    write_pem(&int_key, &ca.intermediate_key_pem, 0o600)?;
+    info!(dir = %dir.display(), "minted a root and its first intermediate");
+    Ok(())
 }
 
 /// The readiness probe: one empty frame the serving process reads and refuses.

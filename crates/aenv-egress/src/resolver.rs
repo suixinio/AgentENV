@@ -97,9 +97,8 @@ impl ResolverSource {
             // The endpoint refused this broker, not this grant: an operator
             // error that must read as an outage, not as a policy denial.
             StatusCode::UNAUTHORIZED => Err(CredentialError::Unavailable(
-                "the resolver refused this broker's credential; resolver.token_file must hold \
-                 either this Pod's projected token for the aenv-api audience or the value the \
-                 api half's secrets.pg.resolver_token_file names"
+                "the resolver refused this broker's credential; resolver.token_file must name \
+                 this Pod's projected token for the aenv-api audience"
                     .into(),
             )),
             // The api half reached its own store and could not answer. It is

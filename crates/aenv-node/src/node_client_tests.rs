@@ -603,23 +603,12 @@ impl crate::node_client::SandboxRecordOwner for FixedRecordOwner {
 
 async fn start_against_a_node_that_already_holds_the_sandbox(
     recorded: anyhow::Result<Option<ExecutionId>>,
-    held_by: ExecutionId,
     launching: ExecutionId,
 ) -> (Arc<ScriptedNode>, anyhow::Result<()>) {
     let (script, node) = scripted_node().await;
     *script.create.lock().expect("lock") = Some(Err(Status::already_exists(
         "sandbox is already on this node",
     )));
-    *script.describe.lock().expect("lock") = Some(Ok(pb::SandboxDescribeResponse {
-        execution_id: held_by.to_string(),
-        facts_from_handle: true,
-        ..Default::default()
-    }));
-    *script.create_again.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
-        sandbox_id: launch_config().sandbox_id.to_string(),
-        execution_id: launching.to_string(),
-        ..Default::default()
-    }));
 
     let factory = RemoteSandboxBackendFactory::new(node.placement())
         .with_record_owner(Arc::new(FixedRecordOwner(recorded)));
@@ -631,20 +620,29 @@ async fn start_against_a_node_that_already_holds_the_sandbox(
 }
 
 #[tokio::test]
-async fn a_node_holding_an_orphan_of_this_id_is_cleared_and_the_launch_retried() {
-    let held_by = ExecutionId::new();
+async fn a_node_holding_a_copy_of_this_id_fails_the_launch_and_is_left_alone() {
     let launching = ExecutionId::new();
     let (script, outcome) =
-        start_against_a_node_that_already_holds_the_sandbox(Ok(None), held_by, launching).await;
+        start_against_a_node_that_already_holds_the_sandbox(Ok(None), launching).await;
 
-    outcome.expect("a copy nothing routes to must not stop the launch");
-    let deletes = script.seen_delete.lock().expect("lock").clone();
-    assert_eq!(deletes.len(), 1, "the orphan was left on the node");
-    assert_eq!(deletes[0].execution_id, held_by.to_string());
+    let err = outcome.expect_err("a node that already holds the id refuses this launch");
+    assert!(
+        err.to_string().contains("orphan"),
+        "the launch must say who decides whether the node's copy is one: {err:#}"
+    );
+    assert!(
+        script.seen_delete.lock().expect("lock").is_empty(),
+        "a launch must not delete a node's copy: from here it is indistinguishable from a \
+         sibling launch's live runtime"
+    );
+    assert!(
+        script.seen_describe.lock().expect("lock").is_empty(),
+        "the node is not asked what it holds, because no answer would license a delete"
+    );
     assert_eq!(
         script.seen_create.lock().expect("lock").len(),
-        2,
-        "the launch retried once after clearing the orphan"
+        1,
+        "one create, one refusal"
     );
 }
 
@@ -653,8 +651,7 @@ async fn a_node_holding_a_sandbox_a_newer_run_owns_fails_without_touching_it() {
     let newer = ExecutionId::new();
     let launching = ExecutionId::new();
     let (script, outcome) =
-        start_against_a_node_that_already_holds_the_sandbox(Ok(Some(newer)), newer, launching)
-            .await;
+        start_against_a_node_that_already_holds_the_sandbox(Ok(Some(newer)), launching).await;
 
     let err = outcome.expect_err("a launch that lost the id must not take the winner's runtime");
     assert!(err.to_string().contains(&newer.to_string()), "{err:#}");
@@ -671,10 +668,8 @@ async fn a_node_holding_a_sandbox_a_newer_run_owns_fails_without_touching_it() {
 
 #[tokio::test]
 async fn a_record_nobody_can_read_stops_the_launch_rather_than_clearing_the_node() {
-    let held_by = ExecutionId::new();
     let (script, outcome) = start_against_a_node_that_already_holds_the_sandbox(
         Err(anyhow::anyhow!("the store is unreachable")),
-        held_by,
         ExecutionId::new(),
     )
     .await;

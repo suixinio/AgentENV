@@ -310,94 +310,40 @@ impl RemoteSandboxStub {
         )
     }
 
-    /// Clears a copy of this sandbox the node still holds, then creates again.
+    /// Explains a node's refusal to create a sandbox it already holds.
     ///
-    /// The node's copy is an orphan only when the deciding half's own record is
-    /// absent or names this very launch. A record naming another incarnation
-    /// means a newer launch owns the id, and this one touches nothing.
-    async fn take_over_orphan(
-        &self,
-        node: &NodeEndpoint,
-        client: &mut super::NodeClient,
-        request: &pb::SandboxCreateRequest,
-    ) -> Result<pb::SandboxCreateResponse> {
+    /// A launch never clears the node's copy: from here the copy and a live
+    /// sibling launch's runtime look the same, and telling them apart needs the
+    /// node's own roster over consecutive heartbeats, which the api half's
+    /// orphan reaper has and this call does not. Nothing is deleted, nothing is
+    /// created, and the launch fails.
+    async fn refuse_existing_sandbox(&self, node: &NodeEndpoint) -> anyhow::Error {
         let sandbox_id = self.sandbox_id;
-        let recorded = self
-            .record_owner
-            .recorded_execution(sandbox_id)
-            .await
-            .with_context(|| {
-                format!(
-                    "read the record of sandbox {sandbox_id} after node {} answered that it \
-                     already holds it",
-                    node.node_id
-                )
-            })?;
-        if let Some(recorded) = recorded {
-            if recorded != self.execution_id {
-                bail!(
-                    "node {} already holds sandbox {sandbox_id}, and the record under that id \
-                     is incarnation {recorded}, not this launch's {}",
-                    node.node_id,
-                    self.execution_id
-                );
-            }
+        match self.record_owner.recorded_execution(sandbox_id).await {
+            Ok(Some(recorded)) if recorded != self.execution_id => anyhow!(
+                "node {} already holds sandbox {sandbox_id}, and the record under that id is \
+                 incarnation {recorded}, not this launch's {}",
+                node.node_id,
+                self.execution_id
+            ),
+            Ok(Some(_)) => anyhow!(
+                "node {} already holds sandbox {sandbox_id} under this launch's own incarnation \
+                 {}, so this create is a duplicate of one that already ran",
+                node.node_id,
+                self.execution_id
+            ),
+            Ok(None) => anyhow!(
+                "node {} already holds sandbox {sandbox_id} and nothing in the control plane \
+                 records it; the node's roster is what decides whether that copy is an orphan, \
+                 and a launch does not delete it",
+                node.node_id
+            ),
+            Err(error) => error.context(format!(
+                "read the record of sandbox {sandbox_id} after node {} answered that it already \
+                 holds it",
+                node.node_id
+            )),
         }
-
-        let held = client
-            .describe(pb::SandboxDescribeRequest {
-                sandbox_id: sandbox_id.to_string(),
-            })
-            .await;
-        let held_execution_id = match held {
-            Ok(response) => response.into_inner().execution_id,
-            // The copy went away between the create and this call.
-            Err(status) if status.code() == tonic::Code::NotFound => String::new(),
-            Err(status) => {
-                return Err(wire::into_error(status)).with_context(|| {
-                    format!(
-                        "ask node {} which incarnation of sandbox {sandbox_id} it holds",
-                        node.node_id
-                    )
-                })
-            }
-        };
-
-        if !held_execution_id.is_empty() {
-            warn!(
-                %sandbox_id,
-                node = %node.node_id,
-                held_execution_id = %held_execution_id,
-                execution_id = %self.execution_id,
-                "the node holds a copy of this sandbox that nothing routes to; deleting it \
-                 before starting this launch"
-            );
-            client
-                .delete(pb::SandboxDeleteRequest {
-                    sandbox_id: sandbox_id.to_string(),
-                    execution_id: held_execution_id,
-                })
-                .await
-                .map_err(wire::into_error)
-                .with_context(|| {
-                    format!(
-                        "delete the orphaned copy of sandbox {sandbox_id} on node {}",
-                        node.node_id
-                    )
-                })?;
-        }
-
-        client
-            .create(request.clone())
-            .await
-            .map(|ack| ack.into_inner())
-            .map_err(wire::into_error)
-            .with_context(|| {
-                format!(
-                    "create sandbox {sandbox_id} on node {} after clearing its orphaned copy",
-                    node.node_id
-                )
-            })
     }
 
     fn fork_child(
@@ -759,16 +705,13 @@ impl SandboxBackend for RemoteSandboxStub {
             let (retryable, error) = match Self::connect(&node.endpoint).await {
                 Ok(mut client) => match client.create(request.clone()).await {
                     Ok(ack) => break (node, client, ack.into_inner()),
-                    // A node that already holds this id is either holding an
-                    // orphan of this launch's or serving a newer one.
+                    // A node that already holds this id is serving something
+                    // under it. Whatever that is, it is not this launch's to
+                    // take, and placing elsewhere would run the same id twice.
                     Err(status) if wire::is_sandbox_already_on_node(&status) => {
-                        match self.take_over_orphan(&node, &mut client, &request).await {
-                            Ok(ack) => break (node, client, ack),
-                            Err(error) => {
-                                self.withdraw_reservation().await;
-                                return Err(error);
-                            }
-                        }
+                        let error = self.refuse_existing_sandbox(&node).await;
+                        self.withdraw_reservation().await;
+                        return Err(error);
                     }
                     Err(status) => (
                         Self::refuses_the_launch(&status),

@@ -12,6 +12,7 @@ use crate::sandbox::{
 };
 use crate::types::{ExecutionId, SandboxId};
 
+use super::launch_claim::RestoredSandbox;
 use super::metrics::OrchestratorMetrics;
 use super::pause_publisher::PausePublisher;
 use super::proxy::ProxyLookupResult;
@@ -118,6 +119,12 @@ orchestration_surface! {
             sandbox_id: SandboxId,
             request: CreateSandboxRequest,
         ) -> Result<SandboxMetadata>;
+        /// The same restore, but a launch of this id already in flight is
+        /// waited out and answered with instead of started a second time.
+        fn restore_or_join_launch(
+            sandbox_id: SandboxId,
+            request: CreateSandboxRequest,
+        ) -> Result<RestoredSandbox>;
         /// Forks into one result per requested child, preserving request order.
         fn fork_sandbox(
             source_sandbox_id: SandboxId,
@@ -215,6 +222,9 @@ orchestration_surface! {
         );
     }
     sync {
+        /// The incarnation of a launch this process is running under this id,
+        /// before any handle or record names it.
+        fn launch_in_flight(sandbox_id: SandboxId) -> Option<ExecutionId>;
         /// The envd access token for a sandbox, when it has one.
         fn get_envd_access_token(metadata: &SandboxMetadata) -> Option<EnvdAccessToken>;
         /// Whether `candidate` is the envd access token for this sandbox.

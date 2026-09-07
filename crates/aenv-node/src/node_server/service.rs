@@ -469,7 +469,10 @@ fn orchestrator_status(err: &OrchestratorError) -> Status {
         // apart from a node that is broken, so it gets its own code.
         OrchestratorError::StoreOperationFailed(
             aenv_core::orchestrator::StoreError::SandboxAlreadyExists { sandbox_id },
-        ) => Status::already_exists(format!("sandbox {sandbox_id} is already on this node")),
+        )
+        | OrchestratorError::LaunchInFlight { sandbox_id } => {
+            Status::already_exists(format!("sandbox {sandbox_id} is already on this node"))
+        }
         other => Status::internal(other.to_string()),
     }
 }
@@ -611,6 +614,18 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
                 %sandbox_id,
                 held_execution_id = ?held.execution_id,
                 "refusing a create for a sandbox this node already holds"
+            );
+            return Err(Status::already_exists(format!(
+                "sandbox {sandbox_id} is already on this node"
+            )));
+        }
+        // A launch that has not written its record yet is held nowhere else,
+        // so its own claim is the only thing that names the id.
+        if let Some(execution_id) = self.orchestration.launch_in_flight(sandbox_id) {
+            warn!(
+                %sandbox_id,
+                held_execution_id = %execution_id,
+                "refusing a create for a sandbox this node is already starting"
             );
             return Err(Status::already_exists(format!(
                 "sandbox {sandbox_id} is already on this node"

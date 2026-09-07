@@ -2019,6 +2019,224 @@ async fn a_launch_under_an_id_this_process_already_runs_is_refused_and_touches_n
     Ok(())
 }
 
+async fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out {what}");
+        sleep(Duration::from_millis(5)).await;
+    }
+}
+
+fn counting_hook(counter: &Arc<AtomicUsize>) -> Arc<dyn Fn() + Send + Sync> {
+    let counter = Arc::clone(counter);
+    Arc::new(move || {
+        counter.fetch_add(1, Ordering::SeqCst);
+    })
+}
+
+/// Starts a launch that stays inside `start_nowait` until the returned counter
+/// has been observed. That is the window in which nothing yet marks the sandbox
+/// id as taken -- no handle, no record -- so it is where a second launch of the
+/// same id has to meet the claim and nothing else.
+fn slow_launch_behavior(started: &Arc<AtomicUsize>) -> Arc<MockBehavior> {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(MockOperation::StartNowait, counting_hook(started));
+    behavior.push_action(
+        MockOperation::StartNowait,
+        MockAction::SucceedAfter(Duration::from_millis(400)),
+    );
+    behavior
+}
+
+#[tokio::test]
+async fn a_launch_racing_one_still_starting_is_refused_before_it_allocates_anything() -> Result<()>
+{
+    setup();
+    let started = Arc::new(AtomicUsize::new(0));
+    let behavior = slow_launch_behavior(&started);
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let sandbox_id = SandboxId::new();
+    let winner = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .restore_sandbox(sandbox_id, create_request(Some(60), &[("team", "winner")]))
+                .await
+        }
+    });
+    wait_until("waiting for the first launch to reach its start", || {
+        started.load(Ordering::SeqCst) > 0
+    })
+    .await;
+
+    let refused = Arc::clone(&orchestrator)
+        .restore_sandbox(sandbox_id, create_request(Some(60), &[("team", "loser")]))
+        .await
+        .expect_err("an id a launch is holding is not free");
+    assert!(
+        matches!(
+            refused,
+            OrchestratorError::LaunchInFlight { sandbox_id: refused_id } if refused_id == sandbox_id
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "the refused launch must not have started a second runtime under this id"
+    );
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "a launch refused at the claim allocated nothing, so it has nothing to release -- and \
+         the runtime the winner is still building must not be what it releases"
+    );
+
+    let metadata = winner.await.expect("the winning launch task")?;
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "the winner finished, so nothing stopped its runtime"
+    );
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_caller_joining_a_launch_in_flight_is_answered_with_what_that_launch_produced(
+) -> Result<()> {
+    setup();
+    let started = Arc::new(AtomicUsize::new(0));
+    let behavior = slow_launch_behavior(&started);
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let sandbox_id = SandboxId::new();
+    let winner = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .restore_sandbox(sandbox_id, create_request(Some(60), &[("team", "winner")]))
+                .await
+        }
+    });
+    wait_until("waiting for the first launch to reach its start", || {
+        started.load(Ordering::SeqCst) > 0
+    })
+    .await;
+
+    let joined = Arc::clone(&orchestrator)
+        .restore_or_join_launch(sandbox_id, create_request(Some(60), &[("team", "joiner")]))
+        .await?;
+    let launched = winner.await.expect("the winning launch task")?;
+    assert!(joined.joined, "this caller did not perform the launch");
+    assert_eq!(joined.metadata.execution_id, launched.execution_id);
+    assert_eq!(joined.metadata.state, SandboxState::Running);
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "joining is waiting, so nothing was built and nothing was torn down"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_caller_waiting_out_another_replicas_launch_answers_with_the_record_it_left() -> Result<()>
+{
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "elsewhere")]))
+        .await?;
+
+    let waited = orchestrator
+        .await_launch_elsewhere(
+            created.id,
+            OrchestratorError::InternalError("the reservation was refused".to_string()),
+        )
+        .await?;
+    assert_eq!(waited.execution_id, created.execution_id);
+    assert_eq!(waited.state, SandboxState::Running);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_caller_waiting_out_a_launch_of_a_sandbox_being_deleted_is_told_it_is_gone() -> Result<()>
+{
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "elsewhere")]))
+        .await?;
+    orchestrator
+        .store
+        .update_if_state(&created.id, &[SandboxState::Running], |metadata| {
+            metadata.state = SandboxState::Killing
+        })
+        .await?;
+
+    let err = orchestrator
+        .await_launch_elsewhere(
+            created.id,
+            OrchestratorError::InternalError("the reservation was refused".to_string()),
+        )
+        .await
+        .expect_err("a sandbox being torn down is not one to wait for");
+    assert!(
+        matches!(err, OrchestratorError::SandboxNotFound(id) if id == created.id),
+        "{err:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_caller_joining_a_launch_that_fails_fails_with_that_launchs_error() -> Result<()> {
+    setup();
+    let started = Arc::new(AtomicUsize::new(0));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(MockOperation::StartNowait, counting_hook(&started));
+    behavior.push_action(
+        MockOperation::StartNowait,
+        MockAction::FailAfter {
+            delay: Duration::from_millis(400),
+            message: "the runtime refused to start".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let sandbox_id = SandboxId::new();
+    let loser = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .restore_sandbox(sandbox_id, create_request(Some(60), &[("team", "winner")]))
+                .await
+        }
+    });
+    wait_until("waiting for the first launch to reach its start", || {
+        started.load(Ordering::SeqCst) > 0
+    })
+    .await;
+
+    let joined = Arc::clone(&orchestrator)
+        .restore_or_join_launch(sandbox_id, create_request(Some(60), &[("team", "joiner")]))
+        .await
+        .expect_err("a joiner cannot succeed where the launch it joined failed");
+    assert!(
+        matches!(joined, OrchestratorError::InternalError(ref message) if message.contains("the runtime refused to start")),
+        "{joined:?}"
+    );
+    assert!(loser.await.expect("the failing launch task").is_err());
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_launch_takes_an_id_whose_runtime_the_cluster_no_longer_routes_to() -> Result<()> {
     setup();

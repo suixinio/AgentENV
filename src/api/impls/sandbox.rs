@@ -13,9 +13,9 @@ use crate::cfg::ConfigManager;
 use crate::node_client::placement::PlacementRefused;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    CreateSandboxRequest, ForkChildren, NewTimeout, OrchestratorError, SandboxExpiry,
-    SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
-    StoreError,
+    CreateSandboxRequest, ForkChildren, NewTimeout, OrchestratorError, RestoredSandbox,
+    SandboxExpiry, SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState,
+    SandboxTimeoutAction, StoreError,
 };
 use crate::sandbox::network::policy::{DomainRule, EndpointDeclaration, HeaderTransform};
 use crate::sandbox::CustomExtensionParams;
@@ -1055,10 +1055,29 @@ impl Sandboxes<()> for ApiImpl {
         };
         match self
             .orchestrator()
-            .restore_sandbox(sandbox_id, request)
+            .restore_or_join_launch(sandbox_id, request)
             .await
         {
-            Ok(resumed_metadata) => {
+            // A caller that waited out somebody else's launch is answered the
+            // way an already-running sandbox is, because that is what it found.
+            Ok(RestoredSandbox {
+                metadata,
+                joined: true,
+            }) => {
+                let routing = RoutingHeaders::of(&metadata);
+                Ok(
+                    SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                        x_agentenv_execution_id: Some(routing.execution_id),
+                        x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                    },
+                )
+            }
+            Ok(RestoredSandbox {
+                metadata: resumed_metadata,
+                joined: false,
+            }) => {
                 self.note_resume_landing(&record, &resumed_metadata).await;
                 let routing = RoutingHeaders::of(&resumed_metadata);
 
@@ -1701,11 +1720,19 @@ impl Sandboxes<()> for ApiImpl {
         match timer
             .time(
                 "resume",
-                self.orchestrator().restore_sandbox(sandbox_id, request),
+                self.orchestrator()
+                    .restore_or_join_launch(sandbox_id, request),
             )
             .await
         {
-            Ok(metadata) => {
+            Ok(RestoredSandbox {
+                metadata,
+                joined: true,
+            }) => Ok(self.resumed_response(metadata)),
+            Ok(RestoredSandbox {
+                metadata,
+                joined: false,
+            }) => {
                 self.note_resume_landing(&record, &metadata).await;
                 Ok(self.resumed_response(metadata))
             }

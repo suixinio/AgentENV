@@ -408,7 +408,8 @@ impl ApiImpl {
         };
         let attempt = tokio::time::timeout(
             crate::api::proxy::auto_resume_deadline(),
-            self.orchestrator().restore_sandbox(sandbox_id, request),
+            self.orchestrator()
+                .restore_or_join_launch(sandbox_id, request),
         )
         .await;
         let attempt = match attempt {
@@ -423,8 +424,10 @@ impl ApiImpl {
             }
         };
         match attempt {
-            Ok(metadata) => {
-                self.note_resume_landing(&record, &metadata).await;
+            Ok(crate::orchestrator::RestoredSandbox { metadata, joined }) => {
+                if !joined {
+                    self.note_resume_landing(&record, &metadata).await;
+                }
                 let node = self.node_running(sandbox_id).await;
                 self.project_running(
                     sandbox_id,
@@ -433,12 +436,16 @@ impl ApiImpl {
                     metadata.projection_ttl_secs(SystemTime::now()),
                 )
                 .await;
-                info!(%sandbox_id, node_id = %node.node_id, "woke a paused sandbox from its snapshot");
+                if joined {
+                    info!(%sandbox_id, node_id = %node.node_id, "joined a wake-up of this sandbox already in flight");
+                } else {
+                    info!(%sandbox_id, node_id = %node.node_id, "woke a paused sandbox from its snapshot");
+                }
                 DataPlaneResume::Woken {
                     node_id: node.node_id,
                     node_address: node.address,
                     execution_id: metadata.execution_id,
-                    already_running: false,
+                    already_running: joined,
                 }
             }
             // Another wake-up or resume is already building this sandbox.

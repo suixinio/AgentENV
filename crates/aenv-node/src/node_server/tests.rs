@@ -1431,6 +1431,92 @@ async fn a_record_kept_without_a_handle_is_described_and_refuses_a_create() {
 }
 
 #[tokio::test]
+async fn a_create_for_a_sandbox_this_node_is_still_starting_is_already_exists() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // start_nowait is the window with no handle and no record: what refuses a
+    // second create there can only be the claim.
+    let started = Arc::new(AtomicUsize::new(0));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(MockOperation::StartNowait, {
+        let started = Arc::clone(&started);
+        Arc::new(move || {
+            started.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    behavior.push_action(
+        MockOperation::StartNowait,
+        MockAction::SucceedAfter(std::time::Duration::from_millis(400)),
+    );
+    let orchestrator = orchestrator_with(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    )
+    .await;
+    let (orchestration, service) = serve_node(Arc::clone(&orchestrator), mock_snapshot_manager());
+
+    let sandbox_id = SandboxId::new();
+    let starting = tokio::spawn({
+        let orchestration = Arc::clone(&orchestration);
+        async move {
+            orchestration
+                .restore_sandbox(sandbox_id, launch(Some(b"owned")))
+                .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while started.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for the first launch to reach its start"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // The window this test is about: the launch holds the id and nothing else
+    // on this node names it yet.
+    assert!(
+        orchestration
+            .get_sandbox(&sandbox_id)
+            .await
+            .expect("read the node's records")
+            .is_none(),
+        "the launch already wrote its record, so the claim is not what the create meets"
+    );
+
+    let status = service
+        .create(Request::new(pb::SandboxCreateRequest {
+            sandbox_id: sandbox_id.to_string(),
+            source: Some(pb::sandbox_create_request::Source::Snapshot(
+                resolved_snapshot_source(),
+            )),
+            expiry: Some(pb::sandbox_create_request::Expiry::NodeKeptTimeoutMs(
+                60_000,
+            )),
+            timeout_action: pb::TimeoutAction::Pause as i32,
+            control_plane_config: b"owned".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a node already starting this sandbox may not start it a second time");
+    assert_eq!(status.code(), Code::AlreadyExists, "{status:?}");
+    assert!(
+        status.message().contains("is already on this node"),
+        "the caller has to read this the same way it reads a create that found the sandbox \
+         already here: {status:?}"
+    );
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "the refused create must not have torn the running launch down"
+    );
+    starting
+        .await
+        .expect("the first launch task")
+        .expect("the launch the refused create was racing");
+}
+
+#[tokio::test]
 async fn describe_says_not_found_for_a_sandbox_this_node_is_not_running() {
     let (orchestration, service) = service().await;
     let running = start(&orchestration, Some(b"owned")).await;

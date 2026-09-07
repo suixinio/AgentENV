@@ -22,6 +22,9 @@ use crate::snapshot::{SnapshotRuntimeVersions, SnapshotSource};
 use crate::types::{bytes_to_mib_ceil, ExecutionId, SandboxId, SandboxResources};
 
 use super::grants::{GrantIssuer, NoGrants};
+use super::launch_claim::{
+    LaunchClaims, LaunchFailure, LaunchHeldElsewhere, LaunchSettlement, RestoredSandbox,
+};
 use super::launch_plan::{LaunchPlan, LaunchSource};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
@@ -43,6 +46,10 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 /// Guards against indefinite blocking when a sandbox's in-progress operation
 /// never completes (e.g. the task holding the state panics without rolling back).
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a caller waiting out another replica's launch re-reads the shared
+/// record. The launch it waits on writes that record once, from another
+/// process, so there is nothing local to be woken by.
+const LAUNCH_ELSEWHERE_POLL: Duration = Duration::from_millis(250);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Maximum expired sandboxes processed per eviction round.
@@ -145,6 +152,10 @@ pub struct Orchestrator<S: MetadataStore, F: SandboxBackendFactory> {
     /// process whose sandboxes run inside it installs none: its own handles
     /// are the answer.
     runtime_routing: OnceCell<Arc<dyn RuntimeRouting>>,
+    /// The sandbox ids this process is launching. A launch takes its id here
+    /// before it allocates anything, which is the only point early enough to
+    /// keep two launches of one id from ever running together.
+    launch_claims: Arc<LaunchClaims>,
 }
 
 /// Outcome when a process-local sandbox handle is absent.
@@ -229,6 +240,7 @@ where
             pause_publisher: tokio::sync::OnceCell::new(),
             grants: tokio::sync::OnceCell::new(),
             runtime_routing: tokio::sync::OnceCell::new(),
+            launch_claims: Arc::new(LaunchClaims::default()),
         }
     }
 
@@ -277,6 +289,7 @@ where
             pause_publisher: OnceCell::new(),
             grants: OnceCell::new(),
             runtime_routing: OnceCell::new(),
+            launch_claims: Arc::new(LaunchClaims::default()),
         });
 
         // Start the auto-evict task.
@@ -437,6 +450,113 @@ where
             this.create_sandbox_inner(sandbox_id, request).await
         })
         .await
+    }
+
+    /// Starts a sandbox under an id the caller records, joining a launch of
+    /// the same id already in flight rather than starting a second one.
+    ///
+    /// A launch this process holds is waited out in memory; one another replica
+    /// holds is waited out on the shared record. Either way the answer is the
+    /// sandbox that launch produced, or the error it failed with.
+    pub async fn restore_or_join_launch(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request: CreateSandboxRequest,
+    ) -> Result<RestoredSandbox> {
+        let joined = match self.restore_sandbox(sandbox_id, request).await {
+            Err(OrchestratorError::LaunchInFlight { .. }) => self.join_launch(sandbox_id).await,
+            Err(error) if LaunchHeldElsewhere::refused(&error) => {
+                self.await_launch_elsewhere(sandbox_id, error).await
+            }
+            other => {
+                return other.map(|metadata| RestoredSandbox {
+                    metadata,
+                    joined: false,
+                })
+            }
+        };
+        joined.map(|metadata| RestoredSandbox {
+            metadata,
+            joined: true,
+        })
+    }
+
+    /// The incarnation of a launch this process is running under `sandbox_id`.
+    ///
+    /// A launch holds its id from before it allocates anything until its record
+    /// is written, which is a window in which nothing else on this process
+    /// names the sandbox.
+    pub fn launch_in_flight(&self, sandbox_id: SandboxId) -> Option<ExecutionId> {
+        self.launch_claims
+            .in_flight(sandbox_id)
+            .map(|held| held.execution_id())
+    }
+
+    /// Waits out the launch this process is running under `sandbox_id`.
+    async fn join_launch(&self, sandbox_id: SandboxId) -> Result<SandboxMetadata> {
+        let Some(in_flight) = self.launch_claims.in_flight(sandbox_id) else {
+            // The launch settled between the refusal and this lookup, so its
+            // record is what it produced.
+            return self.launched_record(sandbox_id).await;
+        };
+        info!(
+            %sandbox_id,
+            holder_execution_id = %in_flight.execution_id(),
+            "joining a launch of this sandbox already in flight in this process"
+        );
+        match in_flight.join(WAIT_TRANSITION_TIMEOUT).await {
+            Some(LaunchSettlement::Launched(metadata)) => Ok(*metadata),
+            Some(LaunchSettlement::Failed(failure)) => Err(failure.into_error(sandbox_id)),
+            None => {
+                warn!(%sandbox_id, "timed out joining a launch of this sandbox");
+                Err(OrchestratorError::InvalidSandboxState {
+                    sandbox_id,
+                    state: SandboxState::Creating,
+                })
+            }
+        }
+    }
+
+    /// Waits for the launch another replica holds to leave a running record.
+    async fn await_launch_elsewhere(
+        &self,
+        sandbox_id: SandboxId,
+        refusal: OrchestratorError,
+    ) -> Result<SandboxMetadata> {
+        info!(
+            %sandbox_id,
+            "another replica is launching this sandbox; waiting for the record it will write"
+        );
+        let deadline = tokio::time::Instant::now() + WAIT_TRANSITION_TIMEOUT;
+        loop {
+            match self.store.get(&sandbox_id).await? {
+                Some(metadata) if metadata.state == SandboxState::Running => return Ok(metadata),
+                Some(metadata) if metadata.state == SandboxState::Killing => {
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id))
+                }
+                _ => {}
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                warn!(%sandbox_id, "timed out waiting for another replica to finish this launch");
+                // The refusal is what this caller actually met; a launch that
+                // never produced a record has nothing better to report.
+                return Err(refusal);
+            }
+            tokio::time::sleep(LAUNCH_ELSEWHERE_POLL.min(deadline - now)).await;
+        }
+    }
+
+    /// The record a launch left behind, read as its outcome.
+    async fn launched_record(&self, sandbox_id: SandboxId) -> Result<SandboxMetadata> {
+        match self.store.get(&sandbox_id).await? {
+            Some(metadata) if metadata.state == SandboxState::Running => Ok(metadata),
+            Some(metadata) => Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            }),
+            None => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
+        }
     }
 
     /// Converts explicit expiry ownership into a record timeout.
@@ -3023,6 +3143,32 @@ where
 
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
+        // The id is taken here, before anything is allocated, because every
+        // later marker of a launch -- the handle, the record -- only appears
+        // once the runtime is running, and two launches racing to that point
+        // tear each other's resources down.
+        let sandbox_id = plan.sandbox_id;
+        let claim = match self.launch_claims.claim(sandbox_id, plan.execution_id()) {
+            Ok(claim) => claim,
+            Err(held) => {
+                warn!(
+                    %sandbox_id,
+                    held_execution_id = %held.execution_id(),
+                    execution_id = %plan.execution_id(),
+                    "refusing a launch under a sandbox id this process is already launching"
+                );
+                return Err(OrchestratorError::LaunchInFlight { sandbox_id });
+            }
+        };
+        let result = self.launch_claimed_sandbox(plan).await;
+        match &result {
+            Ok(metadata) => claim.settle(LaunchSettlement::Launched(Box::new(metadata.clone()))),
+            Err(error) => claim.settle(LaunchSettlement::Failed(LaunchFailure::of(error))),
+        }
+        result
+    }
+
+    async fn launch_claimed_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
 
         // Stamp before both record persistence and backend construction.

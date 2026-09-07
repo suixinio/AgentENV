@@ -1,5 +1,6 @@
 mod facade;
 pub mod grants;
+mod launch_claim;
 mod launch_plan;
 
 mod metrics;
@@ -17,6 +18,7 @@ use crate::virtualization::VirtualizationMode;
 
 pub use facade::SandboxOrchestration;
 pub use grants::{GrantIssuer, GrantsIssuedUpstream, NoGrants};
+pub use launch_claim::{LaunchFailure, LaunchHeldElsewhere, LaunchSettlement, RestoredSandbox};
 pub use metrics::OrchestratorMetrics;
 #[cfg(any(test, feature = "test-support"))]
 pub use pause_publisher::DiscardingPausePublisher;
@@ -77,6 +79,11 @@ pub enum OrchestratorError {
 
     #[error("sandbox {0} not found")]
     SandboxNotFound(SandboxId),
+
+    /// Another launch under the same sandbox id is still running in this
+    /// process. Nothing was built for the refused one.
+    #[error("sandbox {sandbox_id} is already being launched by this process")]
+    LaunchInFlight { sandbox_id: SandboxId },
 
     #[error("sandbox {sandbox_id} is in invalid state {state:?}")]
     InvalidSandboxState {

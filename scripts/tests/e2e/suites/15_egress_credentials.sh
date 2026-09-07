@@ -287,18 +287,9 @@ if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
    && kubectl -n "${K8S_NAMESPACE:-agentenv-system}" get ds/aenv-egress-node >/dev/null 2>&1; then
   ns="${K8S_NAMESPACE:-agentenv-system}"
 
-  # The chain a rule domain presents is leaf + this node's intermediate, and
-  # the guest trusts neither of them directly — it trusts the root they chain
-  # to. Recorded before the rollout so the comparison after it means something.
+  # What the guest's own trust store makes of a rule domain, recorded before
+  # the rollout so the same question after it means something.
   chain_before=$(guest_chain_report "$sandbox_id")
-  chain_depth=$(printf '%s\n' "$chain_before" | grep -c ' s:' || true)
-  if [[ "${chain_depth:-0}" -ge 2 ]]; then
-    _pass "a rule domain is served leaf + intermediate (${chain_depth} certificates)"
-  else
-    _fail "brokered chain depth" ">= 2" "${chain_depth:-0}"
-  fi
-  issuer_before=$(printf '%s\n' "$chain_before" | grep -o 'AgentENV Egress Node [^,/]*' | head -n 1 || true)
-  assert_not_empty "$issuer_before" "the chain names the node that issued it"
   if chain_verifies "$chain_before"; then
     _pass "the guest verifies the brokered chain against its own trust store"
   else
@@ -312,14 +303,11 @@ if [[ "${E2E_MODE:-}" == "k8s" ]] && command -v kubectl >/dev/null 2>&1 \
   assert_eq "$state" "running" "sandbox survives a broker rollout"
   after_roll=$(brokered_auth_within 60)
   assert_eq "$after_roll" "Bearer ${secret_value}" "brokered requests resume after the rollout"
-  # The restarted broker took a fresh intermediate and re-minted the leaf under
-  # it; the guest's trust store never changed, so the handshake still verifies.
+  # The restarted broker minted the leaf again from the same root it mounts,
+  # and the guest's trust store never changed.
   chain_after=$(guest_chain_report "$sandbox_id")
-  assert_not_empty \
-    "$(printf '%s\n' "$chain_after" | grep -o 'AgentENV Egress Node [^,/]*' | head -n 1 || true)" \
-    "a cached name is re-signed after the intermediate is replaced"
   if chain_verifies "$chain_after"; then
-    _pass "the re-signed chain still verifies against the same root"
+    _pass "the chain still verifies against the same root after the rollout"
   else
     _fail "chain verification after the rollout" "Verify return code: 0 (ok)" \
       "$(printf '%s' "$chain_after" | tr '\n' ' ')"

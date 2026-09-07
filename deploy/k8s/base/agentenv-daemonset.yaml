@@ -503,8 +503,8 @@ spec:
             name: agentenv-k8s-config
         # The CA certificate half of the egress-ca Secret: the root guests
         # with rules are told to trust. `items` keeps the key out of this
-        # mount — the api half is the only workload that holds it, and what
-        # this node signs is nothing.
+        # mount — the broker DaemonSet is the only workload that holds it, and
+        # what this node signs is nothing.
         - name: egress-ca
           secret:
             secretName: egress-ca

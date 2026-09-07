@@ -23,8 +23,10 @@ x-agentenv-base: &agentenv-base
     AENV_EGRESS_BROKER_MODE: local
     AENV_EGRESS_BROKER_SOCKET_PATH: /run/aenv-egress/broker.sock
     # The root the broker beside this node minted into their shared volume.
-    # A guest with rules gets it in its trust store; the intermediate that
-    # signs the leaves stays in the broker container.
+    # A guest with rules gets the certificate half in its trust store, and the
+    # key half is what signs the leaves. Compose gives the two containers one
+    # volume, so `ca.key` sits beside it here; in a cluster the broker
+    # DaemonSet is the only workload that mounts it.
     AENV_EGRESS_BROKER_GUEST_CA_CERT_PATH: /run/aenv-egress/ca.crt
     AENV_CLUSTER_NODE_DISCOVERY_MODE: static
     # Keep in step with `aenv_core::logging::DEFAULT_FILTER`: these are target
@@ -68,13 +70,10 @@ x-control-plane-config-volume: &control-plane-config-volume
 # The mint is `aenv-egress gen-ca`, not the openssl CLI: this image carries
 # the binary and its trust store and no other tooling.
 #
-# The intermediate it mints lasts 30 days and nothing renews it: the renewal
-# loop belongs to `[ca].issuer_url`, which this stack has no api half to point
-# at. Past 30 days the broker keeps signing and every leaf carries
-# `notAfter = now`, so a guest fails the handshake rather than seeing the
-# connection closed. Renewing is `rm /run/aenv-egress/intermediate.*` in the
-# volume and restarting these containers; the root, and every trust store
-# loaded from it, stays.
+# The root it mints lasts ten years. Replacing it is `rm /run/aenv-egress/ca.*`
+# in the volume, restarting these containers and then restarting every sandbox:
+# a guest that loaded its trust store from the old root trusts nothing signed
+# by the new one.
 x-aenv-egress: &aenv-egress
   image: agentenv-egress:latest
   user: "0:0"

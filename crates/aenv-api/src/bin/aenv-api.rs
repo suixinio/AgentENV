@@ -149,29 +149,6 @@ async fn internal_auth(config: &AppConfig) -> anyhow::Result<aenv_api::internal_
     Ok(aenv_api::internal_api::InternalAuth { caller, enabled })
 }
 
-/// The root this half issues node intermediates from, when one is configured.
-fn egress_root_ca(
-    config: &AppConfig,
-) -> anyhow::Result<Option<Arc<aenv_api::egress_ca::EgressRootCa>>> {
-    let Some((cert_path, key_path)) = config.egress_ca.root_paths()? else {
-        return Ok(None);
-    };
-    let certificate = std::fs::read(cert_path)
-        .with_context(|| format!("read egress_ca.root_cert_path {cert_path:?}"))?;
-    let key = zeroize::Zeroizing::new(
-        std::fs::read(key_path)
-            .with_context(|| format!("read egress_ca.root_key_path {key_path:?}"))?,
-    );
-    info!(
-        cert_path = %cert_path.display(),
-        "issuing per-node egress intermediates from the configured root"
-    );
-    Ok(Some(Arc::new(
-        aenv_api::egress_ca::EgressRootCa::from_pem(&certificate, &key)
-            .context("load the egress root")?,
-    )))
-}
-
 async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     let identity = NodeIdentity::from_config(&config.node_identity);
     let store_config = cluster_store_config(&config.orchestrator.store)?;
@@ -332,11 +309,8 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         ),
         None => axum::Router::new(),
     };
-    let internal_routes = aenv_api::internal_api::router(
-        internal_auth(config).await?,
-        egress_root_ca(config)?,
-        credential_routes,
-    );
+    let internal_routes =
+        aenv_api::internal_api::router(internal_auth(config).await?, credential_routes);
 
     Ok(Assembly {
         app: server::new_control_plane_only(api_impl, internal_routes),

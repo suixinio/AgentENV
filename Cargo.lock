@@ -87,7 +87,6 @@ dependencies = [
  "libc",
  "metrics",
  "metrics-util",
- "openssl",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
@@ -178,7 +177,6 @@ name = "aenv-egress"
 version = "0.1.2"
 dependencies = [
  "anyhow",
- "arc-swap",
  "async-trait",
  "axum",
  "base64 0.22.1",

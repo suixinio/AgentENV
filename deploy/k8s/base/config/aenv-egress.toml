@@ -23,17 +23,17 @@ socket_path = "/run/aenv-egress/broker.sock"
 peer_uid = 0
 
 [ca]
-# This node's intermediate, issued by the api half against this Pod's own
-# projected token. Guests trust the *root*, never this intermediate: a
-# sandbox pauses on one node and resumes on another, and a process that loaded
-# its trust store once carries it across the move.
+# The `egress-ca` Secret this DaemonSet mounts: the one root every broker in
+# the deployment signs with, and the one each node hands its guests as
+# `[egress_broker].guest_ca_cert_path`. A sandbox pauses on one node and
+# resumes on another, and a process that loaded its trust store once carries
+# it across the move, so every broker has to sign under the same root.
 #
-# A broker that cannot reach the issuer does not refuse to start — it serves
-# the passthrough path and closes matched names, which is one node degraded
-# rather than one node down. `cert_path` and `key_path` are the other shape,
-# for a stack with no api half to ask (see deploy/docker/config).
-issuer_url = "http://agentenv-api:8000/internal"
-issuer_token_file = "/var/run/secrets/aenv/api/token"
+# Both paths are required. A broker with no root would answer every matched
+# name with a certificate no guest trusts, which surfaces as a TLS failure
+# inside the sandbox rather than at startup, so it refuses to start instead.
+cert_path = "/etc/aenv-egress/ca/ca.crt"
+key_path = "/etc/aenv-egress/ca/ca.key"
 leaf_ttl_secs = 86400
 cache_capacity = 4096
 mints_per_sandbox_per_minute = 60
@@ -51,9 +51,9 @@ denied_cidrs = ["10.42.0.0/16", "10.43.0.0/16"]
 # api half itself:
 #   url = "http://agentenv-api:8000/internal"
 # The NetworkPolicy has to admit whatever it names.
-# The same projected token the issuer endpoint checks, and the only credential
-# either endpoint accepts. Read on every call: kubelet rotates a projected
-# token in place, well inside a broker's uptime.
+# This Pod's own projected token, the only credential the resolve endpoint
+# accepts. Read on every call: kubelet rotates a projected token in place,
+# well inside a broker's uptime.
 token_file = "/var/run/secrets/aenv/api/token"
 timeout_ms = 5000
 # How long a resolved credential is reused. It bounds how long a revocation

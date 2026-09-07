@@ -14,15 +14,14 @@ use aenv_egress::handlers::echo::IdentityEchoHandler;
 use aenv_egress::handlers::http::HttpHandler;
 use aenv_egress::handlers::postgres::PostgresHandler;
 use aenv_egress::handlers::tcp::TcpRelayHandler;
-use aenv_egress::issuer::{keep_current, IntermediateIssuer};
 use aenv_egress::resolver::ResolverSource;
 use aenv_egress::runtime::{self, Options, Runtime};
-use aenv_egress::tls::{generate_ca_chain, CaSigner, SignerOptions, SignerSlot};
+use aenv_egress::tls::{generate_root, CaSigner, SignerOptions};
 use aenv_egress::{BrokerDenyList, CredentialSource, Dispatcher, UpstreamGuard};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use confique::Config;
-use tracing::{info, warn};
+use tracing::info;
 
 const CONFIG_PATH_ENV: &str = "AENV_EGRESS_CONFIG_PATH";
 
@@ -43,9 +42,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Mint a throwaway root and first intermediate into DIR, for a
-    /// deployment with no api half to issue one and no Secret to mount one
-    /// from. Keeps whatever is already there.
+    /// Mint a throwaway root into DIR, for a deployment with no `egress-ca`
+    /// Secret to mount one from. Keeps a root already there.
     GenCa { dir: PathBuf },
 }
 
@@ -105,19 +103,12 @@ struct ListenConfig {
     peer_uid: u32,
 }
 
-/// Where the key that signs leaf certificates for intercepted names comes
-/// from. Either the api half issues this node one — the shape a cluster has —
-/// or a static pair on disk, which is what a stack with no api half to ask
-/// runs on.
+/// The root that signs leaf certificates for intercepted names: the same
+/// pair on every broker in a deployment, and the certificate half of it is
+/// what `[egress_broker].guest_ca_cert_path` puts in each guest's trust
+/// store.
 #[derive(Config)]
 struct CaConfig {
-    /// Base URL the api half issues this node's intermediate at, the same one
-    /// `[resolver].url` names. Set, it wins over the static pair below.
-    #[config(env = "AENV_EGRESS_CA_ISSUER_URL")]
-    issuer_url: Option<String>,
-    /// This Pod's projected ServiceAccount token, audience `aenv-api`.
-    #[config(env = "AENV_EGRESS_CA_ISSUER_TOKEN_FILE")]
-    issuer_token_file: Option<PathBuf>,
     #[config(env = "AENV_EGRESS_CA_CERT_PATH")]
     cert_path: Option<PathBuf>,
     #[config(env = "AENV_EGRESS_CA_KEY_PATH")]
@@ -245,55 +236,18 @@ async fn main() -> Result<()> {
         cache_capacity: config.ca.cache_capacity,
         mints_per_sandbox_per_minute: config.ca.mints_per_sandbox_per_minute,
     };
-    let signer = Arc::new(SignerSlot::empty());
-    let renewal = match config.ca.issuer_url.as_deref() {
-        Some(url) => {
-            let Some(token_file) = config.ca.issuer_token_file.clone() else {
-                bail!(
-                    "ca.issuer_url is set but ca.issuer_token_file is not: the issuing endpoint \
-                     identifies this node by its projected ServiceAccount token, and without one \
-                     no intermediate can be asked for"
-                );
-            };
-            let issuer = Arc::new(
-                IntermediateIssuer::new(url, token_file, Duration::from_millis(5_000))
-                    .context("configure the intermediate issuer")?,
-            );
-            // Not a startup failure. A broker that cannot reach the api
-            // half serves the passthrough path and closes matched names; one
-            // that refuses to start would take that node's sandboxes with it.
-            match issuer.issue(signer_options.clone()).await {
-                Ok(issued) => {
-                    info!(not_after = ?issued.not_after(), "took this node's egress intermediate");
-                    signer.store(Arc::new(issued));
-                }
-                Err(err) => warn!(
-                    error = %format_args!("{err:#}"),
-                    "could not take an egress intermediate at startup; rules domains are closed \
-                     until one is issued"
-                ),
-            }
-            Some((Arc::clone(&signer), issuer, signer_options.clone()))
-        }
-        None => {
-            let (Some(cert_path), Some(key_path)) =
-                (config.ca.cert_path.as_ref(), config.ca.key_path.as_ref())
-            else {
-                bail!(
-                    "the broker needs a leaf-signing key: either ca.issuer_url and \
-                     ca.issuer_token_file, or a static ca.cert_path and ca.key_path"
-                );
-            };
-            let ca_cert = std::fs::read(cert_path)
-                .with_context(|| format!("read ca.cert_path {}", cert_path.display()))?;
-            let ca_key = read_secret_file(key_path, "ca key")?;
-            signer.store(Arc::new(
-                CaSigner::from_pem(&ca_cert, &ca_key, signer_options.clone())
-                    .context("load the leaf signing CA")?,
-            ));
-            None
-        }
-    };
+    let (cert_path, key_path) = signing_pair(&config.ca)?;
+    let ca_cert = std::fs::read(cert_path)
+        .with_context(|| format!("read ca.cert_path {}", cert_path.display()))?;
+    let ca_key = read_secret_file(key_path, "ca key")?;
+    let signer = Arc::new(
+        CaSigner::from_pem(&ca_cert, &ca_key, signer_options)
+            .context("load the leaf signing CA")?,
+    );
+    info!(
+        not_after = ?signer.not_after(),
+        "signing leaf certificates with the root the guests trust"
+    );
 
     let creds: Arc<dyn CredentialSource> = match config.resolver.url.as_deref() {
         Some(url) => {
@@ -366,10 +320,6 @@ async fn main() -> Result<()> {
         Arc::new(dispatcher),
     ));
 
-    if let Some((slot, issuer, options)) = renewal {
-        tokio::spawn(keep_current(slot, issuer, options));
-    }
-
     let listener = bind_socket(&config.listen.socket_path)?;
     info!(
         socket_path = %config.listen.socket_path.display(),
@@ -394,7 +344,6 @@ async fn main() -> Result<()> {
 }
 
 const ROOT_CN: &str = "AgentENV Local Egress Root";
-const INTERMEDIATE_CN: &str = "AgentENV Local Egress Intermediate";
 
 fn present(path: &std::path::Path) -> bool {
     std::fs::metadata(path)
@@ -410,42 +359,40 @@ fn write_pem(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<()> {
         .with_context(|| format!("set the mode of {}", path.display()))
 }
 
-/// Writes `ca.crt`/`ca.key` (the root guests trust) and
-/// `intermediate.crt`/`intermediate.key` (what this broker signs leaves with)
-/// into `dir`. A root already there is kept and only the intermediate is
-/// minted under it: replacing the root would leave every trust store already
-/// loaded from it trusting nothing this broker signs. Renewing is therefore
-/// "delete `intermediate.*` and run this again".
+/// Writes the root guests trust — `ca.crt` and the `ca.key` this broker
+/// signs leaves with — into `dir`. A root already there is kept: replacing it
+/// would leave every trust store already loaded from it trusting nothing this
+/// broker signs. Renewing is "delete both and run this again", followed by a
+/// restart of every sandbox holding the old root.
 fn gen_ca(dir: &PathBuf) -> Result<()> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create the CA directory {}", dir.display()))?;
     let (root_cert, root_key) = (dir.join("ca.crt"), dir.join("ca.key"));
-    let (int_cert, int_key) = (dir.join("intermediate.crt"), dir.join("intermediate.key"));
 
     if present(&root_cert) && present(&root_key) {
-        if present(&int_cert) && present(&int_key) {
-            info!(dir = %dir.display(), "a root and an intermediate are already here");
-            return Ok(());
-        }
-        let (cert_pem, key_pem) = aenv_egress::tls::generate_intermediate(
-            &std::fs::read(&root_cert).with_context(|| format!("read {}", root_cert.display()))?,
-            &std::fs::read(&root_key).with_context(|| format!("read {}", root_key.display()))?,
-            INTERMEDIATE_CN,
-        )
-        .context("mint an intermediate under the root already here")?;
-        write_pem(&int_cert, &cert_pem, 0o644)?;
-        write_pem(&int_key, &key_pem, 0o600)?;
-        info!(dir = %dir.display(), "minted an intermediate under the root already here");
+        info!(dir = %dir.display(), "a root is already here");
         return Ok(());
     }
 
-    let ca = generate_ca_chain(ROOT_CN, INTERMEDIATE_CN).context("mint the CA")?;
-    write_pem(&root_cert, &ca.root_cert_pem, 0o644)?;
-    write_pem(&root_key, &ca.root_key_pem, 0o600)?;
-    write_pem(&int_cert, &ca.intermediate_cert_pem, 0o644)?;
-    write_pem(&int_key, &ca.intermediate_key_pem, 0o600)?;
-    info!(dir = %dir.display(), "minted a root and its first intermediate");
+    let (cert_pem, key_pem) = generate_root(ROOT_CN).context("mint the root")?;
+    write_pem(&root_cert, &cert_pem, 0o644)?;
+    write_pem(&root_key, &key_pem, 0o600)?;
+    info!(dir = %dir.display(), "minted a root");
     Ok(())
+}
+
+/// The pair the broker signs with. Both halves or neither: a broker that came
+/// up without a root would answer every matched name with a certificate no
+/// guest trusts, and that surfaces as a TLS failure inside the sandbox rather
+/// than here.
+fn signing_pair(ca: &CaConfig) -> Result<(&PathBuf, &PathBuf)> {
+    match (ca.cert_path.as_ref(), ca.key_path.as_ref()) {
+        (Some(cert), Some(key)) => Ok((cert, key)),
+        _ => bail!(
+            "the broker signs leaf certificates with the root the guests trust: set both \
+             ca.cert_path and ca.key_path to the `egress-ca` Secret this node mounts"
+        ),
+    }
 }
 
 /// The readiness probe: one empty frame the serving process reads and refuses.
@@ -480,4 +427,77 @@ fn bind_socket(socket_path: &PathBuf) -> Result<tokio::net::UnixListener> {
     )
     .with_context(|| format!("set the mode of {}", socket_path.display()))?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ca(cert_path: Option<&str>, key_path: Option<&str>) -> CaConfig {
+        CaConfig {
+            cert_path: cert_path.map(PathBuf::from),
+            key_path: key_path.map(PathBuf::from),
+            leaf_ttl_secs: 86_400,
+            cache_capacity: 4096,
+            mints_per_sandbox_per_minute: 60,
+        }
+    }
+
+    #[test]
+    fn a_broker_holding_half_a_signing_pair_refuses_to_start() {
+        for half in [
+            (None, None),
+            (Some("/etc/aenv-egress/ca/ca.crt"), None),
+            (None, Some("/etc/aenv-egress/ca/ca.key")),
+        ] {
+            let refused = signing_pair(&ca(half.0, half.1))
+                .expect_err("a broker with no root would serve certificates nothing trusts");
+            let said = format!("{refused:#}");
+            assert!(
+                said.contains("ca.cert_path") && said.contains("ca.key_path"),
+                "{said}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_halves_are_the_pair_leaves_are_signed_with() {
+        let config = ca(Some("/ca/ca.crt"), Some("/ca/ca.key"));
+
+        let (cert, key) = signing_pair(&config).unwrap();
+
+        assert_eq!(cert.as_path(), std::path::Path::new("/ca/ca.crt"));
+        assert_eq!(key.as_path(), std::path::Path::new("/ca/ca.key"));
+    }
+
+    #[test]
+    fn gen_ca_mints_one_root_and_nothing_under_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().to_path_buf();
+
+        gen_ca(&at).unwrap();
+
+        let mut written: Vec<String> = std::fs::read_dir(&at)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        written.sort();
+        assert_eq!(written, ["ca.crt", "ca.key"]);
+    }
+
+    #[test]
+    fn gen_ca_keeps_a_root_that_is_already_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let at = dir.path().to_path_buf();
+        gen_ca(&at).unwrap();
+        let first = std::fs::read(at.join("ca.crt")).unwrap();
+
+        gen_ca(&at).unwrap();
+
+        assert_eq!(
+            std::fs::read(at.join("ca.crt")).unwrap(),
+            first,
+            "a replaced root leaves every guest already holding the old one trusting nothing"
+        );
+    }
 }

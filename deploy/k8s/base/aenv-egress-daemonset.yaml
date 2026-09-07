@@ -7,9 +7,9 @@
 # machine; only a separate workload can be rolled without taking the sandboxes
 # with it. That is the whole reason this object exists.
 #
-# It holds the leaf-signing key it mints under the intermediate the api half
-# issues it; that key never reaches a node. Its credential at the api half's
-# internal endpoints is its own projected ServiceAccount token, so this Pod
+# It mounts the `egress-ca` Secret and signs each leaf directly with the root
+# the guests trust; no node holds that key. Its credential at the api half's
+# resolve endpoint is its own projected ServiceAccount token, so this Pod
 # mounts no shared bearer.
 #
 # It prepares its own socket directory. The init container below is the only
@@ -149,13 +149,24 @@ spec:
             - name: api-token
               mountPath: /var/run/secrets/aenv/api
               readOnly: true
+            # The root every broker in this deployment signs leaves with, and
+            # whose certificate half each node hands its guests as
+            # `[egress_broker].guest_ca_cert_path`. The broker refuses to
+            # start without both files.
+            - name: egress-ca
+              mountPath: /etc/aenv-egress/ca
+              readOnly: true
       volumes:
         - name: config
           configMap:
             name: aenv-egress-local-config
-        # No `egress-ca` volume, and that is the point of the intermediate:
-        # the root's key stays in the api half's own mount, and this Pod holds
-        # a key that expires in a week and cannot sign a cluster-internal name.
+        # 0440 and not 0400: `fsGroup` below gives every file in this volume
+        # to root and the Pod's group, and the broker runs as neither root nor
+        # the file's owner — it reads `ca.key` through that group.
+        - name: egress-ca
+          secret:
+            secretName: egress-ca
+            defaultMode: 0440
         # The same path `agentenv-node` mounts. `DirectoryOrCreate` is what
         # creates it on a machine that has never run either workload; the init
         # container is what makes it bindable.

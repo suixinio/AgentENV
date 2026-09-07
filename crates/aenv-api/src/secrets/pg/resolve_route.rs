@@ -1,10 +1,10 @@
 //! The broker's resolve endpoint, served by the api half for
 //! `[secrets].backend = "postgres"`.
 //!
-//! The credential layer is `crate::internal_api`'s, shared with the
-//! intermediate endpoint. What is this route's own is the node scope: a
-//! broker asks only about sandboxes bound to the machine it runs on, so a
-//! compromised broker on one node reads nothing about another's.
+//! The credential layer is `crate::internal_api`'s. What is this route's own
+//! is the node scope: a broker asks only about sandboxes bound to the machine
+//! it runs on, so a compromised broker on one node reads nothing about
+//! another's.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -254,7 +254,6 @@ mod tests {
                 ])),
                 enabled: true,
             },
-            None,
             router(values, bindings),
         )
     }

@@ -24,10 +24,11 @@ resources:
   - agentenv-api-service.yaml
   - agentenv-api-pdb.yaml
   # The egress broker for sandboxes with network.rules, one per node. It
-  # mounts no operator-minted Secret: its credential at the api half's
-  # internal endpoints is its own projected ServiceAccount token, and the
-  # signing key it holds is the intermediate that endpoint issues it. There is
-  # no Service: the node reaches its own machine's broker over a Unix socket.
+  # mounts the operator-minted `egress-ca` Secret and signs each leaf with the
+  # root in it, the same root its node hands the guests; its credential at the
+  # api half's resolve endpoint is its own projected ServiceAccount token.
+  # There is no Service: the node reaches its own machine's broker over a Unix
+  # socket.
   - aenv-egress-daemonset.yaml
   - aenv-egress-networkpolicy.yaml
 

@@ -7,10 +7,6 @@
 //! generated API-key authentication does not reach them, and a broker holding
 //! a user API key would hold the whole REST surface.
 
-mod intermediate;
-
-use std::sync::Arc;
-
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
@@ -19,10 +15,7 @@ use axum::{Json, Router};
 use serde_json::json;
 use tracing::{debug, warn};
 
-use crate::egress_ca::EgressRootCa;
 use crate::internal_auth::{CallerError, SharedCallerNode};
-
-pub use intermediate::INTERMEDIATE_PATH;
 
 /// A request is a handful of short identifiers; the credential check runs
 /// before the body is read, and a body past this is refused unread.
@@ -42,14 +35,10 @@ pub struct InternalAuth {
     pub enabled: bool,
 }
 
-/// Mounts the broker's endpoints. `root_ca` absent leaves the intermediate
-/// endpoint out; `extra` carries whatever the credential backend added.
-pub fn router(auth: InternalAuth, root_ca: Option<Arc<EgressRootCa>>, extra: Router) -> Router {
-    let mut router = extra;
-    if let Some(root_ca) = root_ca {
-        router = router.merge(intermediate::router(root_ca));
-    }
-    router
+/// Mounts the broker's endpoints; `extra` carries whatever the credential
+/// backend added.
+pub fn router(auth: InternalAuth, extra: Router) -> Router {
+    extra
         .route_layer(middleware::from_fn_with_state(auth.clone(), require_caller))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
 }
@@ -115,6 +104,8 @@ fn unauthorized() -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::internal_auth::StaticCallerNode;
 

@@ -20,8 +20,6 @@ pub mod framing;
 pub mod handler;
 pub mod handlers;
 pub mod header;
-#[cfg(all(feature = "tls", feature = "resolver"))]
-pub mod issuer;
 pub mod marker;
 pub mod policy;
 #[cfg(feature = "resolver")]

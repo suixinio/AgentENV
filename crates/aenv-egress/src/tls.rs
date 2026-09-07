@@ -1,6 +1,10 @@
-//! Leaf certificates for intercepted names, signed by the cluster CA the
-//! guests trust. A leaf is minted only after a rule matched the name; a
-//! name no rule covers is never signed.
+//! Leaf certificates for intercepted names, signed by the root the guests
+//! trust — the same key every broker in a deployment holds. A leaf is minted
+//! only after a rule matched the name; a name no rule covers is never signed.
+//!
+//! One layer, and no chain on the wire: the guest already has the certificate
+//! that signed the leaf, because `[egress_broker].guest_ca_cert_path` put it
+//! in the trust store before any of this ran.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -66,56 +70,16 @@ impl Default for SignerOptions {
 pub struct CaSigner {
     key: PKey<Private>,
     cert: X509,
-    cert_pem: Vec<u8>,
-    not_before: SystemTime,
     not_after: SystemTime,
     options: SignerOptions,
     cache: Mutex<LeafCache>,
     budgets: Mutex<HashMap<String, (u64, u32)>>,
 }
 
-/// How long a leaf must still outlive its issuer. A leaf that outlived the
-/// intermediate that signed it would fail verification for the rest of its
-/// own life, and the cache would keep serving it.
+/// How long a leaf must still outlive the root that signed it. A leaf that
+/// outlived its issuer would fail verification for the rest of its own life,
+/// and the cache would keep serving it.
 const ISSUER_MARGIN: Duration = Duration::from_secs(3600);
-
-/// The signer the handler mints from, replaceable while connections are open.
-///
-/// Empty is a state a broker runs in: one that could not reach the issuer
-/// serves the passthrough path and answers a matched name 502 rather than
-/// refusing to start. Replacing the signer replaces its leaf cache with it,
-/// so no leaf signed by a retired issuer can be served afterwards.
-#[derive(Default)]
-pub struct SignerSlot {
-    current: arc_swap::ArcSwapOption<CaSigner>,
-}
-
-impl SignerSlot {
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    pub fn holding(signer: Arc<CaSigner>) -> Self {
-        let slot = Self::default();
-        slot.store(signer);
-        slot
-    }
-
-    pub fn load(&self) -> Option<Arc<CaSigner>> {
-        self.current.load_full()
-    }
-
-    pub fn store(&self, signer: Arc<CaSigner>) {
-        self.current.store(Some(signer));
-    }
-
-    /// Empties the slot. A handler that finds it empty closes the names a
-    /// rule matched, which is the only honest answer when there is nothing
-    /// left to sign with.
-    pub fn clear(&self) {
-        self.current.store(None);
-    }
-}
 
 /// A leaf still worth serving has to outlive the connection about to use it.
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
@@ -141,13 +105,10 @@ impl CaSigner {
     ) -> Result<Self, SignError> {
         let cert = X509::from_pem(ca_cert_pem)?;
         let key = PKey::private_key_from_pem(ca_key_pem)?;
-        let not_before = asn1_to_system_time(cert.not_before())?;
         let not_after = asn1_to_system_time(cert.not_after())?;
         Ok(Self {
             key,
             cert,
-            cert_pem: ca_cert_pem.to_vec(),
-            not_before,
             not_after,
             options,
             cache: Mutex::new(LeafCache {
@@ -159,22 +120,10 @@ impl CaSigner {
         })
     }
 
-    /// The CA certificate as guests receive it.
-    pub fn ca_cert_pem(&self) -> &[u8] {
-        &self.cert_pem
-    }
-
-    /// When this issuer stops being usable.
+    /// When the root this signs with stops being usable, which is also when
+    /// the leaves it has already minted stop verifying.
     pub fn not_after(&self) -> SystemTime {
         self.not_after
-    }
-
-    /// The whole window this issuer was signed for, which is what a renewal
-    /// schedule is a fraction of.
-    pub fn lifetime(&self) -> Duration {
-        self.not_after
-            .duration_since(self.not_before)
-            .unwrap_or(Duration::ZERO)
     }
 
     /// A leaf for `name`, from the cache when one is live, otherwise minted
@@ -222,8 +171,10 @@ impl CaSigner {
         Ok(leaf)
     }
 
-    /// A leaf lives for its TTL, or until an hour before its issuer stops
-    /// being usable, whichever comes first.
+    /// A leaf lives for its TTL, or until an hour before the root stops being
+    /// usable, whichever comes first. The root outlasts a leaf by years in
+    /// every normal deployment; this is what keeps the last day before a root
+    /// expires from minting leaves nothing can verify.
     fn leaf_expiry(&self, now: SystemTime) -> SystemTime {
         let by_ttl = now + self.options.leaf_ttl;
         let by_issuer = self.not_after.checked_sub(ISSUER_MARGIN).unwrap_or(now);
@@ -249,6 +200,29 @@ impl CaSigner {
     }
 
     fn mint(&self, name: &str, now: SystemTime) -> Result<Leaf, SignError> {
+        let (leaf_cert, leaf_key, expires_at) = self.mint_cert(name, now)?;
+
+        // The leaf alone: what signed it is the root already in the guest's
+        // trust store, and sending a certificate the peer must have anyway
+        // adds a round of bytes and nothing else.
+        let leaf_pem = leaf_cert.to_pem()?;
+        let key_pem = leaf_key.private_key_to_pem_pkcs8()?;
+        let identity = native_tls::Identity::from_pkcs8(&leaf_pem, &key_pem)?;
+        let acceptor = native_tls::TlsAcceptor::builder(identity)
+            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
+            .build()?;
+        Ok(Leaf {
+            name: name.to_string(),
+            acceptor: tokio_native_tls::TlsAcceptor::from(acceptor),
+            expires_at,
+        })
+    }
+
+    fn mint_cert(
+        &self,
+        name: &str,
+        now: SystemTime,
+    ) -> Result<(X509, PKey<Private>, SystemTime), SignError> {
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
         let leaf_key = PKey::from_ec_key(EcKey::generate(&group)?)?;
 
@@ -282,20 +256,7 @@ impl CaSigner {
             .build(&builder.x509v3_context(Some(&self.cert), None))?;
         builder.append_extension(san)?;
         builder.sign(&self.key, MessageDigest::sha256())?;
-        let leaf_cert = builder.build();
-
-        let mut chain_pem = leaf_cert.to_pem()?;
-        chain_pem.extend_from_slice(&self.cert_pem);
-        let key_pem = leaf_key.private_key_to_pem_pkcs8()?;
-        let identity = native_tls::Identity::from_pkcs8(&chain_pem, &key_pem)?;
-        let acceptor = native_tls::TlsAcceptor::builder(identity)
-            .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
-            .build()?;
-        Ok(Leaf {
-            name: name.to_string(),
-            acceptor: tokio_native_tls::TlsAcceptor::from(acceptor),
-            expires_at,
-        })
+        Ok((builder.build(), leaf_key, expires_at))
     }
 }
 
@@ -334,15 +295,8 @@ pub fn is_certifiable_name(name: &str) -> bool {
         })
 }
 
-/// A CA certificate and its key: self-signed when `issuer` is absent,
-/// otherwise signed by it. `path_len` bounds how many CAs may sit below this
-/// one; `Some(0)` is an issuer that may sign leaves and nothing else.
-fn new_ca(
-    common_name: &str,
-    days: u32,
-    issuer: Option<(&X509, &PKey<Private>)>,
-    path_len: Option<u32>,
-) -> Result<(X509, PKey<Private>), SignError> {
+/// A self-signed CA certificate and its key, good for `days`.
+fn new_root(common_name: &str, days: u32) -> Result<(X509, PKey<Private>), SignError> {
     let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
     let key = PKey::from_ec_key(EcKey::generate(&group)?)?;
     let mut subject = X509NameBuilder::new()?;
@@ -354,19 +308,11 @@ fn new_ca(
     serial.rand(127, MsbOption::MAYBE_ZERO, false)?;
     builder.set_serial_number(serial.to_asn1_integer()?.as_ref())?;
     builder.set_subject_name(&subject)?;
-    match issuer {
-        Some((issuer_cert, _)) => builder.set_issuer_name(issuer_cert.subject_name())?,
-        None => builder.set_issuer_name(&subject)?,
-    }
+    builder.set_issuer_name(&subject)?;
     builder.set_pubkey(&key)?;
     builder.set_not_before(Asn1Time::days_from_now(0)?.as_ref())?;
     builder.set_not_after(Asn1Time::days_from_now(days)?.as_ref())?;
-    let mut constraints = BasicConstraints::new();
-    constraints.critical().ca();
-    if let Some(path_len) = path_len {
-        constraints.pathlen(path_len);
-    }
-    builder.append_extension(constraints.build()?)?;
+    builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
     builder.append_extension(
         KeyUsage::new()
             .critical()
@@ -374,72 +320,14 @@ fn new_ca(
             .crl_sign()
             .build()?,
     )?;
-    match issuer {
-        Some((_, issuer_key)) => builder.sign(issuer_key, MessageDigest::sha256())?,
-        None => builder.sign(&key, MessageDigest::sha256())?,
-    }
+    builder.sign(&key, MessageDigest::sha256())?;
     Ok((builder.build(), key))
 }
 
-/// A throwaway CA for tests and local runs: returns (cert PEM, PKCS#8 key PEM).
-pub fn generate_test_ca(common_name: &str) -> Result<(Vec<u8>, Vec<u8>), SignError> {
-    let (cert, key) = new_ca(common_name, 3650, None, None)?;
-    Ok((cert.to_pem()?, key.private_key_to_pem_pkcs8()?))
-}
-
-/// How long a minted intermediate lives. A cluster's own intermediates come
-/// from the api half and last a week; this one is renewed by hand, so it is
-/// longer.
-const INTERMEDIATE_DAYS: u32 = 30;
-
-/// The two halves a deployment without an api half has to mint for itself:
-/// the root its guests trust, and the intermediate one broker signs leaves
-/// with. A cluster gets the second half from `POST /internal/egress/intermediate`
-/// instead, and no node ever holds the first.
-pub struct GeneratedCa {
-    pub root_cert_pem: Vec<u8>,
-    pub root_key_pem: Vec<u8>,
-    pub intermediate_cert_pem: Vec<u8>,
-    pub intermediate_key_pem: Vec<u8>,
-}
-
-/// Mints a root and the first intermediate under it. The root outlives the
-/// intermediate by design: `generate_intermediate` issues the next one
-/// against the same root, and the guests' trust store does not move.
-pub fn generate_ca_chain(
-    root_common_name: &str,
-    intermediate_common_name: &str,
-) -> Result<GeneratedCa, SignError> {
-    let (root_cert, root_key) = new_ca(root_common_name, 3650, None, Some(1))?;
-    let (intermediate_cert, intermediate_key) = new_ca(
-        intermediate_common_name,
-        INTERMEDIATE_DAYS,
-        Some((&root_cert, &root_key)),
-        Some(0),
-    )?;
-    Ok(GeneratedCa {
-        root_cert_pem: root_cert.to_pem()?,
-        root_key_pem: root_key.private_key_to_pem_pkcs8()?,
-        intermediate_cert_pem: intermediate_cert.to_pem()?,
-        intermediate_key_pem: intermediate_key.private_key_to_pem_pkcs8()?,
-    })
-}
-
-/// The next intermediate under a root that already exists, as (cert PEM,
-/// PKCS#8 key PEM).
-pub fn generate_intermediate(
-    root_cert_pem: &[u8],
-    root_key_pem: &[u8],
-    common_name: &str,
-) -> Result<(Vec<u8>, Vec<u8>), SignError> {
-    let root_cert = X509::from_pem(root_cert_pem)?;
-    let root_key = PKey::private_key_from_pem(root_key_pem)?;
-    let (cert, key) = new_ca(
-        common_name,
-        INTERMEDIATE_DAYS,
-        Some((&root_cert, &root_key)),
-        Some(0),
-    )?;
+/// A self-signed root, as (cert PEM, PKCS#8 key PEM). The one a deployment
+/// with no Secret to mount mints for itself, and the one tests use.
+pub fn generate_root(common_name: &str) -> Result<(Vec<u8>, Vec<u8>), SignError> {
+    let (cert, key) = new_root(common_name, 3650)?;
     Ok((cert.to_pem()?, key.private_key_to_pem_pkcs8()?))
 }
 
@@ -449,7 +337,7 @@ mod tests {
 
     #[test]
     fn a_leaf_never_outlives_the_issuer_that_signed_it() {
-        let (cert, key) = generate_test_ca("issuer margin").unwrap();
+        let (cert, key) = generate_root("issuer margin").unwrap();
         // A leaf TTL longer than the issuer's own remaining life.
         let signer = CaSigner::from_pem(
             &cert,
@@ -471,7 +359,7 @@ mod tests {
 
     #[test]
     fn a_leaf_shorter_than_its_issuer_keeps_its_own_ttl() {
-        let (cert, key) = generate_test_ca("issuer margin").unwrap();
+        let (cert, key) = generate_root("issuer margin").unwrap();
         let leaf_ttl = Duration::from_secs(3600);
         let signer = CaSigner::from_pem(
             &cert,
@@ -494,78 +382,37 @@ mod tests {
     }
 
     #[test]
-    fn a_generated_intermediate_verifies_against_its_own_root() {
-        let ca = generate_ca_chain("gen-ca root", "gen-ca intermediate").unwrap();
+    fn the_leaf_is_signed_by_the_root_the_guest_was_given() {
+        let (cert, key) = generate_root("single layer root").unwrap();
+        let signer = CaSigner::from_pem(&cert, &key, SignerOptions::default()).unwrap();
 
-        let root = X509::from_pem(&ca.root_cert_pem).unwrap();
-        let intermediate = X509::from_pem(&ca.intermediate_cert_pem).unwrap();
+        let (leaf, _, _) = signer.mint_cert("api.test", SystemTime::now()).unwrap();
+        let root = X509::from_pem(&cert).unwrap();
 
         assert!(
-            intermediate
-                .verify(root.public_key().unwrap().as_ref())
-                .unwrap(),
-            "the intermediate is not signed by the root written beside it"
+            leaf.verify(root.public_key().unwrap().as_ref()).unwrap(),
+            "nothing between the root and the leaf: the guest trusts the root alone"
         );
-        assert!(
-            intermediate
-                .subject_name()
-                .try_cmp(root.subject_name())
-                .unwrap()
-                != std::cmp::Ordering::Equal,
-            "the intermediate is self-signed, so nothing below it chains to the root"
-        );
-    }
-
-    #[test]
-    fn a_renewed_intermediate_is_a_different_certificate_under_the_same_root() {
-        let ca = generate_ca_chain("renewal root", "renewal intermediate").unwrap();
-
-        let (renewed_pem, _) =
-            generate_intermediate(&ca.root_cert_pem, &ca.root_key_pem, "renewal intermediate")
-                .unwrap();
-
-        let root = X509::from_pem(&ca.root_cert_pem).unwrap();
-        let renewed = X509::from_pem(&renewed_pem).unwrap();
-        assert!(renewed.verify(root.public_key().unwrap().as_ref()).unwrap());
-        assert_ne!(
-            renewed_pem, ca.intermediate_cert_pem,
-            "a renewal that returns the same certificate renews nothing"
-        );
-    }
-
-    #[test]
-    fn a_leaf_the_generated_intermediate_signs_carries_the_intermediate_with_it() {
-        let ca = generate_ca_chain("chain root", "chain intermediate").unwrap();
-        let signer = CaSigner::from_pem(
-            &ca.intermediate_cert_pem,
-            &ca.intermediate_key_pem,
-            SignerOptions::default(),
-        )
-        .unwrap();
-
-        signer.leaf_for("api.test", "sbx-1").unwrap();
-
         assert_eq!(
-            signer.ca_cert_pem(),
-            ca.intermediate_cert_pem,
-            "a guest that trusts the root needs the intermediate in the chain it receives"
+            leaf.issuer_name().try_cmp(root.subject_name()).unwrap(),
+            std::cmp::Ordering::Equal
         );
     }
 
     #[test]
-    fn an_empty_slot_holds_nothing_and_a_stored_signer_is_the_one_that_comes_back() {
-        let slot = SignerSlot::empty();
-        assert!(slot.load().is_none());
+    fn a_generated_root_signs_itself() {
+        let (cert, _) = generate_root("gen-ca root").unwrap();
+        let root = X509::from_pem(&cert).unwrap();
 
-        let (cert, key) = generate_test_ca("slot").unwrap();
-        let signer = Arc::new(CaSigner::from_pem(&cert, &key, SignerOptions::default()).unwrap());
-        slot.store(Arc::clone(&signer));
-
-        assert!(Arc::ptr_eq(&slot.load().unwrap(), &signer));
+        assert!(root.verify(root.public_key().unwrap().as_ref()).unwrap());
+        assert_eq!(
+            root.subject_name().try_cmp(root.issuer_name()).unwrap(),
+            std::cmp::Ordering::Equal
+        );
     }
 
     fn signer(options: SignerOptions) -> CaSigner {
-        let (cert, key) = generate_test_ca("AgentENV Egress Test CA").unwrap();
+        let (cert, key) = generate_root("AgentENV Egress Test CA").unwrap();
         CaSigner::from_pem(&cert, &key, options).unwrap()
     }
 

@@ -23,13 +23,11 @@ socket_path = "/run/aenv-egress/broker.sock"
 peer_uid = 0
 
 [ca]
-# The static pair, not `issuer_url`: this stack has no api half to issue an
-# intermediate, so the broker signs with the one its own entrypoint minted.
-# It is the intermediate and not the root beside it — the guests trust the
-# root, and a chain that ends at the certificate the guest already holds is
-# the shape a cluster has.
-cert_path = "/run/aenv-egress/intermediate.crt"
-key_path = "/run/aenv-egress/intermediate.key"
+# The root this stack's own entrypoint minted, because there is no Secret to
+# mount one from. The same file the node hands its guests: what signs a leaf
+# is what the guest trusts, with nothing in between.
+cert_path = "/run/aenv-egress/ca.crt"
+key_path = "/run/aenv-egress/ca.key"
 leaf_ttl_secs = 86400
 cache_capacity = 256
 mints_per_sandbox_per_minute = 60

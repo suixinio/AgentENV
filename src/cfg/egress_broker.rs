@@ -250,33 +250,3 @@ mod secrets_backend_tests {
         }
     }
 }
-
-/// The root `aenv-api` signs per-node egress intermediates with. Only the api
-/// half reads it; a node never holds a signing key.
-#[derive(Debug, Config, Clone)]
-pub struct EgressCaConfig {
-    /// PEM certificate of the root guests trust. Unset leaves the
-    /// intermediate endpoint unmounted.
-    #[config(env = "AENV_EGRESS_CA_ROOT_CERT_PATH")]
-    pub root_cert_path: Option<PathBuf>,
-    /// Its private key, as a path and never a value.
-    #[config(env = "AENV_EGRESS_CA_ROOT_KEY_PATH")]
-    pub root_key_path: Option<PathBuf>,
-}
-
-impl EgressCaConfig {
-    /// The pair, when both halves are configured. One without the other is a
-    /// startup error: an operator who set one meant to set both.
-    pub fn root_paths(&self) -> Result<Option<(&PathBuf, &PathBuf)>> {
-        match (self.root_cert_path.as_ref(), self.root_key_path.as_ref()) {
-            (Some(cert), Some(key)) => Ok(Some((cert, key))),
-            (None, None) => Ok(None),
-            (Some(_), None) => {
-                bail!("egress_ca.root_cert_path is set without egress_ca.root_key_path")
-            }
-            (None, Some(_)) => {
-                bail!("egress_ca.root_key_path is set without egress_ca.root_cert_path")
-            }
-        }
-    }
-}

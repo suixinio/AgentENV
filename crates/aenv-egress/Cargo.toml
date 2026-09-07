@@ -28,7 +28,6 @@ local = ["dep:metrics"]
 # openssl only. The broker binary enables it; `make check-crate-boundaries`
 # fails if `aenv-node` does.
 tls = [
-    "dep:arc-swap",
     "dep:openssl",
     "dep:native-tls",
     "dep:tokio-native-tls",
@@ -67,9 +66,6 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi
 tracing = "0.1.41"
 zeroize = "1"
 anyhow = "1.0.100"
-# Swapping the leaf-signing CA under live connections. No TLS, no allocation
-# on the read path.
-arc-swap = { version = "1.9", optional = true }
 openssl = { version = "0.10", optional = true }
 native-tls = { version = "0.2", optional = true }
 tokio-native-tls = { version = "0.3", optional = true }

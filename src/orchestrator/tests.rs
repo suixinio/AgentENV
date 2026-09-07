@@ -165,6 +165,46 @@ impl PausePublisher for FlakyPausePublisher {
     }
 }
 
+/// Takes `per_attempt` to answer, and never commits.
+struct SlowFailingPausePublisher {
+    per_attempt: Duration,
+    attempts: AtomicUsize,
+}
+
+impl SlowFailingPausePublisher {
+    fn new(per_attempt: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            per_attempt,
+            attempts: AtomicUsize::new(0),
+        })
+    }
+
+    fn attempts(&self) -> usize {
+        self.attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl PausePublisher for SlowFailingPausePublisher {
+    async fn publish(
+        &self,
+        _metadata: &SandboxMetadata,
+        _capture: CapturedSandboxSnapshot,
+    ) -> anyhow::Result<PublishedPause> {
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        sleep(self.per_attempt).await;
+        Err(anyhow::anyhow!("the catalog is unreachable"))
+    }
+
+    async fn published_since(
+        &self,
+        _sandbox_id: SandboxId,
+        _not_before_unix_ms: i64,
+    ) -> anyhow::Result<Option<crate::snapshot::SnapshotId>> {
+        Ok(None)
+    }
+}
+
 #[async_trait]
 impl PausePublisher for FailingPausePublisher {
     async fn publish(
@@ -1934,6 +1974,59 @@ async fn a_pause_whose_vm_is_gone_retries_the_commit_of_the_bytes_the_node_stage
         "the commit that finally landed was the third attempt"
     );
     assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    Ok(())
+}
+
+#[test]
+fn a_joined_pause_waits_out_the_owners_whole_retry_budget() {
+    assert!(
+        CONCURRENT_PAUSE_WAIT >= PAUSE_PUBLICATION_RETRY_DEADLINE + PAUSE_JOIN_MARGIN,
+        "a joiner that gives up before the owner's retries end answers 'stuck' about a \
+         pause that is still working: joiner {CONCURRENT_PAUSE_WAIT:?}, owner budget \
+         {PAUSE_PUBLICATION_RETRY_DEADLINE:?} plus {PAUSE_JOIN_MARGIN:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pause_commit_retries_stop_at_their_deadline_however_slow_each_attempt_is() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.make_captures_staged();
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "the vm is gone".to_string(),
+        },
+    );
+    // Two attempts fit inside the budget; the third backoff would end past it.
+    let publisher = SlowFailingPausePublisher::new(Duration::from_secs(20));
+    let orchestrator = make_orchestrator_without_publisher(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        TEST_DEFAULT_SANDBOX_TIMEOUT,
+    );
+    orchestrator.set_pause_publisher(Arc::clone(&publisher) as Arc<dyn PausePublisher>);
+    let created = orchestrator
+        .create_sandbox(create_request(Some(600), &[("team", "pause-deadline")]))
+        .await?;
+
+    let started = tokio::time::Instant::now();
+    orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("every commit was refused");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        publisher.attempts(),
+        3,
+        "the retry loop must stop at its deadline rather than run out its attempt count"
+    );
+    assert!(
+        elapsed < CONCURRENT_PAUSE_WAIT,
+        "a caller joining this pause waits {CONCURRENT_PAUSE_WAIT:?}, and the owner took \
+         {elapsed:?}"
+    );
     Ok(())
 }
 

@@ -58,9 +58,21 @@ const GRANT_REAP_BATCH_LIMIT: usize = 256;
 /// are the only copy of the sandbox from the first attempt on, so the commit
 /// is retried rather than abandoned.
 const PAUSE_PUBLICATION_ATTEMPTS: u32 = 5;
-/// Delay before the second attempt; each further wait doubles it, so five
-/// attempts span about thirty seconds.
+/// Delay before the second attempt; each further wait doubles it.
 const PAUSE_PUBLICATION_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+/// Wall-clock budget for the retries, measured from the first failed commit.
+/// An attempt whose backoff would end after it is not started, so the number
+/// of attempts is a ceiling and this is the bound.
+const PAUSE_PUBLICATION_RETRY_DEADLINE: Duration = Duration::from_secs(45);
+/// Slack over that budget for the capture, the commit that failed first and
+/// the attempt still running when the budget ends.
+const PAUSE_JOIN_MARGIN: Duration = Duration::from_secs(30);
+/// How long a caller waits out a pause somebody else is performing. It has to
+/// cover the owner's whole retry budget, or it answers "stuck" about a pause
+/// that is still working.
+const CONCURRENT_PAUSE_WAIT: Duration = Duration::from_secs(
+    PAUSE_PUBLICATION_RETRY_DEADLINE.as_secs() + PAUSE_JOIN_MARGIN.as_secs(),
+);
 
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
@@ -1969,17 +1981,29 @@ where
     /// Commits an already-staged pause capture again, with bounded backoff.
     ///
     /// Only reached when the VM is gone: the alternative to a retry is losing
-    /// the sandbox, so this waits rather than failing fast.
+    /// the sandbox, so this waits rather than failing fast. It stops at
+    /// [`PAUSE_PUBLICATION_RETRY_DEADLINE`], which is what a caller waiting out
+    /// this pause budgets for.
     async fn retry_pause_publication(
         &self,
         publisher: &Arc<dyn PausePublisher>,
         metadata: &SandboxMetadata,
         staged: &crate::snapshot::repository::StagedSnapshot,
     ) -> anyhow::Result<PublishedPause> {
+        let deadline = tokio::time::Instant::now() + PAUSE_PUBLICATION_RETRY_DEADLINE;
         let mut delay = PAUSE_PUBLICATION_RETRY_BACKOFF;
         let mut last = anyhow::anyhow!("no commit was attempted");
         for attempt in 2..=PAUSE_PUBLICATION_ATTEMPTS {
-            tokio::time::sleep(delay).await;
+            let wakes_at = tokio::time::Instant::now() + delay;
+            if wakes_at > deadline {
+                warn!(
+                    sandbox_id = %metadata.id,
+                    attempt,
+                    "the commit of this pause capture ran out of its retry budget"
+                );
+                break;
+            }
+            tokio::time::sleep_until(wakes_at).await;
             delay = delay.saturating_mul(2);
             let capture = crate::snapshot::CapturedSandboxSnapshot::staged(staged.clone());
             match publisher.publish(metadata, capture).await {
@@ -2628,7 +2652,7 @@ where
     /// `None` is the pause having finished: the record is gone and the
     /// sandbox's newest catalog row speaks for it from here. `Some` is the
     /// record as it stands after a pause that did not finish. A pause still
-    /// in flight after [`WAIT_TRANSITION_TIMEOUT`] is
+    /// in flight after [`CONCURRENT_PAUSE_WAIT`] is
     /// `InvalidSandboxState { state: Pausing }`.
     pub async fn wait_for_pause_to_settle(
         &self,
@@ -2637,7 +2661,7 @@ where
         let wait = self
             .store
             .wait_while_in_states(&sandbox_id, &[SandboxState::Pausing]);
-        match tokio::time::timeout(WAIT_TRANSITION_TIMEOUT, wait).await {
+        match tokio::time::timeout(CONCURRENT_PAUSE_WAIT, wait).await {
             Ok(settled) => settled.map_err(OrchestratorError::from),
             Err(_elapsed) => {
                 warn!(%sandbox_id, "timed out waiting for a pause to settle");
@@ -2665,7 +2689,7 @@ where
         let wait = self
             .store
             .wait_while_in_states(&sandbox_id, &[SandboxState::Pausing]);
-        match tokio::time::timeout(WAIT_TRANSITION_TIMEOUT, wait).await {
+        match tokio::time::timeout(CONCURRENT_PAUSE_WAIT, wait).await {
             Ok(Ok(None)) => {
                 self.joined_pause_publication(sandbox_id, before, joined_at)
                     .await
@@ -2703,8 +2727,8 @@ where
 
     /// Finds the snapshot the pause this caller joined published.
     ///
-    /// The window starts one [`WAIT_TRANSITION_TIMEOUT`] before the joiner
-    /// began waiting, which is as far back as a pause still in flight can have
+    /// The window starts one [`CONCURRENT_PAUSE_WAIT`] before the joiner began
+    /// waiting, which is as far back as a pause still in flight can have
     /// started.
     async fn joined_pause_publication(
         &self,
@@ -2719,7 +2743,7 @@ where
             )));
         };
         let not_before_unix_ms = joined_at
-            .checked_sub(WAIT_TRANSITION_TIMEOUT)
+            .checked_sub(CONCURRENT_PAUSE_WAIT)
             .and_then(|start| start.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
             .unwrap_or(0);

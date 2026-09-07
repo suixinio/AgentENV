@@ -589,16 +589,28 @@ pub async fn publish_commit(
     commit: crate::snapshot::repository::interfaces::SnapshotCommit,
 ) -> RepositoryResult<SnapshotRecord> {
     let opening = commit_opening_record(&commit);
-    match begin_snapshot(pool, cluster_id, node_id, &opening, STATUS_BUILDING, false).await? {
-        CatalogWrite::Applied(_) | CatalogWrite::Refused(CatalogRefusal::AlreadyExists) => {}
+    // Only a row this call opened is this call's to take back when the commit
+    // that would have made it 'ready' is refused.
+    let opened_here = match begin_snapshot(
+        pool,
+        cluster_id,
+        node_id,
+        &opening,
+        STATUS_BUILDING,
+        false,
+    )
+    .await?
+    {
+        CatalogWrite::Applied(_) => true,
+        CatalogWrite::Refused(CatalogRefusal::AlreadyExists) => false,
         CatalogWrite::Refused(CatalogRefusal::AliasTaken { holder }) => {
             return Err(alias_conflict(commit.alias.as_ref(), &commit.id, holder))
         }
         CatalogWrite::Refused(refusal) => return Err(refused("publish_commit", refusal)),
-    }
+    };
 
     let committed_payload = encode_committed(&commit.committed)?;
-    match commit_snapshot(
+    let committed = commit_snapshot(
         pool,
         cluster_id,
         CommitArgs {
@@ -613,13 +625,39 @@ pub async fn publish_commit(
         node_id,
         now_ms(),
     )
-    .await?
-    {
-        CatalogWrite::Applied(row) => Ok(row),
-        CatalogWrite::Refused(CatalogRefusal::AliasTaken { holder }) => {
+    .await;
+
+    let refusal = match committed {
+        Ok(CatalogWrite::Applied(row)) => return Ok(row),
+        Ok(CatalogWrite::Refused(refusal)) => refusal,
+        // An error is not a refusal: nobody knows whether the row moved, so it
+        // stays and a re-commit of the same id finds it.
+        Err(error) => return Err(error),
+    };
+
+    if opened_here {
+        discard_opened_row(pool, cluster_id, &commit.id).await;
+    }
+    match refusal {
+        CatalogRefusal::AliasTaken { holder } => {
             Err(alias_conflict(commit.alias.as_ref(), &commit.id, holder))
         }
-        CatalogWrite::Refused(refusal) => Err(refused("publish_commit", refusal)),
+        refusal => Err(refused("publish_commit", refusal)),
+    }
+}
+
+/// Removes the row `publish_commit` opened after the commit was refused, so a
+/// refusal leaves no half-built snapshot in the catalog.
+async fn discard_opened_row(pool: &PgPool, cluster_id: Uuid, id: &SnapshotId) {
+    match delete_snapshot(pool, cluster_id, id, now_ms()).await {
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            target: "agentenv",
+            snapshot_id = %id,
+            error = %error,
+            "a refused commit left the row it opened behind; it stays 'building' until \
+             somebody removes it"
+        ),
     }
 }
 

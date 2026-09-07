@@ -516,6 +516,44 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn a_commit_refused_for_a_taken_alias_leaves_no_row_behind() {
+        let catalog = catalog!("a_commit_refused_for_a_taken_alias_leaves_no_row_behind");
+        let holder = commit_for(SnapshotId::generate(), Some("contested-checkpoint"));
+        let holder_id = holder.id.clone();
+        catalog
+            .publish_commit(holder)
+            .await
+            .expect("the first publish binds the alias");
+
+        let id = SnapshotId::generate();
+        let mut refused = commit_for(id.clone(), Some("contested-checkpoint"));
+        refused.source = SnapshotPublishSource::Sandbox {
+            source_sandbox_id: Uuid::new_v4().to_string(),
+        };
+        let error = catalog
+            .publish_commit(refused)
+            .await
+            .expect_err("the alias is held by another snapshot");
+        assert!(
+            matches!(error, RepositoryError::AliasConflict { .. }),
+            "{error:?}"
+        );
+
+        assert!(
+            catalog
+                .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused commit must take back the row it opened, at every read scope"
+        );
+        assert_eq!(
+            catalog.resolve_alias("contested-checkpoint").await.unwrap(),
+            Some(holder_id)
+        );
+    }
+
+    #[tokio::test]
     async fn a_disk_size_of_zero_is_allowed_while_waiting_but_refused_at_ready() {
         let catalog = catalog!("a_disk_size_of_zero_is_allowed_while_waiting_but_refused_at_ready");
         let mut record = template_record(None);

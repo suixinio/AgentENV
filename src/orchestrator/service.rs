@@ -70,9 +70,8 @@ const PAUSE_JOIN_MARGIN: Duration = Duration::from_secs(30);
 /// How long a caller waits out a pause somebody else is performing. It has to
 /// cover the owner's whole retry budget, or it answers "stuck" about a pause
 /// that is still working.
-const CONCURRENT_PAUSE_WAIT: Duration = Duration::from_secs(
-    PAUSE_PUBLICATION_RETRY_DEADLINE.as_secs() + PAUSE_JOIN_MARGIN.as_secs(),
-);
+const CONCURRENT_PAUSE_WAIT: Duration =
+    Duration::from_secs(PAUSE_PUBLICATION_RETRY_DEADLINE.as_secs() + PAUSE_JOIN_MARGIN.as_secs());
 
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {

@@ -28,6 +28,7 @@ use crate::proto::scheduler::{
 };
 
 use super::fleet;
+use super::orphan_reaper::OrphanReaper;
 use super::placement::{ShadowPlacement, ShadowSource};
 use super::registry::{
     AtomicNodeRegistry, NodeNotInRegistry, NodeRegistry, ServiceInstanceMismatch,
@@ -54,6 +55,9 @@ pub struct NodeRegistryGrpcService {
     strategy: Arc<RoundRobinStrategy>,
     /// Resolves metric handles at construction, outside the placement hot path.
     shadow: Arc<ShadowPlacement>,
+    /// Absent leaves every roster entry alone, which is what a deployment with
+    /// no metadata store to compare against has to do.
+    orphan_reaper: Option<Arc<OrphanReaper>>,
 }
 
 impl NodeRegistryGrpcService {
@@ -67,7 +71,15 @@ impl NodeRegistryGrpcService {
             artifact_store: None,
             strategy: Arc::new(RoundRobinStrategy::new()),
             shadow: Arc::new(ShadowPlacement::default()),
+            orphan_reaper: None,
         }
+    }
+
+    /// Wires the reaper that deletes sandboxes a roster names and no record does.
+    #[must_use]
+    pub fn with_orphan_reaper(mut self, reaper: Arc<OrphanReaper>) -> Self {
+        self.orphan_reaper = Some(reaper);
+        self
     }
 
     /// Replaces the shadow scorer with one sampling `k` candidates.
@@ -637,6 +649,13 @@ impl Scheduler for NodeRegistryGrpcService {
         };
 
         let roster = super::registry::roster_from_heartbeat(&req);
+
+        // Before the roster is consumed: reaping is best-effort and never
+        // fails the heartbeat, because a node that cannot report is worse than
+        // an orphan that lives one tick longer.
+        if let Some(reaper) = &self.orphan_reaper {
+            reaper.observe(&node, &roster, now).await;
+        }
 
         // Warm-up means bindings were seeded when a binding store is configured.
         if let Some(binding_store) = &self.binding_store {
@@ -1634,6 +1653,95 @@ mod tests {
             .unwrap()
             .expect("the roster entry must have been reconciled into the binding store");
         assert_eq!(binding.node.id, "node-a");
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_hands_its_roster_to_the_orphan_reaper() {
+        use crate::node_registry::orphan_reaper::{
+            NodeSandboxDeleter, OrphanReaper, SandboxRecordIndex,
+        };
+        use crate::types::{ExecutionId, SandboxId};
+
+        struct NoRecords;
+
+        #[async_trait::async_trait]
+        impl SandboxRecordIndex for NoRecords {
+            async fn recorded_executions(
+                &self,
+                _sandbox_ids: &[SandboxId],
+            ) -> anyhow::Result<std::collections::HashMap<SandboxId, ExecutionId>> {
+                Ok(std::collections::HashMap::new())
+            }
+        }
+
+        #[derive(Default)]
+        struct RecordingDeleter(std::sync::Mutex<Vec<(String, SandboxId, ExecutionId)>>);
+
+        #[async_trait::async_trait]
+        impl NodeSandboxDeleter for Arc<RecordingDeleter> {
+            async fn delete(
+                &self,
+                node: &Node,
+                sandbox_id: SandboxId,
+                execution_id: ExecutionId,
+            ) -> anyhow::Result<()> {
+                self.0.lock().expect("deleted mutex").push((
+                    node.id.clone(),
+                    sandbox_id,
+                    execution_id,
+                ));
+                Ok(())
+            }
+        }
+
+        let deleter = Arc::new(RecordingDeleter::default());
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a:8000")],
+            Duration::from_secs(30),
+        ));
+        let warmup = Arc::new(WarmupGate::new(
+            Arc::clone(&registry) as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            SystemTime::now(),
+        ));
+        // Zero grace leaves the consecutive-sighting rule as the only gate; the
+        // reaper's own tests drive the clock.
+        let service = NodeRegistryGrpcService::new(registry, warmup).with_orphan_reaper(Arc::new(
+            OrphanReaper::with_grace(
+                Box::new(NoRecords),
+                Box::new(Arc::clone(&deleter)),
+                Duration::ZERO,
+            ),
+        ));
+
+        let sandbox_id = SandboxId::new();
+        let execution_id = ExecutionId::new();
+        let beat = || {
+            Request::new(crate::proto::scheduler::HeartbeatRequest {
+                node_id: "node-a".to_string(),
+                cluster_id: "cluster-a".to_string(),
+                service_instance_id: "node-a-instance".to_string(),
+                roster: vec![crate::proto::scheduler::SandboxRosterEntry {
+                    sandbox_id: sandbox_id.to_string(),
+                    execution_id: execution_id.to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+        };
+
+        service.heartbeat(beat()).await.expect("node-a heartbeats");
+        assert!(
+            deleter.0.lock().expect("deleted mutex").is_empty(),
+            "one heartbeat is a snapshot, not evidence"
+        );
+
+        service.heartbeat(beat()).await.expect("node-a heartbeats");
+        assert_eq!(
+            deleter.0.lock().expect("deleted mutex").clone(),
+            vec![("node-a".to_string(), sandbox_id, execution_id)],
+            "the heartbeat is where a node's roster meets the control plane's records"
+        );
     }
 
     #[derive(Default)]

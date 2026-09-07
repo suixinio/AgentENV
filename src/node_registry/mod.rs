@@ -8,6 +8,7 @@ pub mod filter;
 pub mod fleet;
 pub mod grpc_service;
 pub mod kubernetes_discovery;
+pub mod orphan_reaper;
 pub mod placement;
 pub mod redis;
 pub mod registry;

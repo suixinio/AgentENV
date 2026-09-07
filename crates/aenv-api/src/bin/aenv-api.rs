@@ -196,6 +196,16 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     // The same store answers who owns a sandbox id when a node says it already
     // holds one; the clone shares the connection rather than opening another.
     let record_owner = aenv_api::node_client::StoreRecordOwner::shared(store.clone());
+    // A node's heartbeat roster is the only place its own account of what it
+    // runs meets these records, so the reaper reads them there.
+    let node_registry_grpc_service = node_registry_grpc_service.with_orphan_reaper(Arc::new(
+        aenv_api::node_registry::orphan_reaper::OrphanReaper::new(
+            Box::new(aenv_api::node_registry::orphan_reaper::StoreRecordIndex::new(store.clone())),
+            Box::new(aenv_api::node_client::NodeServiceSandboxDeleter::new(
+                config.cluster.node_service_port,
+            )),
+        ),
+    ));
     let orchestrator = Orchestrator::new(
         aenv_api::sandbox::AccessTokenSeedPolicy::MustBeConfigured,
         store,

@@ -591,23 +591,15 @@ pub async fn publish_commit(
     let opening = commit_opening_record(&commit);
     // Only a row this call opened is this call's to take back when the commit
     // that would have made it 'ready' is refused.
-    let opened_here = match begin_snapshot(
-        pool,
-        cluster_id,
-        node_id,
-        &opening,
-        STATUS_BUILDING,
-        false,
-    )
-    .await?
-    {
-        CatalogWrite::Applied(_) => true,
-        CatalogWrite::Refused(CatalogRefusal::AlreadyExists) => false,
-        CatalogWrite::Refused(CatalogRefusal::AliasTaken { holder }) => {
-            return Err(alias_conflict(commit.alias.as_ref(), &commit.id, holder))
-        }
-        CatalogWrite::Refused(refusal) => return Err(refused("publish_commit", refusal)),
-    };
+    let opened_here =
+        match begin_snapshot(pool, cluster_id, node_id, &opening, STATUS_BUILDING, false).await? {
+            CatalogWrite::Applied(_) => true,
+            CatalogWrite::Refused(CatalogRefusal::AlreadyExists) => false,
+            CatalogWrite::Refused(CatalogRefusal::AliasTaken { holder }) => {
+                return Err(alias_conflict(commit.alias.as_ref(), &commit.id, holder))
+            }
+            CatalogWrite::Refused(refusal) => return Err(refused("publish_commit", refusal)),
+        };
 
     let committed_payload = encode_committed(&commit.committed)?;
     let committed = commit_snapshot(

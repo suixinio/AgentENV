@@ -9,6 +9,7 @@ pub mod factory;
 mod native_placement;
 mod node_status;
 pub mod placement;
+pub mod reap;
 pub mod record_owner;
 pub mod stub;
 pub mod wire;
@@ -21,5 +22,6 @@ pub use node_status::override_node_status;
 pub use placement::{
     FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement, PlacementRuntimeRouting,
 };
+pub use reap::NodeServiceSandboxDeleter;
 pub use record_owner::{SandboxRecordOwner, StoreRecordOwner, UnknownRecordOwner};
 pub use stub::RemoteSandboxStub;

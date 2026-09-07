@@ -597,6 +597,25 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
     ) -> Result<Response<pb::SandboxCreateResponse>, Status> {
         let request = request.into_inner();
         let sandbox_id = convert::sandbox_id(&request.sandbox_id)?;
+        // An id this node already holds is refused before any image, artifact
+        // or runtime work: starting a second runtime under it would displace
+        // the first one in the handle table this node answers every other call
+        // from.
+        if let Some(held) = self
+            .orchestration
+            .held_sandbox(sandbox_id)
+            .await
+            .map_err(|err| orchestrator_status(&err))?
+        {
+            warn!(
+                %sandbox_id,
+                held_execution_id = ?held.execution_id,
+                "refusing a create for a sandbox this node already holds"
+            );
+            return Err(Status::already_exists(format!(
+                "sandbox {sandbox_id} is already on this node"
+            )));
+        }
         // Reject malformed scalar fields before any registry or local-artifact work.
         let timeout_action = convert::timeout_action(request.timeout_action)?;
         let expiry = convert::create_expiry(request.expiry)?;
@@ -914,16 +933,15 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
         let request = request.into_inner();
         let sandbox_id = convert::sandbox_id(&request.sandbox_id)?;
 
-        let live = self
+        // The same answer a create refuses on: a record this node kept without
+        // a handle is still a sandbox it holds, and a describe that called it
+        // absent would contradict the create that says it is here.
+        let sandbox = self
             .orchestration
-            .list_live_sandboxes()
+            .held_sandbox(sandbox_id)
             .await
-            .map_err(|err| orchestrator_status(&err))?;
-
-        // NotFound is returned only after a successful live-state read.
-        let sandbox = live
-            .iter()
-            .find(|candidate| candidate.sandbox_id == sandbox_id)
+            .map_err(|err| orchestrator_status(&err))?
+            // NotFound is returned only after a successful live-state read.
             .ok_or_else(|| {
                 Status::not_found(format!("sandbox {sandbox_id} is not running on this node"))
             })?;

@@ -1977,6 +1977,48 @@ async fn a_pause_whose_vm_is_gone_retries_the_commit_of_the_bytes_the_node_stage
     Ok(())
 }
 
+#[tokio::test]
+async fn a_launch_under_an_id_this_process_already_runs_is_refused_and_touches_nothing(
+) -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "duplicate-id")]))
+        .await?;
+
+    let err = Arc::clone(&orchestrator)
+        .restore_sandbox(created.id, create_request(Some(60), &[("team", "second")]))
+        .await
+        .expect_err("an id this process already runs is not free to launch under");
+    assert!(
+        matches!(
+            err,
+            OrchestratorError::StoreOperationFailed(StoreError::SandboxAlreadyExists {
+                sandbox_id
+            }) if sandbox_id == created.id
+        ),
+        "{err:?}"
+    );
+
+    assert_eq!(
+        behavior.stop_calls(),
+        0,
+        "the refused launch built nothing, so it had nothing to stop -- and the sandbox \
+         already running under that id must not be what it stopped"
+    );
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("the running sandbox keeps its record");
+    assert_eq!(metadata.execution_id, created.execution_id);
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &created.id).await?;
+    Ok(())
+}
+
 #[test]
 fn a_joined_pause_waits_out_the_owners_whole_retry_budget() {
     assert!(

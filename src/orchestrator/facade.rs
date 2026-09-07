@@ -161,6 +161,9 @@ orchestration_surface! {
         fn list_sandbox_ids() -> Result<Vec<SandboxId>>;
         /// Lists locally live handles without applying ownership filtering.
         fn list_live_sandboxes() -> Result<Vec<LiveSandbox>>;
+        /// What this process holds under one id: its live handle, or the
+        /// record it kept. `None` is the id being free here.
+        fn held_sandbox(sandbox_id: SandboxId) -> Result<Option<LiveSandbox>>;
         /// The heartbeat roster: what this node claims to be holding.
         fn list_sandbox_roster() -> Result<Vec<SandboxRosterEntry>>;
         /// Sandbox metadata narrowed by a filter.

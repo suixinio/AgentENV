@@ -1387,6 +1387,50 @@ async fn describe_answers_for_a_sandbox_the_listing_leaves_out() {
 }
 
 #[tokio::test]
+async fn a_record_kept_without_a_handle_is_described_and_refuses_a_create() {
+    let orchestrator =
+        orchestrator_with(InMemoryMetadataStore::new(), MockBackendFactory::new()).await;
+    let (orchestration, service) = serve_node(Arc::clone(&orchestrator), mock_snapshot_manager());
+    let started = start(&orchestration, Some(b"owned")).await;
+    assert!(
+        orchestrator
+            .forget_sandbox_handle_for_test(&started.id)
+            .await,
+        "this node held no handle to drop, so the two faces were never asked to disagree"
+    );
+
+    let described = describe(&service, started.id)
+        .await
+        .expect("a node whose record still names this sandbox holds it");
+    assert_eq!(
+        described.execution_id,
+        started.execution_id.to_string(),
+        "the run the node's record names is what a describe has to report"
+    );
+    assert!(
+        !described.facts_from_handle,
+        "there is no handle these facts could have come from"
+    );
+
+    let status = service
+        .create(Request::new(pb::SandboxCreateRequest {
+            sandbox_id: started.id.to_string(),
+            source: Some(pb::sandbox_create_request::Source::Snapshot(
+                resolved_snapshot_source(),
+            )),
+            expiry: Some(pb::sandbox_create_request::Expiry::NodeKeptTimeoutMs(
+                60_000,
+            )),
+            timeout_action: pb::TimeoutAction::Pause as i32,
+            control_plane_config: b"owned".to_vec(),
+            ..Default::default()
+        }))
+        .await
+        .expect_err("a node that describes a sandbox may not create it a second time");
+    assert_eq!(status.code(), Code::AlreadyExists, "{status:?}");
+}
+
+#[tokio::test]
 async fn describe_says_not_found_for_a_sandbox_this_node_is_not_running() {
     let (orchestration, service) = service().await;
     let running = start(&orchestration, Some(b"owned")).await;

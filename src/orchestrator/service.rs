@@ -1096,6 +1096,43 @@ where
         Ok(live)
     }
 
+    /// What this process holds under `sandbox_id`: the live handle if there is
+    /// one, otherwise the record its store keeps.
+    ///
+    /// This is the one answer to "is this id taken here". A create refuses on
+    /// it and a describe reports it, so the two can never disagree about a
+    /// sandbox this process holds.
+    pub async fn held_sandbox(&self, sandbox_id: SandboxId) -> Result<Option<LiveSandbox>> {
+        let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
+        let record = self.store.get(&sandbox_id).await?;
+        if handle.is_none() && record.is_none() {
+            return Ok(None);
+        }
+
+        let record = record.as_ref();
+        let mut entry = LiveSandbox {
+            sandbox_id,
+            execution_id: record.map(|record| record.execution_id),
+            facts_from_handle: false,
+            host_interaction_ip: None,
+            rootfs_virtual_size: None,
+            created_at: record.map(|record| record.created_at),
+            expires_at: record.and_then(|record| record.expires_at),
+            resources: record.map(|record| record.resources),
+            control_plane_config: record.and_then(|record| record.control_plane_config.clone()),
+        };
+        if let Some(handle) = handle.as_ref() {
+            if let Ok(sandbox) = handle.try_lock() {
+                entry.facts_from_handle = true;
+                // The live handle's incarnation is authoritative.
+                entry.execution_id = Some(sandbox.execution_id());
+                entry.host_interaction_ip = sandbox.host_interaction_ip();
+                entry.rootfs_virtual_size = sandbox.runtime_info().rootfs_virtual_size;
+            }
+        }
+        Ok(Some(entry))
+    }
+
     pub fn get_envd_access_token(&self, metadata: &SandboxMetadata) -> Option<EnvdAccessToken> {
         metadata
             .secure
@@ -2996,6 +3033,22 @@ where
 
         let sandbox_id = plan.sandbox_id;
         let transitional_state = plan.transitional_state();
+
+        // Refuse an id this process already holds before anything is built.
+        // The handle table has one slot per sandbox, so starting a second
+        // runtime under a live id would replace the entry the first one is
+        // reached through and then tear that entry down when the store refuses
+        // the duplicate record.
+        if let Some(held) = self.held_sandbox(sandbox_id).await? {
+            warn!(
+                held_execution_id = ?held.execution_id,
+                execution_id = %plan.execution_id(),
+                "refusing a launch under a sandbox id this process already holds"
+            );
+            return Err(OrchestratorError::StoreOperationFailed(
+                StoreError::SandboxAlreadyExists { sandbox_id },
+            ));
+        }
 
         // Build and start the sandbox first, before making any state changes, so that we don't
         // have to roll back any persisted state if the build fails.

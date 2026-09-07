@@ -146,8 +146,8 @@ pub async fn ensure_environment(
     network_capacity::check();
 
     // 7. The directory the node and the broker DaemonSet share. The broker
-    //    binds inside it, so it needs a group that can write.
-    egress_socket::prepare(config)?;
+    //    prepares it; a node brokering locally refuses to come up without it.
+    egress_socket::wait_until_ready(config).await?;
 
     info!("environment setup complete");
 

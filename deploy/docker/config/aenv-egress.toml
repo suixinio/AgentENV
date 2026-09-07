@@ -3,8 +3,9 @@
 # the shape a real deployment uses; this one differs in exactly two ways, both
 # because compose has no Secrets and no hostPath:
 #
-#   * the CA is generated into the socket volume on first start (see the
-#     broker service's entrypoint), so it is a throwaway per stack;
+#   * the CA is minted into the socket volume on first start by
+#     `aenv-egress gen-ca` (see the broker service's entrypoint), so it is a
+#     throwaway per stack;
 #   * `peer_uid = 0` and the broker runs as root, because a compose named
 #     volume is created root-owned with no way to hand it to another uid.
 #
@@ -22,11 +23,13 @@ socket_path = "/run/aenv-egress/broker.sock"
 peer_uid = 0
 
 [ca]
-# The static pair, not `issuer_url`: this stack has no api half with a root to
-# issue against, so the broker signs with the throwaway CA its own entrypoint
-# minted.
-cert_path = "/run/aenv-egress/ca.crt"
-key_path = "/run/aenv-egress/ca.key"
+# The static pair, not `issuer_url`: this stack has no api half to issue an
+# intermediate, so the broker signs with the one its own entrypoint minted.
+# It is the intermediate and not the root beside it — the guests trust the
+# root, and a chain that ends at the certificate the guest already holds is
+# the shape a cluster has.
+cert_path = "/run/aenv-egress/intermediate.crt"
+key_path = "/run/aenv-egress/intermediate.key"
 leaf_ttl_secs = 86400
 cache_capacity = 256
 mints_per_sandbox_per_minute = 60

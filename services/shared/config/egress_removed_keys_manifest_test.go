@@ -11,7 +11,7 @@ import (
 // `mode = "remote"` outright, but a manifest that still declares one of these
 // variables comes up healthy while describing a broker that does not exist.
 //
-// 🔴 It anchors on structure, the same way the gateway walk does: a
+// It anchors on structure, the same way the gateway walk does: a
 // declaration is an entry under a workload's `env:`, a configMapGenerator
 // `literals:` item, a ConfigMap `data:` key or a compose `environment:` key.
 // A comment naming one is not a declaration.
@@ -31,7 +31,7 @@ func TestNoManifestDeclaresARemovedEgressKey(t *testing.T) {
 	if len(paths) < 6 {
 		t.Fatalf("only %d manifests to scan; this test is reading the wrong directory", len(paths))
 	}
-	// 🔴 The control comes first: an absence assertion passes on a tree the
+	// The control comes first: an absence assertion passes on a tree the
 	// walk cannot read, so the same walk must find the variable that still
 	// selects the broker mode — once as an env entry, once as a literal.
 	live := map[string]int{}

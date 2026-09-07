@@ -1,123 +1,219 @@
 //! The directory `aenv-node` and the `aenv-egress` DaemonSet share.
 //!
-//! Both mount it as the same `hostPath`. The node runs as root and creates it;
-//! the broker runs unprivileged and binds its socket inside it, so the mode
-//! has to let the broker's group create a file there. Nothing else on the
-//! machine gets a way in — root excepted, which this was never a boundary
-//! against.
+//! Both mount it as the same `hostPath`, and the broker is what prepares it:
+//! its init container chowns the directory to the group it runs under before
+//! the broker itself binds a socket in it. A node only waits for that to have
+//! happened, so neither workload has to reach a machine before the other.
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use tracing::{info, warn};
+use anyhow::{bail, Result};
+use tracing::{debug, info};
 
-use crate::cfg::{AppConfig, EgressBrokerMode};
+/// Where the broker binds when this node has not been told otherwise.
+pub const DEFAULT_SOCKET_DIR: &str = "/run/aenv-egress";
 
-/// Owner-and-group access, and nothing for anyone else. The group is the
-/// broker's, and it needs write: the socket is a file it creates.
-const MODE: u32 = 0o770;
+/// How long a `local` node waits for the broker to prepare the directory.
+/// Long enough for the broker DaemonSet to land on a machine that is coming
+/// up with it, short enough that a node configured for a broker that will
+/// never arrive fails inside one Pod start.
+const WAIT_FOR_DIRECTORY: Duration = Duration::from_secs(60);
 
-/// Creates the broker's socket directory when this node speaks to a broker
-/// over one. A node in any other mode has nothing to prepare.
-pub fn prepare(config: &AppConfig) -> Result<()> {
-    if config.egress_broker.mode != EgressBrokerMode::Local {
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Waits until the broker's socket directory is one the broker can bind in.
+///
+/// Nothing here creates or chowns it. A `local` node that never sees it is a
+/// node whose broker never started, and it refuses to come up rather than
+/// reporting `local_unreachable` forever with nothing saying why. Every other
+/// mode touches no directory at all.
+pub async fn wait_until_ready(config: &crate::cfg::AppConfig) -> Result<()> {
+    wait_within(config, WAIT_FOR_DIRECTORY, POLL_INTERVAL).await
+}
+
+async fn wait_within(
+    config: &crate::cfg::AppConfig,
+    limit: Duration,
+    poll: Duration,
+) -> Result<()> {
+    if config.egress_broker.mode != crate::cfg::EgressBrokerMode::Local {
         return Ok(());
     }
-    let Some(socket_path) = config.egress_broker.socket_path.as_ref() else {
-        return Ok(());
-    };
-    let Some(directory) = socket_path.parent() else {
-        return Ok(());
-    };
+    let directory = config
+        .egress_broker
+        .socket_path
+        .as_deref()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new(DEFAULT_SOCKET_DIR));
+    let group = config.egress_broker.socket_group;
 
-    fs::create_dir_all(directory)
-        .with_context(|| format!("create the egress broker socket directory {directory:?}"))?;
-    fs::set_permissions(directory, fs::Permissions::from_mode(MODE))
-        .with_context(|| format!("set the mode of {directory:?}"))?;
-    set_broker_group(directory);
-    info!(
-        directory = %directory.display(),
-        mode = format_args!("{MODE:o}"),
-        "the egress broker socket directory is ready"
-    );
+    let deadline = Instant::now() + limit;
+    loop {
+        match bindable_by(directory, group) {
+            Ok(()) => {
+                info!(
+                    directory = %directory.display(),
+                    group,
+                    "the egress broker socket directory is ready"
+                );
+                return Ok(());
+            }
+            Err(why) => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "[egress_broker].mode = \"local\" but {} is not a directory the broker \
+                         can bind in after {}s: {why}. The `aenv-egress` DaemonSet's init \
+                         container is what chowns it to gid {group} with mode 0770; check that \
+                         it is scheduled on this machine and that both workloads mount the same \
+                         hostPath",
+                        directory.display(),
+                        limit.as_secs()
+                    );
+                }
+                debug!(
+                    directory = %directory.display(),
+                    reason = %why,
+                    "waiting for the egress broker to prepare its socket directory"
+                );
+                tokio::time::sleep(poll).await;
+            }
+        }
+    }
+}
 
+/// Whether a process in `group` could create the socket here. This node runs
+/// as root and would be let in whatever the mode says, so the answer is read
+/// off the metadata rather than attempted.
+fn bindable_by(directory: &Path, group: u32) -> std::result::Result<(), String> {
+    let metadata = match fs::metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(err) => return Err(format!("{err}")),
+    };
+    if !metadata.is_dir() {
+        return Err("not a directory".to_string());
+    }
+    if metadata.gid() != group {
+        return Err(format!("group is {}, want {group}", metadata.gid()));
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o030 != 0o030 {
+        return Err(format!(
+            "mode is {mode:o}, want write and search for the group"
+        ));
+    }
     Ok(())
-}
-
-/// Hands the directory to the broker's group. A node that cannot — one not
-/// running as root — leaves the group alone and warns: the broker then fails
-/// to bind, which is the failure an operator can act on.
-fn set_broker_group(directory: &Path) {
-    let group = broker_group();
-    let path = std::ffi::CString::new(directory.as_os_str().as_encoded_bytes())
-        .expect("a path holds no interior nul");
-    // SAFETY: `path` is a valid nul-terminated C string for the duration of
-    // the call, and -1 leaves the owner unchanged.
-    let rc = unsafe { libc::chown(path.as_ptr(), u32::MAX, group) };
-    if rc != 0 {
-        warn!(
-            directory = %directory.display(),
-            group,
-            error = %std::io::Error::last_os_error(),
-            "could not give the egress broker's group the socket directory; the broker will \
-             fail to bind"
-        );
-    }
-}
-
-/// The gid the broker DaemonSet runs under, matching `runAsGroup` in
-/// `deploy/k8s/base/aenv-egress-daemonset.yaml`.
-fn broker_group() -> u32 {
-    const DEFAULT: u32 = 65532;
-    std::env::var("AENV_EGRESS_BROKER_GID")
-        .ok()
-        .and_then(|raw| raw.trim().parse().ok())
-        .unwrap_or(DEFAULT)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfg::{AppConfig, EgressBrokerMode};
 
-    #[test]
-    fn the_mode_lets_the_brokers_group_create_the_socket_and_nobody_else_in() {
-        assert_eq!(
-            MODE & 0o070,
-            0o070,
-            "the broker's group must be able to bind"
-        );
-        assert_eq!(MODE & 0o007, 0, "no other account reaches the socket");
-    }
-
-    #[test]
-    fn a_node_that_speaks_to_no_local_broker_prepares_nothing() {
-        let mut config = AppConfig::default();
-        config.egress_broker.mode = EgressBrokerMode::Disabled;
-        config.egress_broker.socket_path = Some(std::path::PathBuf::from(
-            "/nonexistent/aenv-egress/broker.sock",
-        ));
-
-        prepare(&config).expect("a disabled node touches no directory");
-        assert!(!std::path::Path::new("/nonexistent/aenv-egress").exists());
-    }
-
-    #[test]
-    fn a_local_node_creates_the_directory_its_socket_path_names() {
+    fn prepared(mode: u32) -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let socket_path = dir.path().join("run/aenv-egress/broker.sock");
+        let mounted = dir.path().join("run/aenv-egress");
+        fs::create_dir_all(&mounted).expect("the mount point");
+        fs::set_permissions(&mounted, fs::Permissions::from_mode(mode)).expect("the mode");
+        (dir, mounted)
+    }
+
+    fn own_group(directory: &Path) -> u32 {
+        fs::metadata(directory).unwrap().gid()
+    }
+
+    fn local_config(socket_path: std::path::PathBuf) -> AppConfig {
         let mut config = AppConfig::default();
         config.egress_broker.mode = EgressBrokerMode::Local;
-        config.egress_broker.socket_path = Some(socket_path.clone());
+        config.egress_broker.socket_path = Some(socket_path);
+        config
+    }
 
-        prepare(&config).expect("the directory is created");
-
-        let created = socket_path.parent().expect("the socket has a directory");
-        assert!(created.is_dir());
+    #[test]
+    fn the_default_group_is_the_one_the_broker_daemonset_runs_under() {
         assert_eq!(
-            fs::metadata(created).unwrap().permissions().mode() & 0o777,
-            MODE
+            AppConfig::default().egress_broker.socket_group,
+            65532,
+            "the default has to match runAsGroup in aenv-egress-daemonset.yaml"
         );
+    }
+
+    #[test]
+    fn a_directory_the_brokers_group_can_bind_in_is_ready() {
+        let (_dir, mounted) = prepared(0o770);
+        let group = own_group(&mounted);
+
+        assert_eq!(bindable_by(&mounted, group), Ok(()));
+    }
+
+    #[test]
+    fn kubelets_own_directory_is_not_ready() {
+        // `DirectoryOrCreate` leaves root:root 0755. The broker's group has
+        // search but no write, so it would fail to bind — which is what this
+        // node refuses to start on rather than discovering at first use.
+        let (_dir, mounted) = prepared(0o755);
+        let group = own_group(&mounted);
+
+        assert!(bindable_by(&mounted, group).is_err());
+    }
+
+    #[test]
+    fn a_directory_of_another_group_is_not_ready() {
+        let (_dir, mounted) = prepared(0o770);
+        let group = own_group(&mounted);
+
+        assert!(bindable_by(&mounted, group + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn every_mode_but_local_waits_for_nothing() {
+        for mode in [EgressBrokerMode::Disabled, EgressBrokerMode::Embedded] {
+            let mut config = local_config(std::path::PathBuf::from(
+                "/nonexistent/aenv-egress/broker.sock",
+            ));
+            config.egress_broker.mode = mode;
+
+            wait_until_ready(&config)
+                .await
+                .expect("a node that is not brokering locally touches no directory");
+        }
+        assert!(!Path::new("/nonexistent/aenv-egress").exists());
+    }
+
+    #[tokio::test]
+    async fn a_local_node_whose_broker_never_prepared_the_directory_refuses_to_start() {
+        let (_dir, mounted) = prepared(0o755);
+        let mut config = local_config(mounted.join("broker.sock"));
+        config.egress_broker.socket_group = own_group(&mounted) + 1;
+
+        let refused = wait_within(
+            &config,
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect_err("a node that cannot reach a broker must fail, not report it unreachable");
+
+        let said = format!("{refused:#}");
+        assert!(said.contains("aenv-egress"), "{said}");
+        assert!(said.contains(&mounted.display().to_string()), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_local_node_starts_once_the_directory_is_bindable() {
+        let (_dir, mounted) = prepared(0o770);
+        let mut config = local_config(mounted.join("broker.sock"));
+        config.egress_broker.socket_group = own_group(&mounted);
+
+        wait_within(
+            &config,
+            Duration::from_millis(30),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("a prepared directory is what this waits for");
     }
 }

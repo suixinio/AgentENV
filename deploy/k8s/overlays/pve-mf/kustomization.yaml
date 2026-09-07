@@ -20,12 +20,16 @@ kind: Kustomization
 #     HTTP. It is a configMapGenerator *file*, so an overlay replaces the
 #     whole generator rather than patching a field.
 #
-# Second, brokered egress is switched on here: the nodes dial the broker in
-# remote mode, and the api half keeps secret values in its own PostgreSQL
-# (`[secrets].backend = "postgres"`), which the broker resolves against. Six
-# Secrets from `aenv-egress-secrets.example.yaml` must exist before the first
-# apply: the four every brokered deployment needs, plus `agentenv-secrets-key`
-# (the master key) and `egress-resolver` (the bearer both halves hold).
+# Second, brokered egress is switched on here: each node reaches the broker
+# beside it over their shared Unix socket, and the api half keeps secret
+# values in its own PostgreSQL (`[secrets].backend = "postgres"`), which the
+# broker resolves against. Two Secrets from
+# `aenv-egress-secrets.example.yaml` must exist before the first apply:
+# `egress-ca` (the root, whose key only the api half mounts) and
+# `agentenv-secrets-key` (the master key).
+#
+# The broker's mode below ships `local`, and that is the only value this tree
+# expresses.
 #
 # 🔴 Losing `agentenv-secrets-key` loses every stored value. It is not in the
 # database's own Secret and a database backup cannot recover it.
@@ -46,6 +50,8 @@ configMapGenerator:
     behavior: replace
     files:
       - config.json=regctl.json
+  # The end state, the same as `base`; restated here so this overlay says what
+  # its nodes run rather than inheriting it silently.
   - name: egress-broker-config
     behavior: merge
     literals:
@@ -73,7 +79,7 @@ patches:
   # The credential source: the api half's own resolve endpoint.
   - target:
       kind: DaemonSet
-      name: aenv-egress
+      name: aenv-egress-node
     patch: |-
       - op: add
         path: /spec/template/spec/containers/0/env/-

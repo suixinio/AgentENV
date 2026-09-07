@@ -163,6 +163,8 @@ mode = "disabled"
 # socket_path = "/run/aenv-egress/broker.sock"
 # The root guests with rules trust for intercepted names.
 # guest_ca_cert_path = "/etc/aenv/egress-ca/ca.crt"
+# The gid the broker runs under; this node hands it the socket directory.
+# socket_group = 65532
 # Concurrent brokered connections per sandbox and per node; excess is closed.
 per_sandbox_conns = 256
 node_conns = 20000
@@ -184,21 +186,13 @@ open_timeout_ms = 3000
 # versions, encrypted under a master key this half reads from a file, and
 # serves the broker's credential lookups itself. A node reads none of this.
 backend = "disabled"
-# RFC 3339 instant after which the broker's shared bearer stops being accepted
-# at the internal endpoints, leaving each broker's own ServiceAccount token as
-# the only credential. Empty never closes the window; while it is open, a
-# caller presenting the bearer is scoped to no node.
-legacy_bearer_until = ""
 
 [secrets.pg]
-# Both are paths, never the values: an environment variable holding a master
-# key is readable from /proc, a crash dump and `kubectl describe`. Required
-# when backend = "postgres". The key is base64 of 32 bytes and lives nowhere
-# near the database that holds the ciphertexts; losing it loses every value.
+# A path, never the value: an environment variable holding a master key is
+# readable from /proc, a crash dump and `kubectl describe`. Required when
+# backend = "postgres". The key is base64 of 32 bytes and lives nowhere near
+# the database that holds the ciphertexts; losing it loses every value.
 # key_file = "/etc/aenv/secrets/master-key"
-# The bearer the broker presents at POST /internal/credentials/resolve. The
-# broker's own [resolver].token_file holds the same value.
-# resolver_token_file = "/etc/aenv/secrets/resolver-token"
 
 [cluster]
 # `aenv-api` resolves node placement (`Schedule`/`LookupNode`/
@@ -356,6 +350,12 @@ control_plane_tokens = []
 # mounted Secret; a secretKeyRef environment variable is not refreshed by
 # kubelet, and a mounted volume is.
 control_plane_token_file = ""
+# The credential this half presents at another node's gate, when it should not
+# be one of the credentials above. Empty falls back to the first line of the
+# file above, and to a static token only when there is no file: a rotation
+# moves the file, while the list keeps the retired credential so nodes still
+# accept what is in flight.
+node_client_token_file = ""
 
 [api.proxy]
 # Requests one sandbox may have in flight through the data-plane proxy at

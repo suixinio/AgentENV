@@ -27,6 +27,10 @@ spec:
         app.kubernetes.io/name: agentenv-node
     spec:
       terminationGracePeriodSeconds: 3600
+      # Evicting this Pod under node pressure takes every sandbox on the
+      # machine with it: the Firecracker processes are its children. The
+      # broker DaemonSet beside it carries the same class and says so.
+      priorityClassName: system-node-critical
       nodeSelector:
         kubernetes.io/os: linux
       containers:
@@ -483,9 +487,10 @@ spec:
             - name: egress-ca
               mountPath: /etc/agentenv/egress
               readOnly: true
-            # The directory this process creates and hands to the broker
-            # DaemonSet's group, and where that DaemonSet binds its socket.
-            # Both workloads mount the same hostPath; nothing else does.
+            # Where the broker DaemonSet binds its socket. Both workloads
+            # mount the same hostPath; nothing else does. The broker's own
+            # init container is what creates and chowns it — this process
+            # waits for that and refuses to start in `local` mode without it.
             - name: broker-socket
               mountPath: /run/aenv-egress
       volumes:
@@ -496,9 +501,10 @@ spec:
         - name: agentenv-config
           configMap:
             name: agentenv-k8s-config
-        # The CA certificate half of the egress-ca Secret: the root guests with
-        # rules are told to trust. The key never leaves the broker's own
-        # Secret mount.
+        # The CA certificate half of the egress-ca Secret: the root guests
+        # with rules are told to trust. `items` keeps the key out of this
+        # mount — the api half is the only workload that holds it, and what
+        # this node signs is nothing.
         - name: egress-ca
           secret:
             secretName: egress-ca
@@ -506,10 +512,9 @@ spec:
             items:
               - key: ca.crt
                 path: ca.crt
-        # 🔴 The same path `aenv-egress-daemonset.yaml` mounts, and the reason
-        # `DirectoryOrCreate` is right here and a fallback there: this process
-        # runs as root and is what creates the directory with the group the
-        # broker binds under.
+        # The same path `aenv-egress-daemonset.yaml` mounts. Either workload
+        # may reach the machine first, so both carry `DirectoryOrCreate`; the
+        # broker's init container is what gives it the group that can bind.
         - name: broker-socket
           hostPath:
             path: /run/aenv-egress

@@ -60,6 +60,12 @@ pub struct EgressBrokerConfig {
     /// PEM bundle guests with `rules` trust for intercepted names.
     #[config(env = "AENV_EGRESS_BROKER_GUEST_CA_CERT_PATH")]
     pub guest_ca_cert_path: Option<PathBuf>,
+    /// The gid the broker runs under, which this node hands the socket
+    /// directory to. It has to match `runAsGroup` in
+    /// `deploy/k8s/base/aenv-egress-daemonset.yaml`: the broker creates the
+    /// socket file in that directory, so its group needs write there.
+    #[config(default = 65532u32, env = "AENV_EGRESS_BROKER_SOCKET_GROUP")]
+    pub socket_group: u32,
     #[config(default = 256u32, env = "AENV_EGRESS_BROKER_PER_SANDBOX_CONNS")]
     pub per_sandbox_conns: u32,
     #[config(default = 20_000u32, env = "AENV_EGRESS_BROKER_NODE_CONNS")]
@@ -74,6 +80,7 @@ impl fmt::Debug for EgressBrokerConfig {
             .field("mode", &self.mode)
             .field("socket_path", &self.socket_path)
             .field("guest_ca_cert_path", &self.guest_ca_cert_path)
+            .field("socket_group", &self.socket_group)
             .field("per_sandbox_conns", &self.per_sandbox_conns)
             .field("node_conns", &self.node_conns)
             .field("open_timeout_ms", &self.open_timeout_ms)
@@ -142,13 +149,6 @@ impl SecretsBackendKind {
 pub struct SecretsConfig {
     #[config(default = "disabled", env = "AENV_SECRETS_BACKEND")]
     pub backend: SecretsBackendKind,
-    /// RFC 3339 instant after which the broker's shared bearer stops being
-    /// accepted at the internal endpoints, leaving each broker's own
-    /// ServiceAccount token as the only credential. Empty never closes the
-    /// window, which is what an un-migrated deployment leaves it at — and
-    /// while it is open, a caller presenting the bearer is scoped to no node.
-    #[config(default = "", env = "AENV_SECRETS_LEGACY_BEARER_UNTIL")]
-    pub legacy_bearer_until: String,
     #[config(nested)]
     pub pg: SecretsPgConfig,
 }
@@ -157,15 +157,14 @@ impl fmt::Debug for SecretsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretsConfig")
             .field("backend", &self.backend)
-            .field("legacy_bearer_until", &self.legacy_bearer_until)
             .field("pg", &self.pg)
             .finish()
     }
 }
 
-/// Values in aenv-api's own PostgreSQL. Both credentials are files, never
-/// inline values: an environment variable holding a master key is readable
-/// from `/proc`, a crash dump and `kubectl describe`.
+/// Values in aenv-api's own PostgreSQL. The master key is a file, never an
+/// inline value: an environment variable holding one is readable from
+/// `/proc`, a crash dump and `kubectl describe`.
 #[derive(Config, Clone)]
 pub struct SecretsPgConfig {
     /// File holding the base64 32-byte key values are encrypted under. It is
@@ -173,17 +172,12 @@ pub struct SecretsPgConfig {
     /// that holds the ciphertexts.
     #[config(env = "AENV_SECRETS_PG_KEY_FILE")]
     pub key_file: Option<PathBuf>,
-    /// File holding the bearer the broker presents at the internal resolve
-    /// endpoint. The broker's own `resolver.token_file` holds the same value.
-    #[config(env = "AENV_SECRETS_PG_RESOLVER_TOKEN_FILE")]
-    pub resolver_token_file: Option<PathBuf>,
 }
 
 impl fmt::Debug for SecretsPgConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretsPgConfig")
             .field("key_file", &self.key_file)
-            .field("resolver_token_file", &self.resolver_token_file)
             .finish()
     }
 }
@@ -193,13 +187,13 @@ impl SecretsConfig {
         match self.backend {
             SecretsBackendKind::Disabled => Ok(()),
             SecretsBackendKind::Postgres => {
-                for (name, path) in [
-                    ("key_file", &self.pg.key_file),
-                    ("resolver_token_file", &self.pg.resolver_token_file),
-                ] {
-                    if path.as_ref().is_none_or(|p| p.as_os_str().is_empty()) {
-                        bail!("secrets.backend = \"postgres\" requires secrets.pg.{name}");
-                    }
+                if self
+                    .pg
+                    .key_file
+                    .as_ref()
+                    .is_none_or(|path| path.as_os_str().is_empty())
+                {
+                    bail!("secrets.backend = \"postgres\" requires secrets.pg.key_file");
                 }
                 Ok(())
             }

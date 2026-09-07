@@ -10,7 +10,6 @@
 mod intermediate;
 
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -18,8 +17,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
 use serde_json::json;
-use tracing::warn;
-use zeroize::Zeroizing;
+use tracing::{debug, warn};
 
 use crate::egress_ca::EgressRootCa;
 use crate::internal_auth::{CallerError, SharedCallerNode};
@@ -30,35 +28,18 @@ pub use intermediate::INTERMEDIATE_PATH;
 /// before the body is read, and a body past this is refused unread.
 pub(crate) const MAX_REQUEST_BYTES: usize = 4096;
 
-/// The node a request was established to come from. Absent when the caller
-/// presented the legacy bearer, which names no machine.
+/// The node a request was established to come from. Every admitted caller has
+/// one: the only credential these endpoints accept is a broker's own projected
+/// ServiceAccount token, and that names the machine it was mounted on.
 #[derive(Clone, Debug)]
 pub struct CallerNodeId(pub String);
 
-/// What every internal route shares: who the caller is, and until when the
-/// bearer that predates per-node identity is still accepted.
+/// What every internal route shares: who the caller is.
 #[derive(Clone)]
 pub struct InternalAuth {
     pub caller: SharedCallerNode,
-    /// The bearer the broker used before it had an identity of its own.
-    pub legacy_bearer: Option<Arc<Zeroizing<String>>>,
-    /// When the legacy bearer stops being accepted. `None` never closes the
-    /// window, which is what an un-migrated deployment leaves it at.
-    pub legacy_bearer_until: Option<SystemTime>,
     /// False where this half has no Kubernetes to establish identity against.
     pub enabled: bool,
-}
-
-impl InternalAuth {
-    fn legacy_accepts(&self, presented: &str, now: SystemTime) -> bool {
-        let Some(bearer) = self.legacy_bearer.as_ref() else {
-            return false;
-        };
-        if self.legacy_bearer_until.is_some_and(|until| now >= until) {
-            return false;
-        }
-        aenv_core::api::constant_time_eq(presented.as_bytes(), bearer.as_bytes())
-    }
 }
 
 /// Mounts the broker's endpoints. `root_ca` absent leaves the intermediate
@@ -91,12 +72,9 @@ pub(crate) fn answer(status: StatusCode, body: serde_json::Value) -> Response {
         .into_response()
 }
 
-/// Establishes the caller before any extractor touches the body.
-///
-/// The legacy bearer is tried first: it is a constant-time compare, while the
-/// token costs two calls to the Kubernetes API. A caller it admits carries no
-/// [`CallerNodeId`], so every route that scopes by node has to treat an absent
-/// one as "unscoped" deliberately rather than by accident.
+/// Establishes the caller before any extractor touches the body, so every
+/// route downstream can read a [`CallerNodeId`] and none has to decide what an
+/// absent one means.
 async fn require_caller(
     State(auth): State<InternalAuth>,
     mut request: Request,
@@ -111,9 +89,6 @@ async fn require_caller(
     let Some(presented) = bearer(request.headers()).map(str::to_string) else {
         return unauthorized();
     };
-    if auth.legacy_accepts(&presented, SystemTime::now()) {
-        return next.run(request).await;
-    }
     match auth.caller.node_of(&presented).await {
         Ok(node_id) => {
             request.extensions_mut().insert(CallerNodeId(node_id));
@@ -131,10 +106,9 @@ async fn require_caller(
 }
 
 fn unauthorized() -> Response {
-    warn!(
+    debug!(
         "an internal call presented no credential this half accepts; the broker's projected \
-         token must carry the aenv-api audience, or its resolver.token_file must hold the \
-         value secrets.pg.resolver_token_file names while that bearer is still accepted"
+         token must carry the aenv-api audience"
     );
     answer(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}))
 }
@@ -143,37 +117,15 @@ fn unauthorized() -> Response {
 mod tests {
     use super::*;
     use crate::internal_auth::StaticCallerNode;
-    use std::time::Duration;
-
-    fn auth(until: Option<SystemTime>) -> InternalAuth {
-        InternalAuth {
-            caller: Arc::new(StaticCallerNode::new([("sa-token", "node-a")])),
-            legacy_bearer: Some(Arc::new(Zeroizing::new("legacy".to_string()))),
-            legacy_bearer_until: until,
-            enabled: true,
-        }
-    }
 
     #[test]
-    fn the_legacy_bearer_is_accepted_until_its_deadline_and_never_after() {
-        let now = SystemTime::now();
-        let open = auth(None);
-        assert!(open.legacy_accepts("legacy", now));
-        assert!(!open.legacy_accepts("other", now));
-
-        let closing = auth(Some(now + Duration::from_secs(60)));
-        assert!(closing.legacy_accepts("legacy", now));
-        assert!(!closing.legacy_accepts("legacy", now + Duration::from_secs(61)));
-    }
-
-    #[test]
-    fn a_deployment_that_configured_no_legacy_bearer_accepts_none() {
+    fn a_token_no_node_claims_is_not_a_caller() {
         let auth = InternalAuth {
-            legacy_bearer: None,
-            ..auth(None)
+            caller: Arc::new(StaticCallerNode::new([("sa-token", "node-a")])),
+            enabled: true,
         };
 
-        assert!(!auth.legacy_accepts("legacy", SystemTime::now()));
-        assert!(!auth.legacy_accepts("", SystemTime::now()));
+        assert!(futures::executor::block_on(auth.caller.node_of("sa-token")).is_ok());
+        assert!(futures::executor::block_on(auth.caller.node_of("anything-else")).is_err());
     }
 }

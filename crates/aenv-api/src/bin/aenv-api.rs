@@ -121,14 +121,10 @@ fn spawn_pg_singleton_tasks(
 /// Kubernetes is what establishes a caller's node, so a deployment discovering
 /// nodes any other way has nothing to ask and the endpoints close rather than
 /// admit an unscoped caller.
-async fn internal_auth(
-    config: &AppConfig,
-    secrets: Option<&aenv_api::secrets::SecretsAssembly>,
-) -> anyhow::Result<aenv_api::internal_api::InternalAuth> {
+async fn internal_auth(config: &AppConfig) -> anyhow::Result<aenv_api::internal_api::InternalAuth> {
     use aenv_api::cfg::ClusterNodeDiscoveryMode;
     use aenv_api::internal_auth::{CallerNode, KubernetesCallerNode, NoCallerNode};
 
-    let legacy_bearer_until = parse_legacy_bearer_until(&config.secrets.legacy_bearer_until)?;
     let (caller, enabled): (Arc<dyn CallerNode>, bool) = match config.cluster.node_discovery_mode {
         ClusterNodeDiscoveryMode::Kubernetes => {
             let namespace = config.cluster.kubernetes_discovery.namespace.trim();
@@ -150,24 +146,7 @@ async fn internal_auth(
         }
     };
 
-    Ok(aenv_api::internal_api::InternalAuth {
-        caller,
-        legacy_bearer: secrets.map(|secrets| Arc::new(secrets.resolver_token.clone())),
-        legacy_bearer_until,
-        enabled,
-    })
-}
-
-/// `[secrets].legacy_bearer_until`, as an instant. Empty never closes.
-fn parse_legacy_bearer_until(raw: &str) -> anyhow::Result<Option<std::time::SystemTime>> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    let parsed = chrono::DateTime::parse_from_rfc3339(raw).with_context(|| {
-        format!("[secrets].legacy_bearer_until {raw:?} is not an RFC 3339 instant")
-    })?;
-    Ok(Some(std::time::SystemTime::from(parsed)))
+    Ok(aenv_api::internal_api::InternalAuth { caller, enabled })
 }
 
 /// The root this half issues node intermediates from, when one is configured.
@@ -354,7 +333,7 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         None => axum::Router::new(),
     };
     let internal_routes = aenv_api::internal_api::router(
-        internal_auth(config, secrets.as_ref()).await?,
+        internal_auth(config).await?,
         egress_root_ca(config)?,
         credential_routes,
     );

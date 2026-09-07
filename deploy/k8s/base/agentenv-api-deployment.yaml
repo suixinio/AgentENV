@@ -609,7 +609,7 @@ spec:
             - name: control-plane-token
               mountPath: /etc/agentenv/control-plane
               readOnly: true
-            # 🔴 The signing key, and the only workload that mounts it. A
+            # The signing key, and the only workload that mounts it. A
             # broker holds an intermediate issued from it, never this.
             - name: egress-ca
               mountPath: /etc/agentenv/egress-ca
@@ -646,7 +646,7 @@ spec:
         - name: agentenv-config
           configMap:
             name: agentenv-k8s-config
-        # 🔴 `items` and `optional: true`, for the same reasons the DaemonSet
+        # `items` and `optional: true`, for the same reasons the DaemonSet
         # gives: a Secret carrying only the gateway's `token` must not start
         # this half stamping, and an absent key must leave the credential
         # unset rather than fail the mount.
@@ -713,12 +713,12 @@ spec:
             items:
               - key: pg-dsn.toml
                 path: pg-dsn.toml
-        # 🔴 Two Secrets, one directory, and both halves optional: the master
-        # key and the resolver bearer are minted by the operator
-        # (`aenv-egress-secrets.example.yaml` says how) and neither exists on
-        # a fresh cluster. The key is deliberately *not* in the same Secret as
-        # anything the database side reads: whoever holds a dump of
-        # `secret_values` must not find the key beside it.
+        # 🔴 The master key values are encrypted under, minted by the
+        # operator (`aenv-egress-secrets.example.yaml` says how) and absent on
+        # a fresh cluster, which is why it is optional. It is deliberately
+        # *not* in the same Secret as anything the database side reads:
+        # whoever holds a dump of `secret_values` must not find the key
+        # beside it.
         - name: credential-store
           projected:
             sources:
@@ -728,12 +728,6 @@ spec:
                   items:
                     - key: key
                       path: master-key
-              - secret:
-                  name: egress-resolver
-                  optional: true
-                  items:
-                    - key: token
-                      path: resolver-token
         # The image sets AENV_HOME_PATH=/workspace/env, and the process creates
         # caches under it. On the node that path is the machine's hostPath; here
         # it is scratch with the Pod's own lifetime. If anything this half writes

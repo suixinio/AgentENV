@@ -20,11 +20,11 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: aenv-egress
+  name: aenv-egress-node
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: aenv-egress
+      app.kubernetes.io/name: aenv-egress-node
   policyTypes:
     - Ingress
     - Egress

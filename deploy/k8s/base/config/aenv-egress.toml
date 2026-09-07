@@ -1,4 +1,4 @@
-# The egress broker's configuration, mounted from the `aenv-egress-config`
+# The egress broker's configuration, mounted from the `aenv-egress-local-config`
 # ConfigMap. Paths name the volumes the broker DaemonSet mounts.
 metrics_listen = "0.0.0.0:9103"
 # The deadline for the identity frame. Nothing on a connection is admitted
@@ -24,7 +24,7 @@ peer_uid = 0
 
 [ca]
 # This node's intermediate, issued by the api half against this Pod's own
-# projected token. 🔴 Guests trust the *root*, never this intermediate: a
+# projected token. Guests trust the *root*, never this intermediate: a
 # sandbox pauses on one node and resumes on another, and a process that loaded
 # its trust store once carries it across the move.
 #
@@ -51,11 +51,9 @@ denied_cidrs = ["10.42.0.0/16", "10.43.0.0/16"]
 # api half itself:
 #   url = "http://agentenv-api:8000/internal"
 # The NetworkPolicy has to admit whatever it names.
-# The same projected token the issuer endpoint checks. Read on every call:
-# kubelet rotates a projected token in place, well inside a broker's uptime.
-# While the api half still accepts the shared bearer
-# (`[secrets].legacy_bearer_until`), `/etc/aenv-egress/resolver/token` works
-# here too — and a caller presenting it is scoped to no node.
+# The same projected token the issuer endpoint checks, and the only credential
+# either endpoint accepts. Read on every call: kubelet rotates a projected
+# token in place, well inside a broker's uptime.
 token_file = "/var/run/secrets/aenv/api/token"
 timeout_ms = 5000
 # How long a resolved credential is reused. It bounds how long a revocation

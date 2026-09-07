@@ -40,7 +40,7 @@ k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "openssl-tls"] }
 libc = "0.2"
 metrics = "0.24"
-# 🔴 The same openssl `kube`'s TLS already links, used directly here to issue
+# The same openssl `kube`'s TLS already links, used directly here to issue
 # the node intermediates. It is not a second TLS stack, and `aenv-api` never
 # terminates TLS with it.
 openssl = "0.10"

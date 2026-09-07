@@ -23,12 +23,11 @@ resources:
   - agentenv-api-deployment.yaml
   - agentenv-api-service.yaml
   - agentenv-api-pdb.yaml
-  # The egress broker for sandboxes with network.rules, one per node. Its two
-  # Secrets are not generated here, nor is the api half's third:
-  # aenv-egress-secrets.example.yaml says how to mint all of them, and the
-  # DaemonSet applies without them (its volumes are optional) so the process,
-  # not the apply, is what fails until they exist. There is no Service: the
-  # node reaches its own machine's broker over a Unix socket.
+  # The egress broker for sandboxes with network.rules, one per node. It
+  # mounts no operator-minted Secret: its credential at the api half's
+  # internal endpoints is its own projected ServiceAccount token, and the
+  # signing key it holds is the intermediate that endpoint issues it. There is
+  # no Service: the node reaches its own machine's broker over a Unix socket.
   - aenv-egress-daemonset.yaml
   - aenv-egress-networkpolicy.yaml
 
@@ -435,19 +434,21 @@ configMapGenerator:
   - name: regctl-config
     files:
       - config.json=config/regctl.json
-  # The broker's own configuration file; paths in it name the Secret volumes
-  # aenv-egress-daemonset.yaml mounts.
-  - name: aenv-egress-config
+  # The broker's own configuration file; paths in it name the volumes
+  # aenv-egress-daemonset.yaml mounts. The name carries the shape: `[listen]`
+  # is a table here and was a string in the cluster-wide broker, so an image
+  # from before the per-node move cannot read this file.
+  - name: aenv-egress-local-config
     files:
       - config/aenv-egress.toml
-  # How nodes reach the broker. `disabled` ships: a node that reports no
-  # broker takes no sandbox with rules, and creates with rules answer 503
-  # until this is flipped to `local` and the DaemonSet is rolled. The socket
-  # is the shared hostPath both DaemonSets mount; the root guests trust for
-  # intercepted names comes from the `egress-ca` Secret, mounted optionally.
+  # How nodes reach the broker: `local`, the socket in the shared hostPath both
+  # DaemonSets mount. The root guests trust for intercepted names comes from
+  # the `egress-ca` Secret, mounted optionally. This is the only value this
+  # tree expresses — a cluster coming from the cluster-wide broker drains its
+  # sandboxes and applies the end state (`docs/src/internals/services.md`).
   - name: egress-broker-config
     literals:
-      - AENV_EGRESS_BROKER_MODE=disabled
+      - AENV_EGRESS_BROKER_MODE=local
       - AENV_EGRESS_BROKER_SOCKET_PATH=/run/aenv-egress/broker.sock
   # Where the api half keeps secret values and grants. `disabled` ships:
   # /secrets answers 503 and rules naming secrets are refused. `postgres`

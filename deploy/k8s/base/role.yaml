@@ -26,7 +26,7 @@ rules:
       - list
       - watch
 ---
-# 🔴 Cluster-scoped, and it has to be: `TokenReview` is a non-namespaced
+# Cluster-scoped, and it has to be: `TokenReview` is a non-namespaced
 # subresource of the authentication API, so no Role can grant it.
 #
 # `create` on `tokenreviews` is the narrowest permission that answers "is this

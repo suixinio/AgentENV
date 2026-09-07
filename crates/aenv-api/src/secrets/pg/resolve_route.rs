@@ -18,7 +18,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::internal_api::{answer, CallerNodeId};
 
@@ -32,8 +32,8 @@ pub const RESOLVE_PATH: &str = "/internal/credentials/resolve";
 struct ResolveState {
     values: Arc<PgSecretValues>,
     /// Where a sandbox is running, as the routing table records it. Absent
-    /// leaves the answer unscoped, which is what a deployment without a
-    /// binding store has.
+    /// makes every question undecidable: this half cannot say whose sandbox
+    /// it is, and answering anyway is what the node scope exists to prevent.
     bindings: Option<Arc<dyn BindingStore>>,
 }
 
@@ -64,17 +64,15 @@ enum NodeScope {
 
 async fn scope_to_caller(
     state: &ResolveState,
-    caller: Option<&CallerNodeId>,
+    CallerNodeId(node_id): &CallerNodeId,
     sandbox_id: &str,
     execution_id: &str,
 ) -> NodeScope {
-    // The legacy bearer names no machine. Its whole window is the migration,
-    // and closing it is what turns this check on for every caller.
-    let Some(CallerNodeId(node_id)) = caller else {
-        return NodeScope::Admitted;
-    };
+    // An undecidable question, not an open one. A deployment that reached
+    // this route has a caller identity to scope by and no table to scope
+    // against; answering it would be answering unscoped.
     let Some(bindings) = state.bindings.as_ref() else {
-        return NodeScope::Admitted;
+        return NodeScope::Undecidable("this half keeps no routing table".to_string());
     };
     match bindings.get(sandbox_id, SystemTime::now()).await {
         Ok(Some(binding)) => {
@@ -88,9 +86,11 @@ async fn scope_to_caller(
             }
             NodeScope::Admitted
         }
-        // No binding is no claim that this sandbox is elsewhere: a create's
-        // reservation lands before the sandbox does.
-        Ok(None) => NodeScope::Admitted,
+        // No binding is a refusal, not a pass. Delete and pause remove the
+        // binding before the grant is reaped, and a sandbox in that window is
+        // one no node may still be asked about — least of all a node that is
+        // not the one it ran on.
+        Ok(None) => NodeScope::Refused,
         Err(err) => NodeScope::Undecidable(err.to_string()),
     }
 }
@@ -124,20 +124,18 @@ async fn resolve(
         return answer(StatusCode::NOT_FOUND, json!({"error": "not found"}));
     }
 
-    let caller = caller.map(|Extension(caller)| caller);
-    match scope_to_caller(
-        &state,
-        caller.as_ref(),
-        &request.sandbox_id,
-        &request.execution_id,
-    )
-    .await
-    {
+    // `require_caller` puts one on every request it admits, so this is a
+    // route reached without the layer in front of it, not a caller with no
+    // node.
+    let Some(Extension(caller)) = caller else {
+        return answer(StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"}));
+    };
+    match scope_to_caller(&state, &caller, &request.sandbox_id, &request.execution_id).await {
         NodeScope::Admitted => {}
         NodeScope::Refused => {
-            warn!(
+            debug!(
                 sandbox_id = %request.sandbox_id,
-                node_id = caller.as_ref().map(|CallerNodeId(id)| id.as_str()).unwrap_or_default(),
+                node_id = caller.0,
                 "a broker asked about a sandbox that is not bound to its node"
             );
             return answer(StatusCode::NOT_FOUND, json!({"error": "not found"}));
@@ -195,7 +193,6 @@ mod tests {
     };
     use aenv_core::node_registry::types::Node;
     use axum::http::header;
-    use zeroize::Zeroizing;
 
     use super::*;
     use crate::internal_api::{InternalAuth, MAX_REQUEST_BYTES};
@@ -205,9 +202,7 @@ mod tests {
     use crate::secrets::PgSecretRefStore;
     use crate::snapshot::repository::backends::postgres::migrate::migrate;
 
-    /// The bearer that predates per-node identity, still accepted here.
-    const TOKEN: &str = "broker-bearer";
-    /// What a broker on `node-a` presents instead.
+    /// What a broker on `node-a` presents: its own projected token.
     const NODE_A_TOKEN: &str = "sa-token-node-a";
     const NODE_B_TOKEN: &str = "sa-token-node-b";
 
@@ -225,9 +220,11 @@ mod tests {
             request.json(&body).send().await.unwrap()
         }
 
+        /// As the broker on `node-a`, which is where the default fixture
+        /// binds every sandbox these tests name.
         async fn resolve(&self, sandbox: &str, execution: &str, name: &str) -> reqwest::Response {
             self.post(
-                Some(&format!("Bearer {TOKEN}")),
+                Some(&format!("Bearer {NODE_A_TOKEN}")),
                 json!({"sandboxId": sandbox, "executionId": execution, "name": name}),
             )
             .await
@@ -255,8 +252,6 @@ mod tests {
                     (NODE_A_TOKEN, "node-a"),
                     (NODE_B_TOKEN, "node-b"),
                 ])),
-                legacy_bearer: Some(Arc::new(Zeroizing::new(TOKEN.to_string()))),
-                legacy_bearer_until: None,
                 enabled: true,
             },
             None,
@@ -293,8 +288,10 @@ mod tests {
     }
 
     macro_rules! endpoint_or_skip {
+        // Every caller is a node now, so the default fixture is a table that
+        // binds the sandbox these tests use to `node-a`.
         ($name:literal) => {
-            endpoint_or_skip!($name, None)
+            endpoint_or_skip!($name, Some(bound_to("node-a", "sbx-1", "exec-1")))
         };
         ($name:literal, $bindings:expr) => {{
             let pool = isolated_schema_pool_or_skip!($name);
@@ -420,7 +417,7 @@ mod tests {
             "a wrong bearer is refused whatever the body carries"
         );
         let response = endpoint
-            .post(Some(&format!("Bearer {TOKEN}")), oversized)
+            .post(Some(&format!("Bearer {NODE_A_TOKEN}")), oversized)
             .await;
         assert_eq!(
             response.status(),
@@ -447,8 +444,8 @@ mod tests {
             None,
             Some("Bearer wrong"),
             Some("Bearer "),
-            Some(TOKEN),
-            Some("Basic YnJva2VyLWJlYXJlcg=="),
+            Some(NODE_A_TOKEN),
+            Some("Basic c2EtdG9rZW4tbm9kZS1h"),
         ] {
             let response = endpoint.post(presented, asked.clone()).await;
             assert_eq!(response.status(), 401, "{presented:?} must not be accepted");
@@ -459,6 +456,49 @@ mod tests {
             endpoint.resolve("sbx-1", "exec-1", "openai").await.status(),
             200
         );
+    }
+
+    #[tokio::test]
+    async fn a_sandbox_no_binding_names_is_refused_rather_than_answered() {
+        // Delete and pause remove the binding before the grant is reaped. A
+        // sandbox in that window is one no node may still be asked about.
+        let bindings: Arc<dyn BindingStore> =
+            Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default()));
+        let (endpoint, values, refs) =
+            endpoint_or_skip!("resolve_route_no_binding", Some(Arc::clone(&bindings)));
+        seed(&refs, &values, "openai", opaque("sk-live")).await;
+        values
+            .grant("sbx-1", "exec-1", &["openai".to_string()])
+            .await
+            .unwrap();
+
+        let response = endpoint
+            .resolve_as(NODE_A_TOKEN, "sbx-1", "exec-1", "openai")
+            .await;
+
+        assert_eq!(response.status(), 404);
+        assert!(!response.text().await.unwrap().contains("sk-live"));
+    }
+
+    #[tokio::test]
+    async fn a_half_with_no_routing_table_answers_unavailable_rather_than_unscoped() {
+        let (endpoint, values, refs) = endpoint_or_skip!("resolve_route_no_store", None);
+        seed(&refs, &values, "openai", opaque("sk-live")).await;
+        values
+            .grant("sbx-1", "exec-1", &["openai".to_string()])
+            .await
+            .unwrap();
+
+        let response = endpoint
+            .resolve_as(NODE_A_TOKEN, "sbx-1", "exec-1", "openai")
+            .await;
+
+        assert_eq!(
+            response.status(),
+            503,
+            "a caller with an identity and no table to scope it against is undecidable"
+        );
+        assert!(!response.text().await.unwrap().contains("sk-live"));
     }
 
     #[tokio::test]
@@ -510,25 +550,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_legacy_bearer_is_scoped_to_no_node_while_its_window_is_open() {
-        let bindings = bound_to("node-a", "sbx-1", "exec-1");
-        let (endpoint, values, refs) =
-            endpoint_or_skip!("resolve_route_legacy_scope", Some(Arc::clone(&bindings)));
-        seed(&refs, &values, "openai", opaque("sk-live")).await;
-        values
-            .grant("sbx-1", "exec-1", &["openai".to_string()])
-            .await
-            .unwrap();
-
-        // The cost of the migration window, stated: a caller with no node
-        // identity is bounded by the grant alone.
-        assert_eq!(
-            endpoint.resolve("sbx-1", "exec-1", "openai").await.status(),
-            200
-        );
-    }
-
-    #[tokio::test]
     async fn everything_the_grant_does_not_cover_is_a_404_the_broker_reads_as_a_refusal() {
         let (endpoint, values, refs) = endpoint_or_skip!("resolve_route_denied");
         seed(&refs, &values, "openai", opaque("sk-live")).await;
@@ -568,7 +589,9 @@ mod tests {
             json!({"sandbox_id": "sbx-1", "execution_id": "exec-1", "name": "openai"}),
             json!([1, 2, 3]),
         ] {
-            let response = endpoint.post(Some(&format!("Bearer {TOKEN}")), body).await;
+            let response = endpoint
+                .post(Some(&format!("Bearer {NODE_A_TOKEN}")), body)
+                .await;
             assert_eq!(response.status(), 400);
         }
     }

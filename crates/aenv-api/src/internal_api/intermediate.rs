@@ -30,7 +30,8 @@ async fn issue(
     State(root_ca): State<Arc<EgressRootCa>>,
     caller: Option<Extension<CallerNodeId>>,
 ) -> Response {
-    // The legacy bearer names no machine, and an intermediate is per machine.
+    // `require_caller` puts one on every request it admits, so this is a
+    // route reached without the layer in front of it.
     let Some(Extension(CallerNodeId(node_id))) = caller else {
         warn!(
             "an intermediate was asked for by a caller with no node identity; only a projected \
@@ -71,12 +72,10 @@ async fn issue(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
 
     use axum::body::Body;
     use axum::http::{header, Request as HttpRequest, StatusCode};
     use tower::ServiceExt as _;
-    use zeroize::Zeroizing;
 
     use super::*;
     use crate::egress_ca::generate_root;
@@ -84,16 +83,13 @@ mod tests {
     use crate::internal_auth::StaticCallerNode;
 
     const NODE_TOKEN: &str = "sa-token-node-a";
-    const LEGACY: &str = "broker-bearer";
 
-    fn app(enabled: bool, legacy_until: Option<SystemTime>) -> Router {
+    fn app(enabled: bool) -> Router {
         let (certificate, key) = generate_root("AgentENV Egress Test Root").unwrap();
         let root_ca = Arc::new(EgressRootCa::from_pem(&certificate, &key).unwrap());
         internal_router(
             InternalAuth {
                 caller: Arc::new(StaticCallerNode::new([(NODE_TOKEN, "node-a")])),
-                legacy_bearer: Some(Arc::new(Zeroizing::new(LEGACY.to_string()))),
-                legacy_bearer_until: legacy_until,
                 enabled,
             },
             Some(root_ca),
@@ -122,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_nodes_own_token_gets_an_intermediate_naming_that_node() {
-        let (status, body) = ask(app(true, None), Some(NODE_TOKEN)).await;
+        let (status, body) = ask(app(true), Some(NODE_TOKEN)).await;
 
         assert_eq!(status, StatusCode::OK);
         let certificate =
@@ -136,38 +132,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_legacy_bearer_names_no_node_and_gets_no_key() {
-        let (status, body) = ask(app(true, None), Some(LEGACY)).await;
-
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(body.get("certificate").is_none(), "{body}");
-    }
-
-    #[tokio::test]
     async fn a_token_this_half_does_not_know_is_refused() {
         for presented in [None, Some(""), Some("someone-elses-token")] {
-            let (status, _) = ask(app(true, None), presented).await;
+            let (status, _) = ask(app(true), presented).await;
             assert_eq!(status, StatusCode::UNAUTHORIZED, "{presented:?}");
         }
     }
 
     #[tokio::test]
-    async fn an_expired_legacy_window_refuses_the_bearer_and_still_serves_a_token() {
-        let closed = Some(SystemTime::now() - Duration::from_secs(1));
-
-        assert_eq!(
-            ask(app(true, closed), Some(LEGACY)).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            ask(app(true, closed), Some(NODE_TOKEN)).await.0,
-            StatusCode::OK
-        );
-    }
-
-    #[tokio::test]
     async fn a_deployment_with_no_kubernetes_closes_the_endpoint() {
-        let (status, body) = ask(app(false, None), Some(NODE_TOKEN)).await;
+        let (status, body) = ask(app(false), Some(NODE_TOKEN)).await;
 
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body["error"], "resolve disabled in static mode");

@@ -22,13 +22,17 @@ x-agentenv-base: &agentenv-base
     # here to smoke is the socket, the identity frame and the intercept.
     AENV_EGRESS_BROKER_MODE: local
     AENV_EGRESS_BROKER_SOCKET_PATH: /run/aenv-egress/broker.sock
+    # The root the broker beside this node minted into their shared volume.
+    # A guest with rules gets it in its trust store; the intermediate that
+    # signs the leaves stays in the broker container.
+    AENV_EGRESS_BROKER_GUEST_CA_CERT_PATH: /run/aenv-egress/ca.crt
     AENV_CLUSTER_NODE_DISCOVERY_MODE: static
     # Keep in step with `aenv_core::logging::DEFAULT_FILTER`: these are target
     # prefixes, and a target is `module_path!()`, so the crate names have to be
     # the post-split ones. `agentenv` stays for the explicit
     # `target: "agentenv"` call sites and the generated `agentenv_http_server`.
     RUST_LOG: ${RUST_LOG:-aenv_core=info,aenv_node=info,aenv_api=info,agentenv=info,envd=info,uvm_ublk=info}
-  # 🔴 Each node service re-declares this list and appends its own broker
+  # Each node service re-declares this list and appends its own broker
   # socket volume: a YAML merge key does not merge sequences, and the socket
   # is per node by construction.
   volumes:
@@ -55,31 +59,40 @@ x-control-plane-config-volume: &control-plane-config-volume
 # DaemonSet. Two differences from `deploy/k8s/base/aenv-egress-daemonset.yaml`,
 # both forced by compose and neither the shape a real deployment has:
 #
-#   * it runs as root, because a compose named volume is created root-owned
-#     and there is no way to hand its directory to another uid the way the
-#     node's own startup hands the hostPath to the broker's group;
+#   * it runs as root for the whole of its life rather than only in an init
+#     container, because compose has none;
 #   * it mints a throwaway CA into the socket volume on first start, because
 #     there is no Secret to mount one from. Nothing outside this stack trusts
 #     it and it is regenerated whenever the volume is.
+#
+# The mint is `aenv-egress gen-ca`, not the openssl CLI: this image carries
+# the binary and its trust store and no other tooling.
+#
+# The intermediate it mints lasts 30 days and nothing renews it: the renewal
+# loop belongs to `[ca].issuer_url`, which this stack has no api half to point
+# at. Past 30 days the broker keeps signing and every leaf carries
+# `notAfter = now`, so a guest fails the handshake rather than seeing the
+# connection closed. Renewing is `rm /run/aenv-egress/intermediate.*` in the
+# volume and restarting these containers; the root, and every trust store
+# loaded from it, stays.
 x-aenv-egress: &aenv-egress
   image: agentenv-egress:latest
   user: "0:0"
   environment:
     AENV_EGRESS_CONFIG_PATH: /config/aenv-egress.toml
+    # The same gid the k8s DaemonSet's init container uses and the node's
+    # `[egress_broker].socket_group` defaults to. The node beside this
+    # container refuses to start until the directory carries it.
+    BROKER_GID: "65532"
     RUST_LOG: ${RUST_LOG_EGRESS:-info}
   entrypoint:
     - /bin/sh
     - -c
     - |
       set -e
-      if [ ! -s /run/aenv-egress/ca.crt ]; then
-        openssl ecparam -name prime256v1 -genkey -noout -out /run/aenv-egress/ca.key
-        openssl req -x509 -new -key /run/aenv-egress/ca.key -sha256 -days 30 \
-          -subj "/CN=AgentENV Compose Egress CA" \
-          -addext "basicConstraints=critical,CA:TRUE" \
-          -addext "keyUsage=critical,keyCertSign,cRLSign" \
-          -out /run/aenv-egress/ca.crt
-      fi
+      chown "0:$$BROKER_GID" /run/aenv-egress
+      chmod 0770 /run/aenv-egress
+      /aenv-egress gen-ca /run/aenv-egress
       exec /aenv-egress
   healthcheck:
     test: ["CMD", "/aenv-egress", "--ready"]

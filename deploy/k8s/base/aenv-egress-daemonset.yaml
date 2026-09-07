@@ -2,28 +2,33 @@
 # through it. One per node, reached over a Unix socket in a hostPath both this
 # DaemonSet and `agentenv-node` mount.
 #
-# 🔴 A DaemonSet and not a sidecar of `agentenv-node`. Firecracker runs as a
+# A DaemonSet and not a sidecar of `agentenv-node`. Firecracker runs as a
 # child of `aenv-node`, so replacing that Pod kills every sandbox on the
 # machine; only a separate workload can be rolled without taking the sandboxes
 # with it. That is the whole reason this object exists.
 #
-# It holds the leaf-signing key and the bearer it presents at the api half's
-# resolve endpoint; neither ever reaches a node, and the bearer reads one
-# granted credential at a time rather than a store.
+# It holds the leaf-signing key it mints under the intermediate the api half
+# issues it; that key never reaches a node. Its credential at the api half's
+# internal endpoints is its own projected ServiceAccount token, so this Pod
+# mounts no shared bearer.
 #
-# Every Secret volume is `optional: true` so the object applies on a cluster
-# that has not created the Secrets yet; the process then refuses to start
-# naming the missing file, which is the loud failure this wants.
+# It prepares its own socket directory. The init container below is the only
+# thing on the machine that chowns `/run/aenv-egress`, which is what lets the
+# broker land on a node whatever the node is running.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: aenv-egress
+  # The whole object family carries the per-node name, not only the Pod
+  # label: a DaemonSet's selector cannot be changed in place, so the shape
+  # that replaced the cluster-wide Deployment had to be a new object rather
+  # than an apply over the old one.
+  name: aenv-egress-node
   labels:
-    app.kubernetes.io/name: aenv-egress
+    app.kubernetes.io/name: aenv-egress-node
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: aenv-egress
+      app.kubernetes.io/name: aenv-egress-node
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
@@ -35,10 +40,10 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: aenv-egress
+        app.kubernetes.io/name: aenv-egress-node
     spec:
       serviceAccountName: aenv-egress
-      # 🔴 The same class as `agentenv-node`. A node whose broker was evicted
+      # The same class as `agentenv-node`. A node whose broker was evicted
       # under pressure serves no sandbox with rules, so evicting the broker to
       # keep the node is not a trade that helps.
       priorityClassName: system-node-critical
@@ -50,6 +55,46 @@ spec:
         runAsUser: 65532
         runAsGroup: 65532
         fsGroup: 65532
+      initContainers:
+        # The socket directory, handed to the group the broker runs under.
+        # Root, and the only root on this Pod: the node mounts the same
+        # hostPath but never touches its ownership, so a broker reaches a
+        # bindable directory on a machine no node has prepared.
+        #
+        # `chown 0:$BROKER_GID` and mode 0770: the node connects as root and
+        # the broker binds through its group, and nothing else on the machine
+        # gets in. $BROKER_GID has to equal `runAsGroup` below and the node's
+        # `[egress_broker].socket_group`; `egress_socket_group_manifest_test.go`
+        # holds the three together.
+        - name: socket-dir
+          image: agentenv-egress:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - chown "0:$BROKER_GID" /run/aenv-egress && chmod 0770 /run/aenv-egress
+          env:
+            - name: BROKER_GID
+              value: "65532"
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              add: ["CHOWN", "FOWNER"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          volumeMounts:
+            - name: broker-socket
+              mountPath: /run/aenv-egress
       containers:
         - name: aenv-egress
           image: agentenv-egress:latest
@@ -76,7 +121,7 @@ spec:
               port: metrics
             initialDelaySeconds: 10
             periodSeconds: 20
-          # 🔴 requests == limits. The broker is on the path of every brokered
+          # requests == limits. The broker is on the path of every brokered
           # request on this machine, and a throttled or evicted broker looks to
           # a sandbox exactly like an upstream that stopped answering. Revisit
           # these from a load test, not from a guess.
@@ -97,13 +142,7 @@ spec:
               mountPath: /etc/aenv-egress/config.toml
               subPath: aenv-egress.toml
               readOnly: true
-            # While the api half still accepts the shared bearer, this is
-            # what `[resolver].token_file` may point at instead of the
-            # projected token above.
-            - name: egress-resolver
-              mountPath: /etc/aenv-egress/resolver
-              readOnly: true
-            # The socket directory `agentenv-node` created and handed to this
+            # The socket directory the init container above handed to this
             # Pod's group. Not readOnly: binding the socket writes into it.
             - name: broker-socket
               mountPath: /run/aenv-egress
@@ -113,21 +152,13 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: aenv-egress-config
-        # 🔴 No `egress-ca` volume, and that is the point of the intermediate:
+            name: aenv-egress-local-config
+        # No `egress-ca` volume, and that is the point of the intermediate:
         # the root's key stays in the api half's own mount, and this Pod holds
         # a key that expires in a week and cannot sign a cluster-internal name.
-        # The bearer the broker presents at the resolve endpoint. Named by
-        # [resolver].token_file; an unset [resolver].url leaves it unread.
-        - name: egress-resolver
-          secret:
-            secretName: egress-resolver
-            optional: true
-        # 🔴 The same path `agentenv-node` mounts. `DirectoryOrCreate` is a
-        # fallback only: the node creates it first and gives it this Pod's
-        # group, and a directory kubelet created instead is owned by root with
-        # no group write, which the broker fails to bind in — loudly, naming
-        # the path.
+        # The same path `agentenv-node` mounts. `DirectoryOrCreate` is what
+        # creates it on a machine that has never run either workload; the init
+        # container is what makes it bindable.
         - name: broker-socket
           hostPath:
             path: /run/aenv-egress

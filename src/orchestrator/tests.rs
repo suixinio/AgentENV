@@ -324,9 +324,14 @@ impl MetadataStore for ScriptedStore {
         expected_execution_id: crate::types::ExecutionId,
         expected_states: &[SandboxState],
     ) -> StdResult<FencedRemoval, StoreError> {
-        self.inner
-            .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
-            .await
+        match ScriptedStoreControl::take_action(&self.control.remove_actions) {
+            StoreAction::Delegate => {
+                self.inner
+                    .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+                    .await
+            }
+            StoreAction::Fail(err) => Err(err),
+        }
     }
 
     async fn list(&self) -> StdResult<Vec<SandboxMetadata>, StoreError> {
@@ -940,6 +945,7 @@ async fn cleanup_failed_launch_removes_created_running_metadata() {
         .store
         .add(SandboxMetadata {
             id: sandbox_id,
+            execution_id: plan.execution_id(),
             state: SandboxState::Running,
             ..Default::default()
         })
@@ -951,6 +957,49 @@ async fn cleanup_failed_launch_removes_created_running_metadata() {
         .await;
 
     assert!(orchestrator.store.get(&sandbox_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_stale_launchs_rollback_leaves_a_newer_incarnations_running_record() {
+    let orchestrator = make_orchestrator().await;
+    let sandbox_id = SandboxId::new();
+    let stale_plan = create_launch_plan_with_resources(sandbox_id);
+    let stale_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
+        Arc::new(MockBehavior::new()),
+        ExecutionId::new(),
+    ))));
+
+    // Nothing is registered under this id, so the rollback takes the path that
+    // believes it owns the shared state.
+    let newer_execution_id = ExecutionId::new();
+    assert_ne!(newer_execution_id, stale_plan.execution_id());
+    orchestrator
+        .store
+        .add(SandboxMetadata {
+            id: sandbox_id,
+            execution_id: newer_execution_id,
+            state: SandboxState::Running,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    orchestrator
+        .cleanup_failed_launch(
+            &stale_plan,
+            stale_handle,
+            FailedLaunchStage::RunningPersisted,
+        )
+        .await;
+
+    let kept = orchestrator
+        .store
+        .get(&sandbox_id)
+        .await
+        .unwrap()
+        .expect("the newer incarnation's record must survive a stale rollback");
+    assert_eq!(kept.execution_id, newer_execution_id);
+    assert_eq!(kept.state, SandboxState::Running);
 }
 
 #[tokio::test]

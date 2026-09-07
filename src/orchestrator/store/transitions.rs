@@ -13,6 +13,17 @@ pub enum TransitionEffect {
     Removal,
 }
 
+/// Every state in the machine, for callers whose fence is the incarnation
+/// rather than any particular state.
+pub const ALL_SANDBOX_STATES: [SandboxState; 6] = [
+    SandboxState::Creating,
+    SandboxState::Running,
+    SandboxState::Snapshotting,
+    SandboxState::Forking,
+    SandboxState::Pausing,
+    SandboxState::Killing,
+];
+
 const fn index(state: SandboxState) -> usize {
     match state {
         SandboxState::Creating => 0,
@@ -70,14 +81,7 @@ pub fn is_allowed_transition(from: SandboxState, to: SandboxState) -> bool {
 mod tests {
     use super::*;
 
-    const STATES: [SandboxState; 6] = [
-        SandboxState::Creating,
-        SandboxState::Running,
-        SandboxState::Snapshotting,
-        SandboxState::Forking,
-        SandboxState::Pausing,
-        SandboxState::Killing,
-    ];
+    const STATES: [SandboxState; 6] = ALL_SANDBOX_STATES;
 
     #[test]
     fn allowed_transition_table_matches_call_sites() {

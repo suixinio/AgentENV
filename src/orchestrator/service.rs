@@ -1531,14 +1531,39 @@ where
     /// Drops a sandbox's record and its incarnation's grant together. The
     /// grant goes even when the record removal fails, so no terminal teardown
     /// can leave one behind.
+    ///
+    /// The removal is fenced on `execution_id`: a record another incarnation
+    /// wrote under this id belongs to that incarnation, and a caller cleaning
+    /// up after its own launch must not take it.
     async fn forget_sandbox(
         &self,
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
     ) -> Result<Option<SandboxMetadata>> {
-        let removed = self.store.remove(&sandbox_id).await;
+        // Read first so the caller still learns what the removal took.
+        let current = self.store.get(&sandbox_id).await;
+        let removal = self
+            .store
+            .remove_if_execution(&sandbox_id, execution_id, &ALL_SANDBOX_STATES)
+            .await;
         self.revoke_secrets(sandbox_id, execution_id).await;
-        Ok(removed?)
+        match removal? {
+            FencedRemoval::Removed => Ok(current?),
+            FencedRemoval::Absent => Ok(None),
+            FencedRemoval::Superseded {
+                state,
+                execution_id: actual,
+            } => {
+                info!(
+                    %sandbox_id,
+                    %execution_id,
+                    actual_execution_id = %actual,
+                    actual_state = ?state,
+                    "left this sandbox's record alone: a newer incarnation owns it"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Returns the real machine reported by the live backend, if remote.

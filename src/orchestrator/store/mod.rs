@@ -26,7 +26,9 @@ pub use redis::{
     StoredSandboxRecord, DEFAULT_KEY_PREFIX as DEFAULT_STORE_KEY_PREFIX,
     RECORD_VERSION as STORE_RECORD_VERSION,
 };
-pub use transitions::{is_allowed_transition, state_from_token, state_token, TransitionEffect};
+pub use transitions::{
+    is_allowed_transition, state_from_token, state_token, TransitionEffect, ALL_SANDBOX_STATES,
+};
 
 pub type Result<T> = std::result::Result<T, StoreError>;
 

@@ -169,6 +169,41 @@ pub async fn a_fenced_removal_takes_back_only_its_own_record<S: MetadataStore>(s
     );
 }
 
+pub async fn a_stale_incarnations_rollback_leaves_the_newer_record<S: MetadataStore>(store: &S) {
+    let stale = ExecutionId::new();
+    let newer = ExecutionId::new();
+    let id = SandboxId::new();
+
+    let mut record = running(id);
+    record.execution_id = newer;
+    store.add(record).await.unwrap();
+
+    assert_eq!(
+        store
+            .remove_if_execution(&id, stale, &crate::orchestrator::store::ALL_SANDBOX_STATES)
+            .await
+            .unwrap(),
+        FencedRemoval::Superseded {
+            state: SandboxState::Running,
+            execution_id: newer,
+        },
+        "a rollback that accepts any state must still be refused by the incarnation"
+    );
+
+    let kept = store.get(&id).await.unwrap().expect("the record survives");
+    assert_eq!(kept.execution_id, newer);
+    assert_eq!(kept.state, SandboxState::Running);
+
+    assert_eq!(
+        store
+            .remove_if_execution(&id, newer, &crate::orchestrator::store::ALL_SANDBOX_STATES)
+            .await
+            .unwrap(),
+        FencedRemoval::Removed,
+        "the incarnation that owns the record may take it back from any state"
+    );
+}
+
 pub async fn add_refuses_a_duplicate<S: MetadataStore>(store: &S) {
     let id = SandboxId::new();
     store.add(running(id)).await.unwrap();
@@ -514,6 +549,7 @@ macro_rules! metadata_store_contract {
             add_get_remove_round_trip,
             network_rules_and_brokers_round_trip,
             a_fenced_removal_takes_back_only_its_own_record,
+            a_stale_incarnations_rollback_leaves_the_newer_record,
             add_refuses_a_duplicate,
             missing_records_are_reported_as_missing,
             state_cas_moves_only_from_an_expected_state,

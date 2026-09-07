@@ -771,14 +771,11 @@ async fn create_overlaybd_device(
             .with_context(|| format!("open overlaybd image: {}", image_config.display()))?,
     );
     let image_config_path = image_config.to_path_buf();
-    let discard_supported = !image.is_read_only().await;
+    let writable = !image.is_read_only().await;
 
-    let target = OverlaybdTarget::from_opened_image(
-        image_config_path,
-        Arc::clone(&image),
-        discard_supported,
-    )
-    .context("create overlaybd target")?;
+    let target =
+        OverlaybdTarget::from_opened_image(image_config_path, Arc::clone(&image), writable)
+            .context("create overlaybd target")?;
 
     let ctrl = UVMUblkCtrlBuilder::new()
         .name("overlaybd-blk")
@@ -1091,14 +1088,10 @@ async fn prepare_overlaybd_device(
         let dev_id = p.dev.dev_id();
         tracing::debug!(dev_id, mode, "reusing warm device from pool");
 
-        let discard_supported = !image.is_read_only().await;
+        let writable = !image.is_read_only().await;
         p.dev
             .target()
-            .swap_state(
-                image_config.to_path_buf(),
-                Arc::clone(image),
-                discard_supported,
-            )
+            .swap_state(image_config.to_path_buf(), Arc::clone(image), writable)
             .with_context(|| format!("swap {mode} target state"))?;
 
         if pool.supports_update_size() && p.dev_sectors != new_sectors {
@@ -1559,13 +1552,10 @@ async fn create_new_device(
     image_config: &Path,
     image: &Arc<ImageFile>,
 ) -> Result<UVMUblkDev<OverlaybdTarget>> {
-    let discard_supported = !image.is_read_only().await;
-    let target = OverlaybdTarget::from_opened_image(
-        image_config.to_path_buf(),
-        Arc::clone(image),
-        discard_supported,
-    )
-    .context("create overlaybd target")?;
+    let writable = !image.is_read_only().await;
+    let target =
+        OverlaybdTarget::from_opened_image(image_config.to_path_buf(), Arc::clone(image), writable)
+            .context("create overlaybd target")?;
 
     let ctrl = UVMUblkCtrlBuilder::new()
         .name("overlaybd-blk")

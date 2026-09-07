@@ -344,12 +344,13 @@ spec:
                     # returns, so a hook that never returns is not a hook that
                     # waits patiently — it is a hook that stops the server's own
                     # graceful shutdown from ever starting. That shutdown is
-                    # what *pauses and persists* every sandbox still here; with
-                    # it skipped, the grace period simply expires and everything
-                    # is SIGKILLed. An unbounded wait does not protect
-                    # sandboxes, it destroys them, and it does so on every
-                    # single pod deletion: set image, rollout restart, delete
-                    # pod, drain, node reboot.
+                    # what *stops* every sandbox still here, releasing its
+                    # network namespace, ublk devices and Firecracker process;
+                    # with it skipped, the grace period simply expires and
+                    # everything is SIGKILLed, leaving that state behind. An
+                    # unbounded wait does not protect sandboxes, it destroys
+                    # them, and it does so on every single pod deletion: set
+                    # image, rollout restart, delete pod, drain, node reboot.
                     #
                     # 🔴 Reads /nodes, not /sandboxes. Under `aenv-node` the
                     # sandboxes routes answer 404 (src/api/role_gate.rs), so the

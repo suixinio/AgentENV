@@ -25,7 +25,7 @@ struct TargetState {
     dev_sectors: u64,
     logical_bs_shift: u8,
     physical_bs_shift: u8,
-    discard_supported: bool,
+    writable: bool,
 }
 
 impl TargetState {
@@ -56,7 +56,7 @@ impl fmt::Debug for OverlaybdTarget {
             .field("dev_sectors", &state.dev_sectors)
             .field("logical_bs_shift", &state.logical_bs_shift)
             .field("physical_bs_shift", &state.physical_bs_shift)
-            .field("discard_supported", &state.discard_supported)
+            .field("writable", &state.writable)
             .finish_non_exhaustive()
     }
 }
@@ -91,14 +91,14 @@ impl OverlaybdTarget {
                     )
                 })?,
         );
-        let discard_supported = !image.is_read_only().await;
-        Self::from_opened_image(image_config_path, image, discard_supported)
+        let writable = !image.is_read_only().await;
+        Self::from_opened_image(image_config_path, image, writable)
     }
 
     pub fn from_opened_image(
         image_config_path: PathBuf,
         image: Arc<ImageFile>,
-        discard_supported: bool,
+        writable: bool,
     ) -> Result<Self> {
         let logical_bs_shift = validate_block_size_shift(image.block_size)?;
         let dev_sectors = image.num_lbas();
@@ -115,7 +115,7 @@ impl OverlaybdTarget {
             dev_sectors,
             logical_bs_shift,
             physical_bs_shift: DEFAULT_PHYSICAL_BS_SHIFT.max(logical_bs_shift),
-            discard_supported,
+            writable,
         };
 
         Ok(Self {
@@ -134,7 +134,7 @@ impl OverlaybdTarget {
         &self,
         image_config_path: PathBuf,
         image: Arc<ImageFile>,
-        discard_supported: bool,
+        writable: bool,
     ) -> Result<()> {
         let logical_bs_shift = validate_block_size_shift(image.block_size)?;
         let dev_sectors = image.num_lbas();
@@ -151,7 +151,7 @@ impl OverlaybdTarget {
             dev_sectors,
             logical_bs_shift,
             physical_bs_shift: DEFAULT_PHYSICAL_BS_SHIFT.max(logical_bs_shift),
-            discard_supported,
+            writable,
         };
 
         self.state.store(Arc::new(new_state));
@@ -226,7 +226,7 @@ impl OverlaybdTarget {
         if len == 0 {
             return Ok(0);
         }
-        if !state.discard_supported {
+        if !state.writable {
             return Err(std::io::Error::new(
                 ErrorKind::PermissionDenied,
                 "overlaybd discard on read-only image",
@@ -250,19 +250,25 @@ fn build_ublk_params(
     logical_bs_shift: u8,
     physical_bs_shift: u8,
     max_io_buf_bytes: u32,
-    discard_supported: bool,
+    writable: bool,
 ) -> ublk_sys::ublk_params {
     let logical_block_size = 1u32 << logical_bs_shift;
     ublk_sys::ublk_params {
         types: ublk_sys::UBLK_PARAM_TYPE_BASIC
-            | if discard_supported {
+            | if writable {
                 ublk_sys::UBLK_PARAM_TYPE_DISCARD
             } else {
                 0
             },
         len: size_of::<ublk_sys::ublk_params>() as u32,
         basic: ublk_sys::ublk_param_basic {
-            attrs: 0,
+            // Without this the kernel reports write-through and never sends a
+            // Flush, so a guest fsync ends at the page cache of the upper.
+            attrs: if writable {
+                ublk_sys::UBLK_ATTR_VOLATILE_CACHE
+            } else {
+                0
+            },
             logical_bs_shift,
             physical_bs_shift,
             io_min_shift: logical_bs_shift,
@@ -271,7 +277,7 @@ fn build_ublk_params(
             dev_sectors,
             ..Default::default()
         },
-        discard: if discard_supported {
+        discard: if writable {
             ublk_sys::ublk_param_discard {
                 discard_alignment: logical_block_size,
                 discard_granularity: logical_block_size,
@@ -326,7 +332,7 @@ impl UVMUblkTarget for OverlaybdTarget {
             state.logical_bs_shift,
             state.physical_bs_shift,
             dev_info.max_io_buf_bytes,
-            state.discard_supported,
+            state.writable,
         )
     }
 
@@ -422,7 +428,21 @@ mod tests {
         assert_eq!(params.basic.io_opt_shift, 12);
         assert_eq!(params.basic.max_sectors, 1024);
         assert_eq!(params.basic.dev_sectors, 1024);
-        assert_eq!(params.basic.attrs, 0);
+        assert_eq!(
+            params.basic.attrs, 0,
+            "a read-only device has no cache for the guest to flush"
+        );
+    }
+
+    #[test]
+    fn test_overlaybd_build_params_declare_a_volatile_cache_when_writable() {
+        let params = build_ublk_params(1024, 9, 12, 512 * 1024, true);
+        assert_eq!(
+            params.basic.attrs & ublk_sys::UBLK_ATTR_VOLATILE_CACHE,
+            ublk_sys::UBLK_ATTR_VOLATILE_CACHE,
+            "a guest fsync only reaches the Flush handler when the device says its cache \
+             is volatile"
+        );
     }
 
     #[test]
@@ -567,5 +587,79 @@ mod tests {
             .await
             .expect("read after discard");
         assert!(got.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_overlaybd_target_flush_reaches_the_image() {
+        let tmp = TempDir::new().expect("tempdir");
+        let global_config = write_global_config(&tmp).expect("write global config");
+        let upper_data = tmp.path().join("upper.data");
+        prepare_runtime_upper(&upper_data, None, 8192, UpperMode::Sparse)
+            .expect("prepare sparse upper");
+        let image_config =
+            write_sparse_image_config(&tmp, &upper_data).expect("write image config");
+
+        let service = ImageService::from_config_path(&global_config)
+            .await
+            .expect("open image service");
+        let image = Arc::new(
+            service
+                .create_image_file(&image_config)
+                .await
+                .expect("open image"),
+        );
+        let target = Arc::new(
+            OverlaybdTarget::from_opened_image(image_config.clone(), image, true).unwrap(),
+        );
+        let ring = AsyncIoRingBuilder::new()
+            .nr_sparse_buffer(2)
+            .nr_sparse_file(2)
+            .sqe_entries(8)
+            .cqe_entries(16)
+            .build()
+            .expect("build async io ring");
+        let mut buf = IOBuffer::User(
+            UserBuffer::new(ring.clone(), 4096, 512)
+                .await
+                .expect("allocate io buffer"),
+        );
+
+        {
+            let write = ublksrv_io_desc {
+                op_flags: ublk_sys::UBLK_IO_OP_WRITE,
+                nr_sectors: 8,
+                start_sector: 0,
+                addr: buf.uring_buf_idx() as u64,
+            };
+            if let IOBuffer::User(user) = &mut buf {
+                user.subslice_mut(0, 4096).copy_from_slice(&[0x5Au8; 4096]);
+            }
+            let ret = target
+                .handle_io_request(0, 0, write, &mut buf, None, &ring)
+                .await;
+            assert_eq!(ret, 4096);
+        }
+
+        let flush = ublksrv_io_desc {
+            op_flags: ublk_sys::UBLK_IO_OP_FLUSH,
+            nr_sectors: 0,
+            start_sector: 0,
+            addr: buf.uring_buf_idx() as u64,
+        };
+        let ret = target
+            .handle_io_request(0, 0, flush, &mut buf, None, &ring)
+            .await;
+        assert_eq!(
+            ret, 0,
+            "a guest flush must reach the image, not be answered as unsupported"
+        );
+
+        let state = target.state.load_full();
+        let got = state
+            .image
+            .read_at(0, 4096)
+            .await
+            .expect("read after flush");
+        assert!(got.iter().all(|&b| b == 0x5A));
     }
 }

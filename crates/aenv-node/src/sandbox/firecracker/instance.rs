@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{bail, Context, Result};
-use firecracker_client::models::drive::IoEngine;
+use firecracker_client::models::drive::{CacheType, IoEngine};
 use firecracker_client::models::instance_action_info::ActionType;
 use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
@@ -336,6 +336,7 @@ impl FirecrackerInstance {
         let mut drive = Drive::new(drive_id.to_string(), is_root_device);
         drive.path_on_host = Some(path_on_host.to_string_lossy().into_owned());
         drive.is_read_only = Some(read_only);
+        drive.cache_type = Some(cache_type_for(read_only));
         drive.direct = Some(direct);
         drive.io_engine = Some(io_engine);
         drive.rate_limiter = rate_limiter;
@@ -617,11 +618,40 @@ fn parse_log_level(level: &str) -> Result<firecracker_client::models::logger::Le
     }
 }
 
+/// Writeback is what makes the guest issue flushes: under `Unsafe` the guest is
+/// told the device needs none, so nothing below ever hears about an fsync. A
+/// read-only drive has nothing to flush and keeps the default.
+fn cache_type_for(read_only: bool) -> CacheType {
+    if read_only {
+        CacheType::Unsafe
+    } else {
+        CacheType::Writeback
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
+
+    #[test]
+    fn a_writable_drive_asks_the_guest_to_flush_and_a_read_only_one_does_not() {
+        assert_eq!(cache_type_for(false), CacheType::Writeback);
+        assert_eq!(cache_type_for(true), CacheType::Unsafe);
+    }
+
+    #[test]
+    fn a_writable_drive_carries_its_cache_type_into_the_request_body() {
+        let mut drive = Drive::new("vdb".to_string(), false);
+        drive.is_read_only = Some(false);
+        drive.cache_type = Some(cache_type_for(false));
+        let body = serde_json::to_string(&drive).expect("a drive serializes");
+        assert!(
+            body.contains("\"cache_type\":\"Writeback\""),
+            "the flush the guest issues depends on this field reaching Firecracker: {body}"
+        );
+    }
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {

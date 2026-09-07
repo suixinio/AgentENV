@@ -5,7 +5,10 @@
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
-use super::{FencedRemoval, MetadataStore, SandboxListFilter, SandboxMetadata, StoreError};
+use super::{
+    FencedRemoval, MetadataStore, SandboxListFilter, SandboxMetadata, StoreError,
+    TransitionOutcome, TransitionRequest,
+};
 use crate::orchestrator::SandboxState;
 use crate::types::{ExecutionId, SandboxId};
 
@@ -201,6 +204,75 @@ pub async fn a_stale_incarnations_rollback_leaves_the_newer_record<S: MetadataSt
             .unwrap(),
         FencedRemoval::Removed,
         "the incarnation that owns the record may take it back from any state"
+    );
+}
+
+fn eviction_of(execution_id: ExecutionId) -> TransitionRequest {
+    TransitionRequest::new(SandboxState::Pausing, vec![SandboxState::Running])
+        .with_execution(execution_id)
+        .as_eviction()
+}
+
+async fn expired_running<S: MetadataStore>(store: &S) -> SandboxMetadata {
+    let mut record = running(SandboxId::new());
+    record.set_timeout(Some(Duration::from_millis(1)));
+    store.add(record.clone()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    record
+}
+
+pub async fn an_eviction_claim_rechecks_expiry_and_incarnation<S: MetadataStore>(store: &S) {
+    let expired = expired_running(store).await;
+    let TransitionOutcome::Started(guard) = store
+        .start_transition(&expired.id, eviction_of(expired.execution_id))
+        .await
+        .unwrap()
+    else {
+        panic!("an expired sandbox must be claimable for eviction");
+    };
+    guard.release().await.unwrap();
+    assert_eq!(
+        store.get(&expired.id).await.unwrap().unwrap().state,
+        SandboxState::Pausing,
+        "a released claim leaves the record in the state it entered"
+    );
+
+    // A keep-alive that landed after the candidate was picked wins the race.
+    let kept_alive = expired_running(store).await;
+    store
+        .update_if_state(&kept_alive.id, &[SandboxState::Running], |metadata| {
+            metadata.set_timeout(Some(Duration::from_secs(600)));
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            store
+                .start_transition(&kept_alive.id, eviction_of(kept_alive.execution_id))
+                .await
+                .unwrap(),
+            TransitionOutcome::NotExpired
+        ),
+        "a sandbox somebody kept alive must not be evicted on this tick"
+    );
+    assert_eq!(
+        store.get(&kept_alive.id).await.unwrap().unwrap().state,
+        SandboxState::Running
+    );
+
+    // A record another incarnation wrote is not this candidate.
+    let replaced = expired_running(store).await;
+    let error = store
+        .start_transition(&replaced.id, eviction_of(ExecutionId::new()))
+        .await
+        .expect_err("an eviction must name the run it picked");
+    assert!(
+        matches!(error, StoreError::ExecutionSuperseded { .. }),
+        "{error:?}"
+    );
+    assert_eq!(
+        store.get(&replaced.id).await.unwrap().unwrap().state,
+        SandboxState::Running
     );
 }
 
@@ -550,6 +622,7 @@ macro_rules! metadata_store_contract {
             network_rules_and_brokers_round_trip,
             a_fenced_removal_takes_back_only_its_own_record,
             a_stale_incarnations_rollback_leaves_the_newer_record,
+            an_eviction_claim_rechecks_expiry_and_incarnation,
             add_refuses_a_duplicate,
             missing_records_are_reported_as_missing,
             state_cas_moves_only_from_an_expected_state,

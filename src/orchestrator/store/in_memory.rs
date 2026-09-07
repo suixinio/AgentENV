@@ -1,4 +1,5 @@
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -7,8 +8,9 @@ use tokio::sync::{watch, RwLock};
 use crate::orchestrator::SandboxState;
 
 use super::{
-    ExecutionId, FencedRemoval, MetadataStore, MetadataUpdateResult, Result, SandboxId,
-    SandboxListFilter, SandboxMetadata, StoreError,
+    is_allowed_transition, ExecutionId, FencedRemoval, MetadataStore, MetadataUpdateResult, Result,
+    SandboxId, SandboxListFilter, SandboxMetadata, StoreError, TransitionCompleter,
+    TransitionEffect, TransitionGuard, TransitionOutcome, TransitionRequest,
 };
 
 /// In-memory metadata store backed by a `RwLock<HashMap>`.
@@ -18,7 +20,7 @@ use super::{
 /// This enables efficient, lock-free waiting for state transitions via
 /// `wait_while_in_states`.
 pub struct InMemoryMetadataStore {
-    inner: RwLock<StoreInner>,
+    inner: Arc<RwLock<StoreInner>>,
 }
 
 #[derive(Clone)]
@@ -36,7 +38,7 @@ struct StoreInner {
 impl Default for InMemoryMetadataStore {
     fn default() -> Self {
         Self {
-            inner: RwLock::new(StoreInner::default()),
+            inner: Arc::new(RwLock::new(StoreInner::default())),
         }
     }
 }
@@ -364,6 +366,77 @@ impl MetadataStore for InMemoryMetadataStore {
     ///   that triggered the notification (or a newer one).
     /// - If the sandbox was already in a non-transitional state when the call is
     ///   made, `watch::Receiver::wait_for` returns immediately without blocking.
+    /// Claims a transition under the same fences the cluster store applies.
+    ///
+    /// An in-process store has no second replica to join, so a transition that
+    /// is already at its target is a state conflict rather than an in-flight
+    /// one, and there is no transition key to hold.
+    async fn start_transition(
+        &self,
+        sandbox_id: &SandboxId,
+        request: TransitionRequest,
+    ) -> Result<TransitionOutcome> {
+        let (from_state, tx) = {
+            let mut inner = self.inner.write().await;
+            let Some(record) = inner.records.get_mut(sandbox_id) else {
+                return Err(StoreError::SandboxNotFound {
+                    sandbox_id: *sandbox_id,
+                });
+            };
+            let from_state = record.metadata.state;
+            if let Some(expected) = request.expected_execution_id {
+                if record.metadata.execution_id != expected {
+                    return Err(StoreError::ExecutionSuperseded {
+                        sandbox_id: *sandbox_id,
+                        expected,
+                        actual: Some(record.metadata.execution_id),
+                    });
+                }
+            }
+            if !request.expected_states.contains(&from_state) {
+                return Err(StoreError::StateConflict {
+                    sandbox_id: *sandbox_id,
+                    expected_states: request.expected_states.clone(),
+                    actual_state: from_state,
+                });
+            }
+            if !is_allowed_transition(from_state, request.target_state) {
+                return Err(StoreError::InvalidTransition {
+                    sandbox_id: *sandbox_id,
+                    from: from_state,
+                    to: request.target_state,
+                });
+            }
+            if request.eviction {
+                let now = SystemTime::now();
+                let still_alive = record
+                    .metadata
+                    .expires_at
+                    .is_none_or(|expires_at| expires_at > now);
+                if still_alive {
+                    return Ok(TransitionOutcome::NotExpired);
+                }
+            }
+            record.metadata.state = request.target_state;
+            record.metadata.sync_running_clock(SystemTime::now());
+            (from_state, record.state_tx.clone())
+        };
+
+        Self::notify_state(&tx, Some(request.target_state));
+        Ok(TransitionOutcome::Started(TransitionGuard::new(
+            *sandbox_id,
+            uuid::Uuid::now_v7().to_string(),
+            request.target_state,
+            Arc::new(InMemoryTransitionCompleter {
+                inner: Arc::clone(&self.inner),
+                sandbox_id: *sandbox_id,
+                from_state,
+                transitional_state: request.target_state,
+                effect: request.effect,
+            }),
+        )))
+    }
+
     async fn wait_while_in_states(
         &self,
         sandbox_id: &SandboxId,
@@ -412,6 +485,68 @@ impl MetadataStore for InMemoryMetadataStore {
             .records
             .get(sandbox_id)
             .map(|record| record.metadata.clone()))
+    }
+}
+
+/// Settles an in-process transition; there is no key to release.
+struct InMemoryTransitionCompleter {
+    inner: Arc<RwLock<StoreInner>>,
+    sandbox_id: SandboxId,
+    from_state: SandboxState,
+    transitional_state: SandboxState,
+    effect: TransitionEffect,
+}
+
+#[async_trait]
+impl TransitionCompleter for InMemoryTransitionCompleter {
+    async fn complete(
+        &self,
+        _transition_id: &str,
+        outcome: std::result::Result<(), String>,
+    ) -> Result<()> {
+        let settle_to = match (&self.effect, outcome.is_ok()) {
+            (TransitionEffect::Transient, _) => Some(self.from_state),
+            (TransitionEffect::Terminal(state), true) => Some(*state),
+            (TransitionEffect::Terminal(_), false) => Some(self.from_state),
+            (TransitionEffect::Removal, true) => None,
+            (TransitionEffect::Removal, false) => Some(self.from_state),
+        };
+
+        let (removed, notification) = {
+            let mut inner = self.inner.write().await;
+            let Some(record) = inner.records.get_mut(&self.sandbox_id) else {
+                return Ok(());
+            };
+            if record.metadata.state != self.transitional_state {
+                return Ok(());
+            }
+            match settle_to {
+                Some(state) => {
+                    record.metadata.state = state;
+                    record.metadata.sync_running_clock(SystemTime::now());
+                    let tx = record.state_tx.clone();
+                    (None, Some((tx, Some(state))))
+                }
+                None => {
+                    let removed = inner.records.remove(&self.sandbox_id);
+                    if let Some(record) = &removed {
+                        inner.deindex_expiry(&record.metadata.id, record.metadata.expires_at);
+                    }
+                    let tx = removed.as_ref().map(|record| record.state_tx.clone());
+                    (removed, tx.map(|tx| (tx, None)))
+                }
+            }
+        };
+        let _ = removed;
+
+        if let Some((tx, state)) = notification {
+            InMemoryMetadataStore::notify_state(&tx, state);
+        }
+        Ok(())
+    }
+
+    async fn release(&self, _transition_id: &str) -> Result<()> {
+        Ok(())
     }
 }
 

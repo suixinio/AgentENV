@@ -1306,6 +1306,23 @@ where
             }
         };
 
+        self.delete_entered_sandbox(sandbox_id, previous_state)
+            .await
+    }
+
+    /// Deletes a sandbox whose record this caller already moved into `Killing`.
+    ///
+    /// `previous_state` is where a rollback returns the record.
+    #[tracing::instrument(
+        name = "delete_entered_sandbox",
+        skip(self),
+        fields(sandbox_id = %sandbox_id)
+    )]
+    async fn delete_entered_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        previous_state: SandboxState,
+    ) -> Result<()> {
         // Read the authoritative execution after exclusively entering `Killing`.
         let expected_execution_id = match self.store.get(&sandbox_id).await {
             Ok(Some(metadata)) => metadata.execution_id,
@@ -1623,12 +1640,6 @@ where
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<PauseOutcome> {
         info!("pausing sandbox");
-        let Some(publisher) = self.pause_publisher.get().cloned() else {
-            return Err(OrchestratorError::InternalError(format!(
-                "sandbox {sandbox_id} cannot be paused: this process has nowhere to publish a pause"
-            )));
-        };
-
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
@@ -1653,6 +1664,26 @@ where
             }
             Err(err) => return Err(OrchestratorError::from(err)),
         }
+
+        self.pause_entered_sandbox(sandbox_id).await
+    }
+
+    /// Pauses a sandbox whose record this caller already moved into `Pausing`.
+    #[tracing::instrument(
+        name = "pause_entered_sandbox",
+        skip(self),
+        fields(sandbox_id = %sandbox_id)
+    )]
+    async fn pause_entered_sandbox(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<PauseOutcome> {
+        let Some(publisher) = self.pause_publisher.get().cloned() else {
+            self.rollback_pause_to_running(sandbox_id).await;
+            return Err(OrchestratorError::InternalError(format!(
+                "sandbox {sandbox_id} cannot be paused: this process has nowhere to publish a pause"
+            )));
+        };
 
         // Read the authoritative record after exclusively entering `Pausing`.
         let metadata = match self.store.get(&sandbox_id).await {
@@ -2597,11 +2628,23 @@ where
             if metadata.state != SandboxState::Running {
                 continue;
             }
+            let target_state = match metadata.timeout_action {
+                SandboxTimeoutAction::Pause => SandboxState::Pausing,
+                SandboxTimeoutAction::Delete => SandboxState::Killing,
+            };
+            // The batch is a stale read; the claim re-checks expiry and the
+            // incarnation against the record as it stands now.
+            if !self.claim_eviction(&metadata, target_state).await {
+                continue;
+            }
             if let Err(err) = match metadata.timeout_action {
                 SandboxTimeoutAction::Pause => {
-                    self.pause_sandbox_inner(metadata.id).await.map(|_| ())
+                    self.pause_entered_sandbox(metadata.id).await.map(|_| ())
                 }
-                SandboxTimeoutAction::Delete => self.delete_sandbox_inner(metadata.id).await,
+                SandboxTimeoutAction::Delete => {
+                    self.delete_entered_sandbox(metadata.id, SandboxState::Running)
+                        .await
+                }
             } {
                 warn!(
                     sandbox_id = %metadata.id,
@@ -2615,6 +2658,54 @@ where
         }
 
         Ok(evicted_ids)
+    }
+
+    /// Enters `target_state` for an eviction, atomically with a re-check that
+    /// the sandbox is still the same run and still expired.
+    ///
+    /// `false` means somebody kept the sandbox alive or replaced it between
+    /// the batch read and now, and this tick must leave it alone.
+    async fn claim_eviction(&self, metadata: &SandboxMetadata, target_state: SandboxState) -> bool {
+        let request = TransitionRequest::new(target_state, vec![SandboxState::Running])
+            .with_execution(metadata.execution_id)
+            .as_eviction();
+        match self.store.start_transition(&metadata.id, request).await {
+            Ok(TransitionOutcome::Started(guard)) => {
+                // The operation settles the record itself, so the claim has
+                // nothing left to do once the state is entered.
+                if let Err(error) = guard.release().await {
+                    warn!(
+                        sandbox_id = %metadata.id,
+                        error = %error,
+                        "could not release an eviction claim; it expires on its own"
+                    );
+                }
+                true
+            }
+            Ok(TransitionOutcome::NotExpired) => {
+                debug!(
+                    sandbox_id = %metadata.id,
+                    "a keep-alive landed after this sandbox was picked for eviction"
+                );
+                false
+            }
+            Ok(TransitionOutcome::InFlight { transition_id }) => {
+                debug!(
+                    sandbox_id = %metadata.id,
+                    %transition_id,
+                    "another caller is already moving this sandbox out of running"
+                );
+                false
+            }
+            Err(error) => {
+                debug!(
+                    sandbox_id = %metadata.id,
+                    error = %error,
+                    "the sandbox picked for eviction is no longer the one that was picked"
+                );
+                false
+            }
+        }
     }
 
     /// Starts a background task that periodically evicts expired sandboxes.

@@ -189,6 +189,10 @@ pub trait TransitionCompleter: Send + Sync {
         transition_id: &str,
         outcome: std::result::Result<(), String>,
     ) -> Result<()>;
+
+    /// Drops the transition claim without settling the record, for a caller
+    /// that keeps the target state and settles it itself.
+    async fn release(&self, transition_id: &str) -> Result<()>;
 }
 
 /// Owned transition that must be completed.
@@ -238,6 +242,15 @@ impl TransitionGuard {
             return Ok(());
         };
         completer.complete(&self.transition_id, outcome).await
+    }
+
+    /// Gives up the claim while leaving the record in the state the transition
+    /// put it in. The caller owns settling it from here.
+    pub async fn release(mut self) -> Result<()> {
+        let Some(completer) = self.completer.take() else {
+            return Ok(());
+        };
+        completer.release(&self.transition_id).await
     }
 }
 

@@ -198,6 +198,8 @@ struct ScriptedStoreControl {
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
     remove_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
+    /// Records the eviction batch answers with, whatever the store now holds.
+    stale_expired_batch: StdMutex<Vec<SandboxMetadata>>,
 }
 
 impl ScriptedStoreControl {
@@ -220,6 +222,13 @@ impl ScriptedStoreControl {
             .lock()
             .expect("remove actions mutex poisoned")
             .push_back(action);
+    }
+
+    fn set_stale_expired_batch(&self, records: Vec<SandboxMetadata>) {
+        *self
+            .stale_expired_batch
+            .lock()
+            .expect("stale expired batch mutex poisoned") = records;
     }
 
     fn set_on_add(&self, hook: StoreHook) {
@@ -357,6 +366,31 @@ impl MetadataStore for ScriptedStore {
         now: std::time::SystemTime,
     ) -> StdResult<Vec<SandboxMetadata>, StoreError> {
         self.inner.list_expired(now).await
+    }
+
+    async fn expired_batch(
+        &self,
+        now: std::time::SystemTime,
+        limit: usize,
+    ) -> StdResult<Vec<SandboxMetadata>, StoreError> {
+        let stale = self
+            .control
+            .stale_expired_batch
+            .lock()
+            .expect("stale expired batch mutex poisoned")
+            .clone();
+        if stale.is_empty() {
+            return self.inner.expired_batch(now, limit).await;
+        }
+        Ok(stale)
+    }
+
+    async fn start_transition(
+        &self,
+        sandbox_id: &SandboxId,
+        request: crate::orchestrator::TransitionRequest,
+    ) -> StdResult<crate::orchestrator::TransitionOutcome, StoreError> {
+        self.inner.start_transition(sandbox_id, request).await
     }
 
     async fn list_ids(&self) -> StdResult<Vec<SandboxId>, StoreError> {
@@ -5594,6 +5628,62 @@ async fn a_fork_child_that_never_started_does_not_keep_its_grant() -> Result<()>
         "the child's grant outlived a child that never existed: {:?}",
         grants.events()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_keepalive_that_lands_after_selection_stops_the_eviction() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator =
+        make_orchestrator_without_background(ScriptedStore::new(Arc::clone(&control)));
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(1), &[("team", "evict-race")]))
+        .await?;
+    sleep(Duration::from_millis(1100)).await;
+
+    // The batch is what an eviction round read before the keep-alive landed.
+    let picked = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("the sandbox is recorded");
+    control.set_stale_expired_batch(vec![picked]);
+
+    orchestrator
+        .keep_alive_for(created.id, Some(Duration::from_secs(600)), false)
+        .await?;
+
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+
+    assert!(
+        evicted.is_empty(),
+        "a sandbox somebody kept alive must survive the round that picked it: {evicted:?}"
+    );
+    let survivor = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("the sandbox must still be recorded");
+    assert_eq!(survivor.state, SandboxState::Running);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_expired_sandbox_the_batch_named_is_still_evicted() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator =
+        make_orchestrator_without_background(ScriptedStore::new(Arc::clone(&control)));
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(1), &[("team", "evict-plain")]))
+        .await?;
+    sleep(Duration::from_millis(1100)).await;
+
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+
+    assert_eq!(evicted, vec![created.id]);
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
     Ok(())
 }
 

@@ -315,6 +315,38 @@ impl TransitionCompleter for RedisTransitionCompleter {
         inner.notify(&routing::record(&sandbox_id)).await;
         settled
     }
+
+    async fn release(&self, transition_id: &str) -> Result<()> {
+        let inner = &self.inner;
+        let sandbox_id = self.sandbox_id;
+        let mut connection = inner.connection();
+        let code: i64 = scripts::complete_transition()
+            .key(inner.keys().transition(&sandbox_id))
+            .key(
+                inner
+                    .keys()
+                    .transition_result(&sandbox_id, &self.member.transition_id),
+            )
+            .key(inner.keys().transition_index())
+            .arg(transition_id)
+            .arg(String::new())
+            .arg(duration_to_secs_ceil(inner.config().transition_result_ttl))
+            .arg(self.member.encode())
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend)?;
+
+        if code == 0 {
+            warn!(
+                %sandbox_id,
+                transition_id,
+                "released a transition whose key had already been taken by another transition"
+            );
+        }
+
+        inner.notify(&routing::transition(&sandbox_id)).await;
+        Ok(())
+    }
 }
 
 enum Settle {

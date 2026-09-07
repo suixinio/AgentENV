@@ -3039,14 +3039,29 @@ where
         // reached through and then tear that entry down when the store refuses
         // the duplicate record.
         if let Some(held) = self.held_sandbox(sandbox_id).await? {
-            warn!(
-                held_execution_id = ?held.execution_id,
-                execution_id = %plan.execution_id(),
-                "refusing a launch under a sandbox id this process already holds"
-            );
-            return Err(OrchestratorError::StoreOperationFailed(
-                StoreError::SandboxAlreadyExists { sandbox_id },
-            ));
+            // A routing source with a complete view is the only thing that can
+            // say the id is free here: a replica that watched a pause happen
+            // elsewhere still holds a handle, and that handle must not refuse
+            // this sandbox's resume.
+            let residue = match held.execution_id {
+                Some(execution_id) if self.runtime_confirmed_gone(sandbox_id).await => {
+                    Some(execution_id)
+                }
+                _ => None,
+            };
+            match residue {
+                Some(execution_id) => self.forget_unrouted_runtime(sandbox_id, execution_id).await,
+                None => {
+                    warn!(
+                        held_execution_id = ?held.execution_id,
+                        execution_id = %plan.execution_id(),
+                        "refusing a launch under a sandbox id this process already holds"
+                    );
+                    return Err(OrchestratorError::StoreOperationFailed(
+                        StoreError::SandboxAlreadyExists { sandbox_id },
+                    ));
+                }
+            }
         }
 
         // Build and start the sandbox first, before making any state changes, so that we don't

@@ -2019,6 +2019,36 @@ async fn a_launch_under_an_id_this_process_already_runs_is_refused_and_touches_n
     Ok(())
 }
 
+#[tokio::test]
+async fn a_launch_takes_an_id_whose_runtime_the_cluster_no_longer_routes_to() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "resumed-elsewhere")]))
+        .await?;
+    // A pause performed by another replica leaves this one's handle behind.
+    orchestrator.set_runtime_routing(Arc::new(FixedRouting(false)));
+
+    let restored = Arc::clone(&orchestrator)
+        .restore_sandbox(
+            created.id,
+            create_request(Some(60), &[("team", "resumed-here")]),
+        )
+        .await
+        .expect("a handle nothing routes to must not refuse this sandbox's resume");
+
+    assert_eq!(restored.id, created.id);
+    assert_ne!(
+        restored.execution_id, created.execution_id,
+        "the resume is a new run under the same id"
+    );
+    assert_proxy_ready(&orchestrator, &created.id).await?;
+    Ok(())
+}
+
 #[test]
 fn a_joined_pause_waits_out_the_owners_whole_retry_budget() {
     assert!(

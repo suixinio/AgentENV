@@ -5,7 +5,7 @@ pub mod interfaces;
 pub mod metrics;
 pub mod no_catalog;
 
-pub use composite::SnapshotRepository;
+pub use composite::{OnCommitFailure, SnapshotRepository};
 pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{
     CatalogReadScope, ImportedSnapshotArtifacts, SnapshotAbsence, SnapshotArtifactStore,

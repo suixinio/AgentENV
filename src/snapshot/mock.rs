@@ -129,7 +129,9 @@ impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
 pub struct RecordingSnapshotRepository {
     staged: std::sync::Mutex<Vec<SnapshotId>>,
     committed: std::sync::Mutex<Vec<(SnapshotId, Option<String>)>>,
+    deleted_artifacts: std::sync::Mutex<Vec<SnapshotId>>,
     staging_fails: std::sync::atomic::AtomicBool,
+    commit_refusals: std::sync::atomic::AtomicUsize,
 }
 
 impl RecordingSnapshotRepository {
@@ -144,9 +146,23 @@ impl RecordingSnapshotRepository {
             .clone()
     }
 
+    /// Snapshots whose bytes this repository was told to delete.
+    pub fn deleted_artifacts(&self) -> Vec<SnapshotId> {
+        self.deleted_artifacts
+            .lock()
+            .expect("deleted artifacts mutex poisoned")
+            .clone()
+    }
+
     pub fn fail_staging(&self) {
         self.staging_fails
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Refuses the next `count` commits, then commits normally.
+    pub fn refuse_commits(&self, count: usize) {
+        self.commit_refusals
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -173,9 +189,13 @@ impl SnapshotArtifactStore for RecordingSnapshotRepository {
 
     async fn delete_artifacts(
         &self,
-        _id: &SnapshotId,
+        id: &SnapshotId,
         _publications: &[PersistedDiskImagePublication],
     ) {
+        self.deleted_artifacts
+            .lock()
+            .expect("deleted artifacts mutex poisoned")
+            .push(id.clone());
     }
 }
 
@@ -186,6 +206,20 @@ impl SnapshotCatalog for RecordingSnapshotRepository {
     }
 
     async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
+        if self
+            .commit_refusals
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |left| (left > 0).then(|| left - 1),
+            )
+            .is_ok()
+        {
+            return Err(RepositoryError::Backend {
+                message: "the catalog is unreachable".to_string(),
+                source: None,
+            });
+        }
         self.committed
             .lock()
             .expect("committed mutex poisoned")

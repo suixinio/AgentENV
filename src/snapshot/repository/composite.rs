@@ -17,6 +17,18 @@ use crate::snapshot::types::{
 };
 use crate::types::FirecrackerSnapshotManifest;
 
+/// What a commit does with the staged bytes when the catalog definitely
+/// refused it.
+///
+/// `Retain` belongs to every capture whose sandbox cannot be brought back
+/// without it: the bytes are the only copy, and a later commit of the same
+/// staged value is the recovery path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OnCommitFailure {
+    RollBack,
+    Retain,
+}
+
 /// Durable catalog and artifact store, sequenced so returned records never
 /// expose process-local paths.
 pub struct SnapshotRepository {
@@ -113,12 +125,24 @@ impl SnapshotRepository {
         }
     }
 
+    /// [`Self::commit_staged_with`] under [`OnCommitFailure::RollBack`].
+    pub async fn commit_staged(&self, staged: StagedSnapshot) -> RepositoryResult<SnapshotRecord> {
+        self.commit_staged_with(staged, OnCommitFailure::RollBack)
+            .await
+    }
+
     /// Commits a staged value without consulting local files or the artifact store.
     ///
     /// A refused commit is re-read before anything is deleted: an error that
     /// crossed a lost acknowledgement leaves a committed row, and its bytes are
-    /// the only thing that row points at.
-    pub async fn commit_staged(&self, staged: StagedSnapshot) -> RepositoryResult<SnapshotRecord> {
+    /// the only thing that row points at. `on_failure` decides what a definite
+    /// non-commit does with the bytes; the caller chooses it, because only the
+    /// caller knows whether it can produce them again.
+    pub async fn commit_staged_with(
+        &self,
+        staged: StagedSnapshot,
+        on_failure: OnCommitFailure,
+    ) -> RepositoryResult<SnapshotRecord> {
         let id = staged.commit.id.clone();
         // The staged payload is the commit side's rollback description.
         let publications = staged.commit.committed.disk_publications.clone();
@@ -136,7 +160,17 @@ impl SnapshotRepository {
                     Ok(*record)
                 }
                 CommitProbe::NotLanded => {
-                    self.roll_back_publish(&id, &publications).await;
+                    match on_failure {
+                        OnCommitFailure::RollBack => {
+                            self.roll_back_publish(&id, &publications).await
+                        }
+                        OnCommitFailure::Retain => self.retain_artifacts(
+                            &id,
+                            publications.len(),
+                            "the caller cannot produce these bytes again, so a later commit \
+                             of the same staged snapshot is the only way back",
+                        ),
+                    }
                     Err(error)
                 }
                 CommitProbe::Unknown(because) => {
@@ -364,7 +398,8 @@ mod tests {
 
     struct FakeCatalog {
         journal: Arc<Journal>,
-        commit_fails: bool,
+        /// Refusals `publish_commit` answers with before it starts committing.
+        commit_refusals: Mutex<usize>,
         retains_artifacts: bool,
         retention_unreadable: bool,
         probe: ProbeAnswer,
@@ -374,7 +409,7 @@ mod tests {
         fn new(journal: Arc<Journal>) -> Self {
             Self {
                 journal,
-                commit_fails: false,
+                commit_refusals: Mutex::new(0),
                 retains_artifacts: false,
                 retention_unreadable: false,
                 probe: ProbeAnswer::AsGet,
@@ -384,7 +419,7 @@ mod tests {
         fn refusing(journal: Arc<Journal>, probe: ProbeAnswer) -> Self {
             Self {
                 journal,
-                commit_fails: true,
+                commit_refusals: Mutex::new(usize::MAX),
                 retains_artifacts: false,
                 retention_unreadable: false,
                 probe,
@@ -401,11 +436,15 @@ mod tests {
 
         async fn publish_commit(&self, commit: SnapshotCommit) -> RepositoryResult<SnapshotRecord> {
             self.journal.record("catalog.publish_commit");
-            if self.commit_fails {
-                return Err(RepositoryError::Backend {
-                    message: "commit refused".to_string(),
-                    source: None,
-                });
+            {
+                let mut refusals = self.commit_refusals.lock().expect("commit refusals");
+                if *refusals > 0 {
+                    *refusals = refusals.saturating_sub(1);
+                    return Err(RepositoryError::Backend {
+                        message: "commit refused".to_string(),
+                        source: None,
+                    });
+                }
             }
             let mut record =
                 SnapshotRecord::template_waiting(commit.id, commit.alias.clone(), commit.resources);
@@ -649,7 +688,7 @@ mod tests {
         let repository = SnapshotRepository::new(
             Arc::new(FakeCatalog {
                 journal: Arc::clone(&journal),
-                commit_fails: true,
+                commit_refusals: Mutex::new(usize::MAX),
                 retains_artifacts: false,
                 retention_unreadable: false,
                 probe: ProbeAnswer::NoRow,
@@ -680,7 +719,7 @@ mod tests {
         let repository = SnapshotRepository::new(
             Arc::new(FakeCatalog {
                 journal: Arc::clone(&journal),
-                commit_fails: true,
+                commit_refusals: Mutex::new(usize::MAX),
                 retains_artifacts: true,
                 retention_unreadable: false,
                 probe: ProbeAnswer::NoRow,
@@ -722,7 +761,7 @@ mod tests {
         let repository = SnapshotRepository::new(
             Arc::new(FakeCatalog {
                 journal: Arc::clone(&journal),
-                commit_fails: true,
+                commit_refusals: Mutex::new(usize::MAX),
                 retains_artifacts: true,
                 retention_unreadable: false,
                 probe: ProbeAnswer::NoRow,
@@ -763,7 +802,7 @@ mod tests {
         let repository = SnapshotRepository::new(
             Arc::new(FakeCatalog {
                 journal: Arc::clone(&journal),
-                commit_fails: true,
+                commit_refusals: Mutex::new(usize::MAX),
                 retains_artifacts: false,
                 retention_unreadable: false,
                 probe: ProbeAnswer::NoRow,
@@ -844,7 +883,7 @@ mod tests {
         let repository = SnapshotRepository::new(
             Arc::new(FakeCatalog {
                 journal: Arc::clone(&journal),
-                commit_fails: true,
+                commit_refusals: Mutex::new(usize::MAX),
                 retains_artifacts: false,
                 retention_unreadable: true,
                 probe: ProbeAnswer::NoRow,
@@ -950,7 +989,7 @@ mod tests {
         let repository = SnapshotRepository::on_node(
             Arc::new(FakeCatalog {
                 journal: Arc::clone(&journal),
-                commit_fails: true,
+                commit_refusals: Mutex::new(usize::MAX),
                 retains_artifacts: false,
                 retention_unreadable: false,
                 probe: ProbeAnswer::NoRow,
@@ -978,6 +1017,46 @@ mod tests {
                 "artifacts.delete[rootfs]",
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn a_retained_commit_keeps_the_bytes_for_the_commit_that_lands() {
+        let journal = Arc::new(Journal::default());
+        let repository = SnapshotRepository::on_node(
+            Arc::new(FakeCatalog {
+                journal: Arc::clone(&journal),
+                commit_refusals: Mutex::new(1),
+                retains_artifacts: false,
+                retention_unreadable: false,
+                probe: ProbeAnswer::NoRow,
+            }),
+            Arc::new(FakeArtifactStore::new(Arc::clone(&journal))),
+            "node-a".to_string(),
+        );
+
+        let staged = repository
+            .stage(metadata(), manifest())
+            .await
+            .expect("staging should work");
+        repository
+            .commit_staged_with(staged.clone(), OnCommitFailure::Retain)
+            .await
+            .expect_err("the first commit was refused");
+
+        assert!(
+            !journal
+                .entries()
+                .iter()
+                .any(|entry| entry.starts_with("artifacts.delete")),
+            "a retained commit must not delete the only copy of the sandbox: {:?}",
+            journal.entries()
+        );
+
+        let record = repository
+            .commit_staged_with(staged, OnCommitFailure::Retain)
+            .await
+            .expect("the second commit of the same staged snapshot lands");
+        assert!(record.committed.is_some());
     }
 
     #[test]

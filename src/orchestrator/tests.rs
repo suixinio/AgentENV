@@ -1938,6 +1938,47 @@ async fn a_pause_whose_vm_is_gone_retries_the_commit_of_the_bytes_the_node_stage
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_retried_pause_commit_never_deletes_the_bytes_it_is_about_to_commit() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "the vm is gone".to_string(),
+        },
+    );
+    let (manager, repository) = crate::snapshot::mock::recording_snapshot_manager();
+    let orchestrator = make_orchestrator_without_publisher(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        TEST_DEFAULT_SANDBOX_TIMEOUT,
+    );
+    orchestrator.set_pause_publisher(Arc::new(
+        crate::orchestrator::pause_publisher::CommittingPausePublisher::new(Arc::new(manager)),
+    ));
+    let created = orchestrator
+        .create_sandbox(create_request(Some(600), &[("team", "pause-retain")]))
+        .await?;
+    behavior.make_captures_staged_for(created.id);
+    repository.refuse_commits(1);
+
+    let outcome = orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect("the second commit of the same staged snapshot publishes the pause");
+
+    assert!(matches!(outcome.published, PublishedPause::Committed(_)));
+    assert!(
+        repository.deleted_artifacts().is_empty(),
+        "a capture whose sandbox cannot be resumed is the only copy of it; the commit \
+         that publishes it must find its bytes still there, deleted: {:?}",
+        repository.deleted_artifacts()
+    );
+    assert_eq!(repository.committed().len(), 1);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_pause_that_never_commits_says_where_its_bytes_were_kept() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());

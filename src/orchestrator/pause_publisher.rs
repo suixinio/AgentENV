@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use super::store::SandboxMetadata;
 use super::types::{capture_publish_metadata, PublishedPause};
 use crate::sandbox::CapturedSandboxSnapshot;
+use crate::snapshot::repository::OnCommitFailure;
 use crate::snapshot::{PausedSandboxConfig, SnapshotManager};
 
 /// Makes a pause capture durable for the cluster.
@@ -118,9 +119,16 @@ impl PausePublisher for CommittingPausePublisher {
                 std::time::SystemTime::now(),
             )),
         );
+        // Bytes another machine staged cannot be captured again from here, so a
+        // refused commit keeps them: re-committing this same staged value is
+        // the sandbox's only way back.
+        let on_failure = match &capture {
+            CapturedSandboxSnapshot::Staged(_) => OnCommitFailure::Retain,
+            CapturedSandboxSnapshot::Local(_) => OnCommitFailure::RollBack,
+        };
         let record = self
             .snapshots
-            .publish_captured(publish, capture)
+            .publish_captured_with(publish, capture, on_failure)
             .await
             .with_context(|| format!("commit the pause capture of sandbox {}", metadata.id))?;
         Ok(PublishedPause::Committed(record.id))

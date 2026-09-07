@@ -92,6 +92,7 @@ pub struct MockBehavior {
     last_custom_extension_params: Mutex<Option<Option<CustomExtensionParams>>>,
     captures_are_stageable: AtomicBool,
     captures_are_staged: AtomicBool,
+    staged_capture_source: Mutex<Option<String>>,
     liveness: Mutex<MockLiveness>,
     holding_node_id: Mutex<Option<&'static str>>,
 }
@@ -130,12 +131,32 @@ impl MockBehavior {
         self.captures_are_staged.store(true, Ordering::SeqCst);
     }
 
+    /// [`Self::make_captures_staged`] naming the sandbox the bytes came from,
+    /// which a repository that commits them checks against its own request.
+    pub fn make_captures_staged_for(&self, sandbox_id: crate::types::SandboxId) {
+        *self
+            .staged_capture_source
+            .lock()
+            .expect("mock behavior mutex poisoned") = Some(sandbox_id.to_string());
+        self.make_captures_staged();
+    }
+
     fn capture(&self) -> CapturedSandboxSnapshot {
         if self.captures_are_staged.load(Ordering::SeqCst) {
+            let mut publish = crate::snapshot::SnapshotPublishMetadata::mock();
+            if let Some(source_sandbox_id) = self
+                .staged_capture_source
+                .lock()
+                .expect("mock behavior mutex poisoned")
+                .clone()
+            {
+                publish.source =
+                    crate::snapshot::SnapshotPublishSource::Sandbox { source_sandbox_id };
+            }
             return CapturedSandboxSnapshot::staged(
                 crate::snapshot::repository::interfaces::StagedSnapshot {
                     commit: crate::snapshot::repository::interfaces::SnapshotCommit::new(
-                        &crate::snapshot::SnapshotPublishMetadata::mock(),
+                        &publish,
                         Default::default(),
                         0,
                         Some("mock-node".to_string()),

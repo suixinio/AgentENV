@@ -6,7 +6,9 @@ use crate::runtime_snapshot::RunnableSnapshot;
 use crate::snapshot::captured::{CapturedSandboxSnapshot, SnapshotArtifactAdvertiser};
 use crate::snapshot::repository::backends::AssembledSnapshotBackend;
 use crate::snapshot::repository::interfaces::{SnapshotRuntimeResolver, StagedSnapshot};
-use crate::snapshot::repository::{CatalogReadScope, SnapshotAbsence, SnapshotRepository};
+use crate::snapshot::repository::{
+    CatalogReadScope, OnCommitFailure, SnapshotAbsence, SnapshotRepository,
+};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter, SnapshotListPage};
 use crate::snapshot::{SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord};
 use crate::types::FirecrackerSnapshotManifest;
@@ -145,8 +147,21 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         captured_snapshot: CapturedSandboxSnapshot,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        self.publish_captured_with(metadata, captured_snapshot, OnCommitFailure::RollBack)
+            .await
+    }
+
+    /// [`Self::publish_captured`] with the caller's answer to what a refused
+    /// commit does with the bytes.
+    #[tracing::instrument(skip(self, metadata), fields(snapshot_id = %metadata.id))]
+    pub async fn publish_captured_with(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        captured_snapshot: CapturedSandboxSnapshot,
+        on_failure: OnCommitFailure,
+    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let handle = self.stage_captured(metadata, captured_snapshot).await?;
-        self.commit_and_advertise(handle).await
+        self.commit_and_advertise_with(handle, on_failure).await
     }
 
     /// Stages a local capture or adopts a value already staged on another node.
@@ -246,7 +261,18 @@ impl SnapshotManager {
         &self,
         staged: StagedSnapshot,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        self.repository.commit_staged(staged).await
+        self.commit_staged_with(staged, OnCommitFailure::RollBack)
+            .await
+    }
+
+    /// [`Self::commit_staged`] with the caller's retention policy.
+    #[tracing::instrument(skip(self, staged), fields(snapshot_id = %staged.commit.id))]
+    pub async fn commit_staged_with(
+        &self,
+        staged: StagedSnapshot,
+        on_failure: OnCommitFailure,
+    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        self.repository.commit_staged_with(staged, on_failure).await
     }
 
     /// Advertises committed bytes only when this process holds their local manifest.
@@ -266,8 +292,18 @@ impl SnapshotManager {
         &self,
         handle: StagedSnapshotHandle,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+        self.commit_and_advertise_with(handle, OnCommitFailure::RollBack)
+            .await
+    }
+
+    /// [`Self::commit_and_advertise`] with the caller's retention policy.
+    pub async fn commit_and_advertise_with(
+        &self,
+        handle: StagedSnapshotHandle,
+        on_failure: OnCommitFailure,
+    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let (staged, local) = handle.into_parts();
-        let record = self.commit_staged(staged).await?;
+        let record = self.commit_staged_with(staged, on_failure).await?;
         self.advertise_committed(&record, local).await;
         Ok(record)
     }

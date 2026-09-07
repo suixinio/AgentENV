@@ -309,16 +309,19 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     );
 
     // The broker's resolve endpoint. A deployment with `[secrets].backend =
-    // "disabled"` assembles no store and mounts nothing.
-    let credential_routes = match secrets.as_ref() {
-        Some(secrets) => aenv_api::secrets::pg::resolve_route::router(
-            Arc::clone(&secrets.values),
-            Some(Arc::clone(&binding_store_handle)),
+    // "disabled"` assembles no store and mounts nothing; the credential layer
+    // is only put in front of routes that exist, because axum refuses a
+    // `route_layer` over an empty router.
+    let internal_routes = match secrets.as_ref() {
+        Some(secrets) => aenv_api::internal_api::router(
+            internal_auth(config).await?,
+            aenv_api::secrets::pg::resolve_route::router(
+                Arc::clone(&secrets.values),
+                Some(Arc::clone(&binding_store_handle)),
+            ),
         ),
         None => axum::Router::new(),
     };
-    let internal_routes =
-        aenv_api::internal_api::router(internal_auth(config).await?, credential_routes);
 
     Ok(Assembly {
         app: server::new_control_plane_only(api_impl, internal_routes),

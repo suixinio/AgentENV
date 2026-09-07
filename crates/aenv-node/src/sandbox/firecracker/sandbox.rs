@@ -807,24 +807,21 @@ impl FirecrackerSandbox {
                 }
                 Ok(())
             }
-            (Some(previous), true) => {
+            (Some(mut previous), true) => {
                 let runtime = EgressRuntime::required()?;
                 let policy = policy.expect("wants_brokers implies a policy");
                 runtime.ensure_serves(policy)?;
+                let identity = self.sandbox_identity();
                 let slot = self
                     .network_slot
                     .as_ref()
                     .context("brokered endpoints need an allocated network slot")?;
-                let endpoints = BrokeredEndpoints::replace(
-                    previous,
-                    &runtime,
-                    slot,
-                    self.sandbox_identity(),
-                    policy,
-                )
-                .await
-                .context("replace brokered endpoints")?;
-                self.brokered = Some(endpoints);
+                let updated = previous.update(&runtime, slot, identity, policy).await;
+                // Held either way: a failed update leaves the listeners it did
+                // not touch accepting, and dropping the set here would close
+                // them and leave the sandbox with none.
+                self.brokered = Some(previous);
+                updated.context("update brokered endpoints")?;
                 Ok(())
             }
         }
@@ -1159,6 +1156,12 @@ impl FirecrackerSandbox {
         self.network_slot
             .as_ref()
             .map(|slot| slot.guest_dns_server())
+    }
+
+    /// The network namespace this sandbox's slot holds. What the egress rules
+    /// and their packet counters can be read from without entering the guest.
+    pub fn network_namespace_path(&self) -> Option<PathBuf> {
+        self.network_slot.as_ref().map(|slot| slot.namespace_path())
     }
 
     pub fn firecracker_binary_path(&self) -> &Path {

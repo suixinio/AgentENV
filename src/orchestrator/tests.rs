@@ -155,6 +155,14 @@ impl PausePublisher for FlakyPausePublisher {
             crate::snapshot::SnapshotId::generate(),
         ))
     }
+
+    async fn published_since(
+        &self,
+        _sandbox_id: SandboxId,
+        _not_before_unix_ms: i64,
+    ) -> anyhow::Result<Option<crate::snapshot::SnapshotId>> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -165,6 +173,14 @@ impl PausePublisher for FailingPausePublisher {
         _capture: CapturedSandboxSnapshot,
     ) -> anyhow::Result<PublishedPause> {
         Err(anyhow::anyhow!("the catalog is unreachable"))
+    }
+
+    async fn published_since(
+        &self,
+        _sandbox_id: SandboxId,
+        _not_before_unix_ms: i64,
+    ) -> anyhow::Result<Option<crate::snapshot::SnapshotId>> {
+        Ok(None)
     }
 }
 
@@ -1515,7 +1531,7 @@ async fn pause_publishes_the_capture_stops_the_vm_and_forgets_the_record() -> Re
         Some(case_id.as_str())
     );
     assert!(
-        matches!(outcome.published, Some(PublishedPause::Committed(_))),
+        matches!(outcome.published, PublishedPause::Committed(_)),
         "the caller that performed the pause owns its publication"
     );
     assert_eq!(publisher.published(), vec![sandbox_id]);
@@ -1574,7 +1590,7 @@ async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_publicat
 
     let outcome = orchestrator.pause_sandbox(created.id).await?;
 
-    assert!(outcome.published.is_some());
+    assert!(matches!(outcome.published, PublishedPause::Committed(_)));
     assert!(
         orchestrator.get_sandbox(&created.id).await?.is_none(),
         "a stop failure after publication does not bring the record back"
@@ -1828,7 +1844,7 @@ async fn a_pause_whose_vm_is_gone_retries_the_commit_of_the_bytes_the_node_stage
         .await
         .expect("a retried commit must make the pause succeed");
 
-    assert!(outcome.published.is_some());
+    assert!(matches!(outcome.published, PublishedPause::Committed(_)));
     assert_eq!(
         publisher.attempts(),
         3,
@@ -2221,21 +2237,23 @@ async fn orchestrator_concurrent_pause_calls_all_succeed_and_exactly_one_publish
         })
         .collect();
 
-    let mut performed = 0usize;
-    let mut joined = 0usize;
+    let mut snapshot_ids = Vec::new();
     for (i, handle) in handles.into_iter().enumerate() {
         let outcome = handle
             .await
             .unwrap_or_else(|e| panic!("pause task {i} panicked: {e}"))
             .unwrap_or_else(|e| panic!("concurrent pause call {i} failed: {e}"));
         assert_eq!(outcome.metadata.id, sandbox_id);
-        match outcome.published {
-            Some(_) => performed += 1,
-            None => joined += 1,
-        }
+        let PublishedPause::Committed(snapshot_id) = outcome.published else {
+            panic!("pause call {i} reported nothing committed");
+        };
+        snapshot_ids.push(snapshot_id);
     }
-    assert_eq!(performed, 1, "exactly one caller performed the pause");
-    assert_eq!(joined, N - 1, "every other caller joined it");
+    assert_eq!(snapshot_ids.len(), N);
+    assert!(
+        snapshot_ids.windows(2).all(|pair| pair[0] == pair[1]),
+        "every caller must name the one snapshot the pause published, got {snapshot_ids:?}"
+    );
     assert_eq!(
         publisher.published(),
         vec![sandbox_id],
@@ -2273,7 +2291,10 @@ async fn delete_waits_through_a_pause_and_finds_the_sandbox_gone() -> Result<()>
     orchestrator.delete_sandbox(sandbox_id).await?;
 
     let paused = pause.await.expect("the pause task should not panic")?;
-    assert!(paused.published.is_some(), "the pause ran to completion");
+    assert!(
+        matches!(paused.published, PublishedPause::Committed(_)),
+        "the pause ran to completion"
+    );
     assert_eq!(
         behavior.stop_calls(),
         1,
@@ -3119,6 +3140,79 @@ async fn pause_failure_with_failed_recovery_removes_sandbox() -> Result<()> {
     assert_eq!(behavior.stop_calls(), 1);
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
+}
+
+/// Answers `published_since` with a fixed verdict, as a catalog would.
+struct AnsweringPausePublisher {
+    answer: Option<crate::snapshot::SnapshotId>,
+}
+
+#[async_trait]
+impl PausePublisher for AnsweringPausePublisher {
+    async fn publish(
+        &self,
+        _metadata: &SandboxMetadata,
+        _capture: CapturedSandboxSnapshot,
+    ) -> anyhow::Result<PublishedPause> {
+        Err(anyhow::anyhow!("this publisher only answers lookups"))
+    }
+
+    async fn published_since(
+        &self,
+        _sandbox_id: SandboxId,
+        _not_before_unix_ms: i64,
+    ) -> anyhow::Result<Option<crate::snapshot::SnapshotId>> {
+        Ok(self.answer.clone())
+    }
+}
+
+async fn join_a_vanishing_pause(
+    answer: Option<crate::snapshot::SnapshotId>,
+) -> Result<PauseOutcome> {
+    let orchestrator = make_orchestrator_without_publisher(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        TEST_DEFAULT_SANDBOX_TIMEOUT,
+    );
+    orchestrator.set_pause_publisher(Arc::new(AnsweringPausePublisher { answer }));
+    let sandbox_id = SandboxId::new();
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Pausing)
+        .await
+        .expect("a pausing record should be writable");
+
+    let remover = Arc::clone(&orchestrator);
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(20)).await;
+        let _ = remover.remove_sandbox_for_test(&sandbox_id).await;
+    });
+
+    orchestrator.join_concurrent_pause(sandbox_id).await
+}
+
+#[tokio::test]
+async fn a_joiner_whose_pause_left_no_snapshot_fails_instead_of_reporting_success() {
+    setup();
+    let err = join_a_vanishing_pause(None)
+        .await
+        .expect_err("a record that vanished without a snapshot is not a finished pause");
+    assert!(
+        matches!(err, OrchestratorError::PausePublicationFailed { .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_joiner_reports_the_snapshot_the_pause_it_joined_published() {
+    setup();
+    let snapshot_id = crate::snapshot::SnapshotId::generate();
+    let outcome = join_a_vanishing_pause(Some(snapshot_id.clone()))
+        .await
+        .expect("a published snapshot is what makes the join a success");
+    assert!(
+        matches!(outcome.published, PublishedPause::Committed(id) if id == snapshot_id),
+        "the joiner must name the snapshot it found"
+    );
 }
 
 #[tokio::test]
@@ -4957,7 +5051,7 @@ async fn pause_discards_a_stale_handle_and_rebuilds_from_the_record() -> anyhow:
 
     let paused = orchestrator.pause_sandbox(sandbox_id).await?;
 
-    assert!(paused.published.is_some());
+    assert!(matches!(paused.published, PublishedPause::Committed(_)));
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     assert_eq!(
         orchestrator.stale_handle_discards(),
@@ -4987,7 +5081,7 @@ async fn pause_reuses_a_matching_handle_without_rebuilding_it() -> anyhow::Resul
 
     let paused = orchestrator.pause_sandbox(sandbox_id).await?;
 
-    assert!(paused.published.is_some());
+    assert!(matches!(paused.published, PublishedPause::Committed(_)));
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     assert_eq!(
         orchestrator.stale_handle_discards(),

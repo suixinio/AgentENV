@@ -719,16 +719,8 @@ impl pb::node_sandbox_service_server::NodeSandboxService for NodeSandboxService 
             .map_err(|err| capture_op_failure_status(sandbox_id, SandboxOperation::Pause, &err))?;
 
         let staged = match outcome.published {
-            Some(PublishedPause::Staged(staged)) => *staged,
-            // A pause this call merely joined belongs to the caller that made it;
-            // the node has nothing to hand this one.
-            None => {
-                return Err(Status::failed_precondition(format!(
-                    "sandbox {sandbox_id} was already being paused by another call, and only \
-                     that call receives the staged snapshot"
-                )));
-            }
-            Some(PublishedPause::Committed(snapshot_id)) => {
+            PublishedPause::Staged(staged) => *staged,
+            PublishedPause::Committed(snapshot_id) => {
                 return Err(Status::internal(format!(
                     "sandbox {sandbox_id}'s pause was committed as snapshot {snapshot_id} on this \
                      node, which holds no catalog to commit into"

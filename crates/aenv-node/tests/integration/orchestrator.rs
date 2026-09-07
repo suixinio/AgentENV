@@ -157,7 +157,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         assert_eq!(fetched.state, SandboxState::Running);
 
         let paused = orchestrator.pause_sandbox(sandbox_id).await?;
-        let Some(PublishedPause::Committed(paused_snapshot_id)) = paused.published else {
+        let PublishedPause::Committed(paused_snapshot_id) = paused.published else {
             panic!("a pause this process commits answers with the row it wrote: {paused:?}");
         };
         assert!(

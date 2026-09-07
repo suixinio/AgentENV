@@ -1827,7 +1827,7 @@ where
 
         Ok(PauseOutcome {
             metadata,
-            published: Some(published),
+            published,
         })
     }
 
@@ -2442,11 +2442,12 @@ where
 
     /// Joins a pause another caller is performing on the same sandbox.
     ///
-    /// The record disappearing is the pause finishing: a delete cannot start
-    /// while the sandbox is `Pausing`. The joiner reports the record as it
-    /// stood before waiting; the publication belongs to the caller that made it.
+    /// The record disappearing is not on its own the pause finishing: the owner
+    /// removes the record on several failure paths too, so a joiner reports
+    /// success only against a snapshot row a pause of this sandbox left behind.
     async fn join_concurrent_pause(&self, sandbox_id: SandboxId) -> Result<PauseOutcome> {
         debug!("concurrent pause in progress, waiting for completion");
+        let joined_at = SystemTime::now();
         let before = self
             .store
             .get(&sandbox_id)
@@ -2457,8 +2458,8 @@ where
             .wait_while_in_states(&sandbox_id, &[SandboxState::Pausing]);
         match tokio::time::timeout(WAIT_TRANSITION_TIMEOUT, wait).await {
             Ok(Ok(None)) => {
-                debug!("concurrent pause succeeded");
-                Ok(PauseOutcome::joined(before))
+                self.joined_pause_publication(sandbox_id, before, joined_at)
+                    .await
             }
             Ok(Ok(Some(after))) => match after.state {
                 SandboxState::Running => {
@@ -2486,6 +2487,68 @@ where
                 Err(OrchestratorError::InvalidSandboxState {
                     sandbox_id,
                     state: SandboxState::Pausing,
+                })
+            }
+        }
+    }
+
+    /// Finds the snapshot the pause this caller joined published.
+    ///
+    /// The window starts one [`WAIT_TRANSITION_TIMEOUT`] before the joiner
+    /// began waiting, which is as far back as a pause still in flight can have
+    /// started.
+    async fn joined_pause_publication(
+        &self,
+        sandbox_id: SandboxId,
+        before: SandboxMetadata,
+        joined_at: SystemTime,
+    ) -> Result<PauseOutcome> {
+        let Some(publisher) = self.pause_publisher.get().cloned() else {
+            return Err(OrchestratorError::InternalError(format!(
+                "sandbox {sandbox_id} was paused elsewhere and this process has nowhere to look \
+                 for what that pause published"
+            )));
+        };
+        let not_before_unix_ms = joined_at
+            .checked_sub(WAIT_TRANSITION_TIMEOUT)
+            .and_then(|start| start.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0);
+        match publisher
+            .published_since(sandbox_id, not_before_unix_ms)
+            .await
+        {
+            Ok(Some(snapshot_id)) => {
+                debug!(%snapshot_id, "concurrent pause succeeded");
+                Ok(PauseOutcome {
+                    metadata: before,
+                    published: PublishedPause::Committed(snapshot_id),
+                })
+            }
+            Ok(None) => {
+                warn!(
+                    "the record of a sandbox this caller was waiting on disappeared without a \
+                     snapshot to show for it"
+                );
+                Err(OrchestratorError::PausePublicationFailed {
+                    sandbox_id,
+                    source: anyhow::anyhow!(
+                        "the pause this call joined removed the sandbox's record without \
+                         publishing a snapshot for it"
+                    ),
+                })
+            }
+            Err(error) => {
+                warn!(
+                    error = %format_args!("{error:#}"),
+                    "could not tell whether the pause this caller joined published anything"
+                );
+                Err(OrchestratorError::PausePublicationFailed {
+                    sandbox_id,
+                    source: error.context(
+                        "the pause this call joined cannot be confirmed to have published \
+                         a snapshot",
+                    ),
                 })
             }
         }

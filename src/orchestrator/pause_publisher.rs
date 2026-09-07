@@ -26,6 +26,18 @@ pub trait PausePublisher: Send + Sync {
         metadata: &SandboxMetadata,
         capture: CapturedSandboxSnapshot,
     ) -> anyhow::Result<PublishedPause>;
+
+    /// The snapshot a pause of this sandbox published no earlier than
+    /// `not_before_unix_ms`, for a caller that watched a pause it did not run.
+    ///
+    /// `Ok(None)` is a complete answer that no such snapshot exists. An
+    /// implementation with no catalog to ask returns `Err`, which callers read
+    /// as unknown and never as absence.
+    async fn published_since(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        not_before_unix_ms: i64,
+    ) -> anyhow::Result<Option<crate::snapshot::SnapshotId>>;
 }
 
 /// The node's half: stages the capture on this machine's repository and
@@ -65,6 +77,18 @@ impl PausePublisher for StagingPausePublisher {
             .into_staged();
         Ok(PublishedPause::Staged(Box::new(staged)))
     }
+
+    /// A node holds no catalog, so it cannot answer for a pause it did not run.
+    async fn published_since(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        _not_before_unix_ms: i64,
+    ) -> anyhow::Result<Option<crate::snapshot::SnapshotId>> {
+        anyhow::bail!(
+            "this process keeps no snapshot catalog, so it cannot say whether a pause of \
+             sandbox {sandbox_id} published anything"
+        )
+    }
 }
 
 /// The api half: commits a value a node staged, making the sandbox resumable
@@ -101,6 +125,41 @@ impl PausePublisher for CommittingPausePublisher {
             .with_context(|| format!("commit the pause capture of sandbox {}", metadata.id))?;
         Ok(PublishedPause::Committed(record.id))
     }
+
+    async fn published_since(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        not_before_unix_ms: i64,
+    ) -> anyhow::Result<Option<crate::snapshot::SnapshotId>> {
+        let filter = crate::snapshot::repository::interfaces::SnapshotListFilter::sandbox_snapshots(
+            Some(sandbox_id.to_string()),
+            None,
+        );
+        let mut cursor = None;
+        loop {
+            let page = self
+                .snapshots
+                .list_page_scoped(
+                    filter.clone().paginated(None, cursor.take()),
+                    crate::snapshot::repository::interfaces::CatalogReadScope::Resolvable,
+                )
+                .await?;
+            // Rows come back newest first, so the walk stops as soon as one is
+            // older than the window the caller asked about.
+            for record in &page.items {
+                if record.created_at_unix_ms < not_before_unix_ms {
+                    return Ok(None);
+                }
+                if record.paused_sandbox().is_some() {
+                    return Ok(Some(record.id.clone()));
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => return Ok(None),
+            }
+        }
+    }
 }
 
 /// Publishes nothing and reports a fresh committed id: for tests that exercise
@@ -108,7 +167,7 @@ impl PausePublisher for CommittingPausePublisher {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct DiscardingPausePublisher {
-    published: std::sync::Mutex<Vec<crate::types::SandboxId>>,
+    published: std::sync::Mutex<Vec<(crate::types::SandboxId, crate::snapshot::SnapshotId)>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -122,7 +181,9 @@ impl DiscardingPausePublisher {
         self.published
             .lock()
             .expect("published mutex poisoned")
-            .clone()
+            .iter()
+            .map(|(sandbox_id, _)| *sandbox_id)
+            .collect()
     }
 }
 
@@ -134,13 +195,27 @@ impl PausePublisher for DiscardingPausePublisher {
         metadata: &SandboxMetadata,
         _capture: CapturedSandboxSnapshot,
     ) -> anyhow::Result<PublishedPause> {
+        let snapshot_id = crate::snapshot::SnapshotId::generate();
         self.published
             .lock()
             .expect("published mutex poisoned")
-            .push(metadata.id);
-        Ok(PublishedPause::Committed(
-            crate::snapshot::SnapshotId::generate(),
-        ))
+            .push((metadata.id, snapshot_id.clone()));
+        Ok(PublishedPause::Committed(snapshot_id))
+    }
+
+    async fn published_since(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        _not_before_unix_ms: i64,
+    ) -> anyhow::Result<Option<crate::snapshot::SnapshotId>> {
+        Ok(self
+            .published
+            .lock()
+            .expect("published mutex poisoned")
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == sandbox_id)
+            .map(|(_, snapshot_id)| snapshot_id.clone()))
     }
 }
 

@@ -221,17 +221,8 @@ pub enum PublishedPause {
 pub struct PauseOutcome {
     /// The record as it stood when the VM stopped.
     pub metadata: super::store::SandboxMetadata,
-    /// `None` when this call joined a pause another caller was already
-    /// performing: the publication belongs to that caller.
-    pub published: Option<PublishedPause>,
-}
-
-impl PauseOutcome {
-    /// A pause completed by somebody else.
-    pub fn joined(metadata: super::store::SandboxMetadata) -> Self {
-        Self {
-            metadata,
-            published: None,
-        }
-    }
+    /// What the pause made durable. A caller that joined somebody else's pause
+    /// names the snapshot that pause published, which is the only evidence the
+    /// pause finished rather than gave up.
+    pub published: PublishedPause,
 }

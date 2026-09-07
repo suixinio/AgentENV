@@ -517,7 +517,12 @@ mod pg {
 
     #[tokio::test]
     async fn a_commit_refused_for_a_taken_alias_leaves_no_row_behind() {
-        let catalog = catalog!("a_commit_refused_for_a_taken_alias_leaves_no_row_behind");
+        let pool = isolated_schema_pool_or_skip!(
+            "a_commit_refused_for_a_taken_alias_leaves_no_row_behind"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+        let catalog =
+            PostgresSnapshotCatalog::new(pool.clone(), Uuid::new_v4(), "node-a".to_string());
         let holder = commit_for(SnapshotId::generate(), Some("contested-checkpoint"));
         let holder_id = holder.id.clone();
         catalog
@@ -547,6 +552,25 @@ mod pg {
                 .is_none(),
             "a refused commit must take back the row it opened, at every read scope"
         );
+        let still_building: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM snapshots WHERE id = $1 AND status = 'building'",
+        )
+        .bind(id.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("count the rows this id still has in 'building'");
+        assert_eq!(
+            still_building, 0,
+            "the row a refused commit took back still answers as a build in progress"
+        );
+        let (status, deleted_at_ms): (String, Option<i64>) =
+            sqlx::query_as("SELECT status, deleted_at_ms FROM snapshots WHERE id = $1")
+                .bind(id.to_uuid())
+                .fetch_one(&pool)
+                .await
+                .expect("the discarded row");
+        assert_eq!(status, "error");
+        assert!(deleted_at_ms.is_some());
         assert_eq!(
             catalog.resolve_alias("contested-checkpoint").await.unwrap(),
             Some(holder_id)

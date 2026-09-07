@@ -640,9 +640,19 @@ pub async fn publish_commit(
 
 /// Removes the row `publish_commit` opened after the commit was refused, so a
 /// refusal leaves no half-built snapshot in the catalog.
+///
+/// Deletion here is the catalog's soft one, so the row also has to leave
+/// 'building': nothing else ever moves it. The build reaper only fails
+/// snapshots a stalled `builds` row names, and a commit opens no build.
 async fn discard_opened_row(pool: &PgPool, cluster_id: Uuid, id: &SnapshotId) {
-    match delete_snapshot(pool, cluster_id, id, now_ms()).await {
-        Ok(_) => {}
+    match fail_and_delete_opened_row(pool, cluster_id, id).await {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(
+            target: "agentenv",
+            snapshot_id = %id,
+            "a refused commit found the row it opened already committed or already gone; it \
+             stays as it is"
+        ),
         Err(error) => tracing::warn!(
             target: "agentenv",
             snapshot_id = %id,
@@ -651,6 +661,56 @@ async fn discard_opened_row(pool: &PgPool, cluster_id: Uuid, id: &SnapshotId) {
              somebody removes it"
         ),
     }
+}
+
+/// Moves an uncommitted 'building' row to the schema's terminal status and
+/// soft-deletes it in one transaction. `false` is the row no longer matching.
+async fn fail_and_delete_opened_row(
+    pool: &PgPool,
+    cluster_id: Uuid,
+    id: &SnapshotId,
+) -> RepositoryResult<bool> {
+    let now = now_ms();
+    let error_json = encode_build_error(&TemplateBuildErrorReason {
+        message: "the commit that would have finished this snapshot was refused".to_string(),
+        step: None,
+    });
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(backend_error("discard_opened_row"))?;
+
+    // A row that already carries a committed payload is somebody else's; only
+    // one this call opened and nothing has finished is its to take back.
+    let discarded: Option<(String,)> = sqlx::query_as(
+        "UPDATE snapshots
+            SET status = 'error', build_error = $3, deleted_at_ms = $4, updated_at_ms = $4
+          WHERE id = $1 AND cluster_id = $2 AND deleted_at_ms IS NULL
+            AND status = 'building' AND committed_payload IS NULL
+        RETURNING id::text",
+    )
+    .bind(id.to_uuid())
+    .bind(cluster_id)
+    .bind(&error_json)
+    .bind(now)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(backend_error("discard_opened_row"))?;
+
+    if discarded.is_some() {
+        sqlx::query("DELETE FROM aliases WHERE cluster_id = $1 AND snapshot_id = $2")
+            .bind(cluster_id)
+            .bind(id.to_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend_error("discard_opened_row"))?;
+    }
+
+    tx.commit()
+        .await
+        .map_err(backend_error("discard_opened_row"))?;
+    Ok(discarded.is_some())
 }
 
 /// Repoints a row at the node a resume of its sandbox landed on.

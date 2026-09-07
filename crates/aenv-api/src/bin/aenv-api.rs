@@ -203,6 +203,11 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
         aenv_api::image::DisabledRuntimeImageRefs::shared(),
     )
     .await?;
+    // The routing binding, not this replica's memory, says whether a sandbox's
+    // runtime is still there.
+    orchestrator.set_runtime_routing(aenv_api::node_client::PlacementRuntimeRouting::shared(
+        Arc::clone(&placement),
+    ));
     let orchestration: Arc<dyn SandboxOrchestration> =
         Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>;
 

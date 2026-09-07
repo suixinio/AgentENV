@@ -137,6 +137,25 @@ pub trait NodePlacement: Send + Sync + 'static {
     ) -> anyhow::Result<()>;
 }
 
+/// The placement source's binding answers whether anything still routes to a
+/// sandbox's runtime.
+pub struct PlacementRuntimeRouting(std::sync::Arc<dyn NodePlacement>);
+
+impl PlacementRuntimeRouting {
+    pub fn shared(
+        placement: std::sync::Arc<dyn NodePlacement>,
+    ) -> std::sync::Arc<dyn crate::orchestrator::RuntimeRouting> {
+        std::sync::Arc::new(Self(placement))
+    }
+}
+
+#[async_trait]
+impl crate::orchestrator::RuntimeRouting for PlacementRuntimeRouting {
+    async fn is_routed(&self, sandbox_id: SandboxId) -> anyhow::Result<bool> {
+        Ok(self.0.place_existing(sandbox_id).await?.is_some())
+    }
+}
+
 /// How long a reservation outlives the process that wrote it.
 ///
 /// It bounds the window in which a launch that died mid-flight keeps a sandbox id

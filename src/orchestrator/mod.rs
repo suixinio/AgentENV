@@ -5,6 +5,7 @@ mod launch_plan;
 mod metrics;
 mod pause_publisher;
 mod proxy;
+mod runtime_routing;
 mod service;
 pub mod store;
 mod types;
@@ -21,6 +22,7 @@ pub use metrics::OrchestratorMetrics;
 pub use pause_publisher::DiscardingPausePublisher;
 pub use pause_publisher::{CommittingPausePublisher, PausePublisher, StagingPausePublisher};
 pub use proxy::{ProxyLookupResult, ProxyTarget};
+pub use runtime_routing::RuntimeRouting;
 pub use service::Orchestrator;
 pub use store::{
     configured_max_sandbox_lifetime, is_allowed_transition, ActiveStateRecord, ControlPlaneConfig,

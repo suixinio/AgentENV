@@ -28,6 +28,7 @@ use super::metrics::{
 };
 use super::pause_publisher::PausePublisher;
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
+use super::runtime_routing::RuntimeRouting;
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
@@ -129,6 +130,10 @@ pub struct Orchestrator<S: MetadataStore, F: SandboxBackendFactory> {
     /// Who records which secret names an incarnation may read; `NoGrants`
     /// until the api half installs its store.
     grants: OnceCell<Arc<dyn GrantIssuer>>,
+    /// Who says whether the cluster still routes to a sandbox's runtime. A
+    /// process whose sandboxes run inside it installs none: its own handles
+    /// are the answer.
+    runtime_routing: OnceCell<Arc<dyn RuntimeRouting>>,
 }
 
 /// Outcome when a process-local sandbox handle is absent.
@@ -212,6 +217,7 @@ where
             access_tokens: SandboxAccessTokenGenerator::new(access_token_seed).unwrap(),
             pause_publisher: tokio::sync::OnceCell::new(),
             grants: tokio::sync::OnceCell::new(),
+            runtime_routing: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -259,6 +265,7 @@ where
             access_tokens,
             pause_publisher: OnceCell::new(),
             grants: OnceCell::new(),
+            runtime_routing: OnceCell::new(),
         });
 
         // Start the auto-evict task.
@@ -1170,6 +1177,15 @@ where
             });
         }
 
+        // A record that says running is this replica's memory; the binding is
+        // the cluster's. Extending the life of a runtime nobody can reach
+        // would keep the record out of the evictor's way forever.
+        if self.runtime_confirmed_gone(sandbox_id).await {
+            self.forget_unrouted_runtime(sandbox_id, metadata.execution_id)
+                .await;
+            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+        }
+
         // Only an already-exhausted lifetime ceiling refuses renewal.
         let now = SystemTime::now();
         if let Some(deadline) = metadata.lifetime_deadline(now) {
@@ -1341,6 +1357,12 @@ where
             }
         };
 
+        if self.runtime_confirmed_gone(sandbox_id).await {
+            self.forget_unrouted_runtime(sandbox_id, expected_execution_id)
+                .await;
+            return Ok(());
+        }
+
         let (handle, removed_route) = self
             .detach_sandbox_handle_and_route_checked(&sandbox_id, expected_execution_id)
             .await;
@@ -1419,6 +1441,51 @@ where
     pub fn set_grant_issuer(&self, issuer: Arc<dyn GrantIssuer>) {
         if self.grants.set(issuer).is_err() {
             warn!("grant issuer was already wired; ignoring");
+        }
+    }
+
+    /// Installs who answers whether a sandbox's runtime is still routed to.
+    pub fn set_runtime_routing(&self, routing: Arc<dyn RuntimeRouting>) {
+        if self.runtime_routing.set(routing).is_err() {
+            warn!("runtime routing was already wired; ignoring");
+        }
+    }
+
+    /// Whether the cluster has stopped routing to this sandbox's runtime.
+    ///
+    /// Only a complete answer counts: a lookup that fails, and a process that
+    /// installed no routing source, both leave the record alone.
+    async fn runtime_confirmed_gone(&self, sandbox_id: SandboxId) -> bool {
+        let Some(routing) = self.runtime_routing.get() else {
+            return false;
+        };
+        match routing.is_routed(sandbox_id).await {
+            Ok(routed) => !routed,
+            Err(error) => {
+                warn!(
+                    %sandbox_id,
+                    error = %format_args!("{error:#}"),
+                    "could not tell whether anything still routes to this sandbox"
+                );
+                false
+            }
+        }
+    }
+
+    /// Drops the record and handle of a runtime nothing routes to any more.
+    async fn forget_unrouted_runtime(&self, sandbox_id: SandboxId, execution_id: ExecutionId) {
+        warn!(
+            %sandbox_id,
+            %execution_id,
+            "nothing routes to this sandbox's runtime any more; dropping its record"
+        );
+        self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        if let Err(error) = self.forget_sandbox(sandbox_id, execution_id).await {
+            warn!(
+                %sandbox_id,
+                error = ?error,
+                "failed to remove the record of a sandbox nothing routes to"
+            );
         }
     }
 
@@ -1700,6 +1767,12 @@ where
         };
         let expected_execution_id = metadata.execution_id;
 
+        if self.runtime_confirmed_gone(sandbox_id).await {
+            self.forget_unrouted_runtime(sandbox_id, expected_execution_id)
+                .await;
+            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+        }
+
         let (handle, removed_proxy_route) = self
             .detach_sandbox_handle_and_route_checked(&sandbox_id, expected_execution_id)
             .await;
@@ -1752,6 +1825,12 @@ where
                         .await;
                     self.forget_sandbox(sandbox_id, expected_execution_id)
                         .await?;
+                } else if self.runtime_confirmed_gone(sandbox_id).await {
+                    // A node that says it never had this sandbox, and a cluster
+                    // that routes nowhere for it, agree: there is nothing to
+                    // put back and nothing to retry next tick.
+                    self.forget_unrouted_runtime(sandbox_id, expected_execution_id)
+                        .await;
                 } else {
                     if handle_was_held_here {
                         self.sandboxes.write().await.insert(sandbox_id, handle);

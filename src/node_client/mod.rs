@@ -18,6 +18,8 @@ pub use credential::{client, NodeClient, NodeGateCredential};
 pub use factory::RemoteSandboxBackendFactory;
 pub use native_placement::NativeNodePlacement;
 pub use node_status::override_node_status;
-pub use placement::{FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement};
+pub use placement::{
+    FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement, PlacementRuntimeRouting,
+};
 pub use record_owner::{SandboxRecordOwner, StoreRecordOwner, UnknownRecordOwner};
 pub use stub::RemoteSandboxStub;

@@ -5707,6 +5707,89 @@ async fn an_unclassified_capture_nobody_can_settle_keeps_the_record_running() ->
     Ok(())
 }
 
+/// Answers one fixed verdict about whether a sandbox is still routed to.
+struct FixedRouting(bool);
+
+#[async_trait]
+impl crate::orchestrator::RuntimeRouting for FixedRouting {
+    async fn is_routed(&self, _sandbox_id: SandboxId) -> anyhow::Result<bool> {
+        Ok(self.0)
+    }
+}
+
+#[tokio::test]
+async fn an_eviction_forgets_a_sandbox_the_cluster_no_longer_routes_to() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    // The node answers a pause of a sandbox it does not have.
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "the node did not touch the sandbox".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+    orchestrator.set_runtime_routing(Arc::new(FixedRouting(false)));
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(1), &[("team", "ghost-record")]))
+        .await?;
+    sleep(Duration::from_millis(1100)).await;
+
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+
+    assert!(evicted.is_empty(), "the pause did not produce a snapshot");
+    assert!(
+        orchestrator.get_sandbox(&created.id).await?.is_none(),
+        "a record whose runtime nothing routes to must not survive the round that found it"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_keepalive_on_a_runtime_nothing_routes_to_drops_the_record() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    orchestrator.set_runtime_routing(Arc::new(FixedRouting(false)));
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(600), &[("team", "ghost-keepalive")]))
+        .await?;
+
+    let err = orchestrator
+        .keep_alive_for(created.id, Some(Duration::from_secs(600)), false)
+        .await
+        .expect_err("a dead runtime cannot be kept alive");
+    assert!(
+        matches!(err, OrchestratorError::SandboxNotFound(id) if id == created.id),
+        "{err:?}"
+    );
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_keepalive_on_a_routed_runtime_is_unchanged() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    orchestrator.set_runtime_routing(Arc::new(FixedRouting(true)));
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "live-keepalive")]))
+        .await?;
+
+    let updated = orchestrator
+        .keep_alive_for(created.id, Some(Duration::from_secs(600)), false)
+        .await?
+        .expect("the keep-alive returns the record");
+    assert_eq!(updated.state, SandboxState::Running);
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_some());
+    Ok(())
+}
+
 #[tokio::test]
 async fn a_keepalive_that_lands_after_selection_stops_the_eviction() -> Result<()> {
     setup();

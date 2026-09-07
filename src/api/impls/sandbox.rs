@@ -957,7 +957,9 @@ impl Sandboxes<()> for ApiImpl {
             ));
         };
         let timeout = Duration::from_secs(body.timeout as u64);
-        match self.record_after_any_pause(sandbox_id).await {
+        // `None` falls through to the cold path: either there is no record, or
+        // the record named a runtime nothing routes to and was dropped.
+        let answered = match self.record_after_any_pause(sandbox_id).await {
             Ok(Some(metadata)) => match metadata.state {
                 SandboxState::Creating
                 | SandboxState::Running
@@ -968,64 +970,55 @@ impl Sandboxes<()> for ApiImpl {
                         .keep_alive_for(sandbox_id, Some(timeout), false)
                         .await
                     {
-                        Ok(_) => {}
-                        Err(OrchestratorError::SandboxNotFound(id)) => {
-                            return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
-                                sandbox_not_found(id),
-                            ));
+                        Ok(_) => {
+                            // Include the incarnation required for the gateway's projection write.
+                            let routing = RoutingHeaders::of(&metadata);
+                            Some(
+                                SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning {
+                                    body: self.sandbox_model(metadata),
+                                    x_agentenv_sandbox_id: Some(routing.sandbox_id),
+                                    x_agentenv_execution_id: Some(routing.execution_id),
+                                    x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
+                                },
+                            )
                         }
+                        Err(OrchestratorError::SandboxNotFound(_)) => None,
                         Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
-                            return Ok(
-                                SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                                    Self::error(400, format!("invalid timeout: {timeout:?}")),
-                                ),
-                            );
+                            Some(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                                Self::error(400, format!("invalid timeout: {timeout:?}")),
+                            ))
                         }
-                        Err(err) => {
-                            return Ok(
-                                SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
-                                    err.into(),
-                                ),
-                            );
-                        }
+                        Err(err) => Some(
+                            SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
+                                err.into(),
+                            ),
+                        ),
                     }
-                    // Include the incarnation required for the gateway's projection write.
-                    let routing = RoutingHeaders::of(&metadata);
-
-                    return Ok(
-                        SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning {
-                            body: self.sandbox_model(metadata),
-                            x_agentenv_sandbox_id: Some(routing.sandbox_id),
-                            x_agentenv_execution_id: Some(routing.execution_id),
-                            x_agentenv_projection_ttl_secs: Some(routing.projection_ttl_secs),
-                        },
-                    );
                 }
                 SandboxState::Killing => {
-                    return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
+                    Some(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
                         sandbox_not_found(sandbox_id),
-                    ));
+                    ))
                 }
                 SandboxState::Pausing => {
-                    return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                    Some(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
                         Self::error(400, "sandbox is pausing; connect again once it has paused"),
-                    ));
+                    ))
                 }
             },
-            Ok(None) => {}
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
-                return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                    Self::error(
-                        400,
-                        format!("sandbox is still {state} after waiting; connect again shortly"),
-                    ),
-                ));
-            }
+            Ok(None) => None,
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Some(
+                SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    format!("sandbox is still {state} after waiting; connect again shortly"),
+                )),
+            ),
             Err(err) => {
-                return Ok(
-                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
-                );
+                Some(SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()))
             }
+        };
+        if let Some(response) = answered {
+            return Ok(response);
         }
         if !self.owns_sandboxes() {
             return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
@@ -2342,20 +2335,46 @@ mod paused_sandbox_rest_tests {
     struct Surface {
         api: Arc<ApiImpl>,
         catalog: Arc<InMemorySnapshotCatalog>,
+        orchestrator:
+            Arc<Orchestrator<crate::orchestrator::InMemoryMetadataStore, MockBackendFactory>>,
+    }
+
+    /// Answers one fixed verdict about whether a sandbox is still routed to.
+    struct FixedRouting(bool);
+
+    #[async_trait::async_trait]
+    impl crate::orchestrator::RuntimeRouting for FixedRouting {
+        async fn is_routed(&self, _sandbox_id: SandboxId) -> anyhow::Result<bool> {
+            Ok(self.0)
+        }
     }
 
     impl Surface {
         async fn as_half(wiring: ResumeWiring) -> Self {
+            Self::as_half_routed(wiring, None).await
+        }
+
+        async fn as_half_routed(
+            wiring: ResumeWiring,
+            routing: Option<Arc<dyn crate::orchestrator::RuntimeRouting>>,
+        ) -> Self {
             let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
+            if let Some(routing) = routing {
+                orchestrator.set_runtime_routing(routing);
+            }
             let (snapshot_manager, catalog) = in_memory_snapshot_manager();
             let api = Arc::new(ApiImpl::new(
-                orchestrator,
+                Arc::clone(&orchestrator) as Arc<dyn crate::orchestrator::SandboxOrchestration>,
                 Arc::new(snapshot_manager),
                 None,
                 Vec::new(),
                 wiring,
             ));
-            Self { api, catalog }
+            Self {
+                api,
+                catalog,
+                orchestrator,
+            }
         }
 
         async fn api_half() -> Self {
@@ -2980,6 +2999,49 @@ mod paused_sandbox_rest_tests {
         assert_eq!(
             surface.state_of(sandbox_id).await,
             Some(SandboxState::Running)
+        );
+    }
+
+    async fn connect_over_a_running_record(routed: bool) -> SandboxesSandboxIdConnectPostResponse {
+        let surface = Surface::as_half_routed(
+            ResumeWiring::api_half_for_test(),
+            Some(Arc::new(FixedRouting(routed))),
+        )
+        .await;
+        let sandbox_id = surface.paused(mock_paused_sandbox_config());
+        surface
+            .orchestrator
+            .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+            .await
+            .expect("a running record should be writable");
+
+        surface.connect(sandbox_id).await
+    }
+
+    #[tokio::test]
+    async fn a_connect_to_a_runtime_nothing_routes_to_resumes_instead_of_answering_running() {
+        let response = connect_over_a_running_record(false).await;
+
+        assert!(
+            matches!(
+                response,
+                SandboxesSandboxIdConnectPostResponse::Status201_TheSandboxWasResumedSuccessfully { .. }
+            ),
+            "a record whose runtime the cluster cannot reach must not answer as running, \
+             got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connect_to_a_routed_runtime_still_answers_running() {
+        let response = connect_over_a_running_record(true).await;
+
+        assert!(
+            matches!(
+                response,
+                SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning { .. }
+            ),
+            "a sandbox the cluster still routes to is running, got {response:?}"
         );
     }
 

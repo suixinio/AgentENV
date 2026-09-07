@@ -453,15 +453,43 @@ Custom extension service configuration. When `url` is unset, the integration is 
 | `url` | string | unset | HTTP base URL of the custom extension service. When set, AgentENV invokes sandbox lifecycle hooks under `POST {url}/sandbox-hook/*`. |
 | `timeout_ms` | integer | `5000` | Timeout for each custom extension HTTP call, in milliseconds. |
 
+## `[api]`
+
+The node's own HTTP API and the credential this half presents to another node's gRPC gate. On `aenv-node` the credentials gate its REST and gRPC surfaces; on `aenv-api` no gate is attached and the value is only what the node client stamps outbound.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `control_plane_tokens` | array of strings | `[]` | Static credentials, accepted together so one can be rotated out. Empty together with `control_plane_token_file` leaves the gate open. |
+| `control_plane_token_file` | path | `""` | The same credentials as a file, one per line, re-read when it changes. The effective set is the union with the static tokens. An unreadable file keeps the last set that was read: clearing the file is how a gate is turned off deliberately. |
+| `node_client_token_file` | path | `""` | The credential this half presents at another node's gate, when it is not one of the credentials it accepts itself. Empty falls back to `control_plane_token_file`'s first line, and to a static token only when there is no file — a rotation moves the file, while the static list keeps the retired credential so nodes still accept what is in flight. An unreadable or empty file falls back and says so, rather than presenting nothing. |
+
+## `[api.proxy]`
+
+The data-plane reverse proxy, on the half that serves one (`aenv-node`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_incoming_per_sandbox` | integer | `0` | Requests one sandbox may have in flight through the proxy at once; the excess is refused with 429. `0` does not limit — the sandbox's own service decides what it can take. |
+
+## `[egress_ca]`
+
+The root `aenv-api` signs per-node egress intermediates from, and the root guests with `rules` trust. Only the api half reads this section; a node never holds a signing key. Both halves of the pair are paths and never inline values.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `root_cert_path` | path | unset | PEM certificate of the root. Unset leaves `POST /internal/egress/intermediate` unmounted, and every broker asking for an intermediate is answered 503 — which closes each node's rule domains rather than taking the node down. |
+| `root_key_path` | path | unset | Its private key. Setting one of the two without the other is a startup error: an operator who set one meant to set both. The intermediates it signs carry an excluded-set `nameConstraints` (`.svc`, `.cluster.local`, `.local`, `.internal` and the private address ranges), so no leaf under one can carry a name inside the cluster. |
+
 ## `[egress_broker]`
 
 How a node reaches the egress broker that serves sandboxes declaring `network.rules` or `network["x-aenv-endpoints"]`. A sandbox with rules is placed only on nodes whose heartbeat reports a usable broker; with `mode = "disabled"` this node reports none. See the proposal in `docs/proposals/2026-09-03-sandbox-egress-credential-brokering.md`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `mode` | string | `"disabled"` | `disabled`, `embedded` (the broker core runs inside `aenv-node`; only valid with `[cluster].node_discovery_mode = "static"` and at most one static node) or `local` (a Unix socket to the `aenv-egress` DaemonSet on this same node). `remote` is refused at startup: the value no longer parses. |
+| `mode` | string | `"disabled"` | `disabled`, `embedded` (the broker core runs inside `aenv-node`; only valid with `[cluster].node_discovery_mode = "static"` and at most one static node) or `local` (a Unix socket to the `aenv-egress-node` DaemonSet on this same node). `remote` is refused at startup: the value no longer parses. |
 | `socket_path` | path | unset | The broker's Unix socket on this node. Required in `local` mode; both DaemonSets mount its directory as the same `hostPath`. |
 | `guest_ca_cert_path` | path | unset | PEM bundle guests with rules trust for intercepted names. It is the **root**, not this node's issuer: a sandbox that resumes on another node keeps the trust store it loaded before it moved. |
+| `socket_group` | integer | `65532` | The gid the broker runs under, which `socket_path`'s directory must carry with mode `0770` before this node starts in `local` mode. The broker's init container is what chowns it, so this must match `runAsGroup` in `deploy/k8s/base/aenv-egress-daemonset.yaml`; `services/shared/config/egress_socket_group_manifest_test.go` holds them together. A node waits up to sixty seconds and then refuses to start, naming the path — it never chowns the directory itself. |
 | `per_sandbox_conns` | integer | `256` | Concurrent brokered connections one sandbox may hold; excess connections are closed. |
 | `node_conns` | integer | `20000` | Concurrent brokered connections across the node. |
 | `open_timeout_ms` | integer | `3000` | How long the runtime waits for the broker to accept one connection. |
@@ -478,12 +506,11 @@ With `backend = "postgres"` the values live in the same PostgreSQL that holds th
 
 ## `[secrets.pg]`
 
-Values in `aenv-api`'s own PostgreSQL, AES-256-GCM under one master key. Both keys are paths, never inline values: an environment variable holding a master key is readable from `/proc`, a crash dump and `kubectl describe`.
+Values in `aenv-api`'s own PostgreSQL, AES-256-GCM under one master key. The key is a path, never an inline value: an environment variable holding a master key is readable from `/proc`, a crash dump and `kubectl describe`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `key_file` | path | unset | File holding the base64 32-byte master key. Required when `backend = "postgres"`. Mount it from a Secret; it is never written to the database holding the ciphertexts, and losing it loses every stored value. |
-| `resolver_token_file` | path | unset | File holding the bearer the broker presents at `POST /internal/credentials/resolve`. Required when `backend = "postgres"`; the broker's own `resolver.token_file` holds the same value. Read once at startup. |
 
 ## `aenv-egress.toml`
 
@@ -511,7 +538,7 @@ every path in it names a volume the broker DaemonSet mounts. See
 | `ca.mints_per_sandbox_per_minute` | integer | `60` | Per-sandbox signing budget. With match-before-sign this is what bounds the leaves an unconstrained CA can be made to issue. |
 | `upstream.denied_cidrs` | array of CIDR strings | `[]` | Destinations nothing reaches through the broker. These are absolute: unlike the built-in private ranges, no per-handler `allowed_cidrs` reopens them, so a range that must never be reachable belongs here. The cluster's Service and Pod CIDRs are the ones that do. |
 | `resolver.url` | string | unset | Base URL the broker resolves credentials against. With `[secrets].backend = "postgres"` that base is `aenv-api` itself — `http://agentenv-api:8000/internal` — and the NetworkPolicy has to admit it. Unset leaves the broker with no credential source: it warns once at startup and every marker answers 502. |
-| `resolver.token_file` | path | unset | File holding the bearer token for resolver calls. Required whenever `resolver.url` is set: the endpoint checks a bearer on every call, so a broker without one would have every lookup refused, and startup fails instead. It holds the same value as the api half's `[secrets.pg].resolver_token_file`; a value that differs is answered 401, which the broker reports as an outage (502 to the guest) and both halves log. |
+| `resolver.token_file` | path | unset | File holding the token presented on resolver calls: this Pod's projected ServiceAccount token for the `aenv-api` audience, the only credential that endpoint accepts. Required whenever `resolver.url` is set — the endpoint checks it on every call, so a broker without one would have every lookup refused, and startup fails instead. Read on every call, because kubelet rotates a projected token in place. A token the api half cannot resolve to a node is answered 401, which the broker reports as an outage (502 to the guest) and both halves log. |
 | `resolver.timeout_ms` | integer | `5000` | Timeout for each resolver call. |
 | `resolver.cache_ttl_secs` | integer | `10` | How long a resolved credential is reused. It bounds how long a revocation takes to bite, and it is the only bound there is: the api half has no reverse channel to a broker, so a revoked grant is noticed on the next lookup and not before. |
 | `resolver.cache_capacity` | integer | `4096` | Credentials held at once. Expired entries leave on every insert and the soonest to expire is dropped at capacity, so credential bytes are not retained past the TTL. |

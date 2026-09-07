@@ -69,31 +69,95 @@ Deployment model:
   KVM/PVM mode, and hostPath
 - `agentenv-api`: Deployment answering the `Scheduler` RPCs
 - `agentenv-nodes`: headless Service for Kubernetes-mode node discovery
-- `aenv-egress`: unprivileged DaemonSet, one broker per node, reached over the
-  `/run/aenv-egress` hostPath both it and `agentenv-node` mount. No Service:
+- `aenv-egress-node`: unprivileged DaemonSet, one broker per node, reached over
+  the `/run/aenv-egress` hostPath both it and `agentenv-node` mount. No Service:
   nothing reaches it over the network.
+
+### Bringing the per-node broker up
+
+`deploy/k8s` describes the **end state** and nothing else: `AENV_EGRESS_BROKER_MODE`
+is `local`, and applying the tree is the whole of the move. There is no
+migration script and no intermediate value to patch in.
+
+Coming from the cluster-wide broker is a **breaking upgrade**, not a rolling
+one. The node image refuses to start on a mode it does not know, and rolling
+`ds/agentenv-node` destroys every sandbox on every node it touches, so the
+sandboxes go either way:
+
+1. **Drain the sandboxes.** Delete or let expire everything running. Anything
+   still up when the nodes roll is lost with its Firecracker process.
+2. **Delete the old broker's objects.** They are not in this tree any more and
+   `apply` will not remove them:
+
+   ```bash
+   NS=agentenv-system
+   # Every line carries --ignore-not-found: which of these a cluster has
+   # depends on how far it got, and a missing one must not stop the rest —
+   # pasted into a `set -e` script, an rc=1 here would leave the old-name
+   # DaemonSet below in place.
+   kubectl -n $NS delete deploy/aenv-egress svc/aenv-egress cm/aenv-egress-config \
+     --ignore-not-found
+   kubectl -n $NS delete secret/egress-server secret/egress-hmac secret/egress-transport-ca \
+     --ignore-not-found
+   kubectl -n $NS delete secret/egress-resolver --ignore-not-found
+   # Only on a cluster that ran an interim build: the per-node broker under
+   # the old object name, whose selector this tree cannot apply over.
+   kubectl -n $NS delete ds/aenv-egress networkpolicy/aenv-egress --ignore-not-found
+   ```
+
+   `egress-ca` stays: the api half signs each node's intermediate with it, and
+   the guests' trust store comes from it. So does `sa/aenv-egress` — the
+   broker's identity did not move with the object family, and the api half's
+   internal endpoints resolve a token to a Pod and a machine, never to a
+   ServiceAccount name.
+3. **Apply the end state.** `bash deploy/k8s/run.sh apply` — the file is not
+   executable, which is why the Makefile invokes it the same way.
+4. **Wait for the three rollouts.**
+
+   ```bash
+   kubectl -n $NS rollout status deploy/agentenv-api --timeout=600s
+   kubectl -n $NS rollout status ds/aenv-egress-node --timeout=600s
+   kubectl -n $NS rollout status ds/agentenv-node --timeout=600s
+   ```
+
+   In that order: the api half first, because an older one decodes a node's
+   `local_ok` as unspecified and places no sandbox with rules at all; the
+   broker before the nodes, because a node in `local` mode refuses to start
+   until the broker's init container has prepared `/run/aenv-egress` on its
+   machine, and waits sixty seconds before saying so.
+
+**Rolling `ds/agentenv-node` destroys every sandbox on the nodes it rolls.**
+That is true of any node roll, not only this one. Rolling `ds/aenv-egress-node`
+does not, which is the whole reason the broker is a separate workload: while
+its Pod restarts, that node reports `local_unreachable` and takes no new
+sandbox with rules, and the connections already open on it fail and are
+retried by the guest.
 
 ### Rolling the egress broker back
 
 Three workloads, three answers. What each one needs *in place* to run is what
-decides whether it can be rolled back on its own.
+decides whether it can be rolled back on its own. None of them rolls back
+across the per-node boundary: the shape before it is not in this tree, and
+coming back to it is the runbook above run in reverse, sandboxes drained.
 
-**`aenv-egress` (the broker)** — rolling its image back is free, and it takes
+**`aenv-egress-node` (the broker)** — rolling its image back is free, and it takes
 no sandbox with it. That is the whole reason it is not a sidecar.
 
 | Needs to be there | Why |
 |---|---|
-| `/run/aenv-egress`, group-writable by uid 65532 | the node creates it; a broker started before the node has ever run on that machine finds nothing to bind in |
+| a broker that answers the readiness probe | the node's own probe writes a zero-length frame and waits for a byte back. A broker from before that answer existed reads the frame and closes, and every node then reports `local_unreachable` and takes no sandbox with rules — free to roll back means free within the versions that answer it |
+| a broker that prepares `/run/aenv-egress` | its init container is what chowns the hostPath to gid 65532 with mode 0770. A broker image from before that init container leaves the directory as kubelet made it, and every node on the machine then refuses to start |
 | `POST /internal/egress/intermediate` answering | without it the broker holds no signing key and closes every rule domain (it still starts, and still serves passthrough) |
-| the `egress-resolver` Secret **or** an open `legacy_bearer_until` | an image that predates per-node identity presents the shared bearer and nothing else |
+| its own projected ServiceAccount token | the only credential the internal endpoints accept. A broker image from before per-node identity presents a shared bearer this half no longer knows, and every lookup answers 401 |
 
 **`agentenv-node`** — rolling it back is **not** free: it destroys every
 sandbox on every node it touches. Combine it with a planned node roll.
 
 | Needs to be there | Why |
 |---|---|
-| `AENV_EGRESS_BROKER_MODE` the image understands | an image from before the per-node move refuses to start on `local`; one from after refuses on `remote`. Set the ConfigMap to `disabled` before rolling between the two, and creates with rules answer `503` for that window |
-| `/run/aenv-egress` in the Pod spec | a node image expecting `local` with no such volume can never reach a broker |
+| a ConfigMap that version can read | `egress-broker-config` holds only environment variables and both images read it, so this one costs nothing — the mode value inside it is the thing to set, in the row below |
+| `AENV_EGRESS_BROKER_MODE` the image understands | an image from before the per-node move refuses to start on `local`; one from after refuses on `remote`. There is no value both accept, so rolling between the two is the breaking upgrade above, not a roll |
+| `/run/aenv-egress` in the Pod spec, prepared once | a node image expecting `local` with no such volume can never reach a broker. The sixty-second startup refusal is about the *directory*, not the broker: it fires on a machine where nothing ever chowned the hostPath. A node whose broker is merely gone starts normally — the directory the init container prepared outlives the DaemonSet — and reports `local_unreachable` until one comes back |
 
 **`agentenv-api`** — rolling it back is an image change, no flags, and it takes
 no sandbox with it. It is also the half that must roll **first** on the way
@@ -101,6 +165,7 @@ forward and **last** on the way back.
 
 | Needs to be there | Why |
 |---|---|
+| a ConfigMap that version can read | this half reads `secrets-store-config` and `agentenv-k8s-config`, neither of which changed shape across this move, so this row costs nothing here |
 | the `agentenv-api-token-review` ClusterRole | without it both internal endpoints answer 503, and every broker loses its intermediate at its next renewal |
 | the `egress-ca` Secret with `ca.key` | an api half that cannot read the root issues nothing |
 | `EGRESS_BROKER_STATE_LOCAL_OK` in its proto | an older api half decodes a node's `local_ok` as unspecified, places no sandbox with rules, and answers `503` |

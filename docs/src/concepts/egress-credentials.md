@@ -283,12 +283,13 @@ Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egr
   `aenv-egress-networkpolicy.yaml` lets nothing in but Prometheus — there is no network path to
   the broker at all — and lets the api half, DNS and port 443 of public addresses out.
 - Nodes: `[egress_broker].mode = "local"`, `socket_path = "/run/aenv-egress/broker.sock"`, and
-  `guest_ca_cert_path` pointing at the **root** guests trust. The node creates the socket
-  directory at startup and hands it to the broker's group. A node reports its broker state in
+  `guest_ca_cert_path` pointing at the **root** guests trust. The broker's own init container
+  prepares the socket directory; a node in `local` mode waits up to a minute for it and refuses
+  to start if it never appears. A node reports its broker state in
   every heartbeat, and the api half places a sandbox with rules only on a node reporting
   `local_ok`; when none does the create answers `503`.
 - The api half: `[secrets].backend = "postgres"` with `[secrets.pg].key_file` (base64 of 32
-  bytes, the `agentenv-secrets-key` Secret) and `[secrets.pg].resolver_token_file`, plus
+  bytes, the `agentenv-secrets-key` Secret), plus
   `[egress_ca].root_cert_path` / `root_key_path` (the `egress-ca` Secret) — **the only workload
   that mounts the root's key**. PostgreSQL gains `secret_values` and `secret_grants` beside
   `secret_refs`. The broker points `[resolver].url` and `[ca].issuer_url` at
@@ -298,15 +299,17 @@ Three parts, configured in [`[egress_broker]`](../configuration/reference.md#egr
 
 Both internal endpoints check the broker's projected token through Kubernetes: `TokenReview` says
 whose it is, the Pod says which machine it runs on, and a resolve is then answered only for
-sandboxes bound to that machine. That needs the `agentenv-api-token-review` ClusterRole, and it is
+sandboxes bound to that machine — a sandbox no binding names is refused, and a routing table that
+cannot be read is a `503` rather than an unscoped answer. That needs the `agentenv-api-token-review`
+ClusterRole, and it is
 why `[cluster].node_discovery_mode = "static"` closes both endpoints with a `503` — there is no
-Kubernetes to ask. `[secrets].legacy_bearer_until` keeps the shared bearer working beside the
-token during a migration; while it is open, a caller presenting it is scoped to no node.
+Kubernetes to ask. That token is the only credential either endpoint accepts: there is no shared
+bearer, so every admitted caller names a machine.
 
 `AENV_EGRESS_BROKER_MODE` and `AENV_SECRETS_BACKEND` are both read once at process startup, so
 editing either ConfigMap changes nothing until the process that reads it restarts. 🔴 Rolling
 `ds/agentenv-node` destroys every sandbox on every node — the Firecracker processes are its
-children. Rolling `ds/aenv-egress` does not, which is the whole reason the broker is its own
+children. Rolling `ds/aenv-egress-node` does not, which is the whole reason the broker is its own
 workload.
 
 `mode = "embedded"` runs the broker core inside `aenv-node` for a single static node: it has no
@@ -314,13 +317,28 @@ credential source and no TLS stack, so it carries the one handler that needs nei
 which answers the sandbox's identity — and proves the intercept and identity path without
 brokering HTTPS or Postgres.
 
+A stack with no api half to issue an intermediate — `deploy/docker-compose.yml` is the one in
+this repository — mints its own with `aenv-egress gen-ca <dir>`: a root at `ca.crt` for the
+nodes' `guest_ca_cert_path`, and an intermediate at `intermediate.crt` for the broker's
+`[ca].cert_path` / `key_path`. It keeps a root that is already there and mints only the
+intermediate under it, because a second root would leave every trust store already loaded from
+the first trusting nothing the broker signs. The subcommand is the binary's own, so the image
+needs no certificate tooling.
+
+That intermediate lasts 30 days and **nothing renews it**: the renewal loop belongs to
+`[ca].issuer_url`, and a static pair spawns none. What a static pair does when its 30 days are
+up is not the closed-connection answer a cluster gives — the broker keeps signing, and a leaf it
+signs carries `notAfter = now`, so the guest's own verification fails the handshake. Renewing is
+"delete `intermediate.*` and restart the broker": `gen-ca` mints a new one under the same root,
+and no guest's trust store moves.
+
 ### When a rule domain stops working
 
 In this order, because each step rules out everything below it:
 
 1. **`GET /nodes`** — does the sandbox's node report `egressBroker: "local_ok"`? `disabled` means
    its ConfigMap was never flipped; `local_unreachable` means the socket is not being read.
-2. **`kubectl -n <ns> get pods -l app.kubernetes.io/name=aenv-egress -o wide`** — is there a
+2. **`kubectl -n <ns> get pods -l app.kubernetes.io/name=aenv-egress-node -o wide`** — is there a
    broker Pod on that node, and is it `Ready`? Its readiness probe connects to its own socket, so
    `Ready` means it is serving and not merely up.
 3. **The broker's log on that node** — `no-intermediate` means it never got a signing key: check
@@ -333,6 +351,12 @@ In this order, because each step rules out everything below it:
    a policy one.
 6. **Only then the sandbox's own policy**: `allowOut`, `denyOut`, `allow_internet_access`, and
    whether the secret the rule names still exists and is granted to this run.
+
+A broker at `max_connections` still answers both readiness probes — its own
+and the node's. Probes are held in a small pool of their own, so a node under
+load reports `local_ok` rather than losing every sandbox with rules to
+`local_unreachable`; the session that found no slot is refused with
+`admission_full` instead, which is the answer that belongs to it.
 
 Metrics on the broker's `:9103`: `egress_conns_total{handler,outcome}`, `egress_active_conns`,
 `egress_policy_denied_total{reason}`, `egress_intercept_no_sni_total`,

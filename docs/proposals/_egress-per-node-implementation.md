@@ -166,8 +166,7 @@ v1.1"；`src/api/impls/sandbox.rs:175` 写死的 `allow_public_traffic: Some(tru
 `spec.nodeName`，等于 `AENV_NODE_ID`（`agentenv-daemonset.yaml:149-152`）。RBAC：新增 ClusterRole
 `tokenreviews create` + ClusterRoleBinding 给 `agentenv-api` SA（`deploy/k8s/base/role.yaml:11-27` 只有 namespaced）。
 `static` 发现模式下这两个端点关闭（返回 503 `resolve disabled in static mode`），只允许 `embedded`。
-resolve 双认一个版本：旧 bearer（`resolve_route.rs:76-92`）与新 token 并存，配置 `[secrets].legacy_bearer_until`
-到期后拒绝。
+resolve 只认投影 token：每个被放行的调用方都指名一台机器（收口批删掉了共享 bearer 的并存窗口）。
 
 **P3.3 节点限定 resolve**：`resolve_route.rs` 接 `BindingStore::get(sandbox_id)`（`src/binding_store/mod.rs:87-92`）；
 `Binding.node.id != caller_node_id` ⇒ 404；binding 的 `execution_id` 非空且不等 ⇒ 404；store 不可判定 ⇒ 503，
@@ -208,7 +207,7 @@ status, bytes_in, bytes_out, latency_ms, tls_version, cipher, upstream_addr, rul
 - 每沙箱入站连接上限 `[api.proxy].max_incoming_per_sandbox`，默认 0 = 不限。
 - e2e：默认可达；锁定后无头 403、有头 200；envd 端口不受 token 约束但内部路径被拒。
 
-## P5 迁移与收尾（M）
+## P5 收尾（M）
 
 代码与文档部分（本分支完成）：
 
@@ -217,21 +216,19 @@ status, bytes_in, bytes_out, latency_ms, tls_version, cipher, upstream_addr, rul
 - `CLAUDE.md` 第 102 与 112 行改写为每节点形态（改写不追加，保持 200 行内）；
   `docs/src/concepts/egress-credentials.md` 部署章节、失败表、guest 可见差异（链长 2、issuer CN 为节点名）、
   排障顺序一节；`docs/src/configuration/reference.md` 的 `[egress_broker]`、`[network.egress]`。
-- e2e：`scripts/tests/e2e/suites/15_egress_credentials.sh:174-211` 的 `rollout restart deploy/aenv-egress` 改
-  `ds/aenv-egress`，`scale --replicas=0` 改为删除沙箱所在节点的 broker Pod（先经 `/nodes` 查 binding）；
+- e2e：`scripts/tests/e2e/suites/15_egress_credentials.sh` 的 `rollout restart deploy/aenv-egress` 改
+  DaemonSet；停机注入几经修正，最终形态是**把沙箱所在节点的 broker socket 文件挪走**
+  （删 Pod 的窗口被 DaemonSet 十秒补回；`kill -STOP 1` 对容器 PID 1 是空操作）。沙箱所在节点不查
+  `/registry/sandboxes`（那是暂停沙箱的注册表），改用"逐个 broker token 试 resolve，恰好一个 200"；
   `16_egress_postgres.sh:122-131` 的 503 重试注释改为"全部节点 broker 未就绪"；新增 T1 与 P3 的断言。
 - 三张回滚表写进 `docs/src/internals/services.md`："Rolling the egress broker back"：node、broker、api 各自
   需要什么对象在场。
 
-集群操作部分（验收 agent 在 pve-mf 执行，本分支只提供清单与脚本）：
-
-1. 滚 api（识别新枚举与双认）。
-2. 发 broker DaemonSet，与旧 Deployment 并存。
-3. 滚 node 镜像（识别 `local`，ConfigMap 仍为 `remote` 时仅 warn 并保持 remote 行为直到本次滚动结束——
-   **注意**：本分支 `remote` 已删，所以 node 镜像启动时 `mode = remote` 必须是"拒绝"；为了让第 3、4 步能分开，
-   ConfigMap 在第 3 步前先改成 `disabled`，带规则的创建在此期间 503）。
-4. 改 ConfigMap 为 `local`，再滚一次 node；**存量沙箱清空**，与计划内 node 滚动合并。
-5. 旧 Deployment 与 `egress-hmac`、`egress-server`、`egress-resolver` 缩零保留一个发布周期后删除。
+集群操作部分：**用户裁决 2026-09-07，从旧形态升级是破坏性变更，没有迁移路径**。
+没有迁移脚本、没有中间 mode、没有共享 bearer 的回滚窗口。步骤是"清空沙箱 → 删旧对象族 → apply 终态 →
+等三个 rollout"，全文在 `docs/src/internals/services.md` 的 "Bringing the per-node broker up"。
+依赖顺序从源头拆掉了：broker 的 init container 自己准备 `/run/aenv-egress`，节点不必先滚一遍；
+节点在 `local` 下等不到这个目录就启动失败，而不是静默 `local_unreachable`。
 
 ## 涉及文件清单
 

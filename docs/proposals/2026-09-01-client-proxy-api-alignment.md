@@ -224,7 +224,7 @@ e2b 侧按 `fdc3359`）。前五条是原「永久两项、过渡三项」：过
 > 一并作废。因此实际落地为：`assemble` **只在不拥有用户 REST 的那半边挂门**
 > （与 `role_gate` 同一根轴），api 半边不再挂任何凭据层；`[api].control_plane_tokens` /
 > `control_plane_token_file` 两个配置项**保留**（node 半边读它们）；
-> `deploy/k8s/base/agentenv-api-deployment.yaml` 撤下 `api-gate-token` 投影与
+> `deploy/k8s/base/agentenv-api-deployment.yaml` 撤下 `node-gate-token` 投影与
 > `AENV_API_CONTROL_PLANE_TOKEN_FILE`。武装机制确认为配置驱动（空凭据集 ⇒ Disabled ⇒ 放行），
 > 因此回退 api 镜像时旧门在场但未武装，成立。
 

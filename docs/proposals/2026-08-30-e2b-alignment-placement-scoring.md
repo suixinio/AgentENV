@@ -388,8 +388,8 @@ make -C services proto && git diff --exit-code     # 生成物 diff-clean 门
 
 ### 5.2 门禁取证（逐 Pod）
 
-- Secret `agentenv-control-plane-token` 三键（`token` / `api-gate-token` / `node-gate-token`）
-  非空且字节相等（不打印值）。三处挂载均 `optional: true`
+- Secret `agentenv-control-plane-token` 被读的两键（gateway 读 `token`，api 与 node 都读
+  `node-gate-token`）非空且字节相等（不打印值）。三处挂载均 `optional: true`
   （`deploy/k8s/base/gateway-deployment.yaml:56-71`、`agentenv-api-deployment.yaml:751-758`、
   `agentenv-daemonset.yaml:588-595`），缺失即门禁全关。
 - 🔴 gauge=1 **不**证明加载的 token 等于当前 Secret：读文件失败会保留上一次成功值

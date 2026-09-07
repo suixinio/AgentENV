@@ -129,7 +129,7 @@ Plane 一节记下了这条约定。
 
 ## D7 — 守住 api 半边的控制面凭据投影
 
-api 半边上，`api-gate-token` 这道闸是面向用户 REST 唯一的传输层检查，而此前没有任何东西
+api 半边上，`node-gate-token` 这道闸是面向用户 REST 唯一的传输层检查，而此前没有任何东西
 断言 api Deployment 真的挂载了它。新测试放在 `src/api/control_plane_gate.rs` 的测试模块里，
 形状对齐 `the_gateway_and_the_node_read_different_keys_of_the_credential_secret`：
 `include_str!` 读 `deploy/k8s/base/agentenv-api-deployment.yaml`，锚在 manifest 语法上而非

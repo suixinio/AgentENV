@@ -133,7 +133,7 @@ impl SnapshotRepository {
                         "a commit reported failure and the catalog holds its committed row; \
                          reporting the commit that happened"
                     );
-                    Ok(record)
+                    Ok(*record)
                 }
                 CommitProbe::NotLanded => {
                     self.roll_back_publish(&id, &publications).await;
@@ -154,7 +154,7 @@ impl SnapshotRepository {
             .get_scoped(&id.to_string(), CatalogReadScope::AnyStatus)
             .await
         {
-            Ok(Some(record)) if record.committed.is_some() => CommitProbe::Landed(record),
+            Ok(Some(record)) if record.committed.is_some() => CommitProbe::Landed(Box::new(record)),
             Ok(_) => CommitProbe::NotLanded,
             Err(error) => CommitProbe::Unknown(format!(
                 "the catalog could not say whether the commit landed: {error}"
@@ -288,7 +288,7 @@ impl SnapshotRepository {
 /// What a re-read of a refused commit's row says about it.
 enum CommitProbe {
     /// The row is committed: the commit happened and its error was the answer.
-    Landed(SnapshotRecord),
+    Landed(Box<SnapshotRecord>),
     /// No committed row exists, and the read that says so was complete.
     NotLanded,
     /// The catalog could not answer; `String` says why.

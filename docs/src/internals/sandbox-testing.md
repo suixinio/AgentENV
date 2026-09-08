@@ -9,7 +9,7 @@ This document describes the public sandbox API, the global `ConfigManager` under
 
 ### Types and responsibilities
 
-- `FirecrackerSandboxConfig` (`AgentENV/src/sandbox/firecracker/config.rs`)
+- `FirecrackerSandboxConfig` (`AgentENV/crates/aenv-node/src/sandbox/firecracker/config.rs`)
   - **Purpose**: describes a fresh VM boot (kernel + tools drive + user image).
   - **Key fields**
     - `firecracker_binary`: path to the `firecracker` executable.
@@ -36,7 +36,7 @@ This document describes the public sandbox API, the global `ConfigManager` under
       `FirecrackerSandbox::from_snapshot(&RunnableSnapshot, &SandboxLaunchConfig)`.
     - `uid`/`gid`: File ownership (default `0`).
 
-- `ProcessOpts` (`AgentENV/src/sandbox/process.rs`)
+- `ProcessOpts` (`AgentENV/crates/aenv-node/src/sandbox/process.rs`)
   - **Purpose**: Options for starting a process inside the sandbox.
   - **Key fields**
     - `envs`: `HashMap<String, String>` for process environment variables.
@@ -44,11 +44,11 @@ This document describes the public sandbox API, the global `ConfigManager` under
     - `timeout`: Optional max time to wait for completion.
   - **Builder methods**: `with_envs()`, `with_cwd()`, `with_timeout()`.
 
-- `ProcessOutput` (`AgentENV/src/sandbox/process.rs`)
+- `ProcessOutput` (`AgentENV/crates/aenv-node/src/sandbox/process.rs`)
   - **Purpose**: Result of a completed process execution.
   - **Fields**: `stdout`, `stderr`, `exit_code`.
 
-- `ProcessHandle` (`AgentENV/src/sandbox/process.rs`)
+- `ProcessHandle` (`AgentENV/crates/aenv-node/src/sandbox/process.rs`)
   - **Purpose**: Handle to a running process inside the sandbox.
   - **Key methods**
     - `pid()`: Returns the PID inside the guest VM.
@@ -57,7 +57,7 @@ This document describes the public sandbox API, the global `ConfigManager` under
     - `send_signal(signal).await`: Sends a signal (e.g. SIGTERM).
     - `kill().await`: Kills the process with `SIGKILL`.
 
-- `FirecrackerSnapshotConfig` (`AgentENV/src/sandbox/firecracker/config.rs`)
+- `FirecrackerSnapshotConfig` (`AgentENV/crates/aenv-node/src/sandbox/firecracker/config.rs`)
   - **Purpose**: describes how to resume a VM from snapshot + memory + base disk.
   - **Key fields**
     - `vm_state_path`: Firecracker VM state file.
@@ -78,7 +78,7 @@ This document describes the public sandbox API, the global `ConfigManager` under
     - `SandboxBackend`: `start`, `start_nowait`, `wait_for_ready`, `pause`, `resume`, `stop`.
     - `SandboxExecutor`: `run_command`, `run_command_with_opts`, `start_process`.
 
-- `FirecrackerSandbox` (`AgentENV/src/sandbox/firecracker/sandbox.rs`)
+- `FirecrackerSandbox` (`AgentENV/crates/aenv-node/src/sandbox/firecracker/sandbox.rs`)
   - **Purpose**: lifecycle controller for a single Firecracker instance.
   - **Main methods (detailed)**
     - `FirecrackerSandbox::new(FirecrackerSandboxConfig)`

@@ -1,6 +1,6 @@
 # P2P Artifact Transport
 
-AgentENV has a project-wide P2P artifact transport layer in `src/p2p/`. It lets runtime modules publish, discover, and fetch validated files from peer nodes without depending on a concrete transport implementation.
+AgentENV has a project-wide P2P artifact transport layer in `crates/aenv-node/src/p2p/`. It lets runtime modules publish, discover, and fetch validated files from peer nodes without depending on a concrete transport implementation.
 
 The first concrete backend is embedded in the AgentENV server process and uses `iroh` plus `iroh-blobs`. The public API stays behind traits and serializable types so future backends can be selected by configuration.
 
@@ -16,12 +16,12 @@ The first concrete backend is embedded in the AgentENV server process and uses `
 
 | Path | Responsibility |
 |------|----------------|
-| `src/p2p/mod.rs` | Public exports and `transport_from_config` factory |
-| `src/p2p/config.rs` | Resolved P2P config and transport kind selection |
-| `src/p2p/types.rs` | Transport-neutral artifact, endpoint, peer, and publish types |
-| `src/p2p/transport.rs` | `P2pTransport` trait and disabled implementation |
-| `src/p2p/discovery/` | Peer discovery and artifact-index hints via scheduler/static/no-op implementations |
-| `src/p2p/iroh/` | Embedded `iroh` + `iroh-blobs` backend and catalog protocol |
+| `crates/aenv-node/src/p2p/mod.rs` | Public exports and `transport_from_config` factory |
+| `crates/aenv-node/src/p2p/config.rs` | Resolved P2P config and transport kind selection |
+| `crates/aenv-node/src/p2p/types.rs` | Transport-neutral artifact, endpoint, peer, and publish types |
+| `crates/aenv-node/src/p2p/transport.rs` | `P2pTransport` trait and disabled implementation |
+| `crates/aenv-node/src/p2p/discovery/` | Peer discovery and artifact-index hints via scheduler/static/no-op implementations |
+| `crates/aenv-node/src/p2p/iroh/` | Embedded `iroh` + `iroh-blobs` backend and catalog protocol |
 
 ## Public API
 
@@ -128,14 +128,14 @@ Scheduler keeps this artifact index in memory and stores only key-to-node mappin
 
 ## Snapshot And Overlaybd Consumers
 
-`src/snapshot/p2p.rs` is the snapshot-store integration layer. It is intentionally small: the snapshot manager publishes artifacts after the configured repository commit succeeds, and runtime resolvers treat P2P as an optional acceleration path rather than committed truth.
+`crates/aenv-node/src/snapshot/p2p.rs` is the snapshot-store integration layer. It is intentionally small: the snapshot manager publishes artifacts after the configured repository commit succeeds, and runtime resolvers treat P2P as an optional acceleration path rather than committed truth.
 
 Snapshot publication advertises:
 
 - Fixed Firecracker artifacts under `snapshot/v1/artifacts/{snapshot_id}/{relative_path}`:
   - `vm_state.bin` is published from its local file path.
   - `firecracker-manifest.json` is serialized from the committed manifest and published as bytes.
-- Overlaybd layers referenced by the snapshot's rootfs, memory, and attached-drive image configs. These are not published under a snapshot-specific key. They reuse the overlaybd layer artifact protocol owned by `src/overlaybd/p2p/artifact.rs`, with keys like `overlaybd-layer/v1/sha256:<digest>` and `LayerMetadata` understood by the overlaybd HTTP facade.
+- Overlaybd layers referenced by the snapshot's rootfs, memory, and attached-drive image configs. These are not published under a snapshot-specific key. They reuse the overlaybd layer artifact protocol owned by `crates/aenv-node/src/overlaybd/p2p/artifact.rs`, with keys like `overlaybd-layer/v1/sha256:<digest>` and `LayerMetadata` understood by the overlaybd HTTP facade.
 
 That split is important. Snapshot fixed artifacts are scoped to one snapshot ID and are only consumed by snapshot runtime resolvers. Overlaybd commit layers are content-addressed and may be consumed by any overlaybd runtime path, including foreground range reads through `/p2p-http/{origin}`. Do not add a second snapshot-specific key format for overlaybd layers; doing so publishes bytes that overlaybd cannot discover.
 
@@ -157,4 +157,4 @@ The P2P transport does not define what an artifact means. Each consuming module 
 - Validating metadata before trusting a fetched artifact.
 - Deciding whether and when to publish local artifacts.
 
-This boundary keeps the transport reusable and avoids baking module-specific cache semantics into `src/p2p`.
+This boundary keeps the transport reusable and avoids baking module-specific cache semantics into `crates/aenv-node/src/p2p`.

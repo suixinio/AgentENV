@@ -59,13 +59,9 @@ impl RoutingHeaders {
     }
 }
 
-/// How one endpoint words the refusals a wake can end in.
-///
-/// connect and resume refuse the same conditions: a pause that outlasted the
-/// wait, a launch somebody else already started, a state no wake starts from.
-/// They answer them with different statuses, and each names itself in the
-/// retry it suggests, so both travel with the endpoint and neither with the
-/// condition.
+// connect and resume refuse the same conditions with different statuses, and
+// each names itself in the retry it suggests, so both travel with the endpoint
+// rather than with the condition.
 struct WakeRefusal {
     code: i32,
     /// The action the caller should repeat, as that endpoint calls it.

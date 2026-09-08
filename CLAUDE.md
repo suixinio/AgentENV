@@ -106,7 +106,7 @@ Host setup: `aenv-node --setup-host --runtime-user <user> --runtime-group <group
 
 ## Workspace Crates
 
-- `aenv-core` (root, lib `aenv_core`): everything both halves need — the generated HTTP surface with its wire conversions and credential gate, orchestrator, snapshot catalog model, cfg
+- `aenv-core` (root, lib `aenv_core`): everything both halves need — the generated HTTP surface with its wire conversions and credential gate, the orchestrator, the snapshot model together with the byte backends both halves reach (`oss`, `posix_fs`, the ACR export), the sandbox backend contract, access tokens and network policy, secrets, observability, `types`, the template build spec, image contracts, cfg
 - `crates/aenv-node`: the running half — Firecracker, ublk, overlaybd, image resolution, host setup, node gRPC service, the byte half of both snapshot backends, the p2p transport, the heartbeat reporter, envd process execution, the JSON record directory, its half of the configuration. Ships `aenv-node`
 - `crates/aenv-api`: the deciding half — the user-facing REST implementations and their composition, the node registry, the binding store, the node client, everything that talks to PostgreSQL (`pg`, snapshot catalog backend, `secret_refs`/`secret_values`) and the broker's resolve endpoint. Ships `aenv-api` and `aenv-snapshot-image`
 - `crates/aenv-egress`: the runtime-to-broker contract for `network.rules` (identity header, framing, `BrokerTransport`, `Handler`, `CredentialSource`, `UpstreamGuard`) and the broker dispatch core. `aenv-node` links `core` and `local` (the node-local Unix socket, both ends); `make check-crate-boundaries` fails if it links `tls`, if any single feature stops building on its own, or if the crate gains a database, the byte half, `aenv-core` or a second TLS stack
@@ -117,7 +117,7 @@ Host setup: `aenv-node --setup-host --runtime-user <user> --runtime-group <group
 - `storage/overlaybd`, `storage/ublk` (`uvm-ublk`), `storage/ublk-daemon` (`uvm-ublk-daemon`), `storage/util` (`storage-util`)
 - Generated, machine-managed — regenerate with `make`, do not hand-edit: `src/api/generated`, `src/custom_extension_api/generated`, `thirdparty/firecracker-client`, `thirdparty/envd`
 
-Which half a process is, is a constant of the binary: each builds its own router over its own state, and no code reads a role at runtime. `docs/proposals/2026-09-08-api-half-without-the-lifecycle-state-machine.md` is the standing decision on what remains — the api half still runs `Orchestrator`.
+Which half a process is, is a constant of the binary: each builds its own router over its own state, and no handler reads a role at runtime. The orchestrator still does, in three places: `pause_publisher`, `grants` and `runtime_routing` are `OnceCell`s (`src/orchestrator/service.rs:147,150,154`) that only one half installs, and `service.rs` branches on the empty one. `docs/proposals/2026-09-08-api-half-without-the-lifecycle-state-machine.md` is the standing decision on what remains — the api half still runs `Orchestrator`.
 
 ## Coding Conventions
 

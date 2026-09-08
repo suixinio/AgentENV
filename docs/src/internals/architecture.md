@@ -77,7 +77,7 @@ Long-running daemon process (`uvm-ublk-daemon`) that manages all ublk devices in
 
 - Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.
 - `UblkDaemonClient` spawns and monitors the daemon process from the node runtime.
-- `UblkDeviceManager` (`src/sandbox/ublk/device.rs`) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.
+- `UblkDeviceManager` (`crates/aenv-node/src/sandbox/ublk/device.rs`) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.
 
 This separation keeps ublk device ownership and io_uring control in a dedicated process while the node server orchestrates lifecycle state.
 
@@ -89,7 +89,7 @@ Shared io_uring abstractions used by both ublk and overlaybd.
 - `IoRingWorker`: spawns dedicated worker threads with thread-local io_uring instances. MPSC channel submission eliminates cross-thread locking.
 - `ReloadableIDAllocator`: O(1) bitmap-based ID allocation/recycling with free list. Supports reloading pre-occupied IDs on restart.
 
-### Sandbox integration (`src/sandbox/ublk/` + `src/sandbox/extra_drive.rs`)
+### Sandbox integration (`crates/aenv-node/src/sandbox/ublk/` + `crates/aenv-node/src/sandbox/extra_drive.rs`)
 
 - `device.rs`: owns the process-wide `UblkDeviceManager`, which talks to `uvm-ublk-daemon` and creates / deletes / snapshots all runtime ublk devices.
 - `overlaybd.rs`: materializes runtime configs (rewrites paths, creates symlinks to layer files) for rootfs and attached drives.
@@ -114,14 +114,14 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 | API layer | `crates/aenv-node/src/api/` | Axum HTTP server for this node's own report, its metrics and the reverse proxy to sandbox services; the user-facing REST surface is `aenv-api`'s and is absent here |
 | Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Forking, Snapshotting, Pausing, Killing), auto-eviction, incremental runtime metrics; a pause ends in a snapshot-catalog row and no record |
 | Observability | `src/observability/`, `crates/aenv-node/src/observability/reporter.rs` | Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting |
-| Sandbox | `src/sandbox/` | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
-| Snapshot + Template Builder | `src/snapshot/`, `src/template/` | `src/snapshot/` owns committed snapshot storage/runtime resolution; `src/template/` provides the user-facing builder that publishes snapshots |
+| Sandbox | `src/sandbox/` for the backend contract, access tokens and network policy; `crates/aenv-node/src/sandbox/` for the rest | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
+| Snapshot + Template Builder | `src/snapshot/`, `src/template/`, `crates/aenv-node/src/template/builder.rs` | `src/snapshot/` owns the committed snapshot model, its repository backends and runtime resolution; `src/template/` is the build spec, and the builder that runs it lives on the node |
 | P2P artifact transport | `crates/aenv-node/src/p2p/` | Optional project-wide artifact lookup, publish, and fetch layer with disabled and iroh-backed transports |
-| Config | `src/cfg.rs` | TOML config for firecracker paths, machine specs, timeouts, shared pool tuning, observability metadata, P2P, and scheduler-report settings |
+| Config | `src/cfg.rs`, `crates/aenv-node/src/cfg.rs` | TOML config for firecracker paths, machine specs, timeouts, shared pool tuning, observability metadata, P2P, and scheduler-report settings |
 
 ### Sandbox Networking
 
-Sandbox networking is managed by a process-wide `NetworkManager` (`src/sandbox/network/manager.rs`) plus per-slot `Slot` objects (`src/sandbox/network/slot.rs`).
+Sandbox networking is managed by a process-wide `NetworkManager` (`crates/aenv-node/src/sandbox/network/manager.rs`) plus per-slot `Slot` objects (`crates/aenv-node/src/sandbox/network/slot.rs`).
 
 - Each slot owns a stable index-derived address bundle from `[network.internal]` (defaulting to `10.11.0.0/16` and `10.12.0.0/16`) plus the fixed VM tap link `169.254.0.20/30`, together with the host veth name, namespace path, and iptables rules for one sandbox network namespace.
 - Network policy supports base allow/deny plus explicit egress rules. The `/sandboxes/{sandboxID}/network` endpoint replaces per-sandbox `allowOut` (CIDR/IP/domain patterns) and `denyOut` (CIDR/IP only) rules at runtime; allow rules always take precedence.
@@ -140,7 +140,7 @@ The node observability path combines request-time host collection with request-t
 
 - `src/orchestrator/metrics.rs` maintains incremental runtime counters during lifecycle operations, including running sandbox count, starting sandbox count, allocated CPU/memory, and create success/failure totals.
 - `src/orchestrator/service.rs` publishes those counters through a `tokio::sync::watch` channel whenever lifecycle state changes affect the node's runtime accounting.
-- `src/observability/identity.rs` resolves stable node identity fields such as node ID, cluster ID, service instance ID, package version, and build-time commit.
+- `src/identity.rs` resolves stable node identity fields such as node ID, cluster ID, service instance ID, package version, and build-time commit.
 - `src/observability/machine.rs` captures static machine descriptors from `/proc/cpuinfo`.
 - `src/observability/host.rs` collects host CPU, memory, and disk usage each time a node snapshot is requested. CPU percent is derived from two `/proc/stat` samples; on the first request it takes both samples with a 100ms window to avoid returning a synthetic zero.
 - `src/observability/service.rs` merges the latest orchestrator counters, identity, machine info, request-time host metrics, and current sandbox ID roster into a `NodeSnapshot` returned by the admin endpoints and reused by heartbeat reporting.
@@ -288,14 +288,11 @@ src/                            # aenv-core: what both halves link
 ├── api/                        # generated HTTP surface, credential gate, wire conversions
 ├── orchestrator/               # sandbox lifecycle
 ├── observability/              # node identity + host/runtime metrics projection
-├── sandbox/                    # Firecracker VM management
-│   ├── extra_drive.rs          # extra drive preparation
-│   └── ublk/                   # storage integration
-│       ├── device.rs           # daemon-backed ublk device lifecycle
-│       └── overlaybd.rs        # runtime config materialization
+├── sandbox/                    # the backend contract, access tokens, network policy
+├── secrets/                    # the secret model both halves name
 ├── snapshot/                   # committed snapshot model, repository backends, runtime resolution
-├── template/                   # user-facing template builder over snapshots
-└── cfg.rs                      # TOML config
+├── template/                   # the template build spec
+└── cfg.rs                      # the shared half of the TOML config
 
 crates/aenv-api/src/             # the deciding half
 ├── api/impls/                  # the user-facing REST implementations
@@ -309,7 +306,9 @@ crates/aenv-node/src/            # the running half
 ├── bin/aenv-node.rs            # node binary entrypoint
 ├── api/                        # this node's own router and the sandbox data plane
 ├── node_server/                # the node gRPC service the api half drives
-└── sandbox/, image/, template/ # Firecracker, overlaybd, image resolution
+├── p2p/, record_dir.rs         # artifact transport, node-local JSON records
+├── cfg.rs                      # the node half of the config and its derived paths
+└── sandbox/, image/, template/ # Firecracker (incl. extra_drive.rs and ublk/), overlaybd, image resolution, the template builder
 
 services/                       # distributed control plane (Go)
 ├── gateway/                    # HTTP reverse proxy

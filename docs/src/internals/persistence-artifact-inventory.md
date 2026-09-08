@@ -8,23 +8,23 @@ This document lists AgentENV artifacts that can remain on disk or in object stor
 | --- | --- | --- | --- |
 | `home_path` | `/var/lib/aenv` | `src/cfg.rs` | Base for paths containing the literal `$AENV_HOME` placeholder. `AENV_HOME_PATH` overrides it before placeholder expansion. |
 | `runtime_path` | `/run/aenv` | `src/cfg.rs`, `src/sandbox/network/*` | Base for transient namespace mount points and daemon sockets. `AENV_RUNTIME_PATH` overrides it. |
-| `deps_path` | `$AENV_HOME/deps` | `src/cfg.rs`, `src/setup/*` | Base for downloaded runtime dependencies. `AENV_DEPS_PATH` can place these rebuildable assets outside `home_path`. |
+| `deps_path` | `$AENV_HOME/deps` | `src/cfg.rs`, `crates/aenv-node/src/setup/*` | Base for downloaded runtime dependencies. `AENV_DEPS_PATH` can place these rebuildable assets outside `home_path`. |
 | Managed envd access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | `src/sandbox/access.rs` | Node-local secret used when `[sandbox].access_token_hash_seed` is unset. It must be preserved with persisted secure sandboxes. |
-| Firecracker sandbox work dirs | `$AENV_HOME/firecracker-work` with `agentenv-fc-` children | `src/sandbox/firecracker/*` | Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (`overlaybd/upper.data`, `overlaybd/upper.index`). An explicit `[firecracker].work_dir` overrides the root. |
-| `firecracker.serial_dir` | `$AENV_HOME/logs/serial` | `src/sandbox/firecracker/*` | Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit `[firecracker].serial_dir` overrides the root. |
-| `managed_snapshot_root` | `<firecracker-work-base>/managed-snapshots` | `src/sandbox/firecracker/*` | In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop. |
+| Firecracker sandbox work dirs | `$AENV_HOME/firecracker-work` with `agentenv-fc-` children | `crates/aenv-node/src/sandbox/firecracker/*` | Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (`overlaybd/upper.data`, `overlaybd/upper.index`). An explicit `[firecracker].work_dir` overrides the root. |
+| `firecracker.serial_dir` | `$AENV_HOME/logs/serial` | `crates/aenv-node/src/sandbox/firecracker/*` | Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit `[firecracker].serial_dir` overrides the root. |
+| `managed_snapshot_root` | `<firecracker-work-base>/managed-snapshots` | `crates/aenv-node/src/sandbox/firecracker/*` | In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop. |
 | `persisted_sandbox_store_path` | `$AENV_HOME/persisted-sandboxes` | `crates/aenv-node/src/sandbox/firecracker/overlaybd_snapshot.rs`, `crates/aenv-node/src/node_reclaim/` | Node-local scratch root for capture artifacts and node reclaim. Nothing under it survives a pause; a paused sandbox is a snapshot-catalog row. |
 | `snapshot_store` | `$AENV_HOME/snapshot-store` | `src/snapshot/repository/*` | Durable committed snapshot repository root. The configured backend uses `<snapshot_store>/repository`. Relative explicit paths are resolved against the config file directory. |
-| `snapshot.local_cache_path` | `$AENV_HOME/snapshot-local-cache` | `src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
+| `snapshot.local_cache_path` | `$AENV_HOME/snapshot-local-cache` | `crates/aenv-node/src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. The offline C++ tools own isolated sibling cache roots: `convert-blocks/` (`overlaybd-apply`) and `resize-blocks/` (`overlaybd-resize`). |
-| `p2p.store_dir` | `$AENV_HOME/p2p/store` | `src/p2p/*`, `src/cfg.rs` | Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory. |
+| `p2p.store_dir` | `$AENV_HOME/p2p/store` | `crates/aenv-node/src/p2p/*`, `src/cfg.rs` | Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.remote_blocks` | `<image.cache.root_dir>/remote-blocks` | overlaybd runtime config | Remote block cache root. Overlaybd also stores `premerged-index/` under this cache dir. Its size limit comes from `image.cache.remote_blocks.max_size_gb`. |
-| `ublk.daemon_socket_path` | `$AENV_RUNTIME/ublk-daemon.sock` | `src/sandbox/ublk/*`, `storage/ublk-daemon/*` | Unix socket used for server-to-daemon IPC. |
+| `ublk.daemon_socket_path` | `$AENV_RUNTIME/ublk-daemon.sock` | `crates/aenv-node/src/sandbox/ublk/*`, `storage/ublk-daemon/*` | Unix socket used for server-to-daemon IPC. |
 | `ublk.daemon_log_path` | `$AENV_HOME/logs/ublk-daemon.log` | `storage/ublk-daemon/*` | Daemon log file supplied during config normalization. An explicit path overrides the default. |
 
 ## Setup And Config
 
-Owned by `src/setup/*` and `src/cfg.rs`.
+Owned by `crates/aenv-node/src/setup/*` and `src/cfg.rs`.
 
 | Artifact | Location | Contents | Purpose | Lifecycle |
 | --- | --- | --- | --- | --- |
@@ -43,7 +43,7 @@ Owned by `src/setup/*` and `src/cfg.rs`.
 
 ### Runtime
 
-Owned by `src/sandbox/firecracker/*`.
+Owned by `crates/aenv-node/src/sandbox/firecracker/*`.
 
 | Artifact                     | Location                                                     | Contents                                                  | Purpose                                                      | Lifecycle                                                    | Rebuildable                                                  |
 | ---------------------------- | ------------------------------------------------------------ | --------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
@@ -61,7 +61,7 @@ Owned by `src/sandbox/firecracker/*`.
 
 ### Firecracker Pool
 
-Owned by `src/sandbox/firecracker/pool.rs`.
+Owned by `crates/aenv-node/src/sandbox/firecracker/pool.rs`.
 
 | Artifact           | Location                                                     | Contents                                               | Purpose                             | Lifecycle                                                    |
 | ------------------ | ------------------------------------------------------------ | ------------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------ |
@@ -70,7 +70,7 @@ Owned by `src/sandbox/firecracker/pool.rs`.
 
 ## Extra Drives
 
-Owned by `src/sandbox/extra_drive.rs` and Firecracker snapshot code.
+Owned by `crates/aenv-node/src/sandbox/extra_drive.rs` and Firecracker snapshot code.
 
 | Artifact                      | Location                                           | Contents                                         | Purpose                                                      | Lifecycle                                                    | Rebuildable                               |
 | ----------------------------- | -------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ | ----------------------------------------- |
@@ -107,7 +107,7 @@ Repository records are the logical source of truth for committed snapshots. Buil
 
 ## Snapshot Runtime Resolution
 
-Owned by `src/snapshot/artifact_cache.rs`, `src/snapshot/runtime_support.rs`, and backend runtime resolvers.
+Owned by `crates/aenv-node/src/snapshot/artifact_cache.rs`, `crates/aenv-node/src/snapshot/runtime_support.rs`, and backend runtime resolvers.
 
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |
@@ -125,7 +125,7 @@ Owned by `src/snapshot/artifact_cache.rs`, `src/snapshot/runtime_support.rs`, an
 
 ## P2P Artifact Transport
 
-Owned by `src/p2p/*`.
+Owned by `crates/aenv-node/src/p2p/*`.
 
 | Artifact | Location | Contents | Purpose | Lifecycle |
 | --- | --- | --- | --- | --- |
@@ -141,7 +141,7 @@ Those P2P entries are optional copies, not committed snapshot truth. Clearing `<
 
 ## Ublk Daemon Runtime
 
-Owned by `storage/ublk-daemon/*` and `src/sandbox/ublk/*`.
+Owned by `storage/ublk-daemon/*` and `crates/aenv-node/src/sandbox/ublk/*`.
 
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |

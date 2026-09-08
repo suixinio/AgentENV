@@ -297,14 +297,10 @@ fn append_filters(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFi
     append_pause_axis(sql, binder, filter);
 }
 
-/// The pause axis, as SQL. It must decide the same rows as
-/// [`SnapshotListFilter::pause_axis_matches`], which every other backend reads.
-///
-/// `is_pause` is a column so the common half needs no payload. The metadata
-/// half has nowhere else to live: a sandbox's own metadata is inside the
-/// committed payload, so the predicate decodes it through `catalog_try_jsonb`,
-/// which answers NULL for a payload that is not decodable JSON. One such row
-/// then goes unmatched instead of raising and failing the whole listing.
+// Must decide the same rows as `SnapshotListFilter::pause_axis_matches`, which
+// every other backend reads. The metadata half of it decodes the payload
+// through `catalog_try_jsonb`, whose NULL for anything undecodable leaves that
+// row unmatched instead of raising and failing the listing.
 fn append_pause_axis(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFilter) {
     if filter.pauses_only || filter.user_metadata.is_some() {
         sql.push_str("\n   AND s.is_pause");

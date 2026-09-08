@@ -19,7 +19,7 @@ Current entrypoints:
 
 Implementation references:
 
-- `src/api/proxy.rs`
+- `crates/aenv-node/src/api/proxy.rs`
 - `src/orchestrator/service.rs`
 - `src/orchestrator/proxy.rs`
 
@@ -77,7 +77,7 @@ This keeps hot-path reads lock-light and avoids reading sandbox instance interna
 🔴 **The proxy does not wake sandboxes.** It forwards bytes; deciding that a
 sandbox should be alive belongs to the half that owns sandboxes, and the data
 plane reaches that decision over the gateway's cold path
-(`SandboxResumeService`, `src/api/grpc/resume.rs`) before traffic ever arrives
+(`SandboxResumeService`, `crates/aenv-api/src/api/grpc/resume.rs`) before traffic ever arrives
 at a proxy. A paused sandbox is a snapshot-catalog row, not anything a node
 holds, so the node proxy has no paused state to report.
 
@@ -90,11 +90,11 @@ Request outcomes for paused sandboxes:
   is running.
 
 The lifetime a woken sandbox gets and the bound the wake-up runs under are
-still declared in `src/api/proxy.rs` — `auto_resume_min_sandbox_timeout()`
-(`EnsureMinimum`, `orchestrator.auto_resume_min_sandbox_timeout_secs`, 5
-minutes by default) and `auto_resume_deadline()` (`60s` outside test builds) —
-and read from there by `crate::api::impls::resume_surface` for every wake-up
-over the gateway.
+declared in `crates/aenv-api/src/api/impls/resume_surface.rs` —
+`auto_resume_min_sandbox_timeout()` (`EnsureMinimum`,
+`orchestrator.auto_resume_min_sandbox_timeout_secs`, 5 minutes by default) and
+`auto_resume_deadline()` (`60s` outside test builds) — beside the wake-up that
+reads them, on the half that answers every wake over the gateway.
 
 ## Lifecycle Hooks and Race Hardening
 
@@ -231,7 +231,7 @@ curl -i \
 
 Relevant test coverage exists in:
 
-- `src/api/proxy.rs` unit tests (HTTP, SSE, large body, websocket, headers, path preservation, error mapping)
+- `crates/aenv-node/src/api/proxy.rs` unit tests (HTTP, SSE, large body, websocket, headers, path preservation, error mapping)
 - `src/orchestrator/service.rs` unit tests (route publication/removal behavior and stale-handle guard)
 - Integration lifecycle tests in `tests/integration/orchestrator.rs`
 - E2E proxy suite in `scripts/tests/e2e/suites/06_proxy.sh` (header compatibility, and paused-sandbox wake-up end to end — that suite drives `AENV_PROXY_URL`, so the wake it observes is the gateway's cold path, not the proxy's)

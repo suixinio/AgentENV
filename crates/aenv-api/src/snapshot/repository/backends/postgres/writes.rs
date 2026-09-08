@@ -68,18 +68,24 @@ pub async fn begin_snapshot(
         .map_err(backend_error("begin_snapshot"))?;
 
     let inserted: Option<(String,)> = sqlx::query_as(
+        // is_pause is named, not left to the schema: a row this build opens
+        // carries no payload to classify, and the commit that gives it one
+        // states the answer. The column's compatibility trigger is then only
+        // for writers that do not know the column at all.
         "INSERT INTO snapshots (
             id, cluster_id, source_kind, source_sandbox_id,
             cpu_count, memory_mib, disk_size_mib,
             status, status_group,
             published, origin_node_id,
-            sandbox_started_at_ms, created_at_ms, updated_at_ms
+            sandbox_started_at_ms, created_at_ms, updated_at_ms,
+            is_pause
          ) VALUES (
             $1, $2, $3, $4,
             $5, $6, $7,
             $8, 'pending',
             $9, $10,
-            NULL, $11, $11
+            NULL, $11, $11,
+            false
          )
          ON CONFLICT (id) DO NOTHING
          RETURNING id::text",

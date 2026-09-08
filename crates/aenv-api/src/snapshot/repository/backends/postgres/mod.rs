@@ -607,6 +607,130 @@ mod pg {
         );
     }
 
+    // The two statements the build before one-pause-per-sandbox writes a pause
+    // with. Neither names is_pause: it is the column that build does not know.
+    async fn write_a_pause_the_way_the_previous_build_does(
+        pool: &PgPool,
+        cluster_id: Uuid,
+        sandbox_id: &str,
+        payload: &[u8],
+    ) -> SnapshotId {
+        let id = SnapshotId::generate();
+        sqlx::query(
+            "INSERT INTO snapshots (
+                id, cluster_id, source_kind, source_sandbox_id,
+                cpu_count, memory_mib, disk_size_mib,
+                status, status_group,
+                published, origin_node_id,
+                sandbox_started_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (
+                $1, $2, 'sandbox', $3,
+                1, 512, 1024,
+                'building', 'pending',
+                true, NULL,
+                NULL, $4, $4
+             )",
+        )
+        .bind(id.to_uuid())
+        .bind(cluster_id)
+        .bind(sandbox_id)
+        .bind(1_000_i64)
+        .execute(pool)
+        .await
+        .expect("the previous build's insert should succeed");
+
+        sqlx::query(
+            "UPDATE snapshots
+                SET status            = 'ready',
+                    committed_payload = $2,
+                    committed_schema  = 1,
+                    published         = true,
+                    updated_at_ms     = $3
+              WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .bind(payload)
+        .bind(2_000_i64)
+        .execute(pool)
+        .await
+        .expect("the previous build's commit should succeed");
+        id
+    }
+
+    #[tokio::test]
+    async fn a_pause_the_previous_build_committed_is_a_pause_to_every_reader() {
+        let pool = isolated_schema_pool_or_skip!(
+            "a_pause_the_previous_build_committed_is_a_pause_to_every_reader"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+        let cluster_id = Uuid::new_v4();
+        let catalog = PostgresSnapshotCatalog::new(pool.clone(), cluster_id, "node-a".to_string());
+
+        let commit = sandbox_pause_owned_by("sbx-mixed-window", Some("keep"));
+        let payload = convert::encode_committed(&commit.committed).expect("the payload encodes");
+        let id = write_a_pause_the_way_the_previous_build_does(
+            &pool,
+            cluster_id,
+            "sbx-mixed-window",
+            &payload,
+        )
+        .await;
+
+        let listed = catalog
+            .list_page_scoped(
+                SnapshotListFilter::pauses(None),
+                CatalogReadScope::Resolvable,
+            )
+            .await
+            .expect("the pause listing should succeed");
+        assert_eq!(
+            listed
+                .items
+                .iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![id.to_string()],
+            "a pause committed during the mixed window is on the pause axis"
+        );
+
+        let wanted: std::collections::HashMap<String, String> =
+            [("owner".to_string(), "keep".to_string())]
+                .into_iter()
+                .collect();
+        let resumable = catalog
+            .list_page_scoped(
+                SnapshotListFilter {
+                    source_sandbox_id: Some("sbx-mixed-window".to_string()),
+                    ..SnapshotListFilter::pauses(Some(wanted))
+                },
+                CatalogReadScope::Resolvable,
+            )
+            .await
+            .expect("the resumable lookup should succeed");
+        assert_eq!(
+            resumable
+                .items
+                .iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![id.to_string()],
+            "the read a resume takes must find it, or the sandbox is gone to its owner"
+        );
+
+        let removed = catalog
+            .delete_sandbox_pauses("sbx-mixed-window")
+            .await
+            .expect("deleting the sandbox's pauses should succeed");
+        assert_eq!(
+            removed
+                .iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![id.to_string()],
+            "a pause no delete names is a pause whose bytes nothing reclaims"
+        );
+    }
+
     #[tokio::test]
     async fn one_undecodable_payload_does_not_take_the_metadata_filtered_listing_with_it() {
         let pool = isolated_schema_pool_or_skip!(

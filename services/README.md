@@ -261,6 +261,23 @@ Consequences for an operator:
   in the transaction that commits it, so `GET /snapshots?sandboxID=…` shows one
   pause per sandbox plus however many checkpoints the sandbox has. A checkpoint
   taken while a sandbox ran is a template of it, not a pause, and is untouched.
+- During the roll, replicas of the older build keep serving and keep committing
+  pauses, and their statements do not name `is_pause` at all. The migration
+  installs a `BEFORE INSERT OR UPDATE` trigger, `snapshots_pause_axis_trg`, that
+  classifies such a write from `committed_payload`: a pause committed in that
+  window is a pause to the unique index, the pause listing, a resume and
+  `delete_sandbox_pauses`. A writer that states the column keeps its own answer.
+- **Retiring the trigger.** It exists for that window and for nothing else. Once
+  no replica older than this image can run again, and only then, it can go:
+
+  ```sql
+  DROP TRIGGER IF EXISTS snapshots_pause_axis_trg ON snapshots;
+  DROP FUNCTION IF EXISTS catalog_snapshots_pause_axis_trg();
+  ```
+
+  `is_pause` is `NOT NULL` with no default, so after this a writer that does not
+  name the column is refused rather than recorded as a non-pause. Leave
+  `catalog_try_jsonb` in place: the metadata-filtered listing calls it.
 
 ### Rolling the *API* half back
 

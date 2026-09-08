@@ -14,8 +14,13 @@
 -- sandbox may have many; only pauses are unique per sandbox.
 -- ─────────────────────────────────────────────────────────────────────────────
 
+-- No default, deliberately: NULL on an INSERT, and an unchanged value on an
+-- UPDATE, is the sentinel the trigger below reads as "the writer did not say".
+-- NOT NULL is set after the backfill, so the trigger is what keeps the column
+-- total; a deployment that drops the trigger fails such a write loudly instead
+-- of recording a pause as something else.
 ALTER TABLE snapshots
-    ADD COLUMN IF NOT EXISTS is_pause BOOLEAN NOT NULL DEFAULT false;
+    ADD COLUMN IF NOT EXISTS is_pause BOOLEAN;
 
 -- Stated as an implication, not an equivalence: a sandbox-source row may be a
 -- checkpoint instead, and a template row can never be a pause.
@@ -48,13 +53,63 @@ END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 UPDATE snapshots
-   SET is_pause = true
- WHERE source_kind = 'sandbox'
-   AND COALESCE(catalog_try_jsonb(committed_payload) ? 'paused_sandbox', false);
+   SET is_pause = (
+           source_kind = 'sandbox'
+           AND COALESCE(catalog_try_jsonb(committed_payload) ? 'paused_sandbox', false)
+       )
+ WHERE is_pause IS NULL;
+
+ALTER TABLE snapshots
+    ALTER COLUMN is_pause SET NOT NULL;
+
+-- ── the writer that does not know the column ─────────────────────────────────
+--
+-- A rolling upgrade runs this migration from the first new replica while the
+-- previous build is still serving, and that build still commits pauses. Its
+-- INSERT of the building row and its UPDATE that makes the row ready both name
+-- every column but this one, so the sentinel decides for it: a pause it commits
+-- is a pause the unique index holds, the pause listing returns, a resume finds
+-- and `delete_sandbox_pauses` reclaims.
+--
+-- The classification is spelled with built-ins only. A trigger body resolves
+-- unqualified names through the session's search_path at execution time, so
+-- calling a helper here would make the answer depend on a setting the writer
+-- controls.
+--
+-- Retirement: this trigger exists for the mixed window and for nothing else.
+-- Once no replica older than one-pause-per-sandbox can run again, it can be
+-- dropped; `services/README.md` carries that as an operator step.
+CREATE OR REPLACE FUNCTION catalog_snapshots_pause_axis_trg() RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.is_pause IS NOT NULL THEN
+            RETURN NEW;
+        END IF;
+    ELSIF NEW.is_pause IS DISTINCT FROM OLD.is_pause THEN
+        RETURN NEW;
+    END IF;
+
+    BEGIN
+        NEW.is_pause := NEW.source_kind = 'sandbox'
+            AND COALESCE(
+                    convert_from(NEW.committed_payload, 'UTF8')::jsonb ? 'paused_sandbox',
+                    false
+                );
+    EXCEPTION WHEN others THEN
+        NEW.is_pause := false;
+    END;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS snapshots_pause_axis_trg ON snapshots;
+CREATE TRIGGER snapshots_pause_axis_trg
+    BEFORE INSERT OR UPDATE ON snapshots
+    FOR EACH ROW EXECUTE FUNCTION catalog_snapshots_pause_axis_trg();
 
 -- ── de-duplication ───────────────────────────────────────────────────────────
 --
--- 🔴 Every database that ever paused a sandbox twice already violates the index
+-- Every database that ever paused a sandbox twice already violates the index
 -- below, so this migration cannot refuse duplicates: refusing would brick the
 -- upgrade of exactly the deployments the constraint is for. It resolves them
 -- the way the read it replaces did — the newest ready row wins — and retires

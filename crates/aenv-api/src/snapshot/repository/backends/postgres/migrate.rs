@@ -515,6 +515,21 @@ mod pg {
         id
     }
 
+    // The trigger reads the column, so it goes with it or every later insert
+    // raises instead of reproducing a database that never had either.
+    async fn rewind_to_the_pre_migration_schema(pool: &sqlx::PgPool) {
+        sqlx::raw_sql(
+            "DROP TRIGGER IF EXISTS snapshots_pause_axis_trg ON snapshots;\
+             DROP INDEX IF EXISTS snapshots_one_pause_per_sandbox;\
+             ALTER TABLE snapshots DROP CONSTRAINT IF EXISTS snapshots_pause_axis;\
+             ALTER TABLE snapshots DROP COLUMN IF EXISTS is_pause;\
+             DELETE FROM catalog_schema_migrations WHERE version = 4;",
+        )
+        .execute(pool)
+        .await
+        .expect("rewinding to the pre-migration schema should succeed");
+    }
+
     async fn is_live(pool: &sqlx::PgPool, id: uuid::Uuid) -> bool {
         sqlx::query_scalar::<_, bool>("SELECT deleted_at_ms IS NULL FROM snapshots WHERE id = $1")
             .bind(id)
@@ -531,15 +546,7 @@ mod pg {
         migrate(&pool).await.expect("migration should succeed");
 
         // Rewind to the state a database that never ran this version is in.
-        sqlx::raw_sql(
-            "DROP INDEX IF EXISTS snapshots_one_pause_per_sandbox;\
-             ALTER TABLE snapshots DROP CONSTRAINT IF EXISTS snapshots_pause_axis;\
-             ALTER TABLE snapshots DROP COLUMN IF EXISTS is_pause;\
-             DELETE FROM catalog_schema_migrations WHERE version = 4;",
-        )
-        .execute(&pool)
-        .await
-        .expect("rewinding to the pre-migration schema should succeed");
+        rewind_to_the_pre_migration_schema(&pool).await;
 
         let cluster_id = uuid::Uuid::new_v4();
         let older = seed_committed_sandbox_row(
@@ -757,6 +764,7 @@ mod pg {
             found,
             vec![
                 "builds.builds_status_group_trg -> catalog_status_group_trg",
+                "snapshots.snapshots_pause_axis_trg -> catalog_snapshots_pause_axis_trg",
                 "snapshots.snapshots_status_group_trg -> catalog_status_group_trg",
                 "snapshots.snapshots_updated_at_trg -> snapshots_touch_updated_at_trg",
             ],

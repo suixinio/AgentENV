@@ -239,6 +239,29 @@ listener on `agentenv-api`, so the key could only ever hold
 `ClientConn` for the wake-up RPC. A manifest that still sets it is silently
 ignored — the loader reads no such key.
 
+### 🔴 The catalog migration in this API image is forward-only
+
+`agentenv-api` applies `catalog_schema_migrations` on start, and
+`0004_one_pause_per_sandbox` is the first one that changes rows rather than
+only adding relations. A sandbox may now hold **one** live pause row, enforced
+by a unique index, and every database that ever paused a sandbox twice already
+holds more than one. The migration does not refuse those — refusing would make
+the upgrade impossible on exactly the deployments the constraint is for. It
+keeps the newest ready pause per sandbox, which is the one a resume would have
+picked, and soft-deletes the rest. Their bytes stay where they are: a pause's
+memory layers stack on the layers of the pause before it, and the sandbox's own
+deletion is what reclaims the whole chain.
+
+Consequences for an operator:
+
+- Rolling this image **back** leaves the retired rows retired. The older build
+  reads "newest ready row" and finds the survivor, so every sandbox is still
+  resumable, but a pause history it would have listed is gone.
+- A pause taken **after** the upgrade replaces the sandbox's previous pause row
+  in the transaction that commits it, so `GET /snapshots?sandboxID=…` shows one
+  pause per sandbox plus however many checkpoints the sandbox has. A checkpoint
+  taken while a sandbox ran is a template of it, not a pause, and is untouched.
+
 ### Rolling the *API* half back
 
 Same mechanism as the node half and no flags: set an earlier `agentenv-api`

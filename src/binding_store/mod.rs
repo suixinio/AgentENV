@@ -1,4 +1,6 @@
-//! Routing projection from sandbox id to serving node.
+//! Routing projection from sandbox id to serving node, and the only answer to
+//! which node runs a sandbox: a heartbeat roster reaches routing by being
+//! reconciled into this store, never by being read beside it.
 //! Its key space and failure model remain separate from the orchestrator metadata store.
 //! Deletes are incarnation-fenced, and both backends run the shared contract suite.
 

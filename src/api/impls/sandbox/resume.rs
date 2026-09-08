@@ -7,11 +7,23 @@ use agentenv_http_server::models;
 use crate::cfg::ConfigManager;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    NewTimeout, OrchestratorError, RestoredSandbox, SandboxMetadata, SandboxState, StoreError,
+    NewTimeout, OrchestratorError, RestoredSandbox, SandboxMetadata, SandboxState,
 };
 use crate::types::SandboxId;
 
-use super::{duration_from_secs, sandbox_not_found, ApiImpl, RoutingHeaders};
+use super::super::error_exit::{api_error_exit, ApiErrorExit};
+use super::{duration_from_secs, sandbox_not_found, ApiImpl, RoutingHeaders, WakeRefusal};
+
+api_error_exit!(SandboxesSandboxIdResumePostResponse {
+    404 => Status404_NotFound,
+    409 => Status409_Conflict,
+} _ => Status500_ServerError);
+
+/// A resume refuses with a 409 and tells the caller to resume it again.
+pub(super) const REFUSAL: WakeRefusal = WakeRefusal {
+    code: 409,
+    retry: "resume it again",
+};
 
 fn default_sandbox_timeout() -> Duration {
     static DEFAULT_SANDBOX_TIMEOUT: OnceLock<Duration> = OnceLock::new();
@@ -43,7 +55,7 @@ impl ApiImpl {
     ) -> Result<SandboxesSandboxIdResumePostResponse, ()> {
         let path_id = &path_params.sandbox_id;
         let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
-            return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+            return Ok(SandboxesSandboxIdResumePostResponse::exit(
                 sandbox_not_found(path_id),
             ));
         };
@@ -63,7 +75,7 @@ impl ApiImpl {
                         Ok(Some(metadata)) => metadata,
                         Ok(None) => metadata,
                         Err(OrchestratorError::SandboxNotFound(id)) => {
-                            return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                            return Ok(SandboxesSandboxIdResumePostResponse::exit(
                                 sandbox_not_found(id),
                             ))
                         }
@@ -76,26 +88,20 @@ impl ApiImpl {
                     return Ok(self.resumed_response(metadata));
                 }
                 SandboxState::Killing => {
-                    return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                    return Ok(SandboxesSandboxIdResumePostResponse::exit(
                         sandbox_not_found(sandbox_id),
                     ));
                 }
                 state => {
-                    return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                        Self::error(
-                            409,
-                            format!("sandbox cannot be resumed from {} state", state),
-                        ),
+                    return Ok(SandboxesSandboxIdResumePostResponse::exit(
+                        REFUSAL.not_resumable_from(state),
                     ));
                 }
             },
             Ok(None) => {}
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
-                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                    Self::error(
-                        409,
-                        format!("sandbox is still {state} after waiting; resume it again shortly"),
-                    ),
+                return Ok(SandboxesSandboxIdResumePostResponse::exit(
+                    REFUSAL.still_settling(state),
                 ));
             }
             Err(err) => {
@@ -105,7 +111,7 @@ impl ApiImpl {
             }
         }
         if !self.owns_sandboxes() {
-            return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+            return Ok(SandboxesSandboxIdResumePostResponse::exit(
                 sandbox_not_found(sandbox_id),
             ));
         }
@@ -113,7 +119,7 @@ impl ApiImpl {
         let record = match self.latest_paused_snapshot(sandbox_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
-                return Ok(SandboxesSandboxIdResumePostResponse::Status404_NotFound(
+                return Ok(SandboxesSandboxIdResumePostResponse::exit(
                     sandbox_not_found(sandbox_id),
                 ));
             }
@@ -126,9 +132,10 @@ impl ApiImpl {
         let request = match Self::restore_request(record.clone(), NewTimeout::Set(timeout)) {
             Ok(request) => request,
             Err(err) => {
-                return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                    Self::error(500, err.to_string()),
-                ));
+                return Ok(SandboxesSandboxIdResumePostResponse::exit(Self::error(
+                    500,
+                    err.to_string(),
+                )));
             }
         };
 
@@ -152,20 +159,10 @@ impl ApiImpl {
                 self.note_resume_landing(&record, &metadata).await;
                 Ok(self.resumed_response(metadata))
             }
-            Err(OrchestratorError::StoreOperationFailed(StoreError::SandboxAlreadyExists {
-                ..
-            })) => Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                Self::error(409, "sandbox is already being resumed"),
-            )),
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
-                SandboxesSandboxIdResumePostResponse::Status409_Conflict(Self::error(
-                    409,
-                    format!("sandbox cannot be resumed from {} state", state),
-                )),
-            ),
-            Err(err) => Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                err.into(),
-            )),
+            Err(err) => Ok(match REFUSAL.of_restore(&err) {
+                Some(refusal) => SandboxesSandboxIdResumePostResponse::exit(refusal),
+                None => SandboxesSandboxIdResumePostResponse::Status500_ServerError(err.into()),
+            }),
         }
     }
 }

@@ -3,12 +3,22 @@ use std::time::Duration;
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 
-use crate::orchestrator::{
-    NewTimeout, OrchestratorError, RestoredSandbox, SandboxState, StoreError,
-};
+use crate::orchestrator::{NewTimeout, OrchestratorError, RestoredSandbox, SandboxState};
 use crate::types::SandboxId;
 
-use super::{sandbox_not_found, ApiImpl, RoutingHeaders};
+use super::super::error_exit::{api_error_exit, ApiErrorExit};
+use super::{sandbox_not_found, ApiImpl, RoutingHeaders, WakeRefusal};
+
+api_error_exit!(SandboxesSandboxIdConnectPostResponse {
+    400 => Status400_BadRequest,
+    404 => Status404_NotFound,
+} _ => Status500_ServerError);
+
+/// A connect refuses with a 400 and tells the caller to connect again.
+pub(super) const REFUSAL: WakeRefusal = WakeRefusal {
+    code: 400,
+    retry: "connect again",
+};
 
 impl ApiImpl {
     pub(super) async fn connect_post(
@@ -18,7 +28,7 @@ impl ApiImpl {
     ) -> Result<SandboxesSandboxIdConnectPostResponse, ()> {
         let path_id = &path_params.sandbox_id;
         let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
-            return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
+            return Ok(SandboxesSandboxIdConnectPostResponse::exit(
                 sandbox_not_found(path_id),
             ));
         };
@@ -50,9 +60,10 @@ impl ApiImpl {
                         }
                         Err(OrchestratorError::SandboxNotFound(_)) => None,
                         Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
-                            Some(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                                Self::error(400, format!("invalid timeout: {timeout:?}")),
-                            ))
+                            Some(SandboxesSandboxIdConnectPostResponse::exit(Self::error(
+                                400,
+                                format!("invalid timeout: {timeout:?}"),
+                            )))
                         }
                         Err(err) => Some(
                             SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
@@ -61,23 +72,16 @@ impl ApiImpl {
                         ),
                     }
                 }
-                SandboxState::Killing => {
-                    Some(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
-                        sandbox_not_found(sandbox_id),
-                    ))
-                }
-                SandboxState::Pausing => {
-                    Some(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                        Self::error(400, "sandbox is pausing; connect again once it has paused"),
-                    ))
-                }
+                SandboxState::Killing => Some(SandboxesSandboxIdConnectPostResponse::exit(
+                    sandbox_not_found(sandbox_id),
+                )),
+                SandboxState::Pausing => Some(SandboxesSandboxIdConnectPostResponse::exit(
+                    Self::error(400, "sandbox is pausing; connect again once it has paused"),
+                )),
             },
             Ok(None) => None,
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Some(
-                SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    format!("sandbox is still {state} after waiting; connect again shortly"),
-                )),
+                SandboxesSandboxIdConnectPostResponse::exit(REFUSAL.still_settling(state)),
             ),
             Err(err) => {
                 Some(SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()))
@@ -87,7 +91,7 @@ impl ApiImpl {
             return Ok(response);
         }
         if !self.owns_sandboxes() {
-            return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
+            return Ok(SandboxesSandboxIdConnectPostResponse::exit(
                 sandbox_not_found(sandbox_id),
             ));
         }
@@ -96,7 +100,7 @@ impl ApiImpl {
         let record = match self.latest_paused_snapshot(sandbox_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
-                return Ok(SandboxesSandboxIdConnectPostResponse::Status404_NotFound(
+                return Ok(SandboxesSandboxIdConnectPostResponse::exit(
                     sandbox_not_found(sandbox_id),
                 ));
             }
@@ -111,12 +115,10 @@ impl ApiImpl {
         let request = match Self::restore_request(record.clone(), NewTimeout::Set(timeout)) {
             Ok(request) => request,
             Err(err) => {
-                return Ok(
-                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(Self::error(
-                        500,
-                        err.to_string(),
-                    )),
-                );
+                return Ok(SandboxesSandboxIdConnectPostResponse::exit(Self::error(
+                    500,
+                    err.to_string(),
+                )));
             }
         };
         match self
@@ -156,20 +158,10 @@ impl ApiImpl {
                     },
                 )
             }
-            Err(OrchestratorError::StoreOperationFailed(StoreError::SandboxAlreadyExists {
-                ..
-            })) => Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                Self::error(400, "sandbox is already being resumed"),
-            )),
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
-                SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    format!("sandbox cannot be resumed from {} state", state),
-                )),
-            ),
-            Err(err) => {
-                Ok(SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()))
-            }
+            Err(err) => Ok(match REFUSAL.of_restore(&err) {
+                Some(refusal) => SandboxesSandboxIdConnectPostResponse::exit(refusal),
+                None => SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
+            }),
         }
     }
 }

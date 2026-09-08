@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod attached_drives;
 pub mod auth;
+mod error_exit;
 mod pagination;
 pub use pagination::{snapshot_cursor_from_token, snapshot_next_token, PaginationError};
 mod paused;

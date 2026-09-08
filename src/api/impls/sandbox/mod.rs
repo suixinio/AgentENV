@@ -24,7 +24,7 @@ use http::Method;
 
 use tracing::warn;
 
-use crate::orchestrator::{OrchestratorError, SandboxMetadata, SandboxState};
+use crate::orchestrator::{OrchestratorError, SandboxMetadata, SandboxState, StoreError};
 use crate::sandbox::SandboxNetworkPolicy;
 use crate::secrets::UnusableSecrets;
 use crate::types::SandboxId;
@@ -89,6 +89,57 @@ impl From<OrchestratorError> for models::Error {
             OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
             OrchestratorError::InvalidRequest(_) => Self::new(400, err.to_string()),
             other => ApiImpl::internal_error(&other),
+        }
+    }
+}
+
+/// How one endpoint words the refusals a wake can end in.
+///
+/// connect and resume refuse the same conditions: a pause that outlasted the
+/// wait, a launch somebody else already started, a state no wake starts from.
+/// They answer them with different statuses, and each names itself in the
+/// retry it suggests, so both travel with the endpoint and neither with the
+/// condition.
+struct WakeRefusal {
+    code: i32,
+    /// The action the caller should repeat, as that endpoint calls it.
+    retry: &'static str,
+}
+
+impl WakeRefusal {
+    fn still_settling(&self, state: SandboxState) -> models::Error {
+        ApiImpl::error(
+            self.code,
+            format!(
+                "sandbox is still {state} after waiting; {} shortly",
+                self.retry
+            ),
+        )
+    }
+
+    fn already_resuming(&self) -> models::Error {
+        ApiImpl::error(self.code, "sandbox is already being resumed")
+    }
+
+    fn not_resumable_from(&self, state: SandboxState) -> models::Error {
+        ApiImpl::error(
+            self.code,
+            format!("sandbox cannot be resumed from {state} state"),
+        )
+    }
+
+    /// The refusal a restore ended in, when it ended in one this endpoint has
+    /// words for. Anything else is the endpoint's server error, whatever
+    /// status the orchestrator's own mapping would have given it.
+    fn of_restore(&self, err: &OrchestratorError) -> Option<models::Error> {
+        match err {
+            OrchestratorError::StoreOperationFailed(StoreError::SandboxAlreadyExists {
+                ..
+            }) => Some(self.already_resuming()),
+            OrchestratorError::InvalidSandboxState { state, .. } => {
+                Some(self.not_resumable_from(*state))
+            }
+            _ => None,
         }
     }
 }
@@ -533,6 +584,56 @@ mod routing_header_tests {
         assert!(
             !carries("Sandbox"),
             "the user-facing model must not grow a routing-infrastructure field"
+        );
+    }
+}
+
+#[cfg(test)]
+mod wake_refusal_tests {
+    use super::*;
+    use crate::types::SandboxId;
+
+    #[test]
+    fn each_endpoint_refuses_a_settling_pause_in_its_own_status_and_its_own_words() {
+        let connect = connect::REFUSAL.still_settling(SandboxState::Pausing);
+        assert_eq!(
+            (connect.code, connect.message.as_str()),
+            (
+                400,
+                "sandbox is still pausing after waiting; connect again shortly"
+            )
+        );
+
+        let resume = resume::REFUSAL.still_settling(SandboxState::Pausing);
+        assert_eq!(
+            (resume.code, resume.message.as_str()),
+            (
+                409,
+                "sandbox is still pausing after waiting; resume it again shortly"
+            )
+        );
+    }
+
+    #[test]
+    fn a_restore_failure_neither_endpoint_words_stays_its_server_error() {
+        assert!(
+            resume::REFUSAL
+                .of_restore(&OrchestratorError::ShuttingDown)
+                .is_none(),
+            "a refusal the endpoint has no words for must not be dressed as one it has"
+        );
+
+        let refused = OrchestratorError::InvalidSandboxState {
+            sandbox_id: SandboxId::new(),
+            state: SandboxState::Killing,
+        };
+        assert_eq!(
+            connect::REFUSAL.of_restore(&refused).map(|err| err.code),
+            Some(400)
+        );
+        assert_eq!(
+            resume::REFUSAL.of_restore(&refused).map(|err| err.code),
+            Some(409)
         );
     }
 }

@@ -990,7 +990,8 @@ pub struct CustomExtensionConfig {
     pub timeout_ms: u64,
 }
 
-/// Configured P2P transport kind, mapped to an implementation by `crate::p2p`.
+/// Configured P2P transport kind, mapped to an implementation by `aenv-node`'s
+/// `p2p` module.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum P2pTransportKind {

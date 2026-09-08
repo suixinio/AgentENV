@@ -10,7 +10,6 @@ pub mod node_client;
 pub mod node_registry;
 pub mod observability;
 pub mod orchestrator;
-pub mod p2p;
 pub mod privileges;
 pub mod proto;
 pub mod record_dir;

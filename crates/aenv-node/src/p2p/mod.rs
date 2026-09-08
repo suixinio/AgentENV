@@ -2,7 +2,7 @@ mod config;
 mod discovery;
 mod error;
 mod iroh;
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub mod mock;
 mod transport;
 mod types;

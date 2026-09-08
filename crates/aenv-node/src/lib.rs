@@ -3,8 +3,8 @@
 
 pub use aenv_core::{
     binding_store, digest, identity, leader_task, logging, node_client, node_registry,
-    orchestrator, p2p, privileges, proto, record_dir, runtime_snapshot, scheduler_endpoint,
-    server_main, types, virtualization,
+    orchestrator, privileges, proto, record_dir, runtime_snapshot, scheduler_endpoint, server_main,
+    types, virtualization,
 };
 
 #[cfg(test)]
@@ -19,6 +19,7 @@ pub mod node_reclaim;
 pub mod node_server;
 pub mod observability;
 pub mod overlaybd;
+pub mod p2p;
 pub mod sandbox;
 pub mod setup;
 pub mod snapshot;

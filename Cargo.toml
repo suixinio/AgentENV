@@ -44,7 +44,7 @@ vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 #
 # `aenv-node` and `aenv-api` are separate crates now, so their tests are not
 # `cfg(test)` in here: anything of this crate's that only a test uses —
-# `p2p::mock`, `logging::capture`, `RunnableSnapshot::mock`, the ACR fake
+# `sandbox::mock`, `logging::capture`, `RunnableSnapshot::mock`, the ACR fake
 # registry — is invisible to them unless it is compiled unconditionally.
 # Compiling it unconditionally would put a fake registry server in the
 # shipped binary, so it goes behind this instead, enabled from those crates'
@@ -118,8 +118,6 @@ dashmap = "6.1.0"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
-iroh = { version = "=1.0.0-rc.0" }
-iroh-blobs = { version = "=0.101.0" }
 rand = "0.10"
 zeroize = "1"
 openssl-sys = { version = "0.9", optional = true }

@@ -1,6 +1,6 @@
 mod captured;
 pub mod manager;
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod repository;
 pub mod types;

@@ -2,7 +2,7 @@ pub mod access;
 pub mod backend;
 pub mod custom_extension;
 pub mod envd;
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod network;
 pub mod process;

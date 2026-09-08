@@ -4017,28 +4017,6 @@ where
         Ok(())
     }
 
-    pub async fn set_secure_for_test(&self, sandbox_id: &SandboxId, secure: bool) -> Result<()> {
-        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
-            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
-        };
-        metadata.secure = secure;
-        self.store.update(metadata).await?;
-        Ok(())
-    }
-
-    pub async fn set_max_lifetime_for_test(
-        &self,
-        sandbox_id: &SandboxId,
-        max_lifetime: Duration,
-    ) -> Result<()> {
-        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
-            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
-        };
-        metadata.max_lifetime = Some(max_lifetime);
-        self.store.update(metadata).await?;
-        Ok(())
-    }
-
     /// Test helper that drops a process-local handle without removing its record.
     pub async fn forget_sandbox_handle_for_test(&self, sandbox_id: &SandboxId) -> bool {
         self.sandboxes.write().await.remove(sandbox_id).is_some()

@@ -24,6 +24,7 @@ anyhow = "1.0.100"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dashmap = "6.1.0"
 envd = { version = "0.1.0", path = "../../thirdparty/envd" }

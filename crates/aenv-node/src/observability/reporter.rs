@@ -544,6 +544,13 @@ pub fn egress_broker_wire(
     }
 }
 
+#[async_trait::async_trait]
+impl crate::server_main::HeartbeatReporter for ObservabilityReporter {
+    async fn shutdown(mut self: Box<Self>) -> Result<()> {
+        ObservabilityReporter::shutdown(&mut self).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,13 +821,18 @@ mod against_a_scheduler {
         }
     }
 
+    /// `Scheduler` and `Arc` are both foreign to this crate, so the served
+    /// handle needs a local type of its own.
+    #[derive(Clone)]
+    struct SharedScheduler(Arc<CountingScheduler>);
+
     #[tonic::async_trait]
-    impl Scheduler for Arc<CountingScheduler> {
+    impl Scheduler for SharedScheduler {
         async fn heartbeat(
             &self,
             _request: Request<scheduler::HeartbeatRequest>,
         ) -> Result<Response<scheduler::HeartbeatResponse>, Status> {
-            self.heartbeats.fetch_add(1, AtomicOrdering::SeqCst);
+            self.0.heartbeats.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(Response::new(scheduler::HeartbeatResponse::default()))
         }
         async fn unregister_node(
@@ -881,7 +893,7 @@ mod against_a_scheduler {
         let addr: SocketAddr = listener.local_addr().expect("the bound address");
         let (tx, rx) = oneshot::channel();
 
-        let served = Arc::clone(&scheduler);
+        let served = SharedScheduler(Arc::clone(&scheduler));
         tokio::spawn(async move {
             let _ = tonic::transport::Server::builder()
                 .add_service(SchedulerServer::new(served))

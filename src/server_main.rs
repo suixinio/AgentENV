@@ -11,13 +11,19 @@ use tokio::sync::oneshot;
 use tracing::{info, warn};
 
 use crate::cfg::AppConfig;
-use crate::observability::ObservabilityReporter;
 use crate::orchestrator::SandboxOrchestration;
 
 /// Machine-local process runtime that must be shut down before exit.
 #[async_trait::async_trait]
 pub trait ProcessRuntime: Send {
     async fn shutdown(self: Box<Self>);
+}
+
+/// Periodic self-report a process sends about the machine it runs on. Stopped
+/// first, so no heartbeat announces capacity this process is already giving up.
+#[async_trait::async_trait]
+pub trait HeartbeatReporter: Send {
+    async fn shutdown(self: Box<Self>) -> anyhow::Result<()>;
 }
 
 /// Router and ordered shutdown resources returned by binary assembly.
@@ -30,7 +36,7 @@ pub struct Assembly {
     /// PostgreSQL-elected tasks shut down gracefully to release advisory locks.
     pub pg_singleton_tasks: Vec<crate::leader_task::LeaderTaskHandle>,
     /// The heartbeat sender, for a process that reports itself as a machine.
-    pub reporter: Option<ObservabilityReporter>,
+    pub reporter: Option<Box<dyn HeartbeatReporter>>,
     /// The machine-local runtime, for a process that brought one up.
     pub runtime: Option<Box<dyn ProcessRuntime>>,
     /// Whether this process withdraws itself from placement during shutdown.
@@ -49,7 +55,7 @@ pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()>
         orchestration,
         upkeep,
         pg_singleton_tasks,
-        mut reporter,
+        reporter,
         runtime,
         drains_on_shutdown,
         grpc,
@@ -80,7 +86,7 @@ pub async fn serve(config: &AppConfig, assembly: Assembly) -> anyhow::Result<()>
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
-            if let Some(mut handle) = reporter.take() {
+            if let Some(handle) = reporter {
                 info!(target: "agentenv", "stopping observability reporter before process exit");
                 if let Err(err) = handle.shutdown().await {
                     warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");

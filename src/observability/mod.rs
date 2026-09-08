@@ -14,12 +14,10 @@ mod host;
 mod machine;
 mod model;
 pub mod prometheus;
-mod reporter;
 mod service;
 
 pub use host::{DiskMetric, HostMetrics, HostMetricsCollector};
 pub use model::{
     EgressBrokerProbe, EgressBrokerState, MachineInfo, NodeMetricsSnapshot, NodeSnapshot,
 };
-pub use reporter::ObservabilityReporter;
 pub use service::ObservabilityService;

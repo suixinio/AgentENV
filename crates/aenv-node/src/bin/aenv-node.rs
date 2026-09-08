@@ -21,7 +21,9 @@ use aenv_node::orchestrator::{
 use aenv_node::overlaybd::OverlaybdP2pRuntime;
 use aenv_node::p2p::P2pTransport;
 use aenv_node::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use aenv_node::server_main::{self, spawn_grpc_surface, Assembly, ProcessRuntime};
+use aenv_node::server_main::{
+    self, spawn_grpc_surface, Assembly, HeartbeatReporter, ProcessRuntime,
+};
 use aenv_node::snapshot::SnapshotManager;
 use aenv_node::template::TemplateBuilder;
 use anyhow::Context as _;
@@ -366,7 +368,9 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         orchestration,
         upkeep: Vec::new(),
         pg_singleton_tasks: Vec::new(),
-        reporter: core.reporter,
+        reporter: core
+            .reporter
+            .map(|reporter| Box::new(reporter) as Box<dyn HeartbeatReporter>),
         runtime: Some(Box::new(core.runtime)),
         drains_on_shutdown: true,
         grpc: Some(grpc),

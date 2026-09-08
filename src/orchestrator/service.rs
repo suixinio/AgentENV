@@ -494,6 +494,10 @@ where
 
     /// Waits out the launch this process is running under `sandbox_id`.
     async fn join_launch(&self, sandbox_id: SandboxId) -> Result<SandboxMetadata> {
+        // One deadline covers the whole join, including the wait on another
+        // replica's record that a claim refused elsewhere ends in, so a joiner
+        // never waits longer than the launch it joined.
+        let deadline = tokio::time::Instant::now() + WAIT_TRANSITION_TIMEOUT;
         let Some(in_flight) = self.launch_claims.in_flight(sandbox_id) else {
             // The launch settled between the refusal and this lookup, so its
             // record is what it produced.
@@ -504,8 +508,21 @@ where
             holder_execution_id = %in_flight.execution_id(),
             "joining a launch of this sandbox already in flight in this process"
         );
-        match in_flight.join(WAIT_TRANSITION_TIMEOUT).await {
+        let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match in_flight.join(wait).await {
             Some(LaunchSettlement::Launched(metadata)) => Ok(*metadata),
+            Some(LaunchSettlement::Failed(failure @ LaunchFailure::HeldElsewhere(_))) => {
+                // The launch this caller joined stopped at another replica's
+                // reservation, which decides the id instead of it. Following
+                // the refusal here would answer a failure about a sandbox that
+                // is starting, so this caller waits where the claimant waits.
+                self.await_launch_elsewhere_until(
+                    sandbox_id,
+                    failure.into_error(sandbox_id),
+                    deadline,
+                )
+                .await
+            }
             Some(LaunchSettlement::Failed(failure)) => Err(failure.into_error(sandbox_id)),
             None => {
                 warn!(%sandbox_id, "timed out joining a launch of this sandbox");
@@ -523,11 +540,21 @@ where
         sandbox_id: SandboxId,
         refusal: OrchestratorError,
     ) -> Result<SandboxMetadata> {
+        let deadline = tokio::time::Instant::now() + WAIT_TRANSITION_TIMEOUT;
+        self.await_launch_elsewhere_until(sandbox_id, refusal, deadline)
+            .await
+    }
+
+    async fn await_launch_elsewhere_until(
+        &self,
+        sandbox_id: SandboxId,
+        refusal: OrchestratorError,
+        deadline: tokio::time::Instant,
+    ) -> Result<SandboxMetadata> {
         info!(
             %sandbox_id,
             "another replica is launching this sandbox; waiting for the record it will write"
         );
-        let deadline = tokio::time::Instant::now() + WAIT_TRANSITION_TIMEOUT;
         loop {
             match self.store.get(&sandbox_id).await? {
                 Some(metadata) if metadata.state == SandboxState::Running => return Ok(metadata),

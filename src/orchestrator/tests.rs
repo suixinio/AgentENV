@@ -2237,6 +2237,177 @@ async fn a_caller_joining_a_launch_that_fails_fails_with_that_launchs_error() ->
     Ok(())
 }
 
+/// A launch that stays inside `start_nowait` until the returned counter has
+/// been observed and then meets the reservation another replica holds, which
+/// is the refusal that decides nothing about the id by itself.
+fn held_elsewhere_launch_behavior(
+    started: &Arc<AtomicUsize>,
+    sandbox_id: SandboxId,
+) -> Arc<MockBehavior> {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(MockOperation::StartNowait, counting_hook(started));
+    behavior.push_action(
+        MockOperation::StartNowait,
+        MockAction::FailHeldElsewhere {
+            delay: Duration::from_millis(400),
+            sandbox_id,
+        },
+    );
+    behavior
+}
+
+fn spawn_joiners(
+    orchestrator: &Arc<TestOrchestrator>,
+    sandbox_id: SandboxId,
+    count: usize,
+) -> Vec<tokio::task::JoinHandle<Result<RestoredSandbox>>> {
+    (0..count)
+        .map(|_| {
+            let orchestrator = Arc::clone(orchestrator);
+            tokio::spawn(async move {
+                orchestrator
+                    .restore_or_join_launch(
+                        sandbox_id,
+                        create_request(Some(60), &[("team", "joiner")]),
+                    )
+                    .await
+            })
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_launch_another_replica_reserved_answers_its_joiners_with_that_replicas_record(
+) -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let started = Arc::new(AtomicUsize::new(0));
+    let behavior = held_elsewhere_launch_behavior(&started, sandbox_id);
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let claimant = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .restore_or_join_launch(
+                    sandbox_id,
+                    create_request(Some(60), &[("team", "claimant")]),
+                )
+                .await
+        }
+    });
+    wait_until("waiting for the claimant to reach its reservation", || {
+        started.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    let joiners = spawn_joiners(&orchestrator, sandbox_id, 2);
+
+    let elsewhere = ExecutionId::new();
+    orchestrator
+        .store
+        .add(SandboxMetadata {
+            id: sandbox_id,
+            execution_id: elsewhere,
+            state: SandboxState::Running,
+            ..Default::default()
+        })
+        .await?;
+
+    let claimed = claimant
+        .await
+        .expect("the claimant task")
+        .expect("the claimant waits out the replica that took the id");
+    assert!(claimed.joined);
+    assert_eq!(claimed.metadata.execution_id, elsewhere);
+    assert_eq!(claimed.metadata.state, SandboxState::Running);
+    for joiner in joiners {
+        let joined = joiner.await.expect("a joiner task").expect(
+            "a joiner answers what the launch it joined settled on, not the refusal that launch \
+             met on its way there",
+        );
+        assert!(joined.joined);
+        assert_eq!(
+            joined.metadata.execution_id, elsewhere,
+            "a joiner must land on the record the other replica wrote"
+        );
+        assert_eq!(joined.metadata.state, SandboxState::Running);
+    }
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        1,
+        "only the claimant reached a runtime; the joiners waited"
+    );
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_launch_another_replica_reserved_but_never_recorded_runs_out_the_same_way_for_everyone(
+) -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let started = Arc::new(AtomicUsize::new(0));
+    let behavior = held_elsewhere_launch_behavior(&started, sandbox_id);
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let began = tokio::time::Instant::now();
+    let claimant = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .restore_or_join_launch(
+                    sandbox_id,
+                    create_request(Some(60), &[("team", "claimant")]),
+                )
+                .await
+        }
+    });
+    wait_until("waiting for the claimant to reach its reservation", || {
+        started.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    let joiners = spawn_joiners(&orchestrator, sandbox_id, 2);
+
+    let refused = claimant
+        .await
+        .expect("the claimant task")
+        .expect_err("no replica ever wrote a record for this sandbox");
+    assert_launch_wait_ran_out(&refused, "the claimant");
+    for joiner in joiners {
+        let err = joiner
+            .await
+            .expect("a joiner task")
+            .expect_err("no replica ever wrote a record for this sandbox");
+        assert_launch_wait_ran_out(&err, "a joiner");
+    }
+    let waited = tokio::time::Instant::now() - began;
+    assert!(
+        waited <= WAIT_TRANSITION_TIMEOUT + Duration::from_secs(5),
+        "waiting for another replica's record is one bounded wait, not one per hop: {waited:?}"
+    );
+    Ok(())
+}
+
+fn assert_launch_wait_ran_out(error: &OrchestratorError, who: &str) {
+    assert!(
+        matches!(
+            error,
+            OrchestratorError::SandboxOperationFailed {
+                operation: SandboxOperation::Start,
+                ..
+            }
+        ),
+        "{who} answered a different error class: {error:?}"
+    );
+    assert!(
+        LaunchHeldElsewhere::refused(error),
+        "{who} lost the marker that says the wait was on another replica: {error:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_launch_takes_an_id_whose_runtime_the_cluster_no_longer_routes_to() -> Result<()> {
     setup();

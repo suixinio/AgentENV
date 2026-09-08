@@ -77,6 +77,19 @@ pub enum MockAction {
         delay: Duration,
         message: String,
     },
+    /// The refusal a placement reservation another replica still holds leaves,
+    /// marker and all, which is what a launch meets when a second replica is
+    /// starting the same sandbox id.
+    FailHeldElsewhere {
+        delay: Duration,
+        sandbox_id: crate::types::SandboxId,
+    },
+}
+
+fn held_elsewhere_refusal(sandbox_id: crate::types::SandboxId) -> anyhow::Error {
+    anyhow::Error::new(crate::orchestrator::LaunchHeldElsewhere { sandbox_id }).context(format!(
+        "reserve a routing record for sandbox {sandbox_id} on node mock-node before starting it"
+    ))
 }
 
 #[derive(Default)]
@@ -299,6 +312,10 @@ impl MockBehavior {
                 sleep(delay).await;
                 Err(fail(message))
             }
+            MockAction::FailHeldElsewhere { delay, sandbox_id } => {
+                sleep(delay).await;
+                Err(fail(format!("{:#}", held_elsewhere_refusal(sandbox_id))))
+            }
         }
     }
 
@@ -324,6 +341,10 @@ impl MockBehavior {
             MockAction::FailAfter { delay, message } => {
                 thread::sleep(delay);
                 Err(fail(message))
+            }
+            MockAction::FailHeldElsewhere { delay, sandbox_id } => {
+                thread::sleep(delay);
+                Err(fail(format!("{:#}", held_elsewhere_refusal(sandbox_id))))
             }
         }
     }
@@ -354,8 +375,15 @@ impl MockBehavior {
             _ => {}
         }
 
+        // The generic runners can only build an error out of a string, and
+        // this one is read by its type, not its text.
+        let action = self.pop_action(operation);
+        if let MockAction::FailHeldElsewhere { delay, sandbox_id } = action {
+            sleep(delay).await;
+            return Err(held_elsewhere_refusal(sandbox_id));
+        }
         Self::run_async_action(
-            self.pop_action(operation),
+            action,
             |message| anyhow!(message),
             |message| anyhow!(message),
         )

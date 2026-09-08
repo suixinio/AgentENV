@@ -12,7 +12,7 @@ use tokio::sync::watch;
 
 use super::store::SandboxMetadata;
 use super::types::SandboxState;
-use super::OrchestratorError;
+use super::{OrchestratorError, SandboxOperation};
 use crate::types::{ExecutionId, SandboxId};
 
 /// How a launch ended, for the callers that waited on it.
@@ -30,11 +30,19 @@ pub enum LaunchFailure {
     NotAcceptingNewWork,
     ShuttingDown,
     InvalidState(SandboxState),
+    /// A reservation another replica holds refused the launch. This is not the
+    /// launch's outcome, only the point at which it stopped deciding one: the
+    /// outcome is the record that replica writes, and everyone who joined the
+    /// launch waits for it exactly as the claimant does.
+    HeldElsewhere(String),
     Other(String),
 }
 
 impl LaunchFailure {
     pub fn of(error: &OrchestratorError) -> Self {
+        if LaunchHeldElsewhere::refused(error) {
+            return Self::HeldElsewhere(refusal_detail(error));
+        }
         match error {
             OrchestratorError::StoreOperationFailed(
                 super::store::StoreError::SandboxAlreadyExists { .. },
@@ -57,8 +65,22 @@ impl LaunchFailure {
             Self::InvalidState(state) => {
                 OrchestratorError::InvalidSandboxState { sandbox_id, state }
             }
+            Self::HeldElsewhere(detail) => OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Start,
+                // The marker has to survive the round trip: whoever reads this
+                // error back is the caller that has to wait, not fail.
+                source: anyhow::Error::new(LaunchHeldElsewhere { sandbox_id }).context(detail),
+            },
             Self::Other(message) => OrchestratorError::InternalError(message),
         }
+    }
+}
+
+fn refusal_detail(error: &OrchestratorError) -> String {
+    match error {
+        OrchestratorError::SandboxOperationFailed { source, .. } => format!("{source:#}"),
+        other => other.to_string(),
     }
 }
 
@@ -286,6 +308,43 @@ mod tests {
         assert!(
             !LaunchHeldElsewhere::refused(&other),
             "waiting for a launch nobody is running would hang every ordinary failure"
+        );
+    }
+
+    #[test]
+    fn a_refusal_by_another_replica_settles_as_a_wait_and_reads_back_as_one() {
+        let sandbox_id = SandboxId::new();
+        let refused = OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::Start,
+            source: anyhow::Error::new(LaunchHeldElsewhere { sandbox_id })
+                .context("reserve a routing record before starting it"),
+        };
+        let settlement = LaunchFailure::of(&refused);
+        assert!(
+            matches!(settlement, LaunchFailure::HeldElsewhere(ref detail)
+                if detail.contains("reserve a routing record")),
+            "{settlement:?}"
+        );
+        let read_back = settlement.into_error(sandbox_id);
+        assert!(
+            LaunchHeldElsewhere::refused(&read_back),
+            "a joiner reading this settlement has to reach the same verdict the claimant did: \
+             {read_back:?}"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_launch_failure_is_not_settled_as_a_wait() {
+        let sandbox_id = SandboxId::new();
+        let failed = OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: SandboxOperation::Start,
+            source: anyhow::anyhow!("the node refused the launch"),
+        };
+        assert!(
+            matches!(LaunchFailure::of(&failed), LaunchFailure::Other(_)),
+            "waiting on a record nobody is writing would turn every start failure into a hang"
         );
     }
 

@@ -608,6 +608,66 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn one_undecodable_payload_does_not_take_the_metadata_filtered_listing_with_it() {
+        let pool = isolated_schema_pool_or_skip!(
+            "one_undecodable_payload_does_not_take_the_metadata_filtered_listing_with_it"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+        let cluster_id = Uuid::new_v4();
+        let catalog = PostgresSnapshotCatalog::new(pool.clone(), cluster_id, "node-a".to_string());
+
+        let keep = catalog
+            .publish_commit(sandbox_pause_owned_by("sbx-keep", Some("keep")))
+            .await
+            .expect("the pause commits");
+
+        // Neither UTF-8 nor JSON: the two things the extraction raises on.
+        sqlx::query(
+            "INSERT INTO snapshots (
+                id, cluster_id, source_kind, source_sandbox_id,
+                cpu_count, memory_mib, disk_size_mib,
+                status, status_group,
+                published, origin_node_id,
+                sandbox_started_at_ms, created_at_ms, updated_at_ms,
+                committed_payload, committed_schema, is_pause
+             ) VALUES (
+                $1, $2, 'sandbox', 'sbx-corrupt',
+                1, 512, 1024,
+                'ready', 'ready',
+                true, NULL,
+                NULL, 1, 1,
+                $3, 1, true
+             )",
+        )
+        .bind(SnapshotId::generate().to_uuid())
+        .bind(cluster_id)
+        .bind(vec![0xff_u8, 0xfe, 0x00, 0x01])
+        .execute(&pool)
+        .await
+        .expect("seeding a row with an unreadable payload should succeed");
+
+        let wanted: std::collections::HashMap<String, String> =
+            [("owner".to_string(), "keep".to_string())]
+                .into_iter()
+                .collect();
+        let page = catalog
+            .list_page_scoped(
+                SnapshotListFilter::pauses(Some(wanted)),
+                CatalogReadScope::Resolvable,
+            )
+            .await
+            .expect("one unreadable row must not fail every listing that filters on metadata");
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![keep.id.to_string()],
+            "the unreadable row is unmatched, and the rows that match still answer"
+        );
+    }
+
+    #[tokio::test]
     async fn publish_commit_over_an_existing_template_row_reuses_it() {
         let catalog = catalog!("publish_commit_over_an_existing_template_row_reuses_it");
         let record = template_record(None);

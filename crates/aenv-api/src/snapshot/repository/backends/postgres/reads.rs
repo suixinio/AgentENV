@@ -302,9 +302,9 @@ fn append_filters(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFi
 ///
 /// `is_pause` is a column so the common half needs no payload. The metadata
 /// half has nowhere else to live: a sandbox's own metadata is inside the
-/// committed payload, so the predicate decodes it. A payload that is not the
-/// JSON this catalog writes makes the extraction NULL and the row unmatched,
-/// which is the answer a row whose configuration cannot be read deserves.
+/// committed payload, so the predicate decodes it through `catalog_try_jsonb`,
+/// which answers NULL for a payload that is not decodable JSON. One such row
+/// then goes unmatched instead of raising and failing the whole listing.
 fn append_pause_axis(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFilter) {
     if filter.pauses_only || filter.user_metadata.is_some() {
         sql.push_str("\n   AND s.is_pause");
@@ -320,7 +320,7 @@ fn append_pause_axis(sql: &mut String, binder: &mut Binder, filter: &SnapshotLis
     );
     let placeholder = binder.add(Value::Text(wanted.to_string()));
     sql.push_str(&format!(
-        "\n   AND convert_from(s.committed_payload, 'UTF8')::jsonb \
+        "\n   AND catalog_try_jsonb(s.committed_payload) \
          #> '{{paused_sandbox,user_metadata}}' @> {placeholder}::jsonb"
     ));
 }

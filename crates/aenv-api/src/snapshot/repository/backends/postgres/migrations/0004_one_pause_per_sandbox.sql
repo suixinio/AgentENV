@@ -25,32 +25,32 @@ ALTER TABLE snapshots
     ADD CONSTRAINT snapshots_pause_axis
         CHECK (NOT is_pause OR source_kind = 'sandbox');
 
--- ── backfill ─────────────────────────────────────────────────────────────────
+-- ── reading the payload ──────────────────────────────────────────────────────
 --
 -- The payload is a CommittedSnapshot serialised by serde_json, and its
 -- `paused_sandbox` field is skipped when absent, so the key is present exactly
--- on a pause. This is the one place that reads inside the blob, and it reads
--- for the key's presence only.
+-- on a pause. This function is the only way the schema and the read path look
+-- inside the blob, and both look for that key's presence only.
 --
--- 🔴 Wrapped so that a payload this build cannot decode makes one row a
--- non-pause rather than making every replica refuse to start. `convert_from`
--- raises on invalid UTF-8 and the ::jsonb cast raises on anything that is not
--- JSON; both are unreachable for a payload this catalog wrote, and neither is
--- worth a permanently unstartable deployment if one turns out to be reachable.
-CREATE OR REPLACE FUNCTION catalog_payload_is_pause(payload BYTEA)
-RETURNS BOOLEAN AS $$
+-- Wrapped so that a payload this build cannot decode makes one row a non-pause
+-- and one row unmatched, rather than raising: `convert_from` raises on invalid
+-- UTF-8 and the ::jsonb cast raises on anything that is not JSON. Both are
+-- unreachable for a payload this catalog wrote; neither is worth a permanently
+-- unstartable deployment, nor a 500 on every list that filters on metadata, if
+-- one turns out to be reachable. Kept, not dropped: `reads.rs` calls it.
+CREATE OR REPLACE FUNCTION catalog_try_jsonb(payload BYTEA)
+RETURNS JSONB AS $$
 BEGIN
-    RETURN convert_from(payload, 'UTF8')::jsonb ? 'paused_sandbox';
+    RETURN convert_from(payload, 'UTF8')::jsonb;
 EXCEPTION WHEN others THEN
-    RETURN false;
+    RETURN NULL;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 UPDATE snapshots
    SET is_pause = true
  WHERE source_kind = 'sandbox'
-   AND committed_payload IS NOT NULL
-   AND catalog_payload_is_pause(committed_payload);
+   AND COALESCE(catalog_try_jsonb(committed_payload) ? 'paused_sandbox', false);
 
 -- ── de-duplication ───────────────────────────────────────────────────────────
 --
@@ -90,8 +90,6 @@ DELETE FROM aliases a
  USING superseded
  WHERE a.snapshot_id = superseded.id
    AND a.cluster_id = superseded.cluster_id;
-
-DROP FUNCTION IF EXISTS catalog_payload_is_pause(BYTEA);
 
 -- ── the constraint ───────────────────────────────────────────────────────────
 --

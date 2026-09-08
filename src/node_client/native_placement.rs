@@ -320,6 +320,20 @@ impl NodePlacement for NativeNodePlacement {
                 anyhow!("the local scheduler could not release the reservation for {sandbox_id}: {status}")
             })
     }
+
+    async fn forget_placement(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> Result<()> {
+        self.local
+            .forget_assignment(&sandbox_id.to_string(), &execution_id.to_string())
+            .await
+            .map(|_| ())
+            .map_err(|status| {
+                anyhow!("the local scheduler could not retire the routing record for {sandbox_id}: {status}")
+            })
+    }
 }
 
 #[cfg(test)]
@@ -469,6 +483,57 @@ mod tests {
             .await
             .expect("a clean miss is not a transport error");
         assert!(absent.is_none(), "nothing was ever recorded for this id");
+    }
+
+    #[tokio::test]
+    async fn forget_placement_retires_its_own_incarnation_and_leaves_a_newer_one_bound() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://10.0.0.7:8000")],
+            Duration::from_secs(30),
+        ));
+        let binding_store: Arc<dyn BindingStore> =
+            Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default()));
+        let placement =
+            placement_with_binding_store(Arc::clone(&registry), Arc::clone(&binding_store));
+        let node_endpoint = NodeEndpoint::same_address("node-a", "http://10.0.0.7:8000");
+        let older = ExecutionId::parse_str("00000000-0000-7000-8000-000000000001").expect("uuid");
+        let newer = ExecutionId::parse_str("00000000-0000-7000-8000-000000000002").expect("uuid");
+
+        let own = SandboxId::new();
+        placement
+            .record_placement(own, older, &node_endpoint, 0)
+            .await
+            .expect("node-a is a known node");
+        placement
+            .forget_placement(own, older)
+            .await
+            .expect("retiring one's own placement is not an error");
+        assert!(
+            placement
+                .place_existing(own)
+                .await
+                .expect("no transport error")
+                .is_none(),
+            "the teardown's own incarnation must leave no routing answer behind"
+        );
+
+        let reused = SandboxId::new();
+        placement
+            .record_placement(reused, newer, &node_endpoint, 0)
+            .await
+            .expect("node-a is a known node");
+        placement
+            .forget_placement(reused, older)
+            .await
+            .expect("a refused delete is not an error");
+        assert!(
+            placement
+                .place_existing(reused)
+                .await
+                .expect("no transport error")
+                .is_some(),
+            "a binding a newer incarnation wrote belongs to that incarnation"
+        );
     }
 
     // An incarnation older than the one already holding the id names a launch

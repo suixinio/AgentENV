@@ -990,6 +990,14 @@ impl NodePlacement for ReplacementNodePlacement {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    async fn forget_placement(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[tokio::test]
@@ -1331,6 +1339,14 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
             Ok(())
         }
         async fn release_placement_reservation(
+            &self,
+            _sandbox_id: crate::types::SandboxId,
+            _execution_id: ExecutionId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn forget_placement(
             &self,
             _sandbox_id: crate::types::SandboxId,
             _execution_id: ExecutionId,
@@ -3261,6 +3277,14 @@ impl NodePlacement for ClusterPlacement {
         _execution_id: ExecutionId,
     ) -> anyhow::Result<()> {
         self.reservations.lock().expect("lock").remove(&sandbox_id);
+        Ok(())
+    }
+
+    async fn forget_placement(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }

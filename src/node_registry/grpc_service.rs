@@ -48,7 +48,8 @@ pub struct NodeRegistryGrpcService {
     registry: Arc<AtomicNodeRegistry>,
     warmup: Arc<WarmupGate>,
     binding_store: Option<Arc<dyn BindingStore>>,
-    /// Must match the binding store's construction-time authoritative setting.
+    /// Governs projection TTLs only, and must match the binding store's
+    /// construction-time authoritative setting.
     projection_authoritative: bool,
     max_projection_ttl: Duration,
     artifact_store: Option<Arc<dyn ArtifactStore>>,
@@ -339,6 +340,49 @@ impl NodeRegistryGrpcService {
             })
     }
 
+    /// Retires a sandbox's routing projection as its incarnation is torn down.
+    ///
+    /// This is the primary removal path: the teardown that removes the sandbox
+    /// calls it before the metadata record goes, so no window exists in which
+    /// the projection still names a node that no longer runs the sandbox. The
+    /// node's own event and the next heartbeat's reconcile remain as fallbacks
+    /// for a caller that died before reaching here.
+    pub async fn forget_assignment(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+    ) -> Result<BindingDeleteOutcome, Status> {
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "retiring a routing projection needs a binding store, and this deployment has \
+                 none wired: {NOT_WIRED}"
+            )));
+        };
+        let sandbox_id = sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        let (execution, _reason) =
+            crate::binding_store::record::normalize_execution_id_reason(execution_id);
+        if execution.is_empty() {
+            // An unguarded delete would take whatever incarnation is bound now.
+            return Err(Status::invalid_argument("execution_id is required"));
+        }
+        binding_store
+            .delete(sandbox_id, &execution, SystemTime::now())
+            .await
+            .inspect(|outcome| Self::record_sandbox_event("teardown", outcome.as_str()))
+            .map_err(|err| {
+                Self::record_sandbox_event("teardown", "store_error");
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "scheduler forget_assignment failed"
+                );
+                Status::unavailable("binding store unavailable")
+            })
+    }
+
     /// Withdraws a reservation this process wrote, leaving a confirmation alone.
     pub async fn release_assignment_reservation(
         &self,
@@ -439,6 +483,9 @@ impl NodeRegistryGrpcService {
     }
 
     /// Applies an incarnation-guarded projection delete and reports its outcome.
+    ///
+    /// A fallback behind the teardown's own `forget_assignment`: it runs for a
+    /// sandbox whose teardown never reached that call.
     async fn apply_projection_delete(
         &self,
         binding_store: &Arc<dyn BindingStore>,
@@ -446,10 +493,6 @@ impl NodeRegistryGrpcService {
         now: SystemTime,
     ) -> bool {
         let label = Self::sandbox_event_type_label(event.event_type());
-        if !self.projection_authoritative {
-            Self::record_sandbox_event(label, "ignored_switch_off");
-            return false;
-        }
         let sandbox_id = event.sandbox_id.trim();
         if sandbox_id.is_empty() {
             Self::record_sandbox_event(label, "ignored_no_sandbox");
@@ -1156,8 +1199,13 @@ mod tests {
             )
             .await;
             assert!(
-                binding_store.get("sbx-off", SystemTime::now()).await.unwrap().is_some(),
-                "projection_authoritative=false must leave the switch off, even for a matching event"
+                binding_store
+                    .get("sbx-off", SystemTime::now())
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "projection_authoritative governs TTLs, not whether a matching event \
+                 retires the binding"
             );
         }
 

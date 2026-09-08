@@ -19,6 +19,9 @@ use super::{
 /// `Option<SandboxState>` (where `None` means the sandbox has been removed).
 /// This enables efficient, lock-free waiting for state transitions via
 /// `wait_while_in_states`.
+/// Clones share one inner map, so a test may hold the store the orchestrator
+/// reads.
+#[derive(Clone)]
 pub struct InMemoryMetadataStore {
     inner: Arc<RwLock<StoreInner>>,
 }

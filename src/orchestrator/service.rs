@@ -1807,13 +1807,37 @@ where
             })
     }
 
-    /// Drops a sandbox's record and its incarnation's grant together. The
-    /// grant goes even when the record removal fails, so no terminal teardown
-    /// can leave one behind.
+    /// Retires the cluster's routing answer for one incarnation.
+    ///
+    /// A process that installed no routing source runs no cluster routing and
+    /// has nothing to retire. A failure is not fatal to the teardown: the
+    /// node's own event and the next heartbeat's reconcile still remove the
+    /// binding, one interval later.
+    async fn forget_runtime_routing(&self, sandbox_id: SandboxId, execution_id: ExecutionId) {
+        let Some(routing) = self.runtime_routing.get() else {
+            return;
+        };
+        if let Err(error) = routing.forget(sandbox_id, execution_id).await {
+            warn!(
+                %sandbox_id,
+                %execution_id,
+                error = %format_args!("{error:#}"),
+                "could not retire this sandbox's routing binding; traffic may reach the node \
+                 that no longer runs it until a heartbeat reconciles it"
+            );
+        }
+    }
+
+    /// Drops a sandbox's record, its routing binding and its incarnation's
+    /// grant together. The routing binding goes first, so no request is routed
+    /// at a runtime this teardown has already stopped; the grant goes even
+    /// when the record removal fails, so no terminal teardown can leave one
+    /// behind.
     ///
     /// The removal is fenced on `execution_id`: a record another incarnation
     /// wrote under this id belongs to that incarnation, and a caller cleaning
-    /// up after its own launch must not take it.
+    /// up after its own launch must not take it. The routing retirement
+    /// carries the same fence into the binding store.
     async fn forget_sandbox(
         &self,
         sandbox_id: SandboxId,
@@ -1821,6 +1845,7 @@ where
     ) -> Result<Option<SandboxMetadata>> {
         // Read first so the caller still learns what the removal took.
         let current = self.store.get(&sandbox_id).await;
+        self.forget_runtime_routing(sandbox_id, execution_id).await;
         let removal = self
             .store
             .remove_if_execution(&sandbox_id, execution_id, &ALL_SANDBOX_STATES)

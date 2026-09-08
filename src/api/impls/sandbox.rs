@@ -2374,6 +2374,14 @@ mod paused_sandbox_rest_tests {
         async fn is_routed(&self, _sandbox_id: SandboxId) -> anyhow::Result<bool> {
             Ok(self.0)
         }
+
+        async fn forget(
+            &self,
+            _sandbox_id: SandboxId,
+            _execution_id: crate::types::ExecutionId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     impl Surface {

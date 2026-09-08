@@ -135,6 +135,17 @@ pub trait NodePlacement: Send + Sync + 'static {
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
     ) -> anyhow::Result<()>;
+
+    /// Retires the placement record of an incarnation being torn down, so no
+    /// lookup routes at a runtime that is going away.
+    ///
+    /// Fenced on `execution_id`: a record naming another incarnation is left
+    /// alone.
+    async fn forget_placement(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<()>;
 }
 
 /// The placement source's binding answers whether anything still routes to a
@@ -153,6 +164,10 @@ impl PlacementRuntimeRouting {
 impl crate::orchestrator::RuntimeRouting for PlacementRuntimeRouting {
     async fn is_routed(&self, sandbox_id: SandboxId) -> anyhow::Result<bool> {
         Ok(self.0.place_existing(sandbox_id).await?.is_some())
+    }
+
+    async fn forget(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> anyhow::Result<()> {
+        self.0.forget_placement(sandbox_id, execution_id).await
     }
 }
 
@@ -224,6 +239,15 @@ impl NodePlacement for FixedNodePlacement {
     }
 
     async fn release_placement_reservation(
+        &self,
+        _sandbox_id: SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Succeeds without writing: there is no record to retire.
+    async fn forget_placement(
         &self,
         _sandbox_id: SandboxId,
         _execution_id: ExecutionId,

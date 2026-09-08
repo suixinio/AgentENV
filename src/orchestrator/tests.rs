@@ -51,9 +51,17 @@ async fn make_orchestrator_with_publisher<F: SandboxBackendFactory>(
     factory: F,
     publisher: Arc<dyn PausePublisher>,
 ) -> Arc<TestOrchestrator<InMemoryMetadataStore, F>> {
+    make_orchestrator_with_publisher_over(InMemoryMetadataStore::new(), factory, publisher).await
+}
+
+async fn make_orchestrator_with_publisher_over<F: SandboxBackendFactory>(
+    store: InMemoryMetadataStore,
+    factory: F,
+    publisher: Arc<dyn PausePublisher>,
+) -> Arc<TestOrchestrator<InMemoryMetadataStore, F>> {
     let orchestrator = Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-        InMemoryMetadataStore::new(),
+        store,
         factory,
         test_runtime_image_refs(),
     )
@@ -6310,6 +6318,105 @@ impl crate::orchestrator::RuntimeRouting for FixedRouting {
     async fn is_routed(&self, _sandbox_id: SandboxId) -> anyhow::Result<bool> {
         Ok(self.0)
     }
+
+    async fn forget(
+        &self,
+        _sandbox_id: SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+/// Records every retirement it is asked for, and whether the sandbox's record
+/// was still in the store at that moment.
+struct RecordingRouting {
+    store: InMemoryMetadataStore,
+    forgotten: StdMutex<Vec<(SandboxId, ExecutionId, bool)>>,
+}
+
+impl RecordingRouting {
+    fn over(store: InMemoryMetadataStore) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            forgotten: StdMutex::new(Vec::new()),
+        })
+    }
+
+    fn forgotten(&self) -> Vec<(SandboxId, ExecutionId, bool)> {
+        self.forgotten.lock().expect("recorder lock").clone()
+    }
+}
+
+#[async_trait]
+impl crate::orchestrator::RuntimeRouting for RecordingRouting {
+    async fn is_routed(&self, _sandbox_id: SandboxId) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+
+    async fn forget(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> anyhow::Result<()> {
+        let record_present = self
+            .store
+            .get(&sandbox_id)
+            .await
+            .expect("the in-memory store never fails")
+            .is_some();
+        self.forgotten.lock().expect("recorder lock").push((
+            sandbox_id,
+            execution_id,
+            record_present,
+        ));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_delete_retires_the_routing_binding_before_it_removes_the_record() -> Result<()> {
+    setup();
+    let store = InMemoryMetadataStore::new();
+    let routing = RecordingRouting::over(store.clone());
+    let orchestrator = make_orchestrator_without_background(store);
+    orchestrator
+        .set_runtime_routing(Arc::clone(&routing) as Arc<dyn crate::orchestrator::RuntimeRouting>);
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "routing-delete")]))
+        .await?;
+    orchestrator.delete_sandbox(created.id).await?;
+
+    assert_eq!(
+        routing.forgotten(),
+        vec![(created.id, created.execution_id, true)],
+        "the delete must retire its own incarnation while the record is still there"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pause_retires_the_routing_binding_before_it_removes_the_record() -> Result<()> {
+    setup();
+    let store = InMemoryMetadataStore::new();
+    let routing = RecordingRouting::over(store.clone());
+    let orchestrator = make_orchestrator_with_publisher_over(
+        store,
+        MockBackendFactory::new(),
+        DiscardingPausePublisher::shared(),
+    )
+    .await;
+    orchestrator
+        .set_runtime_routing(Arc::clone(&routing) as Arc<dyn crate::orchestrator::RuntimeRouting>);
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "routing-pause")]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    assert_eq!(
+        routing.forgotten(),
+        vec![(created.id, created.execution_id, true)],
+        "the pause must retire its own incarnation while the record is still there"
+    );
+    Ok(())
 }
 
 #[tokio::test]

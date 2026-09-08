@@ -292,9 +292,9 @@ test-with-redis:
 	  echo "Install redis-server, or point REDIS_SERVER_BIN at one."; \
 	  exit 1; }
 	@mkdir -p $(dir $(REDIS_TEST_LOG))
-	@AENV_REDIS_TEST_REQUIRED=1 $(CARGO) test -p aenv-core --lib -- --nocapture \
+	@AENV_REDIS_TEST_REQUIRED=1 $(CARGO) test -p aenv-core -p aenv-api --lib -- --nocapture \
 	  orchestrator::store:: binding_store::redis:: node_registry::redis:: \
-	  redis_test_server:: \
+	  redis_test_server:: node_client::redis_harness_tests:: \
 	  > $(REDIS_TEST_LOG) 2>&1; status=$$?; \
 	  cat $(REDIS_TEST_LOG); \
 	  if grep -q 'SKIPPED\[redis\]' $(REDIS_TEST_LOG); then \

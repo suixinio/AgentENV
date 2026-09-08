@@ -123,6 +123,18 @@ clippy:
 # `-e normal` on purpose: `aenv-core` dev-depends on nothing, but `aenv-node`
 # and `aenv-api` both dev-depend on `aenv-core`'s `test-support` feature, and a
 # dev edge is not something a shipped binary links.
+#
+# `cargo tree` cannot see inside `aenv-core`, so the module half of the same
+# rule is a path test: these run only on a machine that runs sandboxes, and a
+# copy of any of them under `src/` is the union crate re-forming.
+CORE_EXILED_PATHS := \
+	src/api/proxy.rs \
+	src/observability/reporter.rs \
+	src/p2p \
+	src/record_dir.rs \
+	src/sandbox/envd.rs \
+	src/sandbox/process.rs
+
 check-crate-boundaries:
 	@fail=0; \
 	api_tree=$$($(CARGO) tree -p aenv-api -e normal) || { echo "cargo tree -p aenv-api failed"; exit 1; }; \
@@ -156,7 +168,35 @@ check-crate-boundaries:
 	  echo "cache layout or written as JSON records, and nothing here needs one."; \
 	  fail=1; \
 	fi; \
-	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, aenv-node has no database and no broker TLS, aenv-egress is a leaf whose features each stand alone, the workspace has no embedded database"; fi; \
+	api_flat=$$($(CARGO) tree -p aenv-api -e normal --prefix none) || { echo "cargo tree -p aenv-api --prefix none failed"; exit 1; }; \
+	if printf '%s\n' "$$api_flat" | sort -u | grep -E '^(iroh|iroh-blobs|envd) v[0-9]'; then \
+	  echo "aenv-api links the peer-to-peer transport or the guest agent client; the api half"; \
+	  echo "moves no artifact bytes and speaks to no guest, so both are aenv-node's alone."; \
+	  fail=1; \
+	fi; \
+	for path in $(CORE_EXILED_PATHS); do \
+	  if [ -e "$$path" ]; then \
+	    echo "$$path is under aenv-core again. It runs only where sandboxes run, so aenv-node"; \
+	    echo "owns it; back here it is compiled into the api binary as well."; \
+	    fail=1; \
+	  fi; \
+	done; \
+	for half in aenv-api aenv-node; do \
+	  reexports=$$(sed -n '/^pub use aenv_core::{$$/,/^};$$/p' crates/$$half/src/lib.rs | sed '1d;$$d' | tr -d ' \t' | tr ',' '\n' | grep -v '^$$' || true); \
+	  if [ -z "$$reexports" ]; then \
+	    echo "crates/$$half/src/lib.rs has no 'pub use aenv_core::{' block to read; this check"; \
+	    echo "anchors on that declaration and a reshaped one turns it silently green."; \
+	    fail=1; \
+	  fi; \
+	  for module in $$reexports; do \
+	    if [ ! -e "src/$$module.rs" ] && [ ! -d "src/$$module" ]; then \
+	      echo "crates/$$half/src/lib.rs re-exports aenv_core::$$module, which is no module of"; \
+	      echo "aenv-core: whichever half owns it is the only crate that may publish that path."; \
+	      fail=1; \
+	    fi; \
+	  done; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, no p2p transport and no guest agent, aenv-node has no database and no broker TLS, aenv-core holds neither half's runtime, aenv-egress is a leaf whose features each stand alone, the workspace has no embedded database"; fi; \
 	exit $$fail
 
 mutants:

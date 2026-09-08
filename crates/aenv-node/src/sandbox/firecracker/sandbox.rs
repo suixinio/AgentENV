@@ -33,7 +33,7 @@ use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, RuntimeArtifactSet, SandboxBackend, SandboxCaptureError,
-    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 use crate::sandbox::egress::{BrokeredEndpoints, EgressRuntime};
 use crate::sandbox::envd::EnvdInstance;
@@ -43,6 +43,7 @@ use crate::sandbox::extra_drive::{
 };
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
+use crate::sandbox::process::SandboxExecutor;
 use crate::sandbox::ublk::{
     OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice, UblkBackend,
     UblkCreateSpec, UblkDeviceManager,

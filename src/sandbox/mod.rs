@@ -1,11 +1,9 @@
 pub mod access;
 pub mod backend;
 pub mod custom_extension;
-pub mod envd;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod network;
-pub mod process;
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -19,15 +17,13 @@ pub use crate::types::{
     normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
     ExtraDrive,
 };
-pub use ::envd::process::Signal;
 pub use access::{AccessTokenSeedPolicy, EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
     CapturedSandboxSnapshot, InvalidSandboxRequest, ResolvedImageFacts, RuntimeArtifactSet,
     RuntimeConfirmedGone, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
-    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use network::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
-pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
 
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {

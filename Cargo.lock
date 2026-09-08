@@ -122,7 +122,6 @@ dependencies = [
  "confique",
  "custom_extension_client",
  "dashmap",
- "envd",
  "futures",
  "headers",
  "hex",

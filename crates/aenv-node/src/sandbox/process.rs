@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
 use futures::StreamExt;
 use tokio::time::Duration;
 use tonic::Request;
@@ -289,5 +290,104 @@ impl<'a> Executor<'a> {
             }
         }
         bail!("process stream closed before receiving start event");
+    }
+}
+
+/// Process execution capability of a running sandbox.
+///
+/// Implement [`executor`][Self::executor] to provide a [`ProcessClient`][envd::process::ProcessClient]-backed
+/// [`Executor`]. The three convenience methods (`run_command`,
+/// `run_command_with_opts`, `start_process`) have default implementations that
+/// simply call `self.executor()?` and delegate, so callers can continue using
+/// the familiar `sandbox.run_command(...)` pattern without boilerplate.
+///
+/// # Note on `Send`
+/// `&Self` may be `!Send` (e.g. `FirecrackerSandbox` holds tonic clients that
+/// are `!Sync`), so the generated futures are not required to be `Send`.
+#[async_trait(?Send)]
+pub trait SandboxExecutor: Send {
+    /// Obtain a process executor backed by this sandbox's envd connection.
+    ///
+    /// Returns an error if the sandbox is not running.
+    fn executor(&self) -> Result<Executor<'_>>;
+
+    /// Run a command inside the sandbox and wait for it to complete.
+    ///
+    /// Returns the captured stdout, stderr, and exit code.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use aenv_node::sandbox::SandboxExecutor;
+    /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
+    /// let output = sandbox.run_command("echo", &["hello", "world"]).await?;
+    /// assert_eq!(output.exit_code, 0);
+    /// println!("{}", output.stdout);
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn run_command(&self, cmd: &str, args: &[&str]) -> Result<ProcessOutput> {
+        self.executor()?.run_command(cmd, args).await
+    }
+
+    /// Run a command with custom options and wait for it to complete.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use aenv_node::sandbox::{ProcessOpts, SandboxExecutor};
+    /// use std::collections::HashMap;
+    /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
+    /// let opts = ProcessOpts::new().with_cwd("/tmp");
+    /// let output = sandbox.run_command_with_opts("ls", &["-la"], &opts).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn run_command_with_opts(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        opts: &ProcessOpts,
+    ) -> Result<ProcessOutput> {
+        self.executor()?
+            .run_command_with_opts(cmd, args, opts)
+            .await
+    }
+
+    /// Create a directory (and any missing parents) inside the sandbox.
+    ///
+    /// Goes through envd's filesystem service rather than exec'ing a binary,
+    /// so it works in images that ship no userland (scratch, distroless).
+    /// An already-existing directory is not an error.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use aenv_node::sandbox::SandboxExecutor;
+    /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
+    /// sandbox.create_dir_all("/home/user/work").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn create_dir_all(&self, path: &str) -> Result<()> {
+        self.executor()?.create_dir_all(path).await
+    }
+
+    /// Start a long-running process and return a handle.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use aenv_node::sandbox::{ProcessOpts, SandboxExecutor};
+    /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
+    /// let mut handle = sandbox.start_process("cat", &[], &ProcessOpts::default()).await?;
+    /// handle.send_stdin(b"hello\n").await?;
+    /// handle.kill().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn start_process(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        opts: &ProcessOpts,
+    ) -> Result<ProcessHandle> {
+        self.executor()?.start_process(cmd, args, opts).await
     }
 }

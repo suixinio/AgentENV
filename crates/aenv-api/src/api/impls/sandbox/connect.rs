@@ -90,12 +90,6 @@ impl ApiImpl {
         if let Some(response) = answered {
             return Ok(response);
         }
-        if !self.owns_sandboxes() {
-            return Ok(SandboxesSandboxIdConnectPostResponse::exit(
-                sandbox_not_found(sandbox_id),
-            ));
-        }
-
         // No record: resume from the sandbox's newest pause, if it has one.
         let record = match self.latest_paused_snapshot(sandbox_id).await {
             Ok(Some(record)) => record,

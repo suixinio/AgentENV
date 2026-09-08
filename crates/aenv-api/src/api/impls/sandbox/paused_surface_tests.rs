@@ -77,10 +77,6 @@ impl Surface {
         Self::as_half(ResumeWiring::api_half_for_test()).await
     }
 
-    async fn node_half() -> Self {
-        Self::as_half(ResumeWiring::node_local(ORIGIN)).await
-    }
-
     fn paused_at(&self, sandbox_id: SandboxId, paused: PausedSandboxConfig, at_unix_ms: i64) {
         self.catalog.seed(paused_sandbox_record(
             sandbox_id,
@@ -262,36 +258,6 @@ async fn a_paused_sandbox_is_read_from_its_row_with_state_paused() {
         ),
         "a sandbox with neither a record nor a row is not found"
     );
-}
-
-#[tokio::test]
-async fn the_node_half_does_not_read_paused_rows() {
-    let node = Surface::node_half().await;
-    let sandbox_id = node.paused(mock_paused_sandbox_config());
-
-    assert!(
-        matches!(
-            node.get(sandbox_id).await,
-            SandboxesSandboxIdGetResponse::Status404_NotFound(_)
-        ),
-        "the row sits in this process's catalog and the node half still answers 404"
-    );
-    assert!(matches!(
-        node.resume(sandbox_id).await,
-        SandboxesSandboxIdResumePostResponse::Status404_NotFound(_)
-    ));
-    assert!(matches!(
-        node.pause(sandbox_id).await,
-        SandboxesSandboxIdPausePostResponse::Status404_NotFound(_)
-    ));
-    assert!(
-        matches!(
-            node.delete(sandbox_id).await,
-            SandboxesSandboxIdDeleteResponse::Status404_NotFound(_)
-        ),
-        "and it deletes no rows it does not own"
-    );
-    assert!(node.list_v2(Vec::new()).await.is_empty());
 }
 
 #[tokio::test]

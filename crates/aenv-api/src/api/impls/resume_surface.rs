@@ -86,74 +86,41 @@ pub(in crate::api) trait RoutingProjectionWriter: Send + Sync {
     ) -> Result<(), String>;
 }
 
-/// Whether this process runs sandboxes on its own machine, and which machine
-/// that is.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(in crate::api) enum WakeSite {
-    /// The orchestration surface behind this `ApiImpl` runs sandboxes on this
-    /// machine, named here. It holds no snapshot catalog, so it can only
-    /// answer for what is running.
-    Local(String),
-    /// The orchestration surface places wake-ups on their selected machines.
-    Remote,
-}
-
 /// Everything the resume surface needs beyond what `ApiImpl` already holds.
 #[derive(Clone)]
 pub struct ResumeWiring {
     placement: Option<Arc<dyn ResumePlacementSource>>,
-    /// `None` where this process holds no projection to write: the node half,
-    /// and test wirings that only inject a placement answer.
+    /// `None` in test wirings that only inject a placement answer.
     projection: Option<Arc<dyn RoutingProjectionWriter>>,
-    wake_site: WakeSite,
 }
 
 impl ResumeWiring {
-    /// Constructor seam for injected placement and wake-site policy.
+    /// Constructor seam for injected placement and projection.
     #[cfg(test)]
     pub(in crate::api) fn new(
         placement: Option<Arc<dyn ResumePlacementSource>>,
         projection: Option<Arc<dyn RoutingProjectionWriter>>,
-        wake_site: WakeSite,
     ) -> Self {
         Self {
             placement,
             projection,
-            wake_site,
         }
     }
 
-    /// Whether this wiring's orchestration surface runs sandboxes in process.
-    pub(in crate::api) fn runs_sandboxes_here(&self) -> bool {
-        matches!(self.wake_site, WakeSite::Local(_))
-    }
-
-    /// The node half: runs sandboxes here, consults nothing beyond its own
-    /// records.
-    pub fn node_local(node_id: impl Into<String>) -> Self {
-        Self {
-            placement: None,
-            projection: None,
-            wake_site: WakeSite::Local(node_id.into()),
-        }
-    }
-
-    /// The api half with no cluster wired: tests that need the role only.
+    /// No cluster wired: tests that need the surface and not the placement.
     pub fn api_half_for_test() -> Self {
         Self {
             placement: None,
             projection: None,
-            wake_site: WakeSite::Remote,
         }
     }
 
-    /// The api half over its own in-process node registry.
+    /// Over this process's own in-process node registry.
     pub fn cluster_in_process(local: NodeRegistryGrpcService) -> Self {
         let source = Arc::new(NativePlacementSource { local });
         Self {
             placement: Some(Arc::clone(&source) as Arc<dyn ResumePlacementSource>),
             projection: Some(source as Arc<dyn RoutingProjectionWriter>),
-            wake_site: WakeSite::Remote,
         }
     }
 }
@@ -318,12 +285,6 @@ impl ApiImpl {
             Err(err) => return DataPlaneResume::Undecided(err.to_string()),
         }
 
-        // Only the api half reads the catalog; a node that finds nothing
-        // running has nothing more to say.
-        let WakeSite::Remote = &self.resume_wiring.wake_site else {
-            return DataPlaneResume::NotFound;
-        };
-
         let record = match self.latest_paused_snapshot(sandbox_id).await {
             Ok(Some(record)) => record,
             Ok(None) => return DataPlaneResume::NotFound,
@@ -472,14 +433,11 @@ impl ApiImpl {
     /// The node now running a sandbox this process placed or runs, with the
     /// address the placement source has for it.
     async fn node_running(&self, sandbox_id: SandboxId) -> PlacedNode {
-        let node_id = match &self.resume_wiring.wake_site {
-            WakeSite::Local(here) => here.clone(),
-            WakeSite::Remote => self
-                .orchestrator()
-                .sandbox_holding_node_id(&sandbox_id)
-                .await
-                .unwrap_or_default(),
-        };
+        let node_id = self
+            .orchestrator()
+            .sandbox_holding_node_id(&sandbox_id)
+            .await
+            .unwrap_or_default();
         let address = match self.resume_wiring.placement.as_ref() {
             Some(source) if !node_id.is_empty() => {
                 source.address_of(&node_id).await.unwrap_or_default()
@@ -496,14 +454,10 @@ impl ApiImpl {
         record: &SnapshotRecord,
         metadata: &SandboxMetadata,
     ) {
-        let landed_on = match &self.resume_wiring.wake_site {
-            WakeSite::Local(here) => Some(here.clone()),
-            WakeSite::Remote => {
-                self.orchestrator()
-                    .sandbox_holding_node_id(&metadata.id)
-                    .await
-            }
-        };
+        let landed_on = self
+            .orchestrator()
+            .sandbox_holding_node_id(&metadata.id)
+            .await;
         let Some(landed_on) = landed_on else {
             return;
         };
@@ -637,11 +591,5 @@ mod tests {
             refusal_from_status(&tonic::Status::internal("boom")),
             Err(PlacementRefusal::Failed(_))
         ));
-    }
-
-    #[test]
-    fn only_the_node_half_runs_sandboxes_here() {
-        assert!(ResumeWiring::node_local("node-a").runs_sandboxes_here());
-        assert!(!ResumeWiring::api_half_for_test().runs_sandboxes_here());
     }
 }

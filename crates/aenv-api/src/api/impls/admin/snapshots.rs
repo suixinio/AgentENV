@@ -66,7 +66,6 @@ mod operator_snapshot_delete_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::identity::NodeIdentity;
     use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
@@ -247,7 +246,7 @@ mod operator_snapshot_delete_tests {
             snapshot_manager,
             None,
             Vec::new(),
-            crate::api::ResumeWiring::node_local(NodeIdentity::from_config(&Default::default()).id),
+            crate::api::ResumeWiring::api_half_for_test(),
         ));
 
         Surface {

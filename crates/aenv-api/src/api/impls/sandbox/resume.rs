@@ -110,12 +110,6 @@ impl ApiImpl {
                 ));
             }
         }
-        if !self.owns_sandboxes() {
-            return Ok(SandboxesSandboxIdResumePostResponse::exit(
-                sandbox_not_found(sandbox_id),
-            ));
-        }
-
         let record = match self.latest_paused_snapshot(sandbox_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {

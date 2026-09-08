@@ -28,17 +28,13 @@ impl ApiImpl {
                 ))
             }
         };
-        let forgotten = if self.owns_sandboxes() {
-            match self.forget_paused_snapshots(sandbox_id).await {
-                Ok(deleted) => deleted > 0,
-                Err(err) => {
-                    return Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
-                        Self::snapshot_manager_error(&err),
-                    ))
-                }
+        let forgotten = match self.forget_paused_snapshots(sandbox_id).await {
+            Ok(deleted) => deleted > 0,
+            Err(err) => {
+                return Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ))
             }
-        } else {
-            false
         };
         if killed || forgotten {
             Ok(SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully)

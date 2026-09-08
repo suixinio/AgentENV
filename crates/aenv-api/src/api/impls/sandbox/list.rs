@@ -102,7 +102,7 @@ impl ApiImpl {
         } else {
             Vec::new()
         };
-        if want_paused && self.owns_sandboxes() {
+        if want_paused {
             let running_ids: std::collections::HashSet<SandboxId> =
                 running.iter().map(|sandbox| sandbox.id).collect();
             let paused = match self.list_paused_snapshots(user_metadata).await {

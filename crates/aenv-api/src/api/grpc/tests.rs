@@ -9,9 +9,7 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 use tonic::Code;
 
-use crate::api::impls::{
-    PlacedNode, PlacementRefusal, ResumePlacement, ResumePlacementSource, WakeSite,
-};
+use crate::api::impls::{PlacedNode, PlacementRefusal, ResumePlacement, ResumePlacementSource};
 use crate::api::{ApiImpl, ResumeWiring};
 use crate::cfg::ConfigManager;
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
@@ -30,7 +28,6 @@ use crate::snapshot::PausedSandboxConfig;
 use crate::types::{ExecutionId, SandboxId};
 
 /// Node on which the process under test runs sandboxes when it is a node.
-const THIS_NODE: &str = "node-under-test";
 /// A different node the placement source may name.
 const OTHER_NODE: &str = "node-elsewhere";
 
@@ -66,19 +63,8 @@ fn running_on(node_id: &str, execution_id: ExecutionId) -> ResumePlacement {
     }
 }
 
-fn node_half(answer: Result<ResumePlacement, PlacementRefusal>) -> ResumeWiring {
-    wiring_at(answer, WakeSite::Local(THIS_NODE.to_string()))
-}
-
 fn api_half(answer: Result<ResumePlacement, PlacementRefusal>) -> ResumeWiring {
-    wiring_at(answer, WakeSite::Remote)
-}
-
-fn wiring_at(
-    answer: Result<ResumePlacement, PlacementRefusal>,
-    wake_site: WakeSite,
-) -> ResumeWiring {
-    ResumeWiring::new(Some(Arc::new(StubPlacement(answer))), None, wake_site)
+    ResumeWiring::new(Some(Arc::new(StubPlacement(answer))), None)
 }
 
 struct BuiltApi {
@@ -269,31 +255,6 @@ async fn a_placement_that_names_a_running_node_is_answered_as_it_stands() {
             .code(),
         Code::NotFound,
         "the placement above is what made the sandbox exist; without it the same id is unknown"
-    );
-}
-
-#[tokio::test]
-async fn a_running_record_on_this_node_hands_back_this_nodes_address() {
-    let api = serve_api(node_half(Ok(ResumePlacement::NotRunning))).await;
-    let sandbox_id = api.running(false).await;
-
-    let woken = api
-        .resume(&sandbox_id.to_string(), None, None)
-        .await
-        .expect("a running sandbox is a successful wake-up");
-
-    assert_eq!(
-        woken.node_id, THIS_NODE,
-        "the placement source lagged a record this node holds; the answer names this node"
-    );
-    assert_eq!(
-        woken.node_address,
-        address_of(THIS_NODE),
-        "and its address, so the gateway can forward without looking the node up again"
-    );
-    assert!(
-        !woken.execution_id.is_empty(),
-        "the incarnation is what fences the forwarded request"
     );
 }
 
@@ -669,28 +630,6 @@ async fn a_paused_sandbox_with_auto_resume_off_is_refused_and_the_other_two_are_
         .await
         .expect("an already-running sandbox is a success regardless of the flag");
     assert!(!already.execution_id.is_empty());
-}
-
-#[tokio::test]
-async fn the_node_half_answers_not_found_for_anything_it_is_not_running() {
-    let node = serve_api(node_half(Ok(ResumePlacement::NotRunning))).await;
-    let paused_here = node.paused(mock_paused_sandbox_config());
-
-    assert_eq!(
-        node.resume(&paused_here.to_string(), None, None)
-            .await
-            .expect_err("a node holds no catalog and cannot wake from a row")
-            .code(),
-        Code::NotFound,
-        "the row is in this process's catalog, and the node half must still not read it"
-    );
-    assert_eq!(node.state_of(paused_here).await, None);
-
-    let api = serve_api(api_half(Ok(ResumePlacement::NotRunning))).await;
-    let paused_there = api.paused(mock_paused_sandbox_config());
-    api.resume(&paused_there.to_string(), None, None)
-        .await
-        .expect("the same row wakes on the api half, so the NotFound above is the half's doing");
 }
 
 #[tokio::test]

@@ -32,7 +32,7 @@ pub use resume_surface::ResumeWiring;
 pub(in crate::api) use resume_surface::{DataPlaneResume, DataPlaneResumeRequest};
 #[cfg(test)]
 pub(in crate::api) use resume_surface::{
-    PlacedNode, PlacementRefusal, ResumePlacement, ResumePlacementSource, WakeSite,
+    PlacedNode, PlacementRefusal, ResumePlacement, ResumePlacementSource,
 };
 
 #[derive(Clone, Debug)]
@@ -104,16 +104,6 @@ impl ApiImpl {
     ) -> Self {
         self.node_fleet = NodeFleetView::cluster(registry, node_service_port);
         self
-    }
-
-    /// Whether this process runs the sandboxes represented by this API.
-    pub fn runs_sandbox_runtime(&self) -> bool {
-        self.resume_wiring.runs_sandboxes_here()
-    }
-
-    /// Whether this process owns user-facing sandbox decisions.
-    pub fn owns_sandboxes(&self) -> bool {
-        !self.runs_sandbox_runtime()
     }
 
     /// Returns remote template-build placement, if configured.

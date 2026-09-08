@@ -21,11 +21,6 @@ impl ApiImpl {
             Ok(Some(metadata)) => metadata,
             Ok(None) => {
                 // No record: the sandbox is paused, or it does not exist.
-                if !self.owns_sandboxes() {
-                    return Ok(SandboxesSandboxIdGetResponse::Status404_NotFound(
-                        sandbox_not_found(sandbox_id),
-                    ));
-                }
                 return Ok(match self.latest_paused_snapshot(sandbox_id).await {
                     Ok(Some(record)) => match paused::paused_sandbox_detail(&record) {
                         Some(detail) => {

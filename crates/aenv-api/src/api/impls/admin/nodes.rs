@@ -339,7 +339,6 @@ mod fleet_node_tests {
     use agentenv_http_server::models;
 
     use super::{observed_node_detail, observed_node_model, observed_status, ApiImpl};
-    use crate::identity::NodeIdentity;
     use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
     use crate::node_registry::types::Node as DiscoveredNode;
     use crate::orchestrator::Orchestrator;
@@ -535,14 +534,13 @@ mod fleet_node_tests {
         node_service_port: u16,
     ) -> ApiImpl {
         let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
-        let identity = NodeIdentity::from_config(&Default::default());
 
         let api = ApiImpl::new(
             orchestrator,
             Arc::new(mock_snapshot_manager()),
             None,
             Vec::new(),
-            crate::api::ResumeWiring::node_local(identity.id.clone()),
+            crate::api::ResumeWiring::api_half_for_test(),
         );
         match fleet {
             Some(registry) => {

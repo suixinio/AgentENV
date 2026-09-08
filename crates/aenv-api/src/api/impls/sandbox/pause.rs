@@ -29,9 +29,7 @@ impl ApiImpl {
             ),
             Err(OrchestratorError::SandboxNotFound(id)) => {
                 // Already paused reads as a conflict, never as absence.
-                if self.owns_sandboxes()
-                    && matches!(self.latest_paused_snapshot(id).await, Ok(Some(_)))
-                {
+                if matches!(self.latest_paused_snapshot(id).await, Ok(Some(_))) {
                     return Ok(SandboxesSandboxIdPausePostResponse::Status409_Conflict(
                         Self::error(409, format!("sandbox {id} is already paused")),
                     ));

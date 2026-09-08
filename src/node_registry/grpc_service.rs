@@ -1965,7 +1965,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_registers_every_roster_entry_and_its_holder() {
+    async fn heartbeat_keeps_every_roster_entry_the_node_reported() {
         let store = Arc::new(RecordingBindingStore::default());
         let (registry, service) = service_with_registry(
             vec![node("node-a", "http://node-a")],
@@ -1977,21 +1977,12 @@ mod tests {
             .await
             .expect("node-a heartbeats");
 
-        let (roster, _last_seen) = registry
-            .roster_of("node-a")
+        let roster = registry
+            .rosters_in_cluster("")
+            .into_iter()
+            .find(|roster| roster.node_id == "node-a")
             .expect("the node reported, so it has a roster");
-        let held: Vec<&str> = roster
-            .iter()
-            .map(|entry| entry.sandbox_id.as_str())
-            .collect();
-        assert_eq!(held, vec!["sbx-1", "sbx-2"]);
-        for sandbox_id in ["sbx-1", "sbx-2"] {
-            assert_eq!(
-                registry.nodes_holding(sandbox_id),
-                vec!["node-a".to_string()],
-                "the reverse index names the node holding {sandbox_id}"
-            );
-        }
+        assert_eq!(roster.sandbox_ids(), vec!["sbx-1", "sbx-2"]);
     }
 
     #[tokio::test]
@@ -2879,7 +2870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lookup_node_falls_back_to_the_roster_when_the_binding_store_misses() {
+    async fn lookup_node_answers_not_found_for_a_roster_no_reconcile_ever_bound() {
         let registry = Arc::new(AtomicNodeRegistry::new(
             vec![node("node-a", "http://10.0.0.1:8000")],
             Duration::from_secs(30),
@@ -2894,64 +2885,11 @@ mod tests {
         let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
             .with_binding_store(in_memory_binding_store(), false, Duration::ZERO);
 
-        let resp = service
+        let status = service
             .lookup_sandbox(&sandbox_id.to_string())
             .await
-            .expect("no binding, but node-a's roster lists it");
-        assert_eq!(resp.node.id, "node-a");
-        assert_eq!(resp.label, LookupResultLabel::BoundRoster);
-    }
-
-    #[tokio::test]
-    async fn lookup_node_roster_prefers_the_lexicographically_newer_incarnation() {
-        let sandbox_id = SandboxId::new();
-        for (lower, higher) in [("node-a", "node-b"), ("node-b", "node-a")] {
-            let registry = Arc::new(AtomicNodeRegistry::new(
-                vec![
-                    node("node-a", "http://10.0.0.1:8000"),
-                    node("node-b", "http://10.0.0.2:8000"),
-                ],
-                Duration::from_secs(30),
-            ));
-            let now = SystemTime::now();
-            registry
-                .heartbeat(
-                    &heartbeat_req(
-                        lower,
-                        vec![(
-                            &sandbox_id.to_string(),
-                            "00000000-0000-7000-8000-000000000001",
-                        )],
-                    ),
-                    now,
-                )
-                .expect(lower);
-            registry
-                .heartbeat(
-                    &heartbeat_req(
-                        higher,
-                        vec![(
-                            &sandbox_id.to_string(),
-                            "00000000-0000-7000-8000-000000000002",
-                        )],
-                    ),
-                    now,
-                )
-                .expect(higher);
-            let service = NodeRegistryGrpcService::new(Arc::clone(&registry), warm_gate(&registry))
-                .with_binding_store(in_memory_binding_store(), false, Duration::ZERO);
-
-            let resp = service
-                .lookup_sandbox(&sandbox_id.to_string())
-                .await
-                .expect("a live roster hit");
-            assert_eq!(
-                resp.node.id, higher,
-                "lower={lower} higher={higher}: the newer incarnation must win regardless of \
-                 iteration order"
-            );
-            assert_eq!(resp.execution_id, "00000000-0000-7000-8000-000000000002");
-        }
+            .expect_err("a roster the binding store never saw routes nothing");
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

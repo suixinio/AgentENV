@@ -102,6 +102,9 @@ pub struct StoredObservedRecord {
     pub last_seen_unix_ms: i64,
     pub p2p_endpoint: Option<StoredP2pEndpoint>,
     pub report_ttl_secs: u64,
+    /// The node's last reported roster. Routing does not read it; the binding
+    /// sweeper does, so that a replica which never received this node's
+    /// heartbeat can still retire what it was running.
     pub entries: Vec<StoredRosterEntry>,
 }
 

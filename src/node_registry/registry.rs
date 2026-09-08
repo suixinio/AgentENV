@@ -107,10 +107,6 @@ pub trait NodeRegistry: Send + Sync {
         node_id: &str,
         now: SystemTime,
     ) -> Option<(NodeSnapshot, SnapshotFreshness)>;
-    /// Returns a node's latest normalized roster and receive time.
-    fn roster_of(&self, node_id: &str) -> Option<(Vec<RosterEntry>, SystemTime)>;
-    /// Returns every node whose latest roster names the sandbox.
-    fn nodes_holding(&self, sandbox_id: &str) -> Vec<String>;
     /// Returns cluster rosters sorted by node ID.
     fn rosters_in_cluster(&self, cluster_id: &str) -> Vec<Roster>;
     fn unregister_observed(
@@ -290,7 +286,6 @@ struct Inner {
     observed: HashMap<String, ObservedNodeRecord>,
     cpu_intersection: HashMap<String, String>,
     intersection_sent: HashSet<String>,
-    sandbox_holders: HashMap<String, HashSet<String>>,
     /// First empty-sync time and consecutive confirmation count.
     pending_empty_sync: Option<(SystemTime, u32)>,
 }
@@ -358,53 +353,7 @@ impl Inner {
         intersect_cpu_configs(&jsons).unwrap_or_default()
     }
 
-    /// Replaces a node's roster while keeping the reverse index consistent.
-    fn apply_roster(&mut self, node_id: &str, roster: &[RosterEntry]) {
-        let next: HashSet<&str> = roster.iter().map(|e| e.sandbox_id.as_str()).collect();
-
-        if let Some(previous) = self.observed.get(node_id) {
-            let dropped: Vec<String> = previous
-                .entries
-                .iter()
-                .filter(|e| !next.contains(e.sandbox_id.as_str()))
-                .map(|e| e.sandbox_id.clone())
-                .collect();
-            for sandbox_id in dropped {
-                self.remove_holder(&sandbox_id, node_id);
-            }
-        }
-
-        for sandbox_id in next {
-            self.sandbox_holders
-                .entry(sandbox_id.to_string())
-                .or_default()
-                .insert(node_id.to_string());
-        }
-    }
-
-    fn clear_roster(&mut self, node_id: &str) {
-        if let Some(record) = self.observed.get(node_id) {
-            let sandbox_ids: Vec<String> = record
-                .entries
-                .iter()
-                .map(|e| e.sandbox_id.clone())
-                .collect();
-            for sandbox_id in sandbox_ids {
-                self.remove_holder(&sandbox_id, node_id);
-            }
-        }
-    }
-
-    fn remove_holder(&mut self, sandbox_id: &str, node_id: &str) {
-        if let Some(holders) = self.sandbox_holders.get_mut(sandbox_id) {
-            holders.remove(node_id);
-            if holders.is_empty() {
-                self.sandbox_holders.remove(sandbox_id);
-            }
-        }
-    }
-
-    /// Ingests a local or remote observation while updating roster and CPU caches.
+    /// Ingests a local or remote observation while updating the CPU cache.
     fn ingest_observed(&mut self, node_id: &str, record: ObservedNodeRecord) {
         let prev_cpu = self
             .observed
@@ -421,7 +370,6 @@ impl Inner {
             .as_ref()
             .is_some_and(|m| m.cpu_config_json != prev_cpu);
 
-        self.apply_roster(node_id, &record.entries);
         self.observed.insert(node_id.to_string(), record);
 
         if !existed || cpu_changed {
@@ -520,7 +468,6 @@ impl AtomicNodeRegistry {
                 observed: HashMap::new(),
                 cpu_intersection: HashMap::new(),
                 intersection_sent: HashSet::new(),
-                sandbox_holders: HashMap::new(),
                 pending_empty_sync: None,
             }),
             empty_sync_guard,
@@ -660,7 +607,6 @@ impl AtomicNodeRegistry {
             if !cluster_id.is_empty() {
                 affected_clusters.insert(cluster_id);
             }
-            inner.clear_roster(&node_id);
             inner.observed.remove(&node_id);
             inner.intersection_sent.remove(&node_id);
             departed.push(node_id);
@@ -715,7 +661,6 @@ impl AtomicNodeRegistry {
                     affected_clusters.insert(record.node.cluster_id.clone());
                 }
             }
-            inner.clear_roster(&node_id);
             inner.intersection_sent.remove(&node_id);
             departed.push(node_id);
         }
@@ -934,26 +879,6 @@ impl NodeRegistry for AtomicNodeRegistry {
         Some((snapshot, freshness))
     }
 
-    fn roster_of(&self, node_id: &str) -> Option<(Vec<RosterEntry>, SystemTime)> {
-        let inner = self.inner.read().expect("node registry lock poisoned");
-        let record = inner.observed.get(node_id)?;
-        Some((record.entries.clone(), record.last_seen))
-    }
-
-    fn nodes_holding(&self, sandbox_id: &str) -> Vec<String> {
-        let sandbox_id = sandbox_id.trim();
-        if sandbox_id.is_empty() {
-            return Vec::new();
-        }
-        let inner = self.inner.read().expect("node registry lock poisoned");
-        let Some(holders) = inner.sandbox_holders.get(sandbox_id) else {
-            return Vec::new();
-        };
-        let mut node_ids: Vec<String> = holders.iter().cloned().collect();
-        node_ids.sort();
-        node_ids
-    }
-
     fn rosters_in_cluster(&self, cluster_id: &str) -> Vec<Roster> {
         let wanted = normalize_cluster_id(cluster_id);
         let inner = self.inner.read().expect("node registry lock poisoned");
@@ -996,7 +921,6 @@ impl NodeRegistry for AtomicNodeRegistry {
             return Err(ServiceInstanceMismatch);
         }
         let cluster_id = record.node.cluster_id.clone();
-        inner.clear_roster(node_id);
         inner.observed.remove(node_id);
         inner.invalidate_intersection(&cluster_id);
         drop(inner);
@@ -1256,6 +1180,14 @@ mod tests {
 
     fn roster_ids(entries: &[RosterEntry]) -> Vec<String> {
         entries.iter().map(|e| e.sandbox_id.clone()).collect()
+    }
+
+    /// The node's latest roster, or `None` when it has never reported one.
+    fn reported_roster(registry: &AtomicNodeRegistry, node_id: &str) -> Option<Roster> {
+        registry
+            .rosters_in_cluster("")
+            .into_iter()
+            .find(|roster| roster.node_id == node_id && roster.last_seen.is_some())
     }
 
     /// Builds a remote observed-record fixture.
@@ -1772,23 +1704,20 @@ mod tests {
     }
 
     #[test]
-    fn roster_of_keeps_the_heartbeat_roster() {
+    fn a_heartbeat_is_what_gives_a_node_a_roster() {
         let registry = AtomicNodeRegistry::new(
             vec![node("node-a", "http://node-a")],
             DEFAULT_OBSERVED_REPORT_TTL,
         );
         let now = unix(1_700_000_000);
 
-        assert!(registry.roster_of("node-a").is_none());
+        assert!(reported_roster(&registry, "node-a").is_none());
 
         heartbeat_with_roster(&registry, "node-a", "cluster-a", now, &["s1", "s2"]);
 
-        let (roster, last_seen) = registry.roster_of("node-a").expect("a roster");
-        assert_eq!(roster_ids(&roster), vec!["s1", "s2"]);
-        assert_eq!(last_seen, now);
-
-        let (again, _) = registry.roster_of("node-a").unwrap();
-        assert_eq!(again[0].sandbox_id, "s1");
+        let roster = reported_roster(&registry, "node-a").expect("a roster");
+        assert_eq!(roster_ids(&roster.entries), vec!["s1", "s2"]);
+        assert_eq!(roster.last_seen, Some(now));
     }
 
     #[test]
@@ -1807,28 +1736,19 @@ mod tests {
             &[" s1 ", "", "s1", "s2"],
         );
 
-        let (roster, _) = registry.roster_of("node-a").unwrap();
-        assert_eq!(roster_ids(&roster), vec!["s1", "s2"]);
+        let roster = reported_roster(&registry, "node-a").expect("a roster");
+        assert_eq!(roster_ids(&roster.entries), vec!["s1", "s2"]);
     }
 
     #[test]
-    fn nodes_holding_is_the_reverse_index() {
+    fn a_later_heartbeat_replaces_the_roster_it_reported_before() {
         let registry = AtomicNodeRegistry::new(
-            vec![
-                node("node-a", "http://node-a"),
-                node("node-b", "http://node-b"),
-            ],
+            vec![node("node-a", "http://node-a")],
             DEFAULT_OBSERVED_REPORT_TTL,
         );
         let now = unix(1_700_000_000);
 
         heartbeat_with_roster(&registry, "node-a", "cluster-a", now, &["s1", "s2"]);
-        heartbeat_with_roster(&registry, "node-b", "cluster-a", now, &["s2", "s3"]);
-
-        assert_eq!(registry.nodes_holding("s1"), vec!["node-a"]);
-        assert_eq!(registry.nodes_holding("s2"), vec!["node-a", "node-b"]);
-        assert!(registry.nodes_holding("nobody").is_empty());
-
         heartbeat_with_roster(
             &registry,
             "node-a",
@@ -1836,16 +1756,9 @@ mod tests {
             now + Duration::from_secs(1),
             &["s1"],
         );
-        assert_eq!(registry.nodes_holding("s2"), vec!["node-b"]);
 
-        heartbeat_with_roster(
-            &registry,
-            "node-a",
-            "cluster-a",
-            now + Duration::from_secs(2),
-            &[],
-        );
-        assert!(registry.nodes_holding("s1").is_empty());
+        let roster = reported_roster(&registry, "node-a").expect("a roster");
+        assert_eq!(roster_ids(&roster.entries), vec!["s1"]);
     }
 
     #[test]
@@ -1889,8 +1802,7 @@ mod tests {
             .unregister_observed("node-a", "svc-node-a")
             .unwrap();
 
-        assert!(registry.nodes_holding("s1").is_empty());
-        assert!(registry.roster_of("node-a").is_none());
+        assert!(reported_roster(&registry, "node-a").is_none());
 
         let rosters = registry.rosters_in_cluster("");
         assert_eq!(rosters.len(), 1);
@@ -1913,8 +1825,15 @@ mod tests {
 
         registry.set(vec![node("node-b", "http://node-b")], Vec::new(), now);
 
-        assert!(registry.nodes_holding("s1").is_empty());
-        assert_eq!(registry.nodes_holding("s2"), vec!["node-b"]);
+        assert!(reported_roster(&registry, "node-a").is_none());
+        assert_eq!(
+            roster_ids(
+                &reported_roster(&registry, "node-b")
+                    .expect("node-b is still discovered")
+                    .entries
+            ),
+            vec!["s2"]
+        );
     }
 
     #[test]
@@ -2335,16 +2254,24 @@ mod tests {
             )
             .expect("node-a heartbeats while pending");
         assert_eq!(
-            registry.nodes_holding("sandbox-1"),
-            vec!["node-a".to_string()]
+            roster_ids(
+                &reported_roster(&registry, "node-a")
+                    .expect("node-a reported")
+                    .entries
+            ),
+            vec!["sandbox-1".to_string()]
         );
 
         registry.set(Vec::new(), Vec::new(), unix(105));
         registry.admit_pending(vec![node("node-a", "http://node-a")]);
 
         assert_eq!(
-            registry.nodes_holding("sandbox-1"),
-            vec!["node-a".to_string()],
+            roster_ids(
+                &reported_roster(&registry, "node-a")
+                    .expect("node-a is still pending, not departed")
+                    .entries
+            ),
+            vec!["sandbox-1".to_string()],
             "a still-pending node's roster must survive the set() call in between two              admit_pending calls"
         );
     }
@@ -2485,9 +2412,9 @@ mod tests {
         }];
         registry.merge_remote_snapshot(HashMap::from([("node-a".to_string(), stale)]));
 
-        let (entries, _) = registry.roster_of("node-a").expect("node-a has a roster");
+        let roster = reported_roster(&registry, "node-a").expect("node-a has a roster");
         assert_eq!(
-            roster_ids(&entries),
+            roster_ids(&roster.entries),
             vec!["sbx-fresh".to_string()],
             "a stale pull must never regress a fresher local heartbeat's roster"
         );
@@ -2509,9 +2436,9 @@ mod tests {
         }];
         registry.merge_remote_snapshot(HashMap::from([("node-a".to_string(), newer)]));
 
-        let (entries, last_seen) = registry.roster_of("node-a").expect("node-a has a roster");
-        assert_eq!(roster_ids(&entries), vec!["sbx-new".to_string()]);
-        assert_eq!(last_seen, unix(200));
+        let roster = reported_roster(&registry, "node-a").expect("node-a has a roster");
+        assert_eq!(roster_ids(&roster.entries), vec!["sbx-new".to_string()]);
+        assert_eq!(roster.last_seen, Some(unix(200)));
     }
 
     #[test]

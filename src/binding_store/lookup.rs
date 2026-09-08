@@ -16,9 +16,6 @@ use crate::node_registry::types::{Node, RichNode};
 use crate::node_registry::warmup::WarmupGate;
 use crate::proto::scheduler::ScheduleRequestHint;
 
-/// Maximum age of a heartbeat roster entry eligible for routing.
-pub use crate::node_registry::registry::DEFAULT_OBSERVED_REPORT_TTL as ROSTER_FRESH_TTL;
-
 /// Dependencies shared by schedule and paused-lookup placement.
 /// All callers must use the same round-robin strategy instance.
 #[derive(Clone, Copy)]
@@ -160,7 +157,6 @@ pub fn select_node(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LookupResultLabel {
     BoundBinding,
-    BoundRoster,
     NotFound,
     InvalidArgument,
     UnavailableBindingStore,
@@ -172,7 +168,6 @@ impl LookupResultLabel {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BoundBinding => "bound_binding",
-            Self::BoundRoster => "bound_roster",
             Self::NotFound => "not_found",
             Self::InvalidArgument => "invalid_argument",
             Self::UnavailableBindingStore => "unavailable_binding_store",
@@ -235,44 +230,6 @@ fn authority_for(execution_id: &str) -> ExecutionAuthority {
     }
 }
 
-fn roster_fresh(last_seen: SystemTime, now: SystemTime) -> bool {
-    now.duration_since(last_seen)
-        .map(|age| age <= ROSTER_FRESH_TTL)
-        .unwrap_or(true)
-}
-
-/// The node whose freshest heartbeat roster names `sandbox_id`, preferring the
-/// lexicographically newer incarnation when two nodes both claim it.
-fn roster_holder(
-    node_registry: &dyn NodeRegistry,
-    sandbox_id: &str,
-    now: SystemTime,
-) -> Option<(Node, String)> {
-    let mut best: Option<(Node, String)> = None;
-    for node_id in node_registry.nodes_holding(sandbox_id) {
-        let Some((entries, last_seen)) = node_registry.roster_of(&node_id) else {
-            continue;
-        };
-        if !roster_fresh(last_seen, now) {
-            continue;
-        }
-        let Some(entry) = entries.iter().find(|entry| entry.sandbox_id == sandbox_id) else {
-            continue;
-        };
-        let Some(node) = node_registry.resolve(&node_id) else {
-            continue;
-        };
-        let newer = best
-            .as_ref()
-            .map(|(_, execution_id)| entry.execution_id > *execution_id)
-            .unwrap_or(true);
-        if newer {
-            best = Some((node, entry.execution_id.clone()));
-        }
-    }
-    best
-}
-
 fn lookup_absent(warm: bool) -> LookupOutcome {
     if warm {
         LookupOutcome::NotFound
@@ -284,9 +241,11 @@ fn lookup_absent(warm: bool) -> LookupOutcome {
     }
 }
 
-/// Resolves a non-empty sandbox id to the node running it: the binding first,
-/// then the heartbeat roster. A paused sandbox has neither and is `NotFound`;
-/// its snapshot row, not this lookup, is what a resume consults.
+/// Resolves a non-empty sandbox id to the node running it. The binding is the
+/// whole answer: a heartbeat's roster reaches routing only by being reconciled
+/// into the binding store, never by being read here. A paused sandbox has no
+/// binding and is `NotFound`; its snapshot row, not this lookup, is what a
+/// resume consults.
 pub async fn lookup_node(
     deps: &LookupDeps<'_>,
     sandbox_id: &str,
@@ -319,15 +278,6 @@ pub async fn lookup_node(
         Ok(None) => {}
     }
 
-    if let Some((node, execution_id)) = roster_holder(deps.place.node_registry, sandbox_id, now) {
-        return LookupOutcome::Answer(LookupAnswer {
-            node,
-            execution_authority: authority_for(&execution_id),
-            execution_id,
-            label: LookupResultLabel::BoundRoster,
-        });
-    }
-
     lookup_absent(deps.warmup.warmed_up(now))
 }
 
@@ -339,7 +289,7 @@ mod tests {
     use crate::node_registry::registry::{
         AtomicNodeRegistry, NodeNotInRegistry, ServiceInstanceMismatch, DEFAULT_OBSERVED_REPORT_TTL,
     };
-    use crate::node_registry::types::{Roster, RosterEntry};
+    use crate::node_registry::types::Roster;
     use crate::proto::scheduler::{
         HeartbeatRequest, NodeSnapshot, NodeStatus, ObservedNode, P2pPeer,
     };
@@ -421,12 +371,6 @@ mod tests {
         ) -> Option<(NodeSnapshot, SnapshotFreshness)> {
             self.peeks_with_freshness.fetch_add(1, Ordering::Relaxed);
             self.inner.peek_observed_with_freshness(node_id, now)
-        }
-        fn roster_of(&self, node_id: &str) -> Option<(Vec<RosterEntry>, SystemTime)> {
-            self.inner.roster_of(node_id)
-        }
-        fn nodes_holding(&self, sandbox_id: &str) -> Vec<String> {
-            self.inner.nodes_holding(sandbox_id)
         }
         fn rosters_in_cluster(&self, cluster_id: &str) -> Vec<Roster> {
             self.inner.rosters_in_cluster(cluster_id)
@@ -722,56 +666,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fresh_roster_entry_binds_the_sandbox_to_the_node_reporting_it() {
+    async fn a_heartbeat_roster_alone_routes_nothing() {
         let sandbox_id = SandboxId::new();
         let execution_id = crate::types::ExecutionId::new().to_string();
         let now = SystemTime::now();
-
-        let running = answer(
-            look_up(
-                &node_a_reporting(sandbox_id, &execution_id, now),
-                &empty_binding_store(),
-                true,
-                sandbox_id,
-                now,
-            )
-            .await,
-        );
-        assert_eq!(running.label, LookupResultLabel::BoundRoster);
-        assert_eq!(running.node.id, "node-a");
-        assert_eq!(running.execution_id, execution_id);
-        assert_eq!(running.execution_authority, ExecutionAuthority::Registry);
-    }
-
-    #[tokio::test]
-    async fn a_roster_entry_without_an_incarnation_binds_with_unknown_authority() {
-        let sandbox_id = SandboxId::new();
-        let now = SystemTime::now();
-
-        let running = answer(
-            look_up(
-                &node_a_reporting(sandbox_id, "", now),
-                &empty_binding_store(),
-                true,
-                sandbox_id,
-                now,
-            )
-            .await,
-        );
-        assert_eq!(running.label, LookupResultLabel::BoundRoster);
-        assert_eq!(running.execution_id, "");
-        assert_eq!(running.execution_authority, ExecutionAuthority::Unknown);
-    }
-
-    #[tokio::test]
-    async fn a_stale_roster_entry_is_an_absence() {
-        let sandbox_id = SandboxId::new();
-        let execution_id = crate::types::ExecutionId::new().to_string();
-        let reported_at = SystemTime::now();
-        let now = reported_at + ROSTER_FRESH_TTL + std::time::Duration::from_secs(1);
 
         let outcome = look_up(
-            &node_a_reporting(sandbox_id, &execution_id, reported_at),
+            &node_a_reporting(sandbox_id, &execution_id, now),
             &empty_binding_store(),
             true,
             sandbox_id,
@@ -780,12 +681,12 @@ mod tests {
         .await;
         assert!(
             matches!(outcome, LookupOutcome::NotFound),
-            "a roster older than ROSTER_FRESH_TTL must not route: {outcome:?}"
+            "a roster reaches routing only through the binding store: {outcome:?}"
         );
     }
 
     #[tokio::test]
-    async fn a_binding_answers_ahead_of_the_roster() {
+    async fn the_binding_answers_even_when_a_roster_names_another_node() {
         let sandbox_id = SandboxId::new();
         let roster_execution_id = crate::types::ExecutionId::new().to_string();
         let bound_execution_id = crate::types::ExecutionId::new().to_string();

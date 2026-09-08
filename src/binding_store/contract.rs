@@ -150,8 +150,24 @@ pub async fn reconcile_node_installs_every_roster_entry<S: BindingStore>(store: 
         .await
         .unwrap();
     assert_eq!(decisions.len(), 2);
-    assert!(store.get("sbx-1", unix(0)).await.unwrap().is_some());
-    assert!(store.get("sbx-2", unix(0)).await.unwrap().is_some());
+    // A roster reaches routing only through these bindings, so each one has to
+    // carry the whole answer a lookup needs.
+    let known = store
+        .get("sbx-1", unix(0))
+        .await
+        .unwrap()
+        .expect("the roster named sbx-1");
+    assert_eq!(known.node.id, "node-a");
+    assert_eq!(known.execution_id, "exec-1");
+    assert_eq!(known.state, BindingState::Confirmed);
+    let unknown = store
+        .get("sbx-2", unix(0))
+        .await
+        .unwrap()
+        .expect("an entry with no incarnation still names its node");
+    assert_eq!(unknown.node.id, "node-a");
+    assert!(unknown.execution_id.is_empty());
+    assert_eq!(unknown.state, BindingState::Confirmed);
 }
 
 pub async fn reconcile_node_with_an_empty_roster_removes_everything_it_owns<S: BindingStore>(

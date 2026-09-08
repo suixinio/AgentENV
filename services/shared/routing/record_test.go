@@ -93,14 +93,14 @@ func TestParseRecordCases(t *testing.T) {
 // against a literal. It went with the encoder: it was that function's only
 // remaining caller, and what it pinned — the field names and order, and
 // `execution_id` being omitted when empty — is pinned by
-// `marshal_record`'s own tests in `src/binding_store/record.rs`, against the
+// `marshal_record`'s own tests in `crates/aenv-api/src/binding_store/record.rs`, against the
 // process that actually writes these bytes. The literals below are the same
 // shape, read from the decoding side.
 
 // The two shapes a live writer actually puts in Redis, written out.
 //
 // 🔴 Literals, and not calls to this package's own encoder. Go does not write
-// these bytes any more — `aenv-api` does, from `src/binding_store/record.rs`'s
+// these bytes any more — `aenv-api` does, from `crates/aenv-api/src/binding_store/record.rs`'s
 // `marshal_record` — so a test that encoded with a Go function and decoded with
 // a Go function would pass for any format the two agreed on, including one no
 // writer in the cluster produces. That is not a hypothetical: the format is the
@@ -208,7 +208,7 @@ func TestAReservationIsNotRoutableAndItsConfirmationIs(t *testing.T) {
 
 // rustWriterSource is the file holding the only writer of these bytes in the
 // cluster: `aenv-api`'s `marshal_record`.
-const rustWriterSource = "../../../src/binding_store/record.rs"
+const rustWriterSource = "../../../crates/aenv-api/src/binding_store/record.rs"
 
 // TestTheStoredLiteralsAreTheOnesRustAssertsToo closes the one gap the two
 // suites leave on their own.

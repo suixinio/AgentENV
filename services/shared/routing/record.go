@@ -6,7 +6,7 @@
 // `services/scheduler` wrote these keys and answered lookups from them and
 // Go's internal rule kept the gateway out of that package's internals. That
 // process is deleted: `aenv-api` writes every record now
-// (`src/binding_store/record.rs`), and the gateway reads them directly and
+// (`crates/aenv-api/src/binding_store/record.rs`), and the gateway reads them directly and
 // synthesises the answer a lookup would have given.
 //
 // So the format lives in two languages rather than in two Go packages, which
@@ -56,7 +56,7 @@ type Record struct {
 }
 
 // The states a stored record may name, spelled as `aenv-api`'s BindingState
-// serializes them (src/binding_store/record.rs).
+// serializes them (crates/aenv-api/src/binding_store/record.rs).
 //
 // A confirmed record is written with the field absent, so stateConfirmed is
 // only ever read, never a value the writer emits.
@@ -73,7 +73,7 @@ func BindingKey(prefix string, sandboxID string) string {
 
 // 🔴 The reverse index's key, NodeIndexKey, is not here. It names the set of
 // sandboxes a node holds, which only a writer maintains — and this module holds
-// no writer. `aenv-api` keeps its own (`src/binding_store/record.rs`'s
+// no writer. `aenv-api` keeps its own (`crates/aenv-api/src/binding_store/record.rs`'s
 // `node_index_key`, pinned to the same `{prefix}:node:{node_id}` format by
 // `keys_match_gos_format`), and a second unused copy here is a format free to
 // drift with nothing reading either one.
@@ -131,7 +131,7 @@ func ParseRecord(raw []byte) (Record, bool) {
 // MarshalRecord used to be "the one encoder", written when `services/scheduler`
 // wrote these keys and its Lua heartbeat script had to splice a record together
 // against a shape this file defined. That process is deleted; `aenv-api` writes
-// every one of these keys now (`src/binding_store/record.rs`'s
+// every one of these keys now (`crates/aenv-api/src/binding_store/record.rs`'s
 // `marshal_record`), and Go only ever reads them.
 //
 // A leftover encoder is worse than none. Its only callers were tests, which

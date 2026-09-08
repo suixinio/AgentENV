@@ -56,7 +56,7 @@ spec:
       # would make every api rollout take an hour to finish for no reason at
       # all, and would hide a hung shutdown behind a wait nobody watches.
       terminationGracePeriodSeconds: 60
-      # Grants src/node_registry/kubernetes_discovery.rs endpointslices/pods
+      # Grants crates/aenv-api/src/node_registry/kubernetes_discovery.rs endpointslices/pods
       # get/list/watch access via serviceaccount.yaml/rolebinding.yaml's
       # agentenv-api identity — required because this process always builds
       # its own node registry, unconditionally.
@@ -326,7 +326,7 @@ spec:
             # There were two consumers here and both are gone:
             #
             #   1. `ResumeWiring::cluster_from_config()`
-            #      (`src/api/impls/resume_surface.rs`) — the wake-site
+            #      (`crates/aenv-api/src/api/impls/resume_surface.rs`) — the wake-site
             #      placement source for `WakeSite::Remote`. It refused to
             #      start without this key ("aenv-api needs
             #      [cluster].scheduler_endpoint") and dialled its
@@ -355,7 +355,7 @@ spec:
             # 🔴 `[binding_store]` backs `Schedule`/`LookupNode`/
             # `RecordAssignment`, which native placement always answers
             # locally (`NativeNodePlacement`,
-            # `src/node_client/native_placement.rs`), and this Deployment
+            # `crates/aenv-api/src/node_client/native_placement.rs`), and this Deployment
             # runs `replicas: 2`. There is no backend key here any more:
             # `AENV_BINDING_STORE_BACKEND` (`in_memory` | `redis`) is deleted
             # along with the enum behind it, because `build_binding_store`
@@ -382,7 +382,7 @@ spec:
             # decides whose deadline a same-incarnation refresh keeps: on, a
             # node's reported projection TTL sets the binding's deadline
             # (`resolve_projection_ttl` in
-            # `src/node_registry/grpc_service.rs`, capped by
+            # `crates/aenv-api/src/node_registry/grpc_service.rs`, capped by
             # AENV_BINDING_STORE_MAX_PROJECTION_TTL_SECS); off, every write
             # falls back to AENV_BINDING_STORE_BINDING_TTL_SECS and a sandbox
             # whose lifetime budget outlives that default depends on the next
@@ -446,7 +446,7 @@ spec:
             # former discovery config: neither was set there either, and the
             # Rust port's cache-sync gate across the three watchers
             # (EndpointSlice, and one Pod watch per selector) is not wired
-            # yet — see `src/node_registry/kubernetes_discovery.rs`'s module
+            # yet — see `crates/aenv-api/src/node_registry/kubernetes_discovery.rs`'s module
             # doc. Setting a selector before that gate exists risks a window
             # where it filters nothing instead of everything.
             # The domain sandbox URLs are built from. Not node state: this half
@@ -490,9 +490,9 @@ spec:
             # The credential this half presents at a node's gRPC gate. It is
             # the node's own key of the shared Secret, read from the same file
             # the node reads, so one value opens the gate and passes it. The
-            # node's REST gate reads this variable too; on this half no gate is
-            # attached (see `assemble` in `src/api/server.rs`), so it only ever
-            # steers what the node client stamps outbound.
+            # node's REST gate reads this variable too; on this half no gate
+            # is attached (`crates/aenv-api/src/api/server.rs` composes none),
+            # so it only ever steers what the node client stamps outbound.
             - name: AENV_API_CONTROL_PLANE_TOKEN_FILE
               value: /etc/agentenv/control-plane/token
             # 🔴 AENV_STARTUP_RECLAIM_ENABLED is deliberately absent, here and
@@ -509,7 +509,7 @@ spec:
             - name: grpc
               containerPort: 8002
             # 🔴 No metrics port. This half serves Prometheus on `/metrics` of
-            # the HTTP port above (`src/api/server.rs`), unlike the gateway and
+            # the HTTP port above (`crates/aenv-api/src/api/server.rs`), unlike the gateway and
             # the scheduler which have listeners of their own — and unlike the
             # node, whose second port belongs to the ublk daemon this half does
             # not run.
@@ -619,12 +619,12 @@ spec:
         # in this process. `POST /sandboxes-cold` does not refuse: it validates
         # the request and ships the *unresolved* reference to a node, which
         # resolves it inside the same `Create`
-        # (`SandboxLaunchSource::UnresolvedImage`, `src/api/impls/sandbox.rs`).
+        # (`SandboxLaunchSource::UnresolvedImage`, `crates/aenv-api/src/api/impls/sandbox/create.rs`).
         # A template build dispatches to a node as well
         # (`run_the_build_on_a_node`); its refusal is narrower than it reads.
         # It is two conjuncts, not one:
         # `!self.runs_sandbox_runtime() && self.node_placement().is_none()`
-        # (`src/api/impls/template.rs`), so it fires only for an `aenv-api`
+        # (`crates/aenv-api/src/api/impls/template.rs`), so it fires only for an `aenv-api`
         # with no node to forward to at all.
         # Mounting the volume here would cost nothing and fix nothing — there
         # is no call site left for it to unblock.

@@ -7,7 +7,7 @@ Go implementation of the AgentENV Gateway.
 `docs/proposals/2026-08-20-service-decomposition.md`'s phase four folded node
 discovery, heartbeat receipt (including the cluster CPU-config intersection),
 placement and P2P peer/artifact lookup into the Rust `aenv-api` binary
-(`src/node_registry/`) before this deletion, so the deletion changes no
+(`crates/aenv-api/src/node_registry/`) before this deletion, so the deletion changes no
 deployed behaviour: every RPC on
 `services/api/proto/scheduler.proto` was already answered by `aenv-api` on
 every current deployment. `services/gateway` is the only Go binary this
@@ -35,9 +35,9 @@ is the node-to-api face, with `aenv-node` its only client. See CLAUDE.md's
   reason (503 with `Retry-After: 1` for a transition in progress, 410 for
   `autoResume` off).
 - The Scheduler protocol (`api/proto/scheduler.proto`) supports pluggable
-  placement strategies; `aenv-api`'s implementation (`src/node_registry/`)
+  placement strategies; `aenv-api`'s implementation (`crates/aenv-api/src/node_registry/`)
   always places with round-robin. `RoundRobinStrategy`
-  (`src/node_registry/strategy.rs`) is the only strategy in that tree — Go's
+  (`crates/aenv-api/src/node_registry/strategy.rs`) is the only strategy in that tree — Go's
   `random` was never ported, there is no config knob to pick another, and the
   one-implementation `Strategy` trait has been deleted. The `strategy` metric
   label survives it, still valued `round_robin`.
@@ -290,7 +290,7 @@ The DaemonSet injects heartbeat identity and endpoint wiring for runtime nodes:
 
 - `AENV_NODE_ID` comes from Pod metadata name.
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` enables heartbeat reporting.
-- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://agentenv-api:8002` — `aenv-api`'s own gRPC listener, which answers the `Scheduler.Heartbeat` RPC (`src/node_registry/grpc_service.rs`).
+- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://agentenv-api:8002` — `aenv-api`'s own gRPC listener, which answers the `Scheduler.Heartbeat` RPC (`crates/aenv-api/src/node_registry/grpc_service.rs`).
 - `AENV_SANDBOX_PROXY_DOMAINS` comes from the shared sandbox proxy ConfigMap.
 
 Shared Kubernetes helpers:
@@ -328,7 +328,7 @@ Operational notes:
 ## gRPC API
 
 Proto contract: `api/proto/scheduler.proto`, the node-to-api face. `aenv-api`
-(`src/node_registry/grpc_service.rs`) is the only implementation and
+(`crates/aenv-api/src/node_registry/grpc_service.rs`) is the only implementation and
 `aenv-node` its only client: `services/gateway` calls none of these methods
 (its one RPC is `apiproxy.ResumeSandbox`, `api/proto/apiproxy/apiproxy.proto`).
 The sandbox lookup and the projection writes that used to be `LookupNode` and

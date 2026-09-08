@@ -104,10 +104,10 @@ configMapGenerator:
   #
   # 🔴 阶段四 E1 (task's own label): this now points at `agentenv-api`, not
   # `agentenv-scheduler`. `NodeRegistryGrpcService`
-  # (`src/node_registry/grpc_service.rs`) implements the same
+  # (`crates/aenv-api/src/node_registry/grpc_service.rs`) implements the same
   # `scheduler.v1.Scheduler.Heartbeat` RPC the real scheduler does —
   # including the cluster CPU-config bitwise-AND intersection
-  # (`src/node_registry/cpu_template.rs`, byte-for-byte golden-tested against
+  # (`crates/aenv-api/src/node_registry/cpu_template.rs`, byte-for-byte golden-tested against
   # the Go algorithm) — over the api Deployment's gRPC listener
   # (`AENV_API_GRPC_ADDR`, port 8002, fronted by the `agentenv-api` Service
   # the same way `agentenv-scheduler` fronted the real one). That RPC only
@@ -422,11 +422,11 @@ configMapGenerator:
   # resolves an image in this process. `POST /sandboxes-cold` does not refuse:
   # it validates the request and ships the *unresolved* reference to a node,
   # which resolves it inside the same `Create`
-  # (`SandboxLaunchSource::UnresolvedImage`, `src/api/impls/sandbox.rs`). A
+  # (`SandboxLaunchSource::UnresolvedImage`, `crates/aenv-api/src/api/impls/sandbox/create.rs`). A
   # template build dispatches to a node as well (`run_the_build_on_a_node`);
   # its refusal is narrower than it reads. It is two conjuncts, not one:
   # `!self.runs_sandbox_runtime() && self.node_placement().is_none()`
-  # (`src/api/impls/template.rs`), so it fires only for an `aenv-api` with no
+  # (`crates/aenv-api/src/api/impls/template.rs`), so it fires only for an `aenv-api` with no
   # node to forward to at all. So
   # `agentenv-api-deployment.yaml` carries neither this ConfigMap nor the env
   # var; see the note on its `volumes:` block for the paired absence.

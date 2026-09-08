@@ -38,13 +38,10 @@ spec:
           image: agentenv-runtime:latest
           imagePullPolicy: IfNotPresent
           # 阶段 3b: this machine serves the node sandbox service and nothing
-          # else. The user-facing REST routes answer 404 here
-          # (`src/api/role_gate.rs`); clients reach them at the api half's own
-          # address, and the gateway forwards none of them. That used to be
-          # conditional on the `aenv-node` argument this container passed; it
-          # is unconditional now, because the binary this image runs is
-          # `aenv-node` and there is no argument that could make it answer
-          # those routes. Pinned by `execution_switches_manifest_test.go`.
+          # else. The user-facing REST routes do not exist on this binary's
+          # router (`crates/aenv-node/src/api/server.rs`); clients reach them
+          # at the api half's own address, and the gateway forwards none of
+          # them. Pinned by `execution_switches_manifest_test.go`.
           #
           # 🔴 Rolling back is an **image tag**, not an argument. The pre-split
           # single-process image is the thing that re-serves REST on every node;
@@ -352,8 +349,8 @@ spec:
                     # them, and it does so on every single pod deletion: set
                     # image, rollout restart, delete pod, drain, node reboot.
                     #
-                    # 🔴 Reads /nodes, not /sandboxes. Under `aenv-node` the
-                    # sandboxes routes answer 404 (src/api/role_gate.rs), so the
+                    # 🔴 Reads /nodes, not /sandboxes. An `aenv-node` router
+                    # carries no sandboxes route at all, so the
                     # old `curl -sf … /sandboxes` would fail every time,
                     # `continue` forever, and hang the pod in Terminating for
                     # the full 3600s grace.

@@ -4,7 +4,7 @@
 systemd walkthrough for `services/scheduler` — the Go Scheduler binary — and
 that package is **deleted from the repository**, not merely superseded:
 `Scheduler` RPC handling now lives entirely in the Rust
-`aenv-api` binary (`src/node_registry/`), which requires
+`aenv-api` binary (`crates/aenv-api/src/node_registry/`), which requires
 a reachable PostgreSQL (`[pg]`) unconditionally and today ships as a container
 image (`deploy/docker/Dockerfile.aenv-api`), not as a bare systemd-friendly
 binary with a config story equivalent to what this page describes. Kubernetes
@@ -15,7 +15,7 @@ single-host multi-node simulation.
 
 **What has changed since this banner was first added:** static node discovery
 was ported from the deleted Go scheduler into `aenv-api` itself
-(`src/node_registry/static_discovery.rs`), so a no-Kubernetes, native-mode
+(`crates/aenv-api/src/node_registry/static_discovery.rs`), so a no-Kubernetes, native-mode
 topology is no longer blocked on a Kubernetes API to discover nodes against.
 The pieces confirmed to exist and to be exercised by a real deployment today
 (`deploy/docker-compose.yml`) are:

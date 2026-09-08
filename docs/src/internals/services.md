@@ -6,13 +6,13 @@ module. It routes client traffic across multiple AgentENV backend nodes.
 🔴 `services/scheduler` — the original standalone Go implementation of node
 selection, sandbox-to-node binding, observed node snapshots, and P2P peer
 endpoint discovery — has been deleted. That RPC surface is now answered
-in-process by the Rust `aenv-api` binary (`src/node_registry/`); see
+in-process by the Rust `aenv-api` binary (`crates/aenv-api/src/node_registry/`); see
 CLAUDE.md's "Distributed Control Plane" section for the full picture.
 
 ## Components
 
 - **Gateway** (`services/gateway/`): HTTP reverse proxy that routes by sandbox ID — the only Go binary this module ships now
-- **aenv-api native registry** (`src/node_registry/`): answers the same gRPC contract in-process; see `docs/src/internals/architecture.md`'s "Distributed Control Plane" section
+- **aenv-api native registry** (`crates/aenv-api/src/node_registry/`): answers the same gRPC contract in-process; see `docs/src/internals/architecture.md`'s "Distributed Control Plane" section
 
 ## Build and Test
 
@@ -192,6 +192,6 @@ and alerts written against the deleted Go scheduler's names need this mapping:
 | `agentenv_scheduler_schedule_duration_seconds` | `agentenv_api_schedule_duration_seconds` |
 | `agentenv_scheduler_schedule_assignments_total` | `agentenv_api_schedule_assignments_total` |
 
-Constants live in `src/node_registry/grpc_service.rs`.
+Constants live in `crates/aenv-api/src/node_registry/grpc_service.rs`.
 
 For full configuration details (header compatibility, timeouts, logging), see the [services README](https://github.com/kvcache-ai/AgentENV/blob/main/services/README.md).

@@ -2,7 +2,7 @@
 #
 # Today this holds exactly one thing: the sandbox-to-node bindings
 # (`agentenv:scheduler:bindings:*`), written by `aenv-api`
-# (`src/binding_store/redis/`) and read by the gateway's routing projection
+# (`crates/aenv-api/src/binding_store/redis/`) and read by the gateway's routing projection
 # (`services/shared/routing`). It is not optional and there is no fallback:
 # `aenv-api` runs `replicas: 2`, a binding table one replica cannot see
 # misroutes silently, and `build_binding_store` used to refuse the in-memory

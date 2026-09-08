@@ -111,7 +111,7 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
-| API layer | `src/api/` | Axum HTTP server, OpenAPI endpoints, reverse proxy to sandbox services, node/admin APIs |
+| API layer | `crates/aenv-node/src/api/` | Axum HTTP server for this node's own report, its metrics and the reverse proxy to sandbox services; the user-facing REST surface is `aenv-api`'s and is absent here |
 | Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Forking, Snapshotting, Pausing, Killing), auto-eviction, incremental runtime metrics; a pause ends in a snapshot-catalog row and no record |
 | Observability | `src/observability/`, `crates/aenv-node/src/observability/reporter.rs` | Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting |
 | Sandbox | `src/sandbox/` | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
@@ -210,7 +210,7 @@ selected against.
 
 **Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. A request naming a sandbox is routed from the Redis routing projection; a miss goes to `aenv-api`'s `apiproxy.ResumeSandbox`, which answers a running sandbox as it stands (binding and heartbeat roster — `NodeRegistryGrpcService::lookup_sandbox`, in process) or, for a sandbox with no running record, reads its newest ready paused row in the snapshot catalog and restores it as a create under the same id (refusing with `auto_resume_disabled` when the row's `auto_resume` is false, and requiring the envd access token for a `secure` row when the request targets the control-plane port), then writes the projection back. The gateway calls no scheduler.v1 RPC and writes no projection; an api half it cannot ask is a 502. 🔴 The gateway answers **no** user-facing REST: `sandboxes`/`snapshots`/`templates`, `GET /nodes*` and `GET /registry/sandboxes` all belong to `aenv-api` at its own address, and a request reaching the gateway that names no sandbox — no proxy host name, no routing header — is answered 404. Responses the gateway synthesizes itself carry `Access-Control-Allow-Origin: *` (`services/gateway/internal/cors`); responses a sandbox produced are passed through untouched.
 
-**aenv-api native registry** (`src/node_registry/`): the same RPC surface answered in-process inside the Rust `aenv-api` binary. `NodeRegistryGrpcService` (`src/node_registry/grpc_service.rs`) answers the node-to-api RPCs — `Schedule`, `Heartbeat` (including the cluster-wide CPU-template intersection, `src/node_registry/cpu_template.rs`), `ReportSandboxEvent`, `ListP2pPeers` plus the P2P artifact record/forget/lookup RPCs, `GetNode`, `UnregisterNode` — and carries the in-process sandbox lookup and projection writes (`lookup_sandbox`, `record_assignment`, `record_running`) the REST create path and the resume surface use. `/nodes` reads the registry in-process on the REST surface (`src/node_registry/fleet.rs`); `/registry/sandboxes` lists the snapshot catalog's paused rows (state always `paused`, lease and claim fields null or empty) over the same `[pg]` pool the catalog uses. Node discovery (static or Kubernetes EndpointSlice, `src/node_registry/kubernetes_discovery.rs`) and sandbox-to-node bindings (`src/binding_store/`, always Redis in production) are its own Rust implementations of the same contract, built unconditionally.
+**aenv-api native registry** (`crates/aenv-api/src/node_registry/`): the same RPC surface answered in-process inside the Rust `aenv-api` binary. `NodeRegistryGrpcService` (`crates/aenv-api/src/node_registry/grpc_service.rs`) answers the node-to-api RPCs — `Schedule`, `Heartbeat` (including the cluster-wide CPU-template intersection, `crates/aenv-api/src/node_registry/cpu_template.rs`), `ReportSandboxEvent`, `ListP2pPeers` plus the P2P artifact record/forget/lookup RPCs, `GetNode`, `UnregisterNode` — and carries the in-process sandbox lookup and projection writes (`lookup_sandbox`, `record_assignment`, `record_running`) the REST create path and the resume surface use. `/nodes` reads the registry in-process on the REST surface (`crates/aenv-api/src/node_registry/fleet.rs`); `/registry/sandboxes` lists the snapshot catalog's paused rows (state always `paused`, lease and claim fields null or empty) over the same `[pg]` pool the catalog uses. Node discovery (static or Kubernetes EndpointSlice, `crates/aenv-api/src/node_registry/kubernetes_discovery.rs`) and sandbox-to-node bindings (`crates/aenv-api/src/binding_store/`, always Redis in production) are its own Rust implementations of the same contract, built unconditionally.
 
 Binding lifecycle:
 
@@ -221,7 +221,7 @@ Binding lifecycle:
 
 Discovery modes:
 
-- `static`: explicit static node list from config (`src/node_registry/static_discovery.rs`)
+- `static`: explicit static node list from config (`crates/aenv-api/src/node_registry/static_discovery.rs`)
 - `kubernetes`: EndpointSlice watch over the headless `agentenv-nodes` Service, using ready DaemonSet Pod IPs as backend endpoints
 
 **Limitations**: sandbox-to-node bindings are always Redis-backed in production — `[binding_store]` has no backend switch, `build_binding_store` constructs `RedisBindingStore` unconditionally, and `InMemoryBindingStore` is compiled only under `cfg(test)` / the `test-support` feature for the shared contract suite. Kubernetes discovery updates the schedulable node set dynamically, but the P2P key-to-node artifact index stays in-memory-only and is lost when the replica holding it restarts.
@@ -284,9 +284,8 @@ storage/
     ├── io_ring/                # AsyncIoRing, IoRingWorker
     └── id_allocator.rs         # bitmap-based ID allocation
 
-src/
-├── bin/aenv-node.rs            # node binary entrypoint (crates/aenv-node/src/)
-├── api/                        # HTTP API layer
+src/                            # aenv-core: what both halves link
+├── api/                        # generated HTTP surface, credential gate, wire conversions
 ├── orchestrator/               # sandbox lifecycle
 ├── observability/              # node identity + host/runtime metrics projection
 ├── sandbox/                    # Firecracker VM management
@@ -297,6 +296,20 @@ src/
 ├── snapshot/                   # committed snapshot model, repository backends, runtime resolution
 ├── template/                   # user-facing template builder over snapshots
 └── cfg.rs                      # TOML config
+
+crates/aenv-api/src/             # the deciding half
+├── api/impls/                  # the user-facing REST implementations
+├── api/server.rs               # their composition
+├── node_registry/              # the Scheduler contract, discovery, placement
+├── binding_store/              # the sandbox-to-node routing binding
+├── node_client/                # driving a sandbox on another machine
+└── pg/, secrets/, snapshot/    # PostgreSQL: catalog, secret values
+
+crates/aenv-node/src/            # the running half
+├── bin/aenv-node.rs            # node binary entrypoint
+├── api/                        # this node's own router and the sandbox data plane
+├── node_server/                # the node gRPC service the api half drives
+└── sandbox/, image/, template/ # Firecracker, overlaybd, image resolution
 
 services/                       # distributed control plane (Go)
 ├── gateway/                    # HTTP reverse proxy

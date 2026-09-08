@@ -26,7 +26,7 @@ separate Go process.
 | `agentenv-gateway` | Deployment + ClusterIP Service | HTTP reverse proxy for client traffic |
 | `agentenv-api` | Deployment (2+ replicas) + ClusterIP Service | User-facing REST, sandbox ownership, the snapshot catalog (whose sandbox-source rows are the paused sandboxes), and (阶段四) node discovery/placement — the Go scheduler's former job, folded in, unconditionally |
 | `agentenv-node` | DaemonSet (privileged) | One runtime Pod per Kubernetes node |
-| `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery, by `agentenv-api`'s own `src/node_registry/kubernetes_discovery.rs` |
+| `agentenv-nodes` | Headless Service | Used for EndpointSlice discovery, by `agentenv-api`'s own `crates/aenv-api/src/node_registry/kubernetes_discovery.rs` |
 
 ### Two Client Addresses
 
@@ -295,7 +295,7 @@ make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 ## Service Discovery
 
 `agentenv-api`'s own
-`src/node_registry/kubernetes_discovery.rs` watches EndpointSlices for the
+`crates/aenv-api/src/node_registry/kubernetes_discovery.rs` watches EndpointSlices for the
 headless `agentenv-nodes` Service and watches Pods for optional label-based
 discovery policy — a port of the same mechanism the deleted Go scheduler
 used, configured via `AENV_CLUSTER_KUBERNETES_DISCOVERY_*` (see

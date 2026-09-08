@@ -560,7 +560,7 @@ impl ImageCacheService {
         self.metadata_store
             .get_or_try_init(|| async {
                 let legacy = &self.legacy_metadata_store_path;
-                if aenv_core::record_dir::discard_unreadable_store(legacy).await {
+                if crate::record_dir::discard_unreadable_store(legacy).await {
                     warn!(
                         store = %legacy.display(),
                         "discarded an image cache metadata store this build cannot read; the \

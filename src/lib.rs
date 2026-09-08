@@ -12,7 +12,6 @@ pub mod observability;
 pub mod orchestrator;
 pub mod privileges;
 pub mod proto;
-pub mod record_dir;
 #[cfg(test)]
 mod redis_test_server;
 pub mod runtime_snapshot;

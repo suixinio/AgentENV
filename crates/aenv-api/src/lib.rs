@@ -5,8 +5,8 @@
 // Re-export `aenv-core` so shared module paths remain unchanged.
 pub use aenv_core::{
     api, binding_store, cfg, digest, identity, image, leader_task, logging, node_client,
-    node_registry, observability, privileges, proto, record_dir, runtime_snapshot, sandbox,
-    scheduler_endpoint, server_main, template, types, virtualization,
+    node_registry, observability, privileges, proto, runtime_snapshot, sandbox, scheduler_endpoint,
+    server_main, template, types, virtualization,
 };
 
 pub mod internal_api;

@@ -3529,6 +3529,10 @@ where
     }
 
     /// Reclaims only the failed launch's own fenced record after its handle was superseded.
+    ///
+    /// The routing binding goes first under the same fence, as in
+    /// [`Self::forget_sandbox`]: a replacement handle rebinds this id itself,
+    /// and retiring this incarnation never takes the successor's binding.
     async fn reclaim_superseded_launch_record(
         &self,
         plan: &LaunchPlan,
@@ -3536,6 +3540,7 @@ where
     ) {
         let sandbox_id = plan.sandbox_id;
         let execution_id = plan.execution_id();
+        self.forget_runtime_routing(sandbox_id, execution_id).await;
         match self
             .store
             .remove_if_execution(

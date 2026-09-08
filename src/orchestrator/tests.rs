@@ -6420,6 +6420,41 @@ async fn a_pause_retires_the_routing_binding_before_it_removes_the_record() -> R
 }
 
 #[tokio::test]
+async fn a_superseded_launch_retires_its_own_binding_before_it_takes_its_record_back() {
+    setup();
+    let store = InMemoryMetadataStore::new();
+    let routing = RecordingRouting::over(store.clone());
+    let orchestrator = make_orchestrator_without_background(store);
+    orchestrator
+        .set_runtime_routing(Arc::clone(&routing) as Arc<dyn crate::orchestrator::RuntimeRouting>);
+
+    let sandbox_id = SandboxId::new();
+    let plan = create_launch_plan_with_resources(sandbox_id);
+    orchestrator.store.add(plan.metadata.clone()).await.unwrap();
+    // The handle under this id already belongs to a replacement launch.
+    {
+        let mut sandboxes = orchestrator.sandboxes.write().await;
+        sandboxes.insert(sandbox_id, mock_sandbox_handle());
+    }
+
+    orchestrator
+        .cleanup_failed_launch(
+            &plan,
+            mock_sandbox_handle(),
+            FailedLaunchStage::TransitionalPersisted,
+        )
+        .await;
+
+    assert_eq!(
+        routing.forgotten(),
+        vec![(sandbox_id, plan.execution_id(), true)],
+        "the only other path that removes a record must retire the binding it wrote, \
+         under its own fence and while the record is still there"
+    );
+    assert!(orchestrator.store.get(&sandbox_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn an_eviction_forgets_a_sandbox_the_cluster_no_longer_routes_to() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());

@@ -545,6 +545,14 @@ impl NodeRegistryGrpcService {
             SCHEDULE_ASSIGNMENTS_METRIC,
             "Successful Schedule placements by strategy."
         );
+        metrics::describe_counter!(
+            HEARTBEAT_RECONCILE_FAILURES_METRIC,
+            "Heartbeats whose binding reconcile failed; the heartbeat itself still succeeded."
+        );
+    }
+
+    fn record_heartbeat_reconcile_failure() {
+        metrics::counter!(HEARTBEAT_RECONCILE_FAILURES_METRIC).increment(1);
     }
 
     fn record_lookup_node(label: LookupResultLabel) {
@@ -645,6 +653,8 @@ const LOOKUP_EXECUTION_AUTHORITY_METRIC: &str = "agentenv_api_lookup_execution_a
 const BINDING_EXECUTION_METRIC: &str = "agentenv_api_binding_execution_total";
 const SCHEDULE_DURATION_METRIC: &str = "agentenv_api_schedule_duration_seconds";
 const SCHEDULE_ASSIGNMENTS_METRIC: &str = "agentenv_api_schedule_assignments_total";
+const HEARTBEAT_RECONCILE_FAILURES_METRIC: &str =
+    "agentenv_api_heartbeat_binding_reconcile_failures_total";
 
 fn projection_ttl_from_secs(secs: u32) -> Duration {
     if secs == 0 {
@@ -704,21 +714,26 @@ impl Scheduler for NodeRegistryGrpcService {
         if let Some(binding_store) = &self.binding_store {
             match binding_store.reconcile_node(node, roster, now).await {
                 Err(err) => {
+                    // Best-effort for the same reason the reaper above is: a
+                    // node that cannot report is worse than a projection that
+                    // is one tick stale, and its liveness is already recorded.
+                    // The gate stays cold, so a lookup answers "unavailable"
+                    // rather than absence until a reconcile lands.
+                    Self::record_heartbeat_reconcile_failure();
                     tracing::warn!(
                         node_id = %node_id,
                         error = %err,
                         "scheduler heartbeat binding reconcile failed"
                     );
-                    return Err(Status::unavailable("binding store unavailable"));
                 }
                 Ok(decisions) => {
                     for (_sandbox_id, decision) in decisions {
                         Self::record_binding_execution("heartbeat", decision);
                     }
+                    // Latch warm-up only after the roster reaches the binding store.
+                    self.warmup.reported_in(now);
                 }
             }
-            // Latch warm-up only after the roster reaches the binding store.
-            self.warmup.reported_in(now);
         } else {
             self.warmup.reported_in(now);
         }
@@ -2029,17 +2044,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn heartbeat_fails_with_unavailable_when_the_binding_store_reconcile_fails() {
+    async fn a_heartbeat_survives_a_binding_store_that_cannot_reconcile() {
         let store: Arc<dyn BindingStore> = Arc::new(FailingBindingStore);
         let (mut client, _stop) =
             service_with_binding_store(vec![node("node-a", "http://node-a")], store, true).await;
 
-        let status = client
+        client
             .heartbeat(heartbeat_with_cpu_config("node-a", ""))
             .await
-            .expect_err("a ReconcileNode failure must fail the RPC, unlike ReportSandboxEvent");
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-        assert_eq!(status.message(), "binding store unavailable");
+            .expect("a reconcile failure must not take the node's liveness down with it");
+
+        let observed = client
+            .get_node(crate::proto::scheduler::GetNodeRequest {
+                node_id: "node-a".to_string(),
+                cluster_id: "cluster-a".to_string(),
+            })
+            .await
+            .expect("the node the heartbeat just reported is observed")
+            .into_inner()
+            .node
+            .expect("an observed node");
+        assert_eq!(observed.node_id, "node-a");
     }
 
     #[tokio::test]
@@ -2096,7 +2121,7 @@ mod tests {
         client
             .heartbeat(heartbeat_with_cpu_config("node-a", ""))
             .await
-            .expect_err("FailingBindingStore also fails the heartbeat reconcile in this setup");
+            .expect("the heartbeat registers the identity unregister_node then resolves");
 
         client
             .unregister_node(UnregisterNodeRequest {

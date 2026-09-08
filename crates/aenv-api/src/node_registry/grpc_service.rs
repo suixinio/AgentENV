@@ -712,13 +712,17 @@ impl Scheduler for NodeRegistryGrpcService {
 
         // Warm-up means bindings were seeded when a binding store is configured.
         if let Some(binding_store) = &self.binding_store {
+            // The registry's id, not the request's: it is the one the gate sees
+            // in a discovery snapshot.
+            let node_key = node.id.clone();
             match binding_store.reconcile_node(node, roster, now).await {
                 Err(err) => {
                     // Best-effort for the same reason the reaper above is: a
                     // node that cannot report is worse than a projection that
                     // is one tick stale, and its liveness is already recorded.
-                    // The gate stays cold, so a lookup answers "unavailable"
-                    // rather than absence until a reconcile lands.
+                    // The unabsorbed roster shuts the gate instead, so a lookup
+                    // answers "unavailable" rather than absence until one lands.
+                    self.warmup.roster_not_absorbed(&node_key);
                     Self::record_heartbeat_reconcile_failure();
                     tracing::warn!(
                         node_id = %node_id,
@@ -730,11 +734,11 @@ impl Scheduler for NodeRegistryGrpcService {
                     for (_sandbox_id, decision) in decisions {
                         Self::record_binding_execution("heartbeat", decision);
                     }
-                    // Latch warm-up only after the roster reaches the binding store.
-                    self.warmup.reported_in(now);
+                    self.warmup.roster_absorbed(&node_key, now);
                 }
             }
         } else {
+            // Nothing absorbs a roster here, so liveness is all the gate can wait on.
             self.warmup.reported_in(now);
         }
 
@@ -2056,6 +2060,152 @@ mod tests {
             .node
             .expect("an observed node");
         assert_eq!(observed.node_id, "node-a");
+    }
+
+    /// Absorbs nothing while `reconcile_fails`, and answers every other
+    /// operation: the shape of a store whose reconcile is the part that breaks.
+    struct ReconcileRefusingBindingStore {
+        inner: crate::binding_store::InMemoryBindingStore,
+        reconcile_fails: std::sync::atomic::AtomicBool,
+    }
+
+    impl ReconcileRefusingBindingStore {
+        fn new() -> Self {
+            Self {
+                inner: crate::binding_store::InMemoryBindingStore::new(
+                    crate::binding_store::BindingStoreSettings::default(),
+                ),
+                reconcile_fails: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BindingStore for ReconcileRefusingBindingStore {
+        async fn get(
+            &self,
+            sandbox_id: &str,
+            now: SystemTime,
+        ) -> Result<Option<Binding>, crate::binding_store::BindingStoreError> {
+            self.inner.get(sandbox_id, now).await
+        }
+        async fn record(
+            &self,
+            sandbox_id: &str,
+            binding: Binding,
+            now: SystemTime,
+        ) -> Result<BindingDecision, crate::binding_store::BindingStoreError> {
+            self.inner.record(sandbox_id, binding, now).await
+        }
+        async fn reconcile_node(
+            &self,
+            node: crate::node_registry::types::Node,
+            roster: Vec<crate::node_registry::types::RosterEntry>,
+            now: SystemTime,
+        ) -> Result<Vec<(String, BindingDecision)>, crate::binding_store::BindingStoreError>
+        {
+            if self
+                .reconcile_fails
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::binding_store::BindingStoreError::new(
+                    "reconcile refused",
+                ));
+            }
+            self.inner.reconcile_node(node, roster, now).await
+        }
+        async fn delete(
+            &self,
+            sandbox_id: &str,
+            execution_id: &str,
+            now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            self.inner.delete(sandbox_id, execution_id, now).await
+        }
+        async fn release_reservation(
+            &self,
+            sandbox_id: &str,
+            execution_id: &str,
+            now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            self.inner
+                .release_reservation(sandbox_id, execution_id, now)
+                .await
+        }
+    }
+
+    fn heartbeat_reporting_ready(node_id: &str) -> HeartbeatRequest {
+        HeartbeatRequest {
+            node_id: node_id.to_string(),
+            cluster_id: "cluster-a".to_string(),
+            service_instance_id: format!("{node_id}-instance"),
+            snapshot: Some(crate::proto::scheduler::NodeSnapshot {
+                status: scheduler::NodeStatus::Ready as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_roster_the_binding_store_refuses_leaves_a_miss_unavailable_however_often_it_reports()
+    {
+        let store = Arc::new(ReconcileRefusingBindingStore::new());
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            Duration::from_secs(30),
+        ));
+        let warmup = Arc::new(WarmupGate::new(
+            Arc::clone(&registry) as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            SystemTime::now(),
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup))
+            .with_binding_store(
+                Arc::clone(&store) as Arc<dyn BindingStore>,
+                true,
+                Duration::ZERO,
+            );
+
+        for _ in 0..4 {
+            service
+                .heartbeat(Request::new(heartbeat_reporting_ready("node-a")))
+                .await
+                .expect("a reconcile failure must not take the node's liveness down with it");
+        }
+
+        assert!(
+            !warmup.warmed_up(SystemTime::now()),
+            "the node reported, but nothing wrote its sandboxes into the binding store"
+        );
+        let cold = service
+            .lookup_sandbox("sbx-never-bound")
+            .await
+            .expect_err("nothing is bound");
+        assert_eq!(cold.code(), tonic::Code::Unavailable);
+        assert!(
+            cold.message().contains("still seeding"),
+            "a miss under an unabsorbed roster is not absence: {}",
+            cold.message()
+        );
+
+        store
+            .reconcile_fails
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        service
+            .heartbeat(Request::new(heartbeat_reporting_ready("node-a")))
+            .await
+            .expect("the heartbeat whose roster lands");
+
+        assert!(
+            warmup.warmed_up(SystemTime::now()),
+            "one absorbed roster is what the gate was waiting for"
+        );
+        let absent = service
+            .lookup_sandbox("sbx-never-bound")
+            .await
+            .expect_err("nothing is bound");
+        assert_eq!(absent.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

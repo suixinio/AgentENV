@@ -63,7 +63,7 @@ async fn surface() -> Surface {
         Arc::clone(&snapshot_manager),
         None,
         Vec::new(),
-        crate::api::ResumeWiring::api_half_for_test(),
+        aenv_core::api::ResumeWiring::api_half_for_test(),
     ));
 
     // Keep the temporary configuration and fake executable alive for the process.

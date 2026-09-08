@@ -10,7 +10,7 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,backgr
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use aenv_node::api::{proxy, server, ApiImpl, ResumeWiring};
+use aenv_node::api::{proxy, server, NodeApi};
 use aenv_node::cfg::{validate_node_half, AppConfig, NodeConfigExt};
 use aenv_node::identity::NodeIdentity;
 use aenv_node::image::ImageResolver;
@@ -352,18 +352,16 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         .await?
     };
 
-    let api_impl = Arc::new(ApiImpl::new(
+    let node_api = Arc::new(NodeApi::new(
         Arc::clone(&orchestration),
-        core.snapshot_manager,
         core.observability,
         config.sandbox_proxy.domains.clone(),
-        ResumeWiring::node_local(&core.identity.id),
     ));
 
     Ok(Assembly {
         app: server::new(
-            Arc::clone(&api_impl),
-            proxy::data_plane(Arc::clone(&api_impl)),
+            Arc::clone(&node_api),
+            proxy::data_plane(Arc::clone(&node_api)),
         ),
         orchestration,
         upkeep: Vec::new(),

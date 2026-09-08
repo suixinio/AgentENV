@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    api::{server::DataPlane, ApiImpl},
+    api::{node_api::NodeApi, server::DataPlane},
     cfg::ConfigManager,
     observability::prometheus::HttpRouteSource,
     orchestrator::{OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxState},
@@ -151,7 +151,7 @@ pub fn build_proxy_client() -> ProxyClient {
 /// The node's sandbox data plane, as `server::new` takes it.
 pub fn data_plane<I>(api_impl: I) -> DataPlane
 where
-    I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
+    I: AsRef<NodeApi> + Clone + Send + Sync + 'static,
 {
     let classified = api_impl.clone();
     DataPlane::new(router(api_impl), move |router| {
@@ -164,7 +164,7 @@ where
 
 pub fn router<I>(api_impl: I) -> Router
 where
-    I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
+    I: AsRef<NodeApi> + Clone + Send + Sync + 'static,
 {
     Router::new()
         .route(PROXY_ROUTE, any(proxy_via_prefix::<I>))
@@ -181,7 +181,7 @@ pub async fn sandbox_proxy_classifier<I>(
     next: Next,
 ) -> Response<Body>
 where
-    I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
+    I: AsRef<NodeApi> + Clone + Send + Sync + 'static,
 {
     let path = request.uri().path();
     if path == PROXY_ROUTE || path.starts_with("/proxy/") {
@@ -238,7 +238,7 @@ async fn proxy_via_prefix<I>(
     request: Request,
 ) -> Response<Body>
 where
-    I: AsRef<ApiImpl> + Send + Sync,
+    I: AsRef<NodeApi> + Send + Sync,
 {
     let forward_path = strip_proxy_prefix(request.uri().path()).to_owned();
     with_route_source(
@@ -258,7 +258,7 @@ async fn proxy_via_fallback<I>(
     request: Request,
 ) -> Response<Body>
 where
-    I: AsRef<ApiImpl> + Send + Sync,
+    I: AsRef<NodeApi> + Send + Sync,
 {
     if !has_routing_header(request.headers()) {
         // Unmatched control-plane route: return the API error envelope so
@@ -383,19 +383,19 @@ fn execution_superseded_response(
 ///
 /// Falls back to the arrival-time value if the route disappeared meanwhile.
 async fn execution_that_served(
-    api_impl: &ApiImpl,
+    api_impl: &NodeApi,
     sandbox_id: SandboxId,
     on_arrival: Option<ExecutionId>,
 ) -> Option<ExecutionId> {
     api_impl
-        .orchestrator()
+        .orchestration()
         .live_execution_id(&sandbox_id)
         .await
         .or(on_arrival)
 }
 
 async fn proxy_request(
-    api_impl: &ApiImpl,
+    api_impl: &NodeApi,
     websocket_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     request: Request,
     forward_path: String,
@@ -406,7 +406,12 @@ async fn proxy_request(
     // Fence before resolution can wake a superseded sandbox.
     let sandbox_id = parse_sandbox_id_header(&parts.headers).ok();
     let live_execution = match sandbox_id {
-        Some(sandbox_id) => api_impl.orchestrator().live_execution_id(&sandbox_id).await,
+        Some(sandbox_id) => {
+            api_impl
+                .orchestration()
+                .live_execution_id(&sandbox_id)
+                .await
+        }
         None => None,
     };
     let expected_execution = parse_expect_execution_header(&parts.headers);
@@ -844,7 +849,7 @@ fn map_websocket_handshake_rejection_response(
 /// - Looking up the sandbox's proxy target from the orchestrator.
 /// - Constructing the upstream URI based on the target and the incoming request path and query.
 async fn resolve_proxy_request(
-    api_impl: &ApiImpl,
+    api_impl: &NodeApi,
     proxy_path: &str,
     parts: &http::request::Parts,
     is_websocket_request: bool,
@@ -860,7 +865,7 @@ async fn resolve_proxy_request(
         return Err(proxy_error_response(&ProxyRequestError::EnvdInternalPath));
     }
 
-    let target = match api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await {
+    let target = match api_impl.orchestration().proxy_lookup_for(&sandbox_id).await {
         Ok(ProxyLookupResult::Ready(target)) => target,
         Ok(ProxyLookupResult::NotFound) => {
             return Err(proxy_error_response(&ProxyRequestError::SandboxNotFound(
@@ -1623,7 +1628,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
-    use crate::{api::server, orchestrator::Orchestrator, snapshot::mock::mock_snapshot_manager};
+    use crate::{api::server, orchestrator::Orchestrator};
 
     #[test]
     fn strip_host_port_handles_dns_and_ipv6_hosts() {
@@ -1998,48 +2003,25 @@ mod tests {
         .await
     }
 
-    fn api_half() -> crate::api::ResumeWiring {
-        crate::api::ResumeWiring::api_half_for_test()
-    }
-
-    fn node_half() -> crate::api::ResumeWiring {
-        crate::api::ResumeWiring::node_local(
-            crate::identity::NodeIdentity::from_config(&Default::default()).id,
-        )
-    }
-
-    /// The router `aenv-node` assembles: the generated control plane plus this
-    /// module's own data plane.
-    pub fn node_app(api: Arc<ApiImpl>) -> axum::Router {
+    /// The router `aenv-node` assembles: its own report plus this module's
+    /// data plane.
+    pub fn node_app(api: Arc<NodeApi>) -> axum::Router {
         server::new(Arc::clone(&api), data_plane(api))
     }
 
-    pub async fn build_api() -> Arc<ApiImpl> {
-        build_api_with(Vec::new(), api_half()).await
+    pub async fn build_api() -> Arc<NodeApi> {
+        build_api_with(Vec::new()).await
     }
 
-    pub async fn build_api_as(wiring: crate::api::ResumeWiring) -> Arc<ApiImpl> {
-        build_api_with(Vec::new(), wiring).await
+    async fn build_api_with_sandbox_proxy_domains(domains: Vec<String>) -> Arc<NodeApi> {
+        build_api_with(domains).await
     }
 
-    async fn build_api_with_sandbox_proxy_domains(domains: Vec<String>) -> Arc<ApiImpl> {
-        build_api_with(domains, api_half()).await
-    }
-
-    async fn build_api_with(
-        domains: Vec<String>,
-        resume_wiring: crate::api::ResumeWiring,
-    ) -> Arc<ApiImpl> {
+    async fn build_api_with(domains: Vec<String>) -> Arc<NodeApi> {
         let orchestrator =
             Orchestrator::with_in_memory_store(crate::sandbox::mock::MockBackendFactory::new())
                 .await;
-        Arc::new(ApiImpl::new(
-            orchestrator,
-            Arc::new(mock_snapshot_manager()),
-            None,
-            domains,
-            resume_wiring,
-        ))
+        Arc::new(NodeApi::new(orchestrator, None, domains))
     }
 
     async fn proxy_app_for_sandbox_with_state_and_auto_resume(
@@ -2047,20 +2029,19 @@ mod tests {
         state: crate::orchestrator::SandboxState,
         auto_resume: bool,
     ) -> axum::Router {
-        proxy_app_for_sandbox_as_half(sandbox_id, state, auto_resume, api_half()).await
+        proxy_app_for_sandbox_as_half(sandbox_id, state, auto_resume).await
     }
 
     async fn proxy_app_for_sandbox_as_half(
         sandbox_id: &SandboxId,
         state: crate::orchestrator::SandboxState,
         auto_resume: bool,
-        wiring: crate::api::ResumeWiring,
     ) -> axum::Router {
-        let api = build_api_as(wiring).await;
-        api.orchestrator()
+        let api = build_api().await;
+        api.orchestration()
             .set_proxy_target_for_test(*sandbox_id, ProxyTarget::new(Ipv4Addr::LOCALHOST), state)
             .await;
-        api.orchestrator()
+        api.orchestration()
             .set_auto_resume_for_test(sandbox_id, auto_resume)
             .await
             .unwrap();
@@ -2081,7 +2062,7 @@ mod tests {
         domains: Vec<String>,
     ) -> axum::Router {
         let api = build_api_with_sandbox_proxy_domains(domains).await;
-        api.orchestrator()
+        api.orchestration()
             .set_proxy_target_for_test(
                 *sandbox_id,
                 ProxyTarget::new(Ipv4Addr::LOCALHOST),
@@ -2093,11 +2074,11 @@ mod tests {
 
     async fn proxy_app_for_running_sandbox_without_route(sandbox_id: &SandboxId) -> axum::Router {
         let api = build_api().await;
-        api.orchestrator()
+        api.orchestration()
             .set_metadata_state_for_test(*sandbox_id, crate::orchestrator::SandboxState::Running)
             .await
             .unwrap();
-        api.orchestrator()
+        api.orchestration()
             .remove_proxy_route_for_test(sandbox_id)
             .await;
         node_app(api)
@@ -2225,18 +2206,27 @@ mod tests {
                 .unwrap()
         };
 
-        let node = node_app(build_api_as(node_half()).await);
+        let node = node_app(build_api().await);
         assert_eq!(
             node.clone().oneshot(create()).await.unwrap().status(),
             StatusCode::NOT_FOUND,
             "a node must answer the user-facing create as if the route were not there"
         );
 
-        let api = node_app(build_api().await);
         assert_ne!(
-            api.oneshot(create()).await.unwrap().status(),
+            node.clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/nodes")
+                        .header("X-Admin-Token", "probe")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status(),
             StatusCode::NOT_FOUND,
-            "on aenv-api the create route still exists"
+            "the probe has resolution: a route this node does serve is not a 404"
         );
 
         let response = node
@@ -2275,7 +2265,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_route_is_indistinguishable_from_one_that_never_existed() {
-        let node = node_app(build_api_as(node_half()).await);
+        let node = node_app(build_api().await);
         let answer = |path: &'static str| {
             let node = node.clone();
             async move {
@@ -2314,22 +2304,6 @@ mod tests {
             refused.2.replace("/sandboxes", "<path>"),
             absent.2.replace("/definitely-not-a-route", "<path>"),
             "a node's refusal must not be tellable from a route that never existed"
-        );
-
-        let all = node_app(build_api().await);
-        assert_ne!(
-            all.oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/sandboxes")
-                    .header("x-api-key", "test-key")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap()
-            .status(),
-            StatusCode::NOT_FOUND
         );
     }
 
@@ -3344,7 +3318,7 @@ mod execution_fencing_tests {
 
     async fn app_running_under(sandbox_id: SandboxId, live: ExecutionId) -> axum::Router {
         let api = build_api().await;
-        api.orchestrator()
+        api.orchestration()
             .set_live_execution_for_test(sandbox_id, ProxyTarget::new(Ipv4Addr::LOCALHOST), live)
             .await;
         node_app(api)
@@ -3459,7 +3433,7 @@ mod execution_fencing_tests {
         let sandbox_id = SandboxId::new();
         let app = {
             let api = build_api().await;
-            api.orchestrator()
+            api.orchestration()
                 .set_proxy_target_for_test(
                     sandbox_id,
                     ProxyTarget::new(Ipv4Addr::LOCALHOST),
@@ -3594,7 +3568,7 @@ mod execution_echo_tests {
         let on_arrival = ExecutionId::new();
         let after_waking = ExecutionId::new();
 
-        api.orchestrator()
+        api.orchestration()
             .set_live_execution_for_test(
                 sandbox_id,
                 ProxyTarget::new(Ipv4Addr::LOCALHOST),
@@ -3608,7 +3582,7 @@ mod execution_echo_tests {
             "the answer must come from the sandbox that is live now"
         );
 
-        api.orchestrator()
+        api.orchestration()
             .remove_proxy_route_for_test(&sandbox_id)
             .await;
         assert_eq!(

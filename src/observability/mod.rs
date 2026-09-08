@@ -15,9 +15,11 @@ mod machine;
 mod model;
 pub mod prometheus;
 mod service;
+mod wire;
 
 pub use host::{DiskMetric, HostMetrics, HostMetricsCollector};
 pub use model::{
     EgressBrokerProbe, EgressBrokerState, MachineInfo, NodeMetricsSnapshot, NodeSnapshot,
 };
 pub use service::ObservabilityService;
+pub use wire::{node_detail, node_status};

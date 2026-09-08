@@ -13,6 +13,8 @@ use nix::libc;
 use tracing::{debug, trace, warn};
 use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
+use crate::cfg::NodeConfigExt;
+
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::{NetworkAddressPlan, NetworkError, Slot, HOST_VETH_PREFIX, MAX_SLOTS};
 

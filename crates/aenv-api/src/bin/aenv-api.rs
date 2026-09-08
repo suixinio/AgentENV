@@ -15,8 +15,8 @@ use aenv_api::binding_store::{
     BindingStore, BindingStoreSettings, RedisBindingStore, RedisBindingStoreConfig,
 };
 use aenv_api::cfg::{
-    AppConfig, BindingStoreConfig, ClusterNodeRegistryStoreConfig, MetadataStoreBackendKind,
-    NodeRegistryObservedBackendKind,
+    validate_api_half, AppConfig, BindingStoreConfig, ClusterNodeRegistryStoreConfig,
+    MetadataStoreBackendKind, NodeRegistryObservedBackendKind,
 };
 use aenv_api::identity::NodeIdentity;
 use aenv_api::node_client::{NativeNodePlacement, RemoteSandboxBackendFactory};
@@ -64,9 +64,9 @@ async fn async_main() -> anyhow::Result<()> {
 
     let cli = ApiCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
-        aenv_api::cfg::ConfigManager::init_global_from_path(config_path)?
+        aenv_api::cfg::ConfigManager::init_global_from_path(config_path, validate_api_half)?
     } else {
-        aenv_api::cfg::ConfigManager::init_global()?
+        aenv_api::cfg::ConfigManager::init_global(validate_api_half)?
     };
     let config = config_manager.config();
 

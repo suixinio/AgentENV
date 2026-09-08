@@ -10,7 +10,7 @@ use super::cache::{local_image_services_from_app_config, CachedImageConfig, Sour
 use super::oci_image::{self, ResolvedImage};
 use super::reference::{image_ref_candidates, registry_host_of};
 use super::{ImageError, ImageResolutionMetadata, ImageResult, ResolvedBlockImage};
-use crate::cfg::AppConfig;
+use crate::cfg::{regctl_path, AppConfig, NodeConfigExt};
 use crate::image::oci_image::ImageFormat;
 use crate::observability::prometheus::MetricGuard;
 
@@ -63,7 +63,7 @@ impl ImageResolver {
             overlaybd_install_root: config.deps_path.join("overlaybd"),
             overlaybd_convert_global_config: config.resolved_overlaybd_convert_global_config_path(),
             overlaybd_oci_converter_id: config.resolved_overlaybd_oci_converter_id(),
-            regctl_binary: config.resolved_regctl_binary(),
+            regctl_binary: regctl_path(&config.deps_path),
             default_image: config.image.resolver.default_image.clone(),
             search_registries: config.image.resolver.search_registries.clone(),
             allowed_registries: config.image.resolver.allowed_registries.clone(),

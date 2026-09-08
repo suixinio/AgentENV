@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use aenv_node::api::{proxy, server, ApiImpl, ResumeWiring};
-use aenv_node::cfg::AppConfig;
+use aenv_node::cfg::{validate_node_half, AppConfig, NodeConfigExt};
 use aenv_node::identity::NodeIdentity;
 use aenv_node::image::ImageResolver;
 use aenv_node::observability::{ObservabilityReporter, ObservabilityService};
@@ -148,9 +148,9 @@ async fn async_main() -> anyhow::Result<()> {
 
     let cli = NodeCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {
-        aenv_node::cfg::ConfigManager::init_global_from_path(config_path)?
+        aenv_node::cfg::ConfigManager::init_global_from_path(config_path, validate_node_half)?
     } else {
-        aenv_node::cfg::ConfigManager::init_global()?
+        aenv_node::cfg::ConfigManager::init_global(validate_node_half)?
     };
     let config = config_manager.config();
 

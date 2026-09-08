@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use aenv_node::cfg::{ConfigManager, OssBackendConfig};
+use aenv_node::cfg::{validate_node_half, ConfigManager, OssBackendConfig};
 use aenv_node::snapshot::mock::write_mock_built_artifacts;
 use aenv_node::snapshot::repository::backends::storage::OssBackend;
 use aenv_node::snapshot::{
@@ -101,7 +101,7 @@ fn ensure_test_config() -> Result<()> {
     std::env::set_var("AENV_DEPS_PATH", &deps_path);
     std::env::set_var("AENV_SNAPSHOT_LOCAL_CACHE_PATH", &local_cache);
 
-    let manager = ConfigManager::init_global()?;
+    let manager = ConfigManager::init_global(validate_node_half)?;
     let overlaybd_global = manager.config().ublk.overlaybd.global_config_path.clone();
     let overlaybd_dir = overlaybd_global
         .parent()

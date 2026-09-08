@@ -10,6 +10,7 @@ use overlaybd::config::DownloadConfig;
 use serde::Deserialize;
 use tracing::{debug, info};
 
+use crate::cfg::NodeConfigExt;
 use crate::cfg::{
     AppConfig, OssBackendConfig, OverlaybdDependencyConfig, ResolvedImageCacheConfig,
     SnapshotRepositoryBackendKind,
@@ -815,7 +816,8 @@ mod tests {
     use overlaybd::config::DownloadConfig;
 
     use crate::cfg::{
-        AppConfig, MemorySnapshotConfig, OssBackendConfig, UblkOverlaybdTomlConfig, UblkTomlConfig,
+        AppConfig, MemorySnapshotConfig, NodeConfigExt, OssBackendConfig, UblkOverlaybdTomlConfig,
+        UblkTomlConfig,
     };
 
     fn sample_oss_config() -> OssBackendConfig {

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use aenv_node::cfg::ConfigManager;
+use aenv_node::cfg::{validate_node_half, ConfigManager};
 use aenv_node::image::ImageResolver;
 use aenv_node::sandbox::{FirecrackerSandboxConfig, OverlaybdConfig, UblkDeviceManager};
 use aenv_node::snapshot::repository::backends::storage::{PosixFsBackend, PosixFsBackendConfig};
@@ -40,7 +40,7 @@ pub async fn setup_runtime_only() -> &'static aenv_node::cfg::AppConfig {
         "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
         "integration-test-seed",
     );
-    let config = ConfigManager::init_global()
+    let config = ConfigManager::init_global(validate_node_half)
         .expect("config manager")
         .config();
     UblkDeviceManager::init_global_from_config(config)

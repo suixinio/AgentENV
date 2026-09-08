@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use aenv_api::cfg::{AppConfig, ConfigManager};
+use aenv_api::cfg::{regctl_path, validate_api_half, AppConfig, ConfigManager};
 use aenv_api::pg::{self, PgPoolSettings};
 use aenv_api::snapshot::image_export::SnapshotImageService;
 use anyhow::Context as _;
@@ -47,9 +47,9 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config_manager = match cli.config.as_deref() {
-        Some(path) => ConfigManager::init_global_from_path(path)
+        Some(path) => ConfigManager::init_global_from_path(path, validate_api_half)
             .with_context(|| format!("load AgentENV config from '{}'", path.display()))?,
-        None => ConfigManager::init_global()
+        None => ConfigManager::init_global(validate_api_half)
             .context("load AgentENV config (AENV_CONFIG_PATH or the default config path)")?,
     };
     let settings = pg_settings(config_manager.config())?;
@@ -59,7 +59,7 @@ async fn main() -> anyhow::Result<()> {
 
     let service = SnapshotImageService::from_global_config(
         &pool,
-        config_manager.config().resolved_regctl_binary(),
+        regctl_path(&config_manager.config().deps_path),
     )
     .await
     .context("initialize the snapshot repository export backend")?;

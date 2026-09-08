@@ -66,6 +66,7 @@ uuid = { version = "1", features = ["serde", "v7"] }
 uvm-ublk = { path = "../../storage/ublk" }
 uvm-ublk-daemon = { path = "../../storage/ublk-daemon" }
 warm-pool = { path = "../warm-pool" }
+semver = "1"
 which = "8.0.0"
 
 [dev-dependencies]

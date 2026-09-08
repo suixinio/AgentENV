@@ -126,7 +126,8 @@ async fn setup_sandbox() -> Result<FirecrackerSandbox> {
 }
 
 async fn setup_sandbox_inner(mem_size_mib: u32) -> Result<FirecrackerSandbox> {
-    let app_config = aenv_node::cfg::ConfigManager::init_global()?.config();
+    let app_config =
+        aenv_node::cfg::ConfigManager::init_global(aenv_node::cfg::validate_node_half)?.config();
     let image_config_path = DEFAULT_ROOTFS_IMAGE_CONFIG
         .get_or_try_init(|| async {
             let image_resolver = ImageResolver::new(app_config);

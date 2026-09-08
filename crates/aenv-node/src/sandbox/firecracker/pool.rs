@@ -18,7 +18,7 @@ use warm_pool::{PoolMaintenanceAction, WarmPool};
 
 use super::config::create_firecracker_work_dir;
 use super::FirecrackerInstance;
-use crate::cfg::{ConfigManager, ResolvedFirecrackerPoolConfig};
+use crate::cfg::{ConfigManager, NodeConfigExt, ResolvedFirecrackerPoolConfig};
 use crate::sandbox::network::{NetworkManager, Slot};
 
 const POOL_FIRECRACKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);

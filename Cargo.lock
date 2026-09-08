@@ -149,7 +149,6 @@ dependencies = [
  "rand 0.10.1",
  "redis",
  "reqwest 0.13.3",
- "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -167,7 +166,6 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
- "warm-pool",
  "zeroize",
 ]
 
@@ -245,6 +243,7 @@ dependencies = [
  "prost",
  "reqwest 0.13.3",
  "rtnetlink",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.10.9",

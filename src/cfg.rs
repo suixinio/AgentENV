@@ -84,6 +84,29 @@ pub fn regctl_path(deps_path: &Path) -> PathBuf {
         .join("regctl")
 }
 
+/// Version of the Firecracker build the bundled manifest pins for `mode`.
+pub fn manifest_firecracker_version(mode: VirtualizationMode) -> &'static str {
+    &SetupDependencyManifest::get()
+        .firecracker
+        .for_mode(mode)
+        .version
+}
+
+/// Version of the guest kernel the bundled manifest pins for `mode`.
+pub fn manifest_kernel_version(mode: VirtualizationMode) -> &'static str {
+    &SetupDependencyManifest::get().kernel.for_mode(mode).version
+}
+
+/// Version of the tools drive the bundled manifest pins.
+pub fn manifest_tools_version() -> &'static str {
+    &SetupDependencyManifest::get().tools.version
+}
+
+/// Version of the overlaybd toolchain the bundled manifest pins.
+pub fn manifest_overlaybd_version() -> &'static str {
+    &SetupDependencyManifest::get().overlaybd.version
+}
+
 #[derive(Debug, Clone, Config)]
 pub struct AppConfig {
     /// Optional PostgreSQL settings loaded only from files.
@@ -290,12 +313,6 @@ pub struct FirecrackerProcessPoolConfig {
     #[config(default = true)]
     pub startup_prewarm: bool,
     #[config(default = 4usize)]
-    pub fill_concurrency: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct ResolvedFirecrackerPoolConfig {
-    pub pool: warm_pool::PoolConfig,
     pub fill_concurrency: usize,
 }
 
@@ -1046,180 +1063,13 @@ impl_config_default!(
 );
 
 impl AppConfig {
-    fn manifest_firecracker(&self) -> &ManifestDownload {
-        SetupDependencyManifest::get()
-            .firecracker
-            .for_mode(self.virtualization_mode)
-    }
-
-    fn manifest_kernel(&self) -> &ManifestDownload {
-        SetupDependencyManifest::get()
-            .kernel
-            .for_mode(self.virtualization_mode)
-    }
-
-    pub fn resolved_firecracker_binary_path(&self) -> PathBuf {
-        self.firecracker.binary_path.clone().unwrap_or_else(|| {
-            let version = self
-                .firecracker
-                .version
-                .as_deref()
-                .unwrap_or(&self.manifest_firecracker().version);
-            self.deps_path
-                .join("firecracker")
-                .join(version)
-                .join("firecracker")
-        })
-    }
-
-    pub fn resolved_kernel_image_path(&self) -> PathBuf {
-        self.kernel.image_path.clone().unwrap_or_else(|| {
-            let version = self
-                .kernel
-                .version
-                .as_deref()
-                .unwrap_or(&self.manifest_kernel().version);
-            self.deps_path
-                .join("kernel")
-                .join(version)
-                .join("vmlinux.bin")
-        })
-    }
-
+    /// The tools drive version in effect: the configured one, else the version
+    /// the bundled manifest pins.
     pub fn resolved_tools_version(&self) -> &str {
         self.tools
             .version
             .as_deref()
-            .unwrap_or(&SetupDependencyManifest::get().tools.version)
-    }
-
-    pub fn resolved_tools_drive_path_for_version(&self, version: &str) -> Result<PathBuf> {
-        let version = semver::Version::parse(version).with_context(|| {
-            format!(
-                "invalid tools drive version '{version}': expected SemVer without build metadata"
-            )
-        })?;
-        if !version.build.is_empty() {
-            bail!("invalid tools drive version '{version}': build metadata is not supported");
-        }
-        Ok(self
-            .deps_path
-            .join("tools")
-            .join(version.to_string())
-            .join("tools.ext4"))
-    }
-
-    pub fn resolved_tools_drive_path(&self) -> Result<PathBuf> {
-        self.resolved_tools_drive_path_for_version(self.resolved_tools_version())
-    }
-
-    pub fn resolved_overlaybd_oci_converter_id(&self) -> String {
-        let version = self
-            .overlaybd
-            .as_ref()
-            .map(|overlaybd| overlaybd.version.as_str())
-            .unwrap_or(&SetupDependencyManifest::get().overlaybd.version);
-        format!("overlaybd-oci:{version}:agentenv-cache-v1")
-    }
-
-    /// Path of the generated overlaybd global config dedicated to the offline
-    /// C++ conversion tools (`overlaybd-apply`). It mirrors the runtime global
-    /// config but points at an isolated cacheDir: the C++ file cache manages
-    /// cacheDir as flat files and evicts (truncate+unlink) whatever it finds,
-    /// which would destroy the Rust runtime cache's per-entry directories if
-    /// both shared `remote-blocks`.
-    pub fn resolved_overlaybd_convert_global_config_path(&self) -> PathBuf {
-        self.ublk
-            .overlaybd
-            .global_config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("convert-overlaybd-global.json")
-    }
-
-    /// Path of the generated overlaybd global config dedicated to the offline
-    /// C++ resize tool (`overlaybd-resize`). It mirrors the runtime global
-    /// config but points at an isolated cacheDir: the C++ file cache manages
-    /// cacheDir as flat files and evicts (truncate+unlink) whatever it finds,
-    /// which would destroy the Rust runtime cache's per-entry directories if
-    /// both shared `remote-blocks`.
-    pub fn resolved_overlaybd_resize_global_config_path(&self) -> PathBuf {
-        self.ublk
-            .overlaybd
-            .global_config_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join("resize-overlaybd-global.json")
-    }
-
-    /// Resolve the cpu-template-helper binary path derived from deps_path + version.
-    /// Returns `None` if the binary does not exist on disk.
-    pub fn resolved_cpu_template_helper(&self) -> Option<PathBuf> {
-        let version = self
-            .firecracker
-            .version
-            .as_deref()
-            .unwrap_or(&self.manifest_firecracker().version);
-        let path = self
-            .deps_path
-            .join("firecracker")
-            .join(version)
-            .join("cpu-template-helper");
-        path.exists().then_some(path)
-    }
-
-    pub fn resolved_regctl_binary(&self) -> PathBuf {
-        regctl_path(&self.deps_path)
-    }
-
-    pub fn image_cache_layout(&self) -> ResolvedImageCacheConfig {
-        self.image.cache.layout()
-    }
-
-    pub fn network_pool_config(&self) -> warm_pool::PoolConfig {
-        let pool = &self.pool.network;
-
-        warm_pool::PoolConfig {
-            low_watermark: self.pool.low_watermark,
-            high_watermark: self.pool.high_watermark,
-            maintenance_enabled: pool.enabled && pool.maintenance_enabled,
-            startup_prewarm: pool.startup_prewarm,
-        }
-    }
-
-    pub fn block_pool_config(&self) -> Option<warm_pool::PoolConfig> {
-        let pool = &self.pool.block;
-
-        if !pool.enabled {
-            return None;
-        }
-
-        Some(warm_pool::PoolConfig {
-            low_watermark: self.pool.low_watermark,
-            high_watermark: self.pool.high_watermark,
-            // The ublk daemon uses async request-time refill because the
-            // reusable device shape is image/size dependent.
-            maintenance_enabled: false,
-            startup_prewarm: pool.startup_prewarm,
-        })
-    }
-
-    pub fn firecracker_pool_config(&self) -> Option<ResolvedFirecrackerPoolConfig> {
-        let pool = &self.pool.firecracker;
-
-        if !pool.enabled {
-            return None;
-        }
-
-        Some(ResolvedFirecrackerPoolConfig {
-            pool: warm_pool::PoolConfig {
-                low_watermark: self.pool.low_watermark,
-                high_watermark: self.pool.high_watermark,
-                maintenance_enabled: pool.maintenance_enabled,
-                startup_prewarm: pool.startup_prewarm,
-            },
-            fill_concurrency: pool.fill_concurrency,
-        })
+            .unwrap_or(manifest_tools_version())
     }
 
     fn normalize(&mut self, config_dir: &Path) -> Result<()> {
@@ -1327,210 +1177,42 @@ impl AppConfig {
         }
     }
 
-    fn validate(&self) -> Result<()> {
-        self.validate_pool_config()?;
+    /// Checks over the sections both halves read. Each binary adds its own
+    /// half's checks: the file carries both halves' sections.
+    fn validate_shared(&self) -> Result<()> {
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
-        self.egress_broker.validate(&self.cluster)?;
-        self.secrets.validate()?;
-        if self.ublk.overlaybd.resize_timeout_secs == 0 {
-            bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
-        }
-        self.validate_memory_snapshot_options()?;
-        self.validate_memory_snapshot_background_download()?;
-        self.validate_overlaybd_global_config_paths()?;
-        self.validate_disk_rate_limit()?;
         if self.snapshot.catalog.build_heartbeat_interval_secs == 0 {
             bail!(
                 "snapshot.catalog.build_heartbeat_interval_secs must be > 0; a build that never \
                  says it is alive is ended by the catalog's reaper while it is still running"
             );
         }
-        if self.cluster.placement_shadow_k == 0 {
-            bail!(
-                "cluster.placement_shadow_k must be > 0; a zero-width sample keeps every \
-                 placement shadow metric series alive while making all of them meaningless"
-            );
-        }
         Ok(())
     }
+}
 
-    /// Reject internally inconsistent or out-of-range disk rate limit configs so
-    /// operator mistakes fail at load time. Disabled sections are skipped: both
-    /// the fresh-boot and snapshot-resume paths ignore all configured values when
-    /// disabled, so dormant/pre-staged values must not block startup.
-    ///
-    /// When enabled: a one-time burst is meaningless without a nonzero sustained
-    /// limit (`build_disk_rate_limiter` only creates a bucket when the sustained
-    /// value is > 0, so a burst paired with a zero sustained limit is silently
-    /// ignored), and every value must fit Firecracker's signed `i64` token-bucket
-    /// fields (the consumer converts with `i64::try_from`, so an out-of-range
-    /// value would otherwise only fail later at sandbox start).
-    fn validate_disk_rate_limit(&self) -> Result<()> {
-        let cfg = &self.machine.disk_rate_limit;
-        if !cfg.enabled {
-            return Ok(());
-        }
-        if cfg.bandwidth_burst_bytes > 0 && cfg.bandwidth_bytes_per_sec == 0 {
-            bail!(
-                "machine.disk_rate_limit: bandwidth_burst_bytes is set but \
-                 bandwidth_bytes_per_sec is 0; a burst requires a nonzero sustained limit"
-            );
-        }
-        if cfg.iops_burst > 0 && cfg.iops == 0 {
-            bail!(
-                "machine.disk_rate_limit: iops_burst is set but iops is 0; \
-                 a burst requires a nonzero sustained limit"
-            );
-        }
-        for (name, value) in [
-            ("bandwidth_bytes_per_sec", cfg.bandwidth_bytes_per_sec),
-            ("bandwidth_burst_bytes", cfg.bandwidth_burst_bytes),
-            ("iops", cfg.iops),
-            ("iops_burst", cfg.iops_burst),
-        ] {
-            if value > i64::MAX as u64 {
-                bail!(
-                    "machine.disk_rate_limit.{name} ({value}) exceeds the maximum \
-                     supported value {}",
-                    i64::MAX
-                );
-            }
-        }
-        Ok(())
+/// The checks a binary adds on top of the shared set, over the sections only
+/// its half reads.
+pub type HalfChecks = fn(&AppConfig) -> Result<()>;
+
+/// The checks over sections only `aenv-api` reads. The node half loads the same
+/// file and must not run them.
+pub fn validate_api_half(config: &AppConfig) -> Result<()> {
+    config.secrets.validate()?;
+    if config.cluster.placement_shadow_k == 0 {
+        bail!(
+            "cluster.placement_shadow_k must be > 0; a zero-width sample keeps every \
+             placement shadow metric series alive while making all of them meaningless"
+        );
     }
+    Ok(())
+}
 
-    fn validate_memory_snapshot_options(&self) -> Result<()> {
-        let memory = &self.memory_snapshot;
-        if !memory.track_dirty_pages {
-            return Ok(());
-        }
-        if self.virtualization_mode == VirtualizationMode::Pvm {
-            bail!(
-                "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
-            );
-        }
-        Ok(())
-    }
-
-    /// Sanity-bound the memory-snapshot background download knobs so a legal
-    /// config cannot allocate unbounded scratch or fan out unbounded requests.
-    /// Peak scratch per active layer download is `block_size × concurrency`
-    /// (the download chunk is `block_size` cache blocks fetched per request),
-    /// and `max_inflight_blocks × block_size` node-wide.
-    fn validate_memory_snapshot_background_download(&self) -> Result<()> {
-        const MAX_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
-        const MAX_CONCURRENCY: usize = 16;
-        const MAX_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
-        let cfg = &self.memory_snapshot.background_download;
-        if cfg.concurrency == 0 {
-            bail!("memory_snapshot.background_download.concurrency must be > 0");
-        }
-        if cfg.concurrency > MAX_CONCURRENCY {
-            bail!("memory_snapshot.background_download.concurrency must be <= {MAX_CONCURRENCY}");
-        }
-        if u64::from(cfg.block_size) > MAX_BLOCK_SIZE {
-            bail!("memory_snapshot.background_download.block_size must be <= {MAX_BLOCK_SIZE}");
-        }
-        if u64::from(cfg.block_size) * cfg.concurrency as u64 > MAX_SCRATCH_BYTES {
-            bail!(
-                "memory_snapshot.background_download block_size * concurrency must be <= \
-                 {MAX_SCRATCH_BYTES} bytes"
-            );
-        }
-        const MAX_INFLIGHT_BLOCKS: usize = 128;
-        if cfg.max_inflight_blocks == 0 {
-            bail!("memory_snapshot.background_download.max_inflight_blocks must be > 0");
-        }
-        if cfg.max_inflight_blocks > MAX_INFLIGHT_BLOCKS {
-            bail!(
-                "memory_snapshot.background_download.max_inflight_blocks must be <= \
-                 {MAX_INFLIGHT_BLOCKS}"
-            );
-        }
-        // Backend-wide scratch budget: every in-flight chunk may allocate one
-        // block_size buffer, so the global product must stay bounded too.
-        const MAX_GLOBAL_SCRATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-        let global_scratch = u64::from(cfg.block_size)
-            .checked_mul(cfg.max_inflight_blocks as u64)
-            .ok_or_else(|| {
-                anyhow::anyhow!("memory_snapshot.background_download scratch overflow")
-            })?;
-        if global_scratch > MAX_GLOBAL_SCRATCH_BYTES {
-            bail!(
-                "memory_snapshot.background_download block_size * max_inflight_blocks must be <= \
-                 {MAX_GLOBAL_SCRATCH_BYTES} bytes"
-            );
-        }
-        if cfg.delay < 0 {
-            bail!("memory_snapshot.background_download.delay must be >= 0");
-        }
-        if cfg.try_cnt < 1 {
-            bail!("memory_snapshot.background_download.try_cnt must be >= 1");
-        }
-        Ok(())
-    }
-
-    pub fn validate_overlaybd_global_config_paths(&self) -> Result<()> {
-        let paths = [
-            (
-                "ublk.overlaybd.global_config_path",
-                &self.ublk.overlaybd.global_config_path,
-            ),
-            (
-                "memory_snapshot.overlaybd_global_config_path",
-                &self.memory_snapshot.overlaybd_global_config_path,
-            ),
-            (
-                "derived convert overlaybd global config path",
-                &self.resolved_overlaybd_convert_global_config_path(),
-            ),
-            (
-                "derived resize overlaybd global config path",
-                &self.resolved_overlaybd_resize_global_config_path(),
-            ),
-        ];
-        let normalized =
-            paths.map(|(name, path)| (name, shell_util::lexically_normalize_path(path)));
-        let canonical = normalized
-            .clone()
-            .map(|(name, path)| (name, std::fs::canonicalize(&path).ok()));
-
-        for left in 0..normalized.len() {
-            for right in (left + 1)..normalized.len() {
-                let lexical_alias = normalized[left].1 == normalized[right].1;
-                let canonical_alias =
-                    canonical[left].1.is_some() && canonical[left].1 == canonical[right].1;
-                if lexical_alias || canonical_alias {
-                    bail!(
-                        "{} ({:?}) and {} ({:?}) must be different",
-                        normalized[left].0,
-                        normalized[left].1,
-                        normalized[right].0,
-                        normalized[right].1,
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_pool_config(&self) -> Result<()> {
-        let network = self.network_pool_config();
-        if network.maintenance_enabled {
-            PoolTomlConfig::validate("network", &network)?;
-        }
-        if let Some(block) = self.block_pool_config() {
-            PoolTomlConfig::validate("block", &block)?;
-        }
-        if let Some(firecracker) = self.firecracker_pool_config() {
-            PoolTomlConfig::validate("firecracker", &firecracker.pool)?;
-            if firecracker.fill_concurrency == 0 {
-                bail!("invalid firecracker pool config: fill_concurrency must be > 0");
-            }
-        }
-        Ok(())
-    }
+/// For a process that is neither half: tools and tests that load the file
+/// without either binary's checks.
+pub fn no_half_checks(_config: &AppConfig) -> Result<()> {
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -1550,7 +1232,7 @@ impl ConfigManager {
         // Sibling-crate tests build this crate as a dependency with `cfg(test)` off.
         #[cfg(any(test, feature = "test-support"))]
         {
-            Self::init_global().expect("test ConfigManager initialization failed")
+            Self::init_global(no_half_checks).expect("test ConfigManager initialization failed")
         }
 
         #[cfg(not(any(test, feature = "test-support")))]
@@ -1561,18 +1243,20 @@ impl ConfigManager {
         }
     }
 
-    pub fn init_global() -> Result<&'static Self> {
+    /// Loads the configuration and validates it for the calling half.
+    pub fn init_global(half_checks: HalfChecks) -> Result<&'static Self> {
         if let Some(manager) = GLOBAL_CONFIG_MANAGER.get() {
             return Ok(manager);
         }
-        Self::set_global(Self::new()?)
+        Self::set_global(Self::new(half_checks)?)
     }
 
-    pub fn init_global_from_path(path: &Path) -> Result<&'static Self> {
+    /// Loads the configuration at `path` and validates it for the calling half.
+    pub fn init_global_from_path(path: &Path, half_checks: HalfChecks) -> Result<&'static Self> {
         if let Some(manager) = GLOBAL_CONFIG_MANAGER.get() {
             return Ok(manager);
         }
-        Self::set_global(Self::new_from_path(path)?)
+        Self::set_global(Self::new_from_path(path, half_checks)?)
     }
 
     fn set_global(manager: Self) -> Result<&'static Self> {
@@ -1592,17 +1276,17 @@ impl ConfigManager {
             .ok_or_else(|| anyhow!("failed to initialize global sandbox config manager"))
     }
 
-    pub fn new() -> Result<Self> {
+    pub fn new(half_checks: HalfChecks) -> Result<Self> {
         let config_path = Self::env_path(ENV_CONFIG_PATH).unwrap_or_else(Self::default_config_path);
-        let config = Self::load_config_file(&config_path)?;
+        let config = Self::load_config_file(&config_path, half_checks)?;
         Ok(Self {
             config,
             config_path: Some(config_path),
         })
     }
 
-    pub fn new_from_path(path: &Path) -> Result<Self> {
-        let config = Self::load_config_file(path)?;
+    pub fn new_from_path(path: &Path, half_checks: HalfChecks) -> Result<Self> {
+        let config = Self::load_config_file(path, half_checks)?;
         Ok(Self {
             config,
             config_path: Some(path.to_path_buf()),
@@ -1632,8 +1316,8 @@ impl ConfigManager {
             .join("default.toml")
     }
 
-    fn load_config_file(path: &Path) -> Result<AppConfig> {
-        Self::load_config_file_with_overlays(path, &Self::overlay_paths_from_env())
+    fn load_config_file(path: &Path, half_checks: HalfChecks) -> Result<AppConfig> {
+        Self::load_config_file_with_overlays(path, &Self::overlay_paths_from_env(), half_checks)
     }
 
     /// Returns non-empty overlay paths in left-to-right application order.
@@ -1653,7 +1337,11 @@ impl ConfigManager {
 
     /// Loads with confique's ordinary path when no overlays are configured;
     /// otherwise deep-merges TOML before applying the environment layer.
-    fn load_config_file_with_overlays(path: &Path, overlays: &[PathBuf]) -> Result<AppConfig> {
+    fn load_config_file_with_overlays(
+        path: &Path,
+        overlays: &[PathBuf],
+        half_checks: HalfChecks,
+    ) -> Result<AppConfig> {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let mut config = if overlays.is_empty() {
             AppConfig::builder()
@@ -1680,7 +1368,8 @@ impl ConfigManager {
                 })?
         };
         config.normalize(config_dir)?;
-        config.validate()?;
+        config.validate_shared()?;
+        half_checks(&config)?;
 
         Ok(config)
     }
@@ -1814,20 +1503,6 @@ fn parse_trimmed_string(raw: &str) -> std::result::Result<String, std::convert::
     Ok(raw.trim().to_string())
 }
 
-impl PoolTomlConfig {
-    fn validate(name: &str, pool: &warm_pool::PoolConfig) -> Result<()> {
-        if pool.low_watermark > pool.high_watermark {
-            bail!(
-                "invalid {name} pool config: low_watermark ({}) must be <= high_watermark ({})",
-                pool.low_watermark,
-                pool.high_watermark
-            );
-        }
-
-        Ok(())
-    }
-}
-
 impl ClusterConfig {
     fn normalize(&mut self) {
         self.scheduler_endpoint = self
@@ -1870,7 +1545,7 @@ mod tests {
     fn bundled_default_config_loads() -> Result<()> {
         let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        ConfigManager::new_from_path(&workspace.join("config/default.toml"), validate_api_half)?;
         Ok(())
     }
 
@@ -1905,7 +1580,7 @@ mod tests {
         let _env = env_guard();
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         assert_eq!(
-            ConfigManager::new_from_path(&workspace.join("config/default.toml"))
+            ConfigManager::new_from_path(&workspace.join("config/default.toml"), no_half_checks)
                 .expect("load without the override")
                 .config()
                 .binding_store
@@ -1922,7 +1597,7 @@ mod tests {
         let bundled = workspace.join("config/default.toml");
 
         assert_eq!(
-            ConfigManager::new_from_path(&bundled)
+            ConfigManager::new_from_path(&bundled, no_half_checks)
                 .expect("load without the override")
                 .config()
                 .snapshot
@@ -1936,7 +1611,7 @@ mod tests {
             ("posix_fs", SnapshotRepositoryBackendKind::PosixFs),
         ] {
             std::env::set_var("AENV_SNAPSHOT_REPOSITORY_BACKEND", value);
-            let overridden = ConfigManager::new_from_path(&bundled);
+            let overridden = ConfigManager::new_from_path(&bundled, no_half_checks);
             std::env::remove_var("AENV_SNAPSHOT_REPOSITORY_BACKEND");
 
             assert_eq!(
@@ -1952,7 +1627,7 @@ mod tests {
 
         for typo in ["OSS", "oss ", "s3", "object_storage", "posixfs"] {
             std::env::set_var("AENV_SNAPSHOT_REPOSITORY_BACKEND", typo);
-            let loaded = ConfigManager::new_from_path(&bundled);
+            let loaded = ConfigManager::new_from_path(&bundled, no_half_checks);
             std::env::remove_var("AENV_SNAPSHOT_REPOSITORY_BACKEND");
 
             assert!(
@@ -1991,6 +1666,7 @@ mod tests {
             let from_overlay = ConfigManager::load_config_file_with_overlays(
                 &bundled,
                 std::slice::from_ref(&overlay),
+                no_half_checks,
             )
             .expect("load with the overlay alone");
             assert_eq!(
@@ -2002,6 +1678,7 @@ mod tests {
             let overridden = ConfigManager::load_config_file_with_overlays(
                 &bundled,
                 std::slice::from_ref(&overlay),
+                no_half_checks,
             );
             std::env::remove_var("AENV_SNAPSHOT_REPOSITORY_BACKEND");
 
@@ -2023,7 +1700,8 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         let bundled = workspace.join("config/default.toml");
 
-        let shipped = ConfigManager::new_from_path(&bundled).expect("load without the override");
+        let shipped = ConfigManager::new_from_path(&bundled, no_half_checks)
+            .expect("load without the override");
         let shipped_capacity = shipped.config().image.cache.capacity_gb;
         let shipped_remote = shipped.config().image.cache.remote_blocks.max_size_gb;
 
@@ -2040,7 +1718,7 @@ mod tests {
 
         std::env::set_var("AENV_IMAGE_CACHE_CAPACITY_GB", "24");
         std::env::set_var("AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB", "12");
-        let overridden = ConfigManager::new_from_path(&bundled);
+        let overridden = ConfigManager::new_from_path(&bundled, no_half_checks);
         std::env::remove_var("AENV_IMAGE_CACHE_CAPACITY_GB");
         std::env::remove_var("AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB");
 
@@ -2056,7 +1734,8 @@ mod tests {
             "AENV_IMAGE_CACHE_REMOTE_BLOCKS_MAX_SIZE_GB did not reach the config"
         );
 
-        let after = ConfigManager::new_from_path(&bundled).expect("load after the override");
+        let after = ConfigManager::new_from_path(&bundled, no_half_checks)
+            .expect("load after the override");
         assert_eq!(after.config().image.cache.capacity_gb, shipped_capacity);
         assert_eq!(
             after.config().image.cache.remote_blocks.max_size_gb,
@@ -2164,9 +1843,9 @@ endpoint = "http://second:9000"
             .load()
             .expect("the pre-overlay load");
         old.normalize(config_dir).expect("normalize");
-        old.validate().expect("validate");
+        old.validate_shared().expect("validate");
 
-        let new = ConfigManager::load_config_file_with_overlays(&bundled, &[])
+        let new = ConfigManager::load_config_file_with_overlays(&bundled, &[], no_half_checks)
             .expect("the current load with no overlay");
 
         let old_dump = format!("{old:#?}");
@@ -2201,11 +1880,14 @@ endpoint = "http://second:9000"
         let empty = dir.path().join("empty.toml");
         std::fs::write(&empty, "# nothing but a comment\n").expect("write empty overlay");
 
-        let without = ConfigManager::load_config_file_with_overlays(&bundled, &[])
+        let without = ConfigManager::load_config_file_with_overlays(&bundled, &[], no_half_checks)
             .expect("load with no overlay");
-        let with_empty =
-            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&empty))
-                .expect("load with an empty overlay");
+        let with_empty = ConfigManager::load_config_file_with_overlays(
+            &bundled,
+            std::slice::from_ref(&empty),
+            no_half_checks,
+        )
+        .expect("load with an empty overlay");
         assert_eq!(
             format!("{without:#?}"),
             format!("{with_empty:#?}"),
@@ -2214,9 +1896,12 @@ endpoint = "http://second:9000"
 
         let changed = dir.path().join("changed.toml");
         std::fs::write(&changed, "[firecracker]\nsocket_poll_ms = 7\n").expect("write overlay");
-        let with_change =
-            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&changed))
-                .expect("load with a real overlay");
+        let with_change = ConfigManager::load_config_file_with_overlays(
+            &bundled,
+            std::slice::from_ref(&changed),
+            no_half_checks,
+        )
+        .expect("load with a real overlay");
         assert_eq!(with_change.firecracker.socket_poll_ms, 7);
         assert_ne!(
             format!("{without:#?}"),
@@ -2252,6 +1937,7 @@ endpoint = "http://second:9000"
         let config = ConfigManager::load_config_file_with_overlays(
             &bundled,
             &[public.clone(), secret.clone()],
+            no_half_checks,
         )
         .expect("load with both halves");
         let oss = config
@@ -2271,7 +1957,7 @@ endpoint = "http://second:9000"
         assert_eq!(oss.access_key_id.as_deref(), Some("planted-key-id"));
         assert_eq!(oss.access_key_secret.as_deref(), Some("planted-key-secret"));
 
-        let alone = ConfigManager::load_config_file_with_overlays(&bundled, &[])
+        let alone = ConfigManager::load_config_file_with_overlays(&bundled, &[], no_half_checks)
             .expect("load the main file alone");
         assert!(alone.backend.oss.is_none());
         assert_eq!(
@@ -2279,17 +1965,23 @@ endpoint = "http://second:9000"
             SnapshotRepositoryBackendKind::PosixFs
         );
 
-        let public_only =
-            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&public))
-                .expect("the public half alone loads");
+        let public_only = ConfigManager::load_config_file_with_overlays(
+            &bundled,
+            std::slice::from_ref(&public),
+            no_half_checks,
+        )
+        .expect("the public half alone loads");
         assert!(public_only
             .backend
             .oss
             .expect("public half supplies the section")
             .access_key_id
             .is_none());
-        let secret_only =
-            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&secret));
+        let secret_only = ConfigManager::load_config_file_with_overlays(
+            &bundled,
+            std::slice::from_ref(&secret),
+            no_half_checks,
+        );
         assert!(
             secret_only.is_err(),
             "a [backend.oss] with credentials but no endpoint or bucket must be refused, not \
@@ -2302,11 +1994,15 @@ endpoint = "http://second:9000"
         let secret_last = ConfigManager::load_config_file_with_overlays(
             &bundled,
             &[public.clone(), shadow.clone(), secret.clone()],
+            no_half_checks,
         )
         .expect("load");
-        let shadow_last =
-            ConfigManager::load_config_file_with_overlays(&bundled, &[public, secret, shadow])
-                .expect("load");
+        let shadow_last = ConfigManager::load_config_file_with_overlays(
+            &bundled,
+            &[public, secret, shadow],
+            no_half_checks,
+        )
+        .expect("load");
         assert_eq!(
             secret_last
                 .backend
@@ -2336,17 +2032,24 @@ endpoint = "http://second:9000"
         let present = dir.path().join("present.toml");
         std::fs::write(&present, "[firecracker]\nsocket_poll_ms = 7\n").expect("write");
         assert_eq!(
-            ConfigManager::load_config_file_with_overlays(&bundled, std::slice::from_ref(&present))
-                .expect("an overlay that exists loads")
-                .firecracker
-                .socket_poll_ms,
+            ConfigManager::load_config_file_with_overlays(
+                &bundled,
+                std::slice::from_ref(&present),
+                no_half_checks
+            )
+            .expect("an overlay that exists loads")
+            .firecracker
+            .socket_poll_ms,
             7
         );
 
         let missing = dir.path().join("not-mounted.toml");
-        let err =
-            ConfigManager::load_config_file_with_overlays(&bundled, &[present, missing.clone()])
-                .expect_err("a missing overlay must not be treated as an empty layer");
+        let err = ConfigManager::load_config_file_with_overlays(
+            &bundled,
+            &[present, missing.clone()],
+            no_half_checks,
+        )
+        .expect_err("a missing overlay must not be treated as an empty layer");
         let text = format!("{err:#}");
         assert!(
             text.contains(&missing.display().to_string()),
@@ -2398,7 +2101,8 @@ endpoint = "http://second:9000"
             );
         }
 
-        let quiet = ConfigManager::new_from_path(&bundled).expect("load with the variable unset");
+        let quiet = ConfigManager::new_from_path(&bundled, no_half_checks)
+            .expect("load with the variable unset");
         assert_eq!(
             quiet.config().firecracker.socket_poll_ms,
             1,
@@ -2406,7 +2110,7 @@ endpoint = "http://second:9000"
         );
 
         std::env::set_var(ENV_CONFIG_OVERLAY_PATH, overlay.display().to_string());
-        let mounted = ConfigManager::new_from_path(&bundled);
+        let mounted = ConfigManager::new_from_path(&bundled, no_half_checks);
         std::env::remove_var(ENV_CONFIG_OVERLAY_PATH);
         assert_eq!(
             mounted
@@ -2744,214 +2448,6 @@ endpoint = "http://second:9000"
     }
 
     #[test]
-    fn validate_memory_snapshot_options_enforces_dirty_page_requirements() {
-        let cases = [
-            (VirtualizationMode::Kvm, false, None),
-            (VirtualizationMode::Kvm, true, None),
-            (
-                VirtualizationMode::Pvm,
-                true,
-                Some("is disabled in PVM mode"),
-            ),
-        ];
-
-        for (virtualization_mode, track_dirty_pages, expected_error) in cases {
-            let config = AppConfig {
-                virtualization_mode,
-                memory_snapshot: MemorySnapshotConfig {
-                    track_dirty_pages,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            let result = config.validate_memory_snapshot_options();
-            match expected_error {
-                Some(expected_error) => {
-                    let error = result.unwrap_err();
-                    assert!(
-                        error.to_string().contains(expected_error),
-                        "expected error containing {expected_error:?}, got: {error}"
-                    );
-                }
-                None => result.expect("supported memory snapshot options should be valid"),
-            }
-        }
-    }
-
-    #[test]
-    fn validate_rejects_zero_memory_snapshot_download_concurrency() {
-        let mut config = AppConfig::default();
-        config.memory_snapshot.background_download.concurrency = 0;
-
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("memory_snapshot.background_download.concurrency must be > 0"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_invalid_disk_rate_limit() {
-        let cases = [
-            (
-                DiskRateLimitConfig {
-                    enabled: true,
-                    bandwidth_burst_bytes: 1024,
-                    ..Default::default()
-                },
-                "bandwidth_burst_bytes is set but",
-            ),
-            (
-                DiskRateLimitConfig {
-                    enabled: true,
-                    iops_burst: 500,
-                    ..Default::default()
-                },
-                "iops_burst is set but",
-            ),
-            (
-                DiskRateLimitConfig {
-                    enabled: true,
-                    bandwidth_bytes_per_sec: i64::MAX as u64 + 1,
-                    ..Default::default()
-                },
-                "machine.disk_rate_limit.bandwidth_bytes_per_sec",
-            ),
-        ];
-
-        for (disk_rate_limit, expected_error) in cases {
-            let mut config = AppConfig::default();
-            config.machine.disk_rate_limit = disk_rate_limit;
-
-            let err = config.validate().unwrap_err();
-            assert!(
-                err.to_string().contains(expected_error),
-                "expected error containing {expected_error:?}, got: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_skips_disabled_disk_rate_limit() {
-        // A disabled section is ignored at runtime, so even internally
-        // inconsistent or out-of-range values must not block startup.
-        let mut config = AppConfig::default();
-        config.machine.disk_rate_limit.enabled = false;
-        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 0;
-        config.machine.disk_rate_limit.bandwidth_burst_bytes = 1024;
-        config.machine.disk_rate_limit.iops = u64::MAX;
-        config
-            .validate()
-            .expect("disabled disk rate limit config is not validated");
-    }
-
-    #[test]
-    fn validate_accepts_consistent_disk_rate_limit() {
-        let mut config = AppConfig::default();
-        config.machine.disk_rate_limit.enabled = true;
-        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 104_857_600;
-        config.machine.disk_rate_limit.bandwidth_burst_bytes = 10_485_760;
-        config.machine.disk_rate_limit.iops = 3000;
-        config.machine.disk_rate_limit.iops_burst = 500;
-        config
-            .validate()
-            .expect("consistent disk rate limit config passes");
-    }
-
-    #[test]
-    fn validate_rejects_colliding_overlaybd_global_config_paths() {
-        let cases = [
-            (
-                "/tmp/shared-overlaybd-global.json",
-                "/tmp/shared-overlaybd-global.json",
-                "ublk.overlaybd.global_config_path",
-                "memory_snapshot.overlaybd_global_config_path",
-            ),
-            (
-                "/tmp/aenv/x/../global.json",
-                "/tmp/aenv/global.json",
-                "ublk.overlaybd.global_config_path",
-                "memory_snapshot.overlaybd_global_config_path",
-            ),
-            (
-                "/tmp/overlaybd/resize-overlaybd-global.json",
-                "/var/lib/aenv/overlaybd/mem-overlaybd-global.json",
-                "ublk.overlaybd.global_config_path",
-                "derived resize",
-            ),
-            (
-                "/tmp/overlaybd/overlaybd-global.json",
-                "/tmp/overlaybd/convert-overlaybd-global.json",
-                "memory_snapshot.overlaybd_global_config_path",
-                "derived convert",
-            ),
-        ];
-
-        for (runtime_path, memory_path, left_name, right_name) in cases {
-            let mut config = AppConfig::default();
-            config.ublk.overlaybd.global_config_path = runtime_path.into();
-            config.memory_snapshot.overlaybd_global_config_path = memory_path.into();
-
-            let err = config.validate().unwrap_err();
-            let message = err.to_string();
-            assert!(message.contains(left_name), "unexpected error: {err}");
-            assert!(message.contains(right_name), "unexpected error: {err}");
-            assert!(
-                message.contains("must be different"),
-                "unexpected error: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn validate_bounds_memory_snapshot_background_download() {
-        let mut config = AppConfig::default();
-        config.memory_snapshot.background_download.concurrency = 17;
-        assert!(config.validate().is_err());
-
-        let mut config = AppConfig::default();
-        config.memory_snapshot.background_download.block_size = 65 * 1024 * 1024;
-        config.memory_snapshot.background_download.concurrency = 1;
-        assert!(config.validate().is_err());
-
-        let mut config = AppConfig::default();
-        config.memory_snapshot.background_download.block_size = 64 * 1024 * 1024;
-        config.memory_snapshot.background_download.concurrency = 8;
-        assert!(config.validate().is_err());
-
-        let mut config = AppConfig::default();
-        config.memory_snapshot.background_download.block_size = 32 * 1024 * 1024;
-        config.memory_snapshot.background_download.concurrency = 8;
-        config.validate().expect("defaults-shaped config passes");
-
-        let mut config = AppConfig::default();
-        config.memory_snapshot.background_download.delay = -1;
-        assert!(config.validate().is_err());
-
-        let mut config = AppConfig::default();
-        config.memory_snapshot.background_download.try_cnt = 0;
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn overlaybd_converter_cache_id_includes_configured_tool_version() {
-        let config = AppConfig {
-            overlaybd: Some(OverlaybdDependencyConfig {
-                version: "test-version".to_string(),
-                url: None,
-                package_url: None,
-            }),
-            ..Default::default()
-        };
-        assert_eq!(
-            config.resolved_overlaybd_oci_converter_id(),
-            "overlaybd-oci:test-version:agentenv-cache-v1"
-        );
-    }
-
-    #[test]
     fn resolve_path_joins_relative_paths_against_config_dir() -> Result<()> {
         let temp = tempdir()?;
         let config_dir = temp.path();
@@ -3056,7 +2552,7 @@ endpoint = "http://second:9000"
     }
 
     #[test]
-    fn managed_dependency_paths_remain_implicit_and_resolve_from_deps_path() -> Result<()> {
+    fn managed_dependency_paths_remain_implicit() -> Result<()> {
         let temp = tempdir()?;
         let config_dir = temp.path().join("configs");
         let mut config = AppConfig {
@@ -3069,67 +2565,12 @@ endpoint = "http://second:9000"
 
         config.normalize(&config_dir)?;
 
-        let deps_path = config_dir.join("deps");
-        assert_eq!(config.deps_path, deps_path);
+        assert_eq!(config.deps_path, config_dir.join("deps"));
         assert_eq!(config.firecracker.binary_path, None);
         assert_eq!(config.kernel.image_path, None);
         assert_eq!(config.tools.drive_path, None);
-        assert_eq!(
-            config.resolved_firecracker_binary_path(),
-            deps_path.join("firecracker/fc-test/firecracker")
-        );
-        assert_eq!(
-            config.resolved_kernel_image_path(),
-            deps_path.join("kernel/kernel-test/vmlinux.bin")
-        );
-        assert_eq!(
-            config.resolved_tools_drive_path()?,
-            deps_path.join("tools/1.2.3-custom.1/tools.ext4")
-        );
-        assert!(config
-            .resolved_tools_drive_path_for_version("../escape")
-            .is_err());
-        assert!(config
-            .resolved_tools_drive_path_for_version("1.2.3+rebuilt")
-            .is_err());
 
         Ok(())
-    }
-
-    #[test]
-    fn managed_dependency_paths_select_the_active_mode_versions() {
-        let manifest = SetupDependencyManifest::get();
-        let mut config = AppConfig {
-            deps_path: PathBuf::from("/deps"),
-            virtualization_mode: VirtualizationMode::Kvm,
-            ..Default::default()
-        };
-        assert_eq!(
-            config.resolved_firecracker_binary_path(),
-            PathBuf::from("/deps/firecracker")
-                .join(&manifest.firecracker.kvm.version)
-                .join("firecracker")
-        );
-        assert_eq!(
-            config.resolved_kernel_image_path(),
-            PathBuf::from("/deps/kernel")
-                .join(&manifest.kernel.kvm.version)
-                .join("vmlinux.bin")
-        );
-
-        config.virtualization_mode = VirtualizationMode::Pvm;
-        assert_eq!(
-            config.resolved_firecracker_binary_path(),
-            PathBuf::from("/deps/firecracker")
-                .join(&manifest.firecracker.pvm.version)
-                .join("firecracker")
-        );
-        assert_eq!(
-            config.resolved_kernel_image_path(),
-            PathBuf::from("/deps/kernel")
-                .join(&manifest.kernel.pvm.version)
-                .join("vmlinux.bin")
-        );
     }
 
     #[test]
@@ -3324,65 +2765,6 @@ endpoint = "http://second:9000"
     }
 
     #[test]
-    fn validate_pool_config_rejects_invalid_values() {
-        let config = AppConfig {
-            pool: PoolTomlConfig {
-                low_watermark: 64,
-                high_watermark: 32,
-                ..PoolTomlConfig::default()
-            },
-            ..AppConfig::default()
-        };
-        let err = config.validate_pool_config().unwrap_err();
-        assert!(
-            err.to_string().contains("low_watermark"),
-            "unexpected error: {err}"
-        );
-
-        let config = AppConfig {
-            pool: PoolTomlConfig {
-                low_watermark: 64,
-                high_watermark: 32,
-                network: PoolComponentConfig {
-                    maintenance_enabled: false,
-                    ..PoolComponentConfig::default()
-                },
-                block: PoolComponentConfig {
-                    enabled: false,
-                    ..PoolComponentConfig::default()
-                },
-                firecracker: FirecrackerProcessPoolConfig {
-                    enabled: false,
-                    ..FirecrackerProcessPoolConfig::default()
-                },
-            },
-            ..AppConfig::default()
-        };
-        assert!(config.validate_pool_config().is_ok());
-    }
-
-    #[test]
-    fn firecracker_pool_fill_concurrency_rejects_zero() {
-        let config = AppConfig {
-            pool: PoolTomlConfig {
-                firecracker: FirecrackerProcessPoolConfig {
-                    enabled: true,
-                    fill_concurrency: 0,
-                    ..FirecrackerProcessPoolConfig::default()
-                },
-                ..PoolTomlConfig::default()
-            },
-            ..AppConfig::default()
-        };
-
-        let err = config.validate_pool_config().unwrap_err();
-        assert!(
-            err.to_string().contains("fill_concurrency"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn placement_shadow_k_defaults_to_three_and_binds_its_documented_env_var() {
         use confique::meta::{Expr, FieldKind, Integer, LeafKind};
 
@@ -3409,27 +2791,14 @@ endpoint = "http://second:9000"
     fn validate_rejects_a_zero_placement_shadow_k() {
         let mut config = AppConfig::default();
         config.cluster.placement_shadow_k = 0;
-        let err = config.validate().unwrap_err();
+        let err = validate_api_half(&config).unwrap_err();
         assert!(
             err.to_string()
                 .contains("cluster.placement_shadow_k must be > 0"),
             "unexpected error: {err}"
         );
 
-        AppConfig::default()
-            .validate()
-            .expect("the shipped default must load");
-    }
-
-    #[test]
-    fn validate_rejects_zero_overlaybd_resize_timeout() {
-        let mut config = AppConfig::default();
-        config.ublk.overlaybd.resize_timeout_secs = 0;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("resize_timeout_secs must be > 0"),
-            "unexpected error: {err}"
-        );
+        validate_api_half(&AppConfig::default()).expect("the shipped default must load");
     }
 
     /// Returns whether a manifest sets `var`, excluding comment-only mentions.

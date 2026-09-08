@@ -10,7 +10,7 @@ use serde_json::Value;
 use tracing::info;
 
 use super::service::{HoldNamespace, ImageCacheService};
-use crate::cfg::{AppConfig, ConfigManager};
+use crate::cfg::{AppConfig, ConfigManager, NodeConfigExt};
 use crate::image::oci_image::ImageConversion;
 use crate::image::{ImageResolutionMetadata, RuntimeImageOwner, RuntimeImageRefs};
 use crate::sandbox::RuntimeArtifactSet;

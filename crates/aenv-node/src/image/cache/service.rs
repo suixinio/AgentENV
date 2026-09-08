@@ -30,7 +30,7 @@ use super::source_config::{
     SourceImageCache, SourceImageLock,
 };
 use super::store::{CachedImageConfig, OverlaybdLayerLocation};
-use crate::cfg::{AppConfig, ResolvedImageCacheConfig};
+use crate::cfg::{AppConfig, NodeConfigExt, ResolvedImageCacheConfig};
 use crate::digest::FileDigest;
 use crate::image::commit_index::{self, CommitIndex};
 use crate::image::local_layer::LocalLayer;

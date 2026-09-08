@@ -15,6 +15,7 @@ use uvm_ublk_daemon::{
 };
 
 use super::overlaybd::OverlaybdConfig;
+use crate::cfg::NodeConfigExt;
 use crate::observability::prometheus::MetricGuard;
 use crate::sandbox::SandboxCaptureError;
 

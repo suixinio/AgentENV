@@ -114,12 +114,10 @@ url = "2.5"
 clap = { version = "4", features = ["derive"] }
 shell-util = { path = "crates/shell-util" }
 linux-cap = { path = "crates/linux-cap" }
-warm-pool = { path = "crates/warm-pool" }
 dashmap = "6.1.0"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
-semver = "1"
 iroh = { version = "=1.0.0-rc.0" }
 iroh-blobs = { version = "=0.101.0" }
 rand = "0.10"

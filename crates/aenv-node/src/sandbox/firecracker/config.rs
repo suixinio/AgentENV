@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::mmds::MmdsMetadata;
-use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
+use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, NodeConfigExt, ToolsConfig};
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::ublk::UblkConfig;
 use crate::sandbox::SandboxNetworkPolicy;

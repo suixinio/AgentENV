@@ -17,6 +17,9 @@ pub mod secrets;
 pub mod snapshot;
 
 #[cfg(test)]
+mod control_path_tests;
+
+#[cfg(test)]
 mod default_filter_guard {
     use aenv_core::logging::capture::targets_passing_filter;
     use aenv_core::logging::{DEFAULT_FILTER, PRE_RENAME_FILTER};

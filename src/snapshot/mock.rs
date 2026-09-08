@@ -615,6 +615,9 @@ impl InMemorySnapshotCatalog {
                 return false;
             }
         }
+        if !filter.pause_axis_matches(record) {
+            return false;
+        }
         if let Some(statuses) = filter.template_statuses.as_ref() {
             let SnapshotSource::Template { build } = &record.source else {
                 return false;

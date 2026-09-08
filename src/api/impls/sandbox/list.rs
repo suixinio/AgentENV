@@ -105,7 +105,7 @@ impl ApiImpl {
         if want_paused && self.owns_sandboxes() {
             let running_ids: std::collections::HashSet<SandboxId> =
                 running.iter().map(|sandbox| sandbox.id).collect();
-            let paused = match self.list_paused_snapshots().await {
+            let paused = match self.list_paused_snapshots(user_metadata).await {
                 Ok(paused) => paused,
                 Err(err) => {
                     return Ok(V2SandboxesGetResponse::Status500_ServerError(
@@ -124,14 +124,6 @@ impl ApiImpl {
                 let Some(model) = paused::listed_paused_sandbox(record) else {
                     continue;
                 };
-                if let Some(wanted) = user_metadata.as_ref() {
-                    let has = model.metadata.as_ref();
-                    if !wanted.iter().all(|(key, value)| {
-                        has.is_some_and(|metadata| metadata.get(key) == Some(value))
-                    }) {
-                        continue;
-                    }
-                }
                 listed.push((paused::paused_started_at(record), sandbox_id, model));
             }
         }

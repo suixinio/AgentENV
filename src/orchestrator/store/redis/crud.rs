@@ -290,19 +290,6 @@ pub async fn wake_or_poll(wake: &mut broadcast::Receiver<()>, poll: Duration) {
     }
 }
 
-fn user_metadata_matches(
-    metadata: &SandboxMetadata,
-    required: Option<&HashMap<String, String>>,
-) -> bool {
-    required.is_none_or(|required| {
-        metadata.user_metadata.as_ref().is_some_and(|actual| {
-            required
-                .iter()
-                .all(|(key, value)| actual.get(key) == Some(value))
-        })
-    })
-}
-
 #[async_trait]
 impl MetadataStore for RedisMetadataStore {
     async fn add(&self, mut metadata: SandboxMetadata) -> Result<()> {
@@ -550,7 +537,10 @@ impl MetadataStore for RedisMetadataStore {
                     .is_some_and(|states| states.contains(&metadata.state));
                 state_matches
                     && !excluded
-                    && user_metadata_matches(metadata, filter.user_metadata.as_ref())
+                    && crate::orchestrator::store::user_metadata_matches(
+                        metadata.user_metadata.as_ref(),
+                        filter.user_metadata.as_ref(),
+                    )
             })
             .collect())
     }

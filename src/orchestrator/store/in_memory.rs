@@ -64,22 +64,6 @@ impl InMemoryMetadataStore {
     fn notify_state(tx: &watch::Sender<Option<SandboxState>>, new_state: Option<SandboxState>) {
         tx.send_replace(new_state);
     }
-
-    fn user_metadata_matches(
-        metadata: &SandboxMetadata,
-        required_pairs: Option<&HashMap<String, String>>,
-    ) -> bool {
-        required_pairs.is_none_or(|required_pairs| {
-            metadata
-                .user_metadata
-                .as_ref()
-                .is_some_and(|actual_metadata| {
-                    required_pairs
-                        .iter()
-                        .all(|(k, v)| actual_metadata.get(k) == Some(v))
-                })
-        })
-    }
 }
 
 impl StoreInner {
@@ -331,8 +315,10 @@ impl MetadataStore for InMemoryMetadataStore {
                 let excluded_state_matches = excluded_states_filter
                     .as_ref()
                     .is_some_and(|states| states.contains(&metadata.state));
-                let user_metadata_matches =
-                    Self::user_metadata_matches(metadata, user_metadata_filter.as_ref());
+                let user_metadata_matches = super::user_metadata_matches(
+                    metadata.user_metadata.as_ref(),
+                    user_metadata_filter.as_ref(),
+                );
                 state_matches && !excluded_state_matches && user_metadata_matches
             })
             .map(|record| record.metadata.clone())

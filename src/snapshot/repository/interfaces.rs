@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -100,6 +101,13 @@ pub struct SnapshotListFilter {
     ///
     /// Sandbox records never match this field.
     pub template_statuses: Option<Vec<TemplateBuildStatus>>,
+    /// Restrict results to rows a resume rebuilds a sandbox from: a pause, not
+    /// a checkpoint taken while the sandbox went on running.
+    pub pauses_only: bool,
+    /// Restrict results to pauses whose sandbox carried every one of these
+    /// metadata pairs. Only a pause can carry them, so a row that is not one
+    /// never matches a filter that names any.
+    pub user_metadata: Option<HashMap<String, String>>,
     /// Page size; `None` uses [`DEFAULT_LIST_PAGE_LIMIT`].
     pub limit: Option<u32>,
     /// Page start; `None` starts at the newest row.
@@ -123,6 +131,31 @@ impl SnapshotListFilter {
         self.limit
             .unwrap_or(DEFAULT_LIST_PAGE_LIMIT)
             .min(MAX_LIST_PAGE_LIMIT)
+    }
+
+    /// The pause axis of this filter, as every backend that cannot push it
+    /// into a query must read it. A backend that words it a second time is a
+    /// listing whose halves disagree about what the caller asked for.
+    pub fn pause_axis_matches(&self, record: &SnapshotRecord) -> bool {
+        let paused = record.paused_sandbox();
+        if (self.pauses_only || self.user_metadata.is_some()) && paused.is_none() {
+            return false;
+        }
+        crate::orchestrator::store::user_metadata_matches(
+            paused.and_then(|paused| paused.user_metadata.as_ref()),
+            self.user_metadata.as_ref(),
+        )
+    }
+
+    /// The sandbox's live pauses, restricted to those whose metadata carries
+    /// every pair a listing named.
+    pub fn pauses(user_metadata: Option<HashMap<String, String>>) -> Self {
+        Self {
+            sources: Some(vec![SnapshotSourceKind::Sandbox]),
+            pauses_only: true,
+            user_metadata,
+            ..Self::default()
+        }
     }
 
     pub fn templates() -> Self {

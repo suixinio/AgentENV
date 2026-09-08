@@ -456,6 +456,63 @@ mod pg {
         }
     }
 
+    fn sandbox_pause_owned_by(sandbox_id: &str, owner: Option<&str>) -> SnapshotCommit {
+        let mut commit = sandbox_commit_for(sandbox_id, true);
+        let paused = commit
+            .committed
+            .paused_sandbox
+            .as_mut()
+            .expect("a pause carries its configuration");
+        paused.user_metadata = owner.map(|owner| {
+            [("owner".to_string(), owner.to_string())]
+                .into_iter()
+                .collect()
+        });
+        commit
+    }
+
+    #[tokio::test]
+    async fn a_metadata_filter_selects_the_pauses_whose_sandbox_carried_the_pairs() {
+        let catalog =
+            catalog!("a_metadata_filter_selects_the_pauses_whose_sandbox_carried_the_pairs");
+        let keep = catalog
+            .publish_commit(sandbox_pause_owned_by("sbx-keep", Some("keep")))
+            .await
+            .expect("the pause commits");
+        for commit in [
+            sandbox_pause_owned_by("sbx-other", Some("drop")),
+            sandbox_pause_owned_by("sbx-bare", None),
+            sandbox_commit_for("sbx-keep", false),
+        ] {
+            catalog
+                .publish_commit(commit)
+                .await
+                .expect("the other rows commit");
+        }
+
+        let wanted: std::collections::HashMap<String, String> =
+            [("owner".to_string(), "keep".to_string())]
+                .into_iter()
+                .collect();
+        let page = catalog
+            .list_page_scoped(
+                SnapshotListFilter::pauses(Some(wanted)),
+                CatalogReadScope::Resolvable,
+            )
+            .await
+            .expect("listing should succeed");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![keep.id.to_string()],
+            "a sandbox with another owner, one with no metadata, and a checkpoint of the \
+             matching sandbox all fall outside the filter"
+        );
+    }
+
     #[tokio::test]
     async fn a_second_pause_of_one_sandbox_retires_the_first() {
         let catalog = catalog!("a_second_pause_of_one_sandbox_retires_the_first");

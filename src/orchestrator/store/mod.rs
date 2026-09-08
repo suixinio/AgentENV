@@ -124,6 +124,24 @@ pub struct SandboxListFilter {
     pub user_metadata: Option<HashMap<String, String>>,
 }
 
+/// Whether a sandbox's own metadata carries every pair a listing asked for.
+///
+/// A listing that spans running records and paused catalog rows reads this one
+/// predicate for both halves; a second wording of it is one listing answering
+/// two different questions.
+pub fn user_metadata_matches(
+    actual: Option<&HashMap<String, String>>,
+    required: Option<&HashMap<String, String>>,
+) -> bool {
+    required.is_none_or(|required| {
+        actual.is_some_and(|actual| {
+            required
+                .iter()
+                .all(|(key, value)| actual.get(key) == Some(value))
+        })
+    })
+}
+
 /// Batched records plus the ids authoritatively covered by the read.
 /// Destructive callers may act on absence only after verifying full coverage.
 #[derive(Debug, Default)]

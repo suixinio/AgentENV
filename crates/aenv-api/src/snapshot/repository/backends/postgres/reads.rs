@@ -293,6 +293,36 @@ fn append_filters(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFi
             sql.push_str(&format!("\n   AND s.status = ANY({placeholder})"));
         }
     }
+
+    append_pause_axis(sql, binder, filter);
+}
+
+/// The pause axis, as SQL. It must decide the same rows as
+/// [`SnapshotListFilter::pause_axis_matches`], which every other backend reads.
+///
+/// `is_pause` is a column so the common half needs no payload. The metadata
+/// half has nowhere else to live: a sandbox's own metadata is inside the
+/// committed payload, so the predicate decodes it. A payload that is not the
+/// JSON this catalog writes makes the extraction NULL and the row unmatched,
+/// which is the answer a row whose configuration cannot be read deserves.
+fn append_pause_axis(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFilter) {
+    if filter.pauses_only || filter.user_metadata.is_some() {
+        sql.push_str("\n   AND s.is_pause");
+    }
+    let Some(pairs) = filter.user_metadata.as_ref().filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let wanted = serde_json::Value::Object(
+        pairs
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+            .collect(),
+    );
+    let placeholder = binder.add(Value::Text(wanted.to_string()));
+    sql.push_str(&format!(
+        "\n   AND convert_from(s.committed_payload, 'UTF8')::jsonb \
+         #> '{{paused_sandbox,user_metadata}}' @> {placeholder}::jsonb"
+    ));
 }
 
 fn source_kind_str(kind: crate::snapshot::types::SnapshotSourceKind) -> &'static str {

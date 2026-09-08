@@ -14,7 +14,6 @@ use super::ApiImpl;
 use crate::orchestrator::{CreateSandboxRequest, NewTimeout, SandboxExpiry, SandboxLaunchSource};
 use crate::snapshot::{
     CatalogReadScope, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind,
 };
 use crate::types::SandboxId;
 
@@ -61,7 +60,10 @@ impl ApiImpl {
         &self,
         sandbox_id: SandboxId,
     ) -> anyhow::Result<Option<SnapshotRecord>> {
-        let filter = SnapshotListFilter::sandbox_snapshots(Some(sandbox_id.to_string()), None);
+        let filter = SnapshotListFilter {
+            source_sandbox_id: Some(sandbox_id.to_string()),
+            ..SnapshotListFilter::pauses(None)
+        };
         let mut cursor = None;
         loop {
             let page = self
@@ -71,11 +73,7 @@ impl ApiImpl {
                     CatalogReadScope::Resolvable,
                 )
                 .await?;
-            if let Some(record) = page
-                .items
-                .iter()
-                .find(|record| record.paused_sandbox().is_some())
-            {
+            if let Some(record) = page.items.first() {
                 return Ok(Some(record.clone()));
             }
             match page.next {
@@ -88,11 +86,9 @@ impl ApiImpl {
     /// Every paused sandbox, newest snapshot per sandbox.
     pub(in crate::api) async fn list_paused_snapshots(
         &self,
+        user_metadata: Option<HashMap<String, String>>,
     ) -> anyhow::Result<Vec<SnapshotRecord>> {
-        let mut filter = SnapshotListFilter {
-            sources: Some(vec![SnapshotSourceKind::Sandbox]),
-            ..SnapshotListFilter::default()
-        };
+        let mut filter = SnapshotListFilter::pauses(user_metadata);
         let mut newest: HashMap<SandboxId, SnapshotRecord> = HashMap::new();
         loop {
             let page = self
@@ -100,9 +96,6 @@ impl ApiImpl {
                 .list_page_scoped(filter.clone(), CatalogReadScope::Resolvable)
                 .await?;
             for record in page.items {
-                if record.paused_sandbox().is_none() {
-                    continue;
-                }
                 let Some(sandbox_id) = paused_sandbox_id(&record) else {
                     continue;
                 };
@@ -123,7 +116,7 @@ impl ApiImpl {
         &self,
     ) -> anyhow::Result<Vec<PausedSandboxRow>> {
         Ok(self
-            .list_paused_snapshots()
+            .list_paused_snapshots(None)
             .await?
             .iter()
             .filter_map(PausedSandboxRow::of)

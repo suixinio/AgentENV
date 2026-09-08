@@ -183,6 +183,14 @@ impl Surface {
     }
 
     async fn list_v2(&self, state: Vec<models::SandboxState>) -> Vec<models::ListedSandbox> {
+        self.list_v2_matching(state, None).await
+    }
+
+    async fn list_v2_matching(
+        &self,
+        state: Vec<models::SandboxState>,
+        metadata: Option<&str>,
+    ) -> Vec<models::ListedSandbox> {
         let response = self
             .api
             .v2_sandboxes_get(
@@ -191,7 +199,7 @@ impl Surface {
                 &CookieJar::new(),
                 &super::super::Claims,
                 &models::V2SandboxesGetQueryParams {
-                    metadata: None,
+                    metadata: metadata.map(ToString::to_string),
                     state,
                     next_token: None,
                     limit: None,
@@ -703,5 +711,67 @@ async fn a_resume_during_a_pause_that_fails_answers_the_sandbox_that_kept_runnin
             SandboxesSandboxIdConnectPostResponse::Status200_TheSandboxWasAlreadyRunning { .. }
         ),
         "nothing was rebuilt over the sandbox that kept running"
+    );
+}
+
+fn paused_owned_by(owner: &str) -> PausedSandboxConfig {
+    PausedSandboxConfig {
+        user_metadata: Some(
+            [("owner".to_string(), owner.to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        ..mock_paused_sandbox_config()
+    }
+}
+
+#[tokio::test]
+async fn both_halves_of_one_listing_keep_the_same_sandboxes_for_a_metadata_filter() {
+    let surface = Surface::api_half().await;
+    let paused_keep = surface.paused(paused_owned_by("keep"));
+    let paused_drop = surface.paused(paused_owned_by("drop"));
+    let running_keep = surface.paused(paused_owned_by("keep"));
+    let running_drop = surface.paused(paused_owned_by("drop"));
+    let _ = surface.resume(running_keep).await;
+    let _ = surface.resume(running_drop).await;
+
+    let listed = surface
+        .list_v2_matching(Vec::new(), Some("owner=keep"))
+        .await;
+    let mut got: Vec<(String, models::SandboxState)> = listed
+        .iter()
+        .map(|sandbox| (sandbox.sandbox_id.clone(), sandbox.state))
+        .collect();
+    got.sort();
+    let mut expected = vec![
+        (paused_keep.to_string(), models::SandboxState::Paused),
+        (running_keep.to_string(), models::SandboxState::Running),
+    ];
+    expected.sort();
+    assert_eq!(
+        got, expected,
+        "one filter, both halves: {paused_drop} and {running_drop} carry another owner"
+    );
+}
+
+#[tokio::test]
+async fn a_metadata_filter_the_paused_half_answers_alone_still_drops_the_others() {
+    let surface = Surface::api_half().await;
+    let keep = surface.paused(paused_owned_by("keep"));
+    let other = surface.paused(paused_owned_by("drop"));
+    let unlabelled = surface.paused(mock_paused_sandbox_config());
+
+    let listed = surface
+        .list_v2_matching(vec![models::SandboxState::Paused], Some("owner=keep"))
+        .await;
+
+    assert_eq!(
+        listed
+            .iter()
+            .map(|sandbox| sandbox.sandbox_id.clone())
+            .collect::<Vec<_>>(),
+        vec![keep.to_string()],
+        "a sandbox that carries no metadata cannot match a filter that names some, \
+         and neither can {other} or {unlabelled}"
     );
 }

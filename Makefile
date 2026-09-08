@@ -127,25 +127,31 @@ clippy:
 # `cargo tree` cannot see inside `aenv-core`, so the module half of the same
 # rule is a path test: these run only on a machine that runs sandboxes, and a
 # copy of any of them under `src/` is the union crate re-forming.
+#
+# Each entry is `<path that must stay out of aenv-core>:<the half that owns it
+# now>`. The second half is the positive control this check would otherwise
+# have none of: an absence test passes forever on a path nobody ever writes, so
+# a typo in an entry, or a module renamed out from under one, is caught here
+# rather than by nothing.
 CORE_EXILED_PATHS := \
-	src/api/proxy.rs \
-	src/observability/reporter.rs \
-	src/p2p \
-	src/record_dir.rs \
-	src/sandbox/envd.rs \
-	src/sandbox/process.rs
+	src/api/proxy.rs:crates/aenv-node/src/api/proxy.rs \
+	src/observability/reporter.rs:crates/aenv-node/src/observability/reporter.rs \
+	src/p2p:crates/aenv-node/src/p2p \
+	src/record_dir.rs:crates/aenv-node/src/record_dir.rs \
+	src/sandbox/envd.rs:crates/aenv-node/src/sandbox/envd.rs \
+	src/sandbox/process.rs:crates/aenv-node/src/sandbox/process.rs
 
 # The mirror image: modules only the deciding half runs. A copy of any of them
 # under `src/` puts the whole user-facing surface, the cluster's placement and
 # its routing store back into every node binary, which is what the role gate
 # used to hide.
 API_EXILED_PATHS := \
-	src/api/impls \
-	src/api/grpc \
-	src/api/server.rs \
-	src/binding_store \
-	src/node_client \
-	src/node_registry
+	src/api/impls:crates/aenv-api/src/api/impls \
+	src/api/grpc:crates/aenv-api/src/api/grpc \
+	src/api/server.rs:crates/aenv-api/src/api/server.rs \
+	src/binding_store:crates/aenv-api/src/binding_store \
+	src/node_client:crates/aenv-api/src/node_client \
+	src/node_registry:crates/aenv-api/src/node_registry
 
 check-crate-boundaries:
 	@fail=0; \
@@ -186,19 +192,41 @@ check-crate-boundaries:
 	  echo "moves no artifact bytes and speaks to no guest, so both are aenv-node's alone."; \
 	  fail=1; \
 	fi; \
-	for path in $(CORE_EXILED_PATHS); do \
+	for pair in $(CORE_EXILED_PATHS); do \
+	  path=$${pair%%:*}; home=$${pair#*:}; \
 	  if [ -e "$$path" ]; then \
 	    echo "$$path is under aenv-core again. It runs only where sandboxes run, so aenv-node"; \
 	    echo "owns it; back here it is compiled into the api binary as well."; \
 	    fail=1; \
 	  fi; \
+	  if [ ! -e "$$home" ]; then \
+	    echo "$$home does not exist, so the rule keeping $$path out of aenv-core is watching a"; \
+	    echo "path nothing owns and would pass whatever happens. Name where it lives, or drop the pair."; \
+	    fail=1; \
+	  fi; \
+	  case "$$home" in */"$$path") ;; *) \
+	    echo "$$home is not $$path under a half's crate: the two spellings must be the same path,"; \
+	    echo "or a typo on the left is a rule about nothing and the control on the right cannot see it."; \
+	    fail=1;; \
+	  esac; \
 	done; \
-	for path in $(API_EXILED_PATHS); do \
+	for pair in $(API_EXILED_PATHS); do \
+	  path=$${pair%%:*}; home=$${pair#*:}; \
 	  if [ -e "$$path" ]; then \
 	    echo "$$path is under aenv-core again. Only the deciding half serves it, so aenv-api"; \
 	    echo "owns it; back here it is compiled into every node binary as well."; \
 	    fail=1; \
 	  fi; \
+	  if [ ! -e "$$home" ]; then \
+	    echo "$$home does not exist, so the rule keeping $$path out of aenv-core is watching a"; \
+	    echo "path nothing owns and would pass whatever happens. Name where it lives, or drop the pair."; \
+	    fail=1; \
+	  fi; \
+	  case "$$home" in */"$$path") ;; *) \
+	    echo "$$home is not $$path under a half's crate: the two spellings must be the same path,"; \
+	    echo "or a typo on the left is a rule about nothing and the control on the right cannot see it."; \
+	    fail=1;; \
+	  esac; \
 	done; \
 	for half in aenv-api aenv-node; do \
 	  reexports=$$(sed -n '/^pub use aenv_core::{$$/,/^};$$/p' crates/$$half/src/lib.rs | sed '1d;$$d' | tr -d ' \t' | tr ',' '\n' | grep -v '^$$' || true); \
@@ -207,10 +235,21 @@ check-crate-boundaries:
 	    echo "anchors on that declaration and a reshaped one turns it silently green."; \
 	    fail=1; \
 	  fi; \
+	  own=$$(grep -E '^pub mod [a-z_]+;$$' crates/$$half/src/lib.rs | sed 's/^pub mod //; s/;$$//' || true); \
+	  if [ -z "$$own" ]; then \
+	    echo "crates/$$half/src/lib.rs declares no 'pub mod' of its own; this check reads that"; \
+	    echo "list to tell a re-exported path from one the half owns, and an empty list tells it nothing."; \
+	    fail=1; \
+	  fi; \
 	  for module in $$reexports; do \
 	    if [ ! -e "src/$$module.rs" ] && [ ! -d "src/$$module" ]; then \
 	      echo "crates/$$half/src/lib.rs re-exports aenv_core::$$module, which is no module of"; \
 	      echo "aenv-core: whichever half owns it is the only crate that may publish that path."; \
+	      fail=1; \
+	    fi; \
+	    if printf '%s\n' "$$own" | grep -qx "$$module"; then \
+	      echo "crates/$$half/src/lib.rs both re-exports aenv_core::$$module and declares its own"; \
+	      echo "'pub mod $$module'. One path, one owner: publish core's or the half's, not both."; \
 	      fail=1; \
 	    fi; \
 	  done; \

@@ -488,6 +488,27 @@ mod pg {
         created_at_ms: i64,
         payload_json: &str,
     ) -> uuid::Uuid {
+        seed_sandbox_row_with_status(
+            pool,
+            cluster_id,
+            source_sandbox_id,
+            created_at_ms,
+            payload_json,
+            "ready",
+        )
+        .await
+    }
+
+    // status decides status_group through the trigger, and status_group is the
+    // first ordering term the de-duplication ranks on.
+    async fn seed_sandbox_row_with_status(
+        pool: &sqlx::PgPool,
+        cluster_id: uuid::Uuid,
+        source_sandbox_id: &str,
+        created_at_ms: i64,
+        payload_json: &str,
+        status: &str,
+    ) -> uuid::Uuid {
         let id = uuid::Uuid::now_v7();
         sqlx::query(
             "INSERT INTO snapshots (
@@ -499,7 +520,7 @@ mod pg {
              ) VALUES (
                 $1, $2, 'sandbox', $3,
                 1, 512, 1024,
-                'ready', 'pending', true,
+                $6, 'pending', true,
                 $4, $4,
                 convert_to($5, 'UTF8'), 1
              )",
@@ -509,6 +530,7 @@ mod pg {
         .bind(source_sandbox_id)
         .bind(created_at_ms)
         .bind(payload_json)
+        .bind(status)
         .execute(pool)
         .await
         .expect("seeding a pre-migration row should succeed");
@@ -600,6 +622,47 @@ mod pg {
             pauses,
             vec![true, true, false],
             "the backfill reads the payload's key, not the row's source kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pause_migration_prefers_a_ready_duplicate_to_a_newer_unfinished_one() {
+        let pool = isolated_schema_pool_or_skip!(
+            "the_pause_migration_prefers_a_ready_duplicate_to_a_newer_unfinished_one"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+        rewind_to_the_pre_migration_schema(&pool).await;
+
+        let cluster_id = uuid::Uuid::new_v4();
+        let ready = seed_committed_sandbox_row(
+            &pool,
+            cluster_id,
+            "sbx-unfinished",
+            1_000,
+            r#"{"paused_sandbox":{}}"#,
+        )
+        .await;
+        let newer_but_building = seed_sandbox_row_with_status(
+            &pool,
+            cluster_id,
+            "sbx-unfinished",
+            2_000,
+            r#"{"paused_sandbox":{}}"#,
+            "building",
+        )
+        .await;
+
+        migrate(&pool)
+            .await
+            .expect("a database that already holds duplicates must still migrate");
+
+        assert!(
+            is_live(&pool, ready).await,
+            "a resume reads a ready row, so the newest ready one is what the constraint keeps"
+        );
+        assert!(
+            !is_live(&pool, newer_but_building).await,
+            "a newer row that is not ready loses to it, exactly as the read it replaces decided"
         );
     }
 

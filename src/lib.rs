@@ -34,11 +34,20 @@ mod mock_module_gating {
         matches!(rest.chars().next(), Some(';') | Some('{') | Some(' '))
     }
 
+    // Every cfg that excludes a release build. An allowlist, not a shape test:
+    // `#[cfg(not(test))]` and `#[cfg(target_os = "linux")]` are cfgs too, and
+    // both leave the module in the shipped binaries.
+    const TEST_ONLY_CFGS: [&str; 3] = [
+        "#[cfg(test)]",
+        "#[cfg(feature = \"test-support\")]",
+        "#[cfg(any(test, feature = \"test-support\"))]",
+    ];
+
     fn gated(preceding: &[&str]) -> bool {
         for line in preceding.iter().rev() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("#[cfg(") {
-                return true;
+                return TEST_ONLY_CFGS.contains(&trimmed);
             }
             if trimmed.starts_with("#[") || trimmed.starts_with("//") {
                 continue;
@@ -60,13 +69,29 @@ mod mock_module_gating {
             .collect()
     }
 
+    // aenv-core's own `src/`, plus the `src/` of every sibling crate: a mock
+    // declared in either is a public path of a shipped binary.
+    fn scanned_roots() -> Vec<PathBuf> {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut roots = vec![workspace.join("src")];
+        let mut crates: Vec<PathBuf> = std::fs::read_dir(workspace.join("crates"))
+            .expect("the workspace has a crates directory")
+            .flatten()
+            .map(|entry| entry.path().join("src"))
+            .filter(|src| src.is_dir())
+            .collect();
+        crates.sort();
+        roots.extend(crates);
+        roots
+    }
+
     #[test]
     fn no_mock_module_reaches_a_shipped_binary() {
-        let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let roots = scanned_roots();
         let mut files = 0usize;
         let mut declarations = 0usize;
         let mut offenders: Vec<String> = Vec::new();
-        let mut stack = vec![src.clone()];
+        let mut stack = roots.clone();
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -96,22 +121,21 @@ mod mock_module_gating {
 
         assert!(
             offenders.is_empty(),
-            "{offenders:?} declare `pub mod mock` with no `#[cfg(...)]` above it. \
-             Nothing here strips a non-generic `pub fn`, so an ungated test double is \
-             linked into both shipped binaries and is a public path of both sibling \
-             crates. Gate it with `#[cfg(any(test, feature = \"test-support\"))]`, the \
-             way `src/p2p/mod.rs` and `src/image/mod.rs` do."
+            "{offenders:?} declare `pub mod mock` under no cfg that excludes a release \
+             build. Nothing here strips a non-generic `pub fn`, so such a test double is \
+             linked into a shipped binary and is a public path of the crate that declares \
+             it. Gate it with one of {TEST_ONLY_CFGS:?}, the way `src/image/mod.rs` and \
+             `crates/aenv-node/src/p2p/mod.rs` do."
         );
         assert!(
             declarations > 0,
-            "the walk over {} matched no `pub mod mock` line; a scan that finds nothing \
-             passes everything",
-            src.display()
+            "the walk over {roots:?} matched no `pub mod mock` line; a scan that finds \
+             nothing passes everything"
         );
+        assert!(files > 100, "only {files} files under {roots:?} were read");
         assert!(
-            files > 100,
-            "only {files} files under {} were read",
-            src.display()
+            roots.len() > 3,
+            "{roots:?} is not every crate's source root"
         );
 
         assert_eq!(
@@ -120,13 +144,26 @@ mod mock_module_gating {
             "the scan does not notice an ungated declaration"
         );
         assert!(
-            ungated_mock_declarations("#[cfg(any(test, feature = \"x\"))]\npub mod mock;\n")
-                .is_empty(),
+            ungated_mock_declarations(
+                "#[cfg(any(test, feature = \"test-support\"))]\npub mod mock;\n"
+            )
+            .is_empty(),
             "the scan reports a gated declaration"
         );
         assert!(
             ungated_mock_declarations("// pub mod mock;\n").is_empty(),
             "the scan matches a comment describing the pattern"
+        );
+        assert_eq!(
+            ungated_mock_declarations("#[cfg(not(test))]\npub mod mock;\n"),
+            vec![2],
+            "a cfg that keeps the module out of test builds and in release ones passes \
+             the gate"
+        );
+        assert_eq!(
+            ungated_mock_declarations("#[cfg(target_os = \"linux\")]\npub mod mock;\n"),
+            vec![2],
+            "any cfg at all satisfies the gate, so it proves nothing about release builds"
         );
     }
 }

@@ -6,38 +6,10 @@ use http::Method;
 use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
-use crate::snapshot::{SnapshotListFilter, SnapshotRecord, SnapshotSource};
+use crate::snapshot::{SnapshotListFilter, SnapshotSource};
 
-use super::pagination::{
-    snapshot_cursor_from_token, snapshot_next_token, system_time_from_unix_ms,
-};
+use super::pagination::{snapshot_cursor_from_token, snapshot_next_token};
 use super::ApiImpl;
-
-impl From<SnapshotRecord> for models::SnapshotInfo {
-    fn from(record: SnapshotRecord) -> Self {
-        let snapshot_id = record.id.to_string();
-        let image_ref = record.published_rootfs_image_ref().map(str::to_owned);
-        let names = if let Some(alias) = record.alias {
-            vec![alias.to_string()]
-        } else {
-            vec![]
-        };
-        models::SnapshotInfo {
-            snapshot_id,
-            names,
-            cpu_count: record.resources.cpu_count,
-            memory_mb: record.resources.memory_mib,
-            disk_size_mb: record.resources.disk_size_mib,
-            created_at: chrono::DateTime::<chrono::Utc>::from(system_time_from_unix_ms(
-                record.created_at_unix_ms,
-            )),
-            updated_at: chrono::DateTime::<chrono::Utc>::from(system_time_from_unix_ms(
-                record.updated_at_unix_ms,
-            )),
-            image_ref,
-        }
-    }
-}
 
 #[async_trait]
 impl Snapshots<()> for ApiImpl {
@@ -128,7 +100,7 @@ impl Snapshots<()> for ApiImpl {
 mod tests {
     use super::*;
     use crate::snapshot::{
-        rootfs_snapshot_image_tag, CommittedSnapshot, PersistedDiskImagePublication,
+        rootfs_snapshot_image_tag, CommittedSnapshot, PersistedDiskImagePublication, SnapshotRecord,
     };
 
     #[test]

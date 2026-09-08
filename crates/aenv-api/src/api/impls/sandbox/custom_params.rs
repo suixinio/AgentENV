@@ -4,8 +4,8 @@ use agentenv_http_server::models;
 use crate::orchestrator::OrchestratorError;
 use crate::types::SandboxId;
 
-use super::conversions::{params_map_to_model, params_model_to_map};
 use super::{sandbox_not_found, ApiImpl};
+use aenv_core::api::wire::{params_map_to_model, params_model_to_map};
 
 impl ApiImpl {
     pub(super) async fn custom_params_get(

@@ -2,13 +2,10 @@
 //! resolution, snapshots, and templates.
 
 pub use aenv_core::{
-    binding_store, digest, identity, leader_task, logging, node_client, node_registry,
-    orchestrator, privileges, proto, runtime_snapshot, scheduler_endpoint, server_main, types,
-    virtualization,
+    digest, identity, leader_task, logging, orchestrator, privileges, proto, runtime_snapshot,
+    scheduler_endpoint, server_main, types, virtualization,
 };
 
-#[cfg(test)]
-mod node_client_tests;
 #[cfg(test)]
 mod tests;
 

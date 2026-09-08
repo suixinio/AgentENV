@@ -61,6 +61,17 @@ pub mod node {
     }
 }
 
+impl scheduler::EgressBrokerState {
+    /// Whether a sandbox whose rules name the public `http` handler can run
+    /// on a node in this state. An embedded broker dispatches only the
+    /// identity-echo handler the node's own integration tests use, and an
+    /// unrecognized value — what an older node's report decodes to — is not a
+    /// placement target either.
+    pub fn can_broker(self) -> bool {
+        matches!(self, Self::LocalOk)
+    }
+}
+
 #[cfg(test)]
 mod node_wire_tests {
     use super::node as pb;

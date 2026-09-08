@@ -22,7 +22,7 @@ use sample::{sample_without_replacement, ScriptedRng, ThreadShadowRng};
 use score::{classify, Classification, RequestResources, SnapshotFreshness, UnknownReason};
 
 /// Default shadow sample width.
-pub const DEFAULT_PLACEMENT_SHADOW_K: u32 = 3;
+pub use aenv_core::cfg::DEFAULT_PLACEMENT_SHADOW_K;
 
 const AGREEMENT_METRIC: &str = "agentenv_api_placement_shadow_agreement_total";
 const CLASSIFICATION_METRIC: &str = "agentenv_api_placement_shadow_classification_total";

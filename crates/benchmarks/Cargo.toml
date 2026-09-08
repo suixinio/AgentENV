@@ -6,6 +6,7 @@ publish = false
 
 [dev-dependencies]
 aenv-core = { path = "../.." }
+aenv-api = { path = "../aenv-api" }
 aenv-node = { path = "../aenv-node" }
 anyhow = "1.0.100"
 criterion = { version = "0.8", features = ["async_tokio"] }

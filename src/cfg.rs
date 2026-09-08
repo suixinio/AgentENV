@@ -77,6 +77,9 @@ impl SetupDependencyManifest {
     }
 }
 
+/// Default shadow sample width; the same value `placement_shadow_k` defaults to.
+pub const DEFAULT_PLACEMENT_SHADOW_K: u32 = 3;
+
 pub fn regctl_path(deps_path: &Path) -> PathBuf {
     deps_path
         .join("regctl")
@@ -752,6 +755,8 @@ pub struct ClusterConfig {
     /// Candidate count for metrics-only placement shadow scoring.
     ///
     /// Zero is invalid; this setting never changes real round-robin placement.
+    /// The literal and [`DEFAULT_PLACEMENT_SHADOW_K`] are one value; confique
+    /// cannot read a constant here.
     #[config(default = 3u32, env = "AENV_CLUSTER_PLACEMENT_SHADOW_K")]
     pub placement_shadow_k: u32,
     /// The shared-roster fix: see [`ClusterNodeRegistryStoreConfig`].
@@ -2730,7 +2735,7 @@ endpoint = "http://second:9000"
             kubernetes_discovery: Default::default(),
             static_discovery_nodes: Vec::new(),
             native_warmup_timeout_secs: 15,
-            placement_shadow_k: crate::node_registry::placement::DEFAULT_PLACEMENT_SHADOW_K,
+            placement_shadow_k: DEFAULT_PLACEMENT_SHADOW_K,
             node_registry_store: Default::default(),
         };
         config.normalize();
@@ -2746,7 +2751,7 @@ endpoint = "http://second:9000"
             kubernetes_discovery: Default::default(),
             static_discovery_nodes: Vec::new(),
             native_warmup_timeout_secs: 15,
-            placement_shadow_k: crate::node_registry::placement::DEFAULT_PLACEMENT_SHADOW_K,
+            placement_shadow_k: DEFAULT_PLACEMENT_SHADOW_K,
             node_registry_store: Default::default(),
         };
         config.normalize();

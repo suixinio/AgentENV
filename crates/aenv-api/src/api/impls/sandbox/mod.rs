@@ -1,5 +1,4 @@
 mod connect;
-mod conversions;
 mod create;
 mod custom_params;
 mod delete;
@@ -34,7 +33,7 @@ use agentenv_http_server::types::Nullable;
 
 use super::ApiImpl;
 
-pub(in crate::api) use conversions::{
+pub(in crate::api) use aenv_core::api::wire::{
     allow_internet_access_from_base_policy, network_config_model,
 };
 
@@ -56,39 +55,6 @@ impl RoutingHeaders {
             sandbox_id: metadata.id.to_string(),
             execution_id: metadata.execution_id.to_string(),
             projection_ttl_secs: i64::from(metadata.projection_ttl_secs(SystemTime::now())),
-        }
-    }
-}
-
-impl From<OrchestratorError> for models::Error {
-    fn from(err: OrchestratorError) -> Self {
-        match err {
-            OrchestratorError::ShuttingDown => {
-                Self::new(503, "orchestrator is shutting down".to_string())
-            }
-            OrchestratorError::NotAcceptingNewWork => Self::new(
-                503,
-                "node is isolated and is not taking new sandboxes".to_string(),
-            ),
-            OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
-            OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
-            OrchestratorError::SandboxLifetimeExceeded { .. } => Self::new(400, err.to_string()),
-            OrchestratorError::SandboxOperationFailed {
-                sandbox_id,
-                operation,
-                source,
-            } => Self::new(
-                500,
-                format!(
-                    "sandbox {} operation {:?} failed: {}",
-                    sandbox_id,
-                    operation,
-                    ApiImpl::internal_error(source.as_ref()).message
-                ),
-            ),
-            OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
-            OrchestratorError::InvalidRequest(_) => Self::new(400, err.to_string()),
-            other => ApiImpl::internal_error(&other),
         }
     }
 }
@@ -444,7 +410,7 @@ mod routing_header_tests {
         "x-agentenv-projection-ttl-secs",
     ];
 
-    const SPEC: &str = include_str!("../../openapi.yml");
+    const SPEC: &str = include_str!("../../../../../../src/api/openapi.yml");
 
     fn indent_of(line: &str) -> usize {
         line.len() - line.trim_start().len()

@@ -1,6 +1,7 @@
+use aenv_core::api::wire::system_time_from_unix_ms;
 use std::cmp::Ordering;
 use std::fmt::Display;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE, Engine};
 use thiserror::Error;
@@ -147,15 +148,6 @@ where
         b_value: &T,
     ) -> Ordering {
         b_time.cmp(&a_time).then_with(|| a_value.cmp(b_value))
-    }
-}
-
-/// A snapshot record's `created_at` as an instant.
-pub fn system_time_from_unix_ms(unix_ms: i64) -> SystemTime {
-    if unix_ms >= 0 {
-        UNIX_EPOCH + Duration::from_millis(unix_ms as u64)
-    } else {
-        UNIX_EPOCH - Duration::from_millis(unix_ms.unsigned_abs())
     }
 }
 

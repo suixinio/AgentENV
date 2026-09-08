@@ -14,7 +14,7 @@ use super::{RedisMetadataStore, RedisStoreConfig};
 const DATABASES: u32 = 512;
 
 /// This suite's dedicated Redis server.
-pub(crate) fn server() -> Option<&'static RedisTestServer> {
+pub fn server() -> Option<&'static RedisTestServer> {
     static SERVER: OnceLock<Option<RedisTestServer>> = OnceLock::new();
     SERVER
         .get_or_init(|| redis_test_server::start("redis-test-server", "the store tests", DATABASES))
@@ -22,7 +22,7 @@ pub(crate) fn server() -> Option<&'static RedisTestServer> {
 }
 
 /// This suite's dedicated logical-database counter.
-pub(crate) fn db_counter() -> &'static AtomicU32 {
+pub fn db_counter() -> &'static AtomicU32 {
     static NEXT: AtomicU32 = AtomicU32::new(1);
     &NEXT
 }
@@ -71,6 +71,7 @@ pub async fn store_for(
 }
 
 /// Binds a store or returns after reporting a visible skip.
+#[cfg(test)]
 macro_rules! store_or_skip {
     ($test:literal) => {
         store_or_skip!($test, |_config| {})
@@ -83,6 +84,7 @@ macro_rules! store_or_skip {
     };
 }
 
+#[cfg(test)]
 pub(crate) use store_or_skip;
 
 /// Raw connection for assertions outside the store API.

@@ -5,10 +5,10 @@ use crate::orchestrator::OrchestratorError;
 use crate::sandbox::{SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::types::SandboxId;
 
-use super::conversions::{
+use super::{sandbox_not_found, ApiImpl};
+use aenv_core::api::wire::{
     base_policy_from_allow_internet_access, endpoints_from_model, rules_from_model,
 };
-use super::{sandbox_not_found, ApiImpl};
 
 fn network_policy_from_update(
     body: &models::SandboxNetworkUpdateConfig,

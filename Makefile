@@ -135,6 +135,18 @@ CORE_EXILED_PATHS := \
 	src/sandbox/envd.rs \
 	src/sandbox/process.rs
 
+# The mirror image: modules only the deciding half runs. A copy of any of them
+# under `src/` puts the whole user-facing surface, the cluster's placement and
+# its routing store back into every node binary, which is what the role gate
+# used to hide.
+API_EXILED_PATHS := \
+	src/api/impls \
+	src/api/grpc \
+	src/api/server.rs \
+	src/binding_store \
+	src/node_client \
+	src/node_registry
+
 check-crate-boundaries:
 	@fail=0; \
 	api_tree=$$($(CARGO) tree -p aenv-api -e normal) || { echo "cargo tree -p aenv-api failed"; exit 1; }; \
@@ -178,6 +190,13 @@ check-crate-boundaries:
 	  if [ -e "$$path" ]; then \
 	    echo "$$path is under aenv-core again. It runs only where sandboxes run, so aenv-node"; \
 	    echo "owns it; back here it is compiled into the api binary as well."; \
+	    fail=1; \
+	  fi; \
+	done; \
+	for path in $(API_EXILED_PATHS); do \
+	  if [ -e "$$path" ]; then \
+	    echo "$$path is under aenv-core again. Only the deciding half serves it, so aenv-api"; \
+	    echo "owns it; back here it is compiled into every node binary as well."; \
 	    fail=1; \
 	  fi; \
 	done; \

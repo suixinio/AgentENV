@@ -86,7 +86,7 @@ impl From<SandboxMetadata> for models::Sandbox {
 /// not hold: the lock lives on the record, as the token minted with it. A
 /// response that answered `true` for a locked sandbox would describe a
 /// sandbox its own client cannot reach without a token.
-pub(in crate::api) fn network_config_model(
+pub fn network_config_model(
     policy: &SandboxNetworkPolicy,
     locked: bool,
 ) -> models::SandboxNetworkConfig {
@@ -154,7 +154,7 @@ fn endpoints_model(endpoints: &[EndpointDeclaration]) -> Vec<models::SandboxBrok
         .collect()
 }
 
-pub(super) fn endpoints_from_model(
+pub fn endpoints_from_model(
     endpoints: Option<&Vec<models::SandboxBrokeredEndpoint>>,
 ) -> anyhow::Result<Option<Vec<EndpointDeclaration>>> {
     let Some(endpoints) = endpoints else {
@@ -189,7 +189,7 @@ pub(super) fn endpoints_from_model(
         .map(Some)
 }
 
-pub(super) fn rules_from_model(
+pub fn rules_from_model(
     rules: Option<&HashMap<String, Vec<models::SandboxNetworkRule>>>,
 ) -> Option<BTreeMap<String, Vec<DomainRule>>> {
     rules.map(|rules| {
@@ -219,9 +219,7 @@ pub(super) fn rules_from_model(
     })
 }
 
-pub(super) fn base_policy_from_allow_internet_access(
-    value: Option<bool>,
-) -> BaseSandboxNetworkPolicy {
+pub fn base_policy_from_allow_internet_access(value: Option<bool>) -> BaseSandboxNetworkPolicy {
     match value {
         Some(true) => BaseSandboxNetworkPolicy::Allow,
         Some(false) => BaseSandboxNetworkPolicy::Deny,
@@ -229,9 +227,7 @@ pub(super) fn base_policy_from_allow_internet_access(
     }
 }
 
-pub(in crate::api) fn allow_internet_access_from_base_policy(
-    policy: BaseSandboxNetworkPolicy,
-) -> Nullable<bool> {
+pub fn allow_internet_access_from_base_policy(policy: BaseSandboxNetworkPolicy) -> Nullable<bool> {
     match policy {
         BaseSandboxNetworkPolicy::Default => Nullable::Null,
         BaseSandboxNetworkPolicy::Allow => Nullable::Present(true),
@@ -275,7 +271,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 }
 
 /// Convert a generated params model into the internal params map.
-pub(super) fn params_model_to_map(
+pub fn params_model_to_map(
     model: &std::collections::HashMap<String, agentenv_http_server::types::Object>,
 ) -> serde_json::Map<String, serde_json::Value> {
     model
@@ -286,7 +282,7 @@ pub(super) fn params_model_to_map(
 
 /// Convert stored params into the generated response model. Absent params
 /// yield an empty object (empty params).
-pub(super) fn params_map_to_model(
+pub fn params_map_to_model(
     params: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> std::collections::HashMap<String, agentenv_http_server::types::Object> {
     match params {
@@ -361,7 +357,7 @@ mod execution_exposure_tests {
 
     #[test]
     fn the_execution_is_never_an_input() {
-        let spec = include_str!("../../openapi.yml");
+        let spec = include_str!("../openapi.yml");
         let mut schema = None;
         let mut offenders = Vec::new();
 

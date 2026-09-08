@@ -105,7 +105,7 @@ async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
     let snapshots = Arc::new(resolvable_snapshot_manager());
     orchestrator.set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(&snapshots))));
     let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = crate::node_server::NodeSandboxService::new(
+    let service = aenv_node::node_server::NodeSandboxService::new(
         Arc::clone(&orchestration),
         snapshots,
         "node-under-test".to_string(),
@@ -142,8 +142,8 @@ async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) 
         deps_path,
         ..Default::default()
     };
-    let image_resolver = Arc::new(crate::image::ImageResolver::new(&config));
-    let template_builder = Arc::new(crate::template::TemplateBuilder::new());
+    let image_resolver = Arc::new(aenv_node::image::ImageResolver::new(&config));
+    let template_builder = Arc::new(aenv_node::template::TemplateBuilder::new());
 
     let orchestrator = Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
@@ -154,7 +154,7 @@ async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) 
     .await
     .expect("an in-memory orchestrator");
     let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
-    let service = crate::node_server::NodeSandboxService::new(
+    let service = aenv_node::node_server::NodeSandboxService::new(
         Arc::clone(&orchestration),
         Arc::new(resolvable_snapshot_manager()),
         "node-under-test".to_string(),
@@ -1763,7 +1763,7 @@ fn the_remote_factory_sends_no_blank_ownership_marker() {
     const BLANK_MARKER: &str = "control_plane_config: Vec::new()";
 
     // The scanned factory source lives in `aenv-core`.
-    let factory = include_str!("../../../src/node_client/factory.rs");
+    let factory = include_str!("factory.rs");
 
     assert!(
         !factory.contains(BLANK_MARKER),
@@ -1817,7 +1817,7 @@ async fn the_marker_the_orchestrator_stamped_is_the_marker_on_the_wire() {
         "the node handed back different bytes from the ones it was sent"
     );
     assert_eq!(
-        crate::node_server::owned_by_control_plane(&live).len(),
+        aenv_node::node_server::owned_by_control_plane(&live).len(),
         1,
         "a sandbox the control plane created must be one the control plane recognises"
     );
@@ -1855,7 +1855,7 @@ async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
         "an empty marker on the wire must not become a marker on the node"
     );
     assert!(
-        crate::node_server::owned_by_control_plane(&live).is_empty(),
+        aenv_node::node_server::owned_by_control_plane(&live).is_empty(),
         "a sandbox nobody claimed must not be offered up for reconciliation"
     );
 }
@@ -1879,20 +1879,20 @@ async fn the_gate_refuses_a_node_rpc_that_carries_no_credential() {
     let addr = listener.local_addr().expect("the bound address");
     let (stop, stopped) = oneshot::channel::<()>();
 
-    let gate = crate::node_server::NodeGrpcGate::new(crate::api::ControlPlaneGate::new(
+    let gate = aenv_node::node_server::NodeGrpcGate::new(crate::api::ControlPlaneGate::new(
         vec!["node-token".to_string()],
         "",
     ));
     let serving = tokio::spawn(async move {
         tonic::transport::Server::builder()
-            .add_service(crate::node_server::server_with_gate(
+            .add_service(aenv_node::node_server::server_with_gate(
                 orchestration,
                 Arc::new(resolvable_snapshot_manager()),
                 "node-under-test".to_string(),
-                Arc::new(crate::image::ImageResolver::new(
+                Arc::new(aenv_node::image::ImageResolver::new(
                     &crate::cfg::AppConfig::default(),
                 )),
-                Arc::new(crate::template::TemplateBuilder::new()),
+                Arc::new(aenv_node::template::TemplateBuilder::new()),
                 gate,
             ))
             .serve_with_incoming_shutdown(
@@ -1976,15 +1976,15 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
 
     let served = Arc::clone(&orchestration);
     let serving = tokio::spawn(async move {
-        crate::node_server::serve_on(
+        aenv_node::node_server::serve_on(
             listener,
             served,
             Arc::new(resolvable_snapshot_manager()),
             "node-under-test".to_string(),
-            Arc::new(crate::image::ImageResolver::new(
+            Arc::new(aenv_node::image::ImageResolver::new(
                 &crate::cfg::AppConfig::default(),
             )),
-            Arc::new(crate::template::TemplateBuilder::new()),
+            Arc::new(aenv_node::template::TemplateBuilder::new()),
             async {
                 let _ = stopped.await;
             },

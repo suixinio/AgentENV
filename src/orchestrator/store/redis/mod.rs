@@ -12,8 +12,8 @@ mod record;
 mod scripts;
 mod transition;
 
-#[cfg(test)]
-pub(crate) mod harness;
+#[cfg(any(test, feature = "test-support"))]
+pub mod harness;
 #[cfg(test)]
 mod tests;
 
@@ -159,7 +159,7 @@ impl RedisMetadataStore {
     }
 
     /// Deletes this test store's namespace.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn flush_namespace(&self) -> Result<()> {
         let mut connection = self.inner.connection.clone();
         let pattern = format!("{}:*", self.inner.config.key_prefix);
@@ -252,7 +252,7 @@ impl StoreInner {
             .readiness(self.config.transition_reaper_enabled)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn skip_background_warmup(&self) {
         for warmup in [&self.healer_warmup, &self.reaper_warmup] {
             *warmup

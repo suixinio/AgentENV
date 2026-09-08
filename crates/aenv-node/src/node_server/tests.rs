@@ -1757,8 +1757,13 @@ async fn a_pause_that_joins_another_callers_pause_is_refused_the_staged_value() 
         .await
         .expect_err("a pause somebody else is performing has no row for this caller");
     assert_eq!(joined.code(), Code::Internal, "{joined}");
+    // What the caller decodes is the detail, so assert on the detail itself:
+    // an unclassified failure is read as terminal on the other side.
+    let classification = prost::Message::decode(joined.details())
+        .map(|failure: pb::SandboxCaptureFailure| failure.terminal)
+        .expect("the refusal carries a capture classification");
     assert!(
-        !crate::node_client::wire::into_capture_error(joined).is_terminal(),
+        !classification,
         "a joiner that got nothing did not touch the runtime"
     );
 

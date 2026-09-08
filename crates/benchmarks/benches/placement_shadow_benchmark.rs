@@ -5,12 +5,12 @@
 
 use std::time::{Duration, SystemTime};
 
-use aenv_core::binding_store::lookup::{select_node, ScheduleDeps};
-use aenv_core::node_registry::filter::filter_unschedulable;
-use aenv_core::node_registry::placement::{ShadowPlacement, ShadowSource};
-use aenv_core::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
-use aenv_core::node_registry::strategy::RoundRobinStrategy;
-use aenv_core::node_registry::types::{Node, RichNode};
+use aenv_api::binding_store::lookup::{select_node, ScheduleDeps};
+use aenv_api::node_registry::filter::filter_unschedulable;
+use aenv_api::node_registry::placement::{ShadowPlacement, ShadowSource};
+use aenv_api::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
+use aenv_api::node_registry::strategy::RoundRobinStrategy;
+use aenv_api::node_registry::types::{Node, RichNode};
 use aenv_core::proto::scheduler::{
     schedule_request_hint::Kind, HeartbeatRequest, NewSandboxHint, NodeSnapshot, NodeStatus,
     ScheduleRequestHint,

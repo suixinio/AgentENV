@@ -21,6 +21,13 @@ path = "src/bin/aenv-api.rs"
 name = "aenv-snapshot-image"
 path = "src/bin/aenv-snapshot-image.rs"
 
+[features]
+# 🔴 The same contract `aenv-core`'s feature of this name carries, for the
+# modules that moved here with it: test scaffolding a sibling crate's tests
+# need and that nothing ships. Nothing in the workspace enables it today; the
+# gates it names are also true under this crate's own `cfg(test)`.
+test-support = ["aenv-core/test-support"]
+
 [dependencies]
 aenv-core = { path = "../.." }
 # 🔴 The only cipher in the workspace, and deliberately not the ambient
@@ -29,13 +36,32 @@ aenv-core = { path = "../.." }
 # that matter. See `src/secrets/envelope.rs`.
 aes-gcm = "0.10"
 agentenv-observability = { path = "../observability" }
+agentenv_http_server = { path = "../../src/api/generated" }
 anyhow = "1.0.100"
 async-trait = "0.1"
 base64 = "0.22"
 axum = { version = "0.8", features = ["multipart", "ws"] }
+axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
+bytes = "1"
+dashmap = "6.1.0"
+headers = "0.4"
+http = "1"
+prost = "0.14.3"
+rand = "0.10"
+redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"] }
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
+# `src/node_registry/kubernetes_discovery.rs` runs the EndpointSlice/Pod
+# informers that seed this half's node registry. `kube`'s default TLS backend
+# is rustls; `openssl-tls` (backed by `hyper-openssl`) is selected explicitly
+# instead, for the same reason the `sqlx` entry below picks native-tls:
+# `reqwest` already resolves to native-tls/openssl by default, and a second TLS
+# stack in the same binary is exactly what that argues against. `crates/aenv`
+# is the documented exception that uses rustls on purpose; this is not it.
+# `v1_34` pins a specific Kubernetes API generation rather than tracking
+# `k8s-openapi`'s `latest` feature, matching how Firecracker/kernel versions
+# are pinned in `config/deps_manifest.toml` rather than floated.
 k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
 kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "openssl-tls"] }
 libc = "0.2"
@@ -50,6 +76,7 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-n
 # 🔴 A normal dependency, not a dev one: `aenv-snapshot-image` materializes the
 # blobs it hands `regctl` under a temporary directory.
 tempfile = "3.22.0"
+toml = "0.9.11"
 thiserror = "2.0.18"
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 tokio = { version = "1", features = ["full"] }
@@ -61,6 +88,13 @@ uuid = { version = "1", features = ["serde", "v7"] }
 zeroize = "1"
 
 [dev-dependencies]
+# 🔴 A dev dependency and never a normal one, and the direction matters: the
+# rule this workspace keeps is that nothing in `aenv-node` may name
+# `aenv-api`. The node-client tests drive this crate's stub against a real node
+# service over a real socket, and that service is `aenv-node`'s.
+# `make check-crate-boundaries` reads `cargo tree -e normal`, so the byte half
+# stays out of the shipped api binary.
+aenv-node = { path = "../aenv-node" }
 # Driving the internal router with `oneshot`, so the endpoint tests need no
 # port and no server task.
 tower = { version = "0.5.2", features = ["util"] }

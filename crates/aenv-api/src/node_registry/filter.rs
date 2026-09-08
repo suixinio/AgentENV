@@ -1,7 +1,7 @@
 //! Filters real placement candidates using node-reported schedulability.
 
 use crate::node_registry::types::RichNode;
-use crate::proto::scheduler::{EgressBrokerState, NodeStatus};
+use crate::proto::scheduler::NodeStatus;
 
 /// Removes nodes whose latest heartbeat says they cannot accept new requests.
 ///
@@ -34,21 +34,11 @@ pub fn filter_without_egress_broker(nodes: Vec<RichNode>) -> Vec<RichNode> {
         .collect()
 }
 
-impl EgressBrokerState {
-    /// Whether a sandbox whose rules name the public `http` handler can run
-    /// on a node in this state. An embedded broker dispatches only the
-    /// identity-echo handler the node's own integration tests use, and an
-    /// unrecognized value — what an older node's report decodes to — is not a
-    /// placement target either.
-    pub fn can_broker(self) -> bool {
-        matches!(self, Self::LocalOk)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::node_registry::types::Node;
+    use crate::proto::scheduler::EgressBrokerState;
     use crate::proto::scheduler::NodeSnapshot;
 
     fn node(id: &str) -> Node {

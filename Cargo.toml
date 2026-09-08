@@ -127,19 +127,6 @@ rand = "0.10"
 zeroize = "1"
 openssl-sys = { version = "0.9", optional = true }
 redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"] }
-# `src/node_registry/kubernetes_discovery.rs` runs the EndpointSlice/Pod
-# informers that seed `aenv-api`'s node registry. `kube`'s default TLS backend
-# is rustls; `openssl-tls` (backed by `hyper-openssl`) is selected explicitly
-# instead, for the same reason
-# `crates/aenv-api`'s `sqlx` entry picks `tls-native-tls`: `reqwest` already
-# resolves to native-tls/openssl by default, and a second TLS stack in the same
-# binary is exactly what that comment argues against. `crates/aenv` is the
-# documented exception that uses rustls on purpose; this is not it. `v1_34`
-# pins a specific Kubernetes API generation rather than tracking `k8s-openapi`'s
-# `latest` feature, matching how Firecracker/kernel versions are pinned in
-# `config/deps_manifest.toml` rather than floated.
-kube = { version = "4.2.0", default-features = false, features = ["client", "runtime", "openssl-tls"] }
-k8s-openapi = { version = "0.28.0", features = ["v1_34"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

@@ -168,49 +168,7 @@ pub fn next_db(counter: &AtomicU32, databases: u32, tests: &str) -> u32 {
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    use super::{next_db, redis_required, RedisTestServer};
-
-    /// Redis subsystem harnesses and their independently owned resources.
-    fn harnesses() -> [(
-        &'static str,
-        &'static AtomicU32,
-        Option<&'static RedisTestServer>,
-    ); 3] {
-        [
-            (
-                "orchestrator::store::redis",
-                crate::orchestrator::store::redis::harness::db_counter(),
-                crate::orchestrator::store::redis::harness::server(),
-            ),
-            (
-                "binding_store::redis",
-                crate::binding_store::redis::harness::db_counter(),
-                crate::binding_store::redis::harness::server(),
-            ),
-            (
-                "node_registry::redis",
-                crate::node_registry::redis::harness::db_counter(),
-                crate::node_registry::redis::harness::server(),
-            ),
-        ]
-    }
-
-    #[test]
-    fn the_three_redis_harnesses_allocate_logical_databases_from_independent_counters() {
-        let harnesses = harnesses();
-        for (index, (name, counter, _)) in harnesses.iter().enumerate() {
-            for (other_name, other_counter, _) in harnesses.iter().skip(index + 1) {
-                assert!(
-                    !std::ptr::eq(*counter, *other_counter),
-                    "{name} and {other_name} allocate logical databases from one shared \
-                     counter. They must not: three independent 512-database spaces is what \
-                     stops two suites' concurrent tests landing on the same logical database, \
-                     which surfaces as cross-suite flakiness nobody can attribute. Give each \
-                     harness back its own `static NEXT: AtomicU32`."
-                );
-            }
-        }
-    }
+    use super::next_db;
 
     #[test]
     fn allocating_from_one_counter_does_not_advance_another() {
@@ -226,41 +184,5 @@ mod tests {
             "allocating twice from one counter advanced another"
         );
         assert_eq!(next_db(&yours, DATABASES, "yours"), 1);
-    }
-
-    #[test]
-    fn the_three_redis_harnesses_own_distinct_redis_server_instances() {
-        let harnesses = harnesses();
-        let mut started = Vec::new();
-        for (name, _, server) in harnesses {
-            let Some(server) = server else {
-                if redis_required() {
-                    panic!(
-                        "AENV_REDIS_TEST_REQUIRED=1 but no redis-server could be started for \
-                         {name}'s harness. Install redis-server, or point REDIS_SERVER_BIN at \
-                         one."
-                    );
-                }
-                eprintln!(
-                    "SKIPPED[redis]: the_three_redis_harnesses_own_distinct_redis_server_instances \
-                     (no redis-server available)"
-                );
-                return;
-            };
-            started.push((name, server));
-        }
-
-        for (index, (name, server)) in started.iter().enumerate() {
-            for (other_name, other_server) in started.iter().skip(index + 1) {
-                assert_ne!(
-                    server.port(),
-                    other_server.port(),
-                    "{name} and {other_name} are talking to one shared redis-server. They must \
-                     not: each harness owns its own process, so that one suite flushing its key \
-                     namespace cannot reach a database another suite is mid-test on."
-                );
-                assert_ne!(server.url(7), other_server.url(7));
-            }
-        }
     }
 }

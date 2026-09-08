@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aenv_core::binding_store::BindingStore;
+use crate::binding_store::BindingStore;
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -188,10 +188,8 @@ mod tests {
     use aenv_core::secrets::SecretsBackend;
     use aenv_core::secrets::{SecretMetadata, SecretRefStore, SecretString, SecretValue};
 
-    use aenv_core::binding_store::{
-        Binding, BindingState, BindingStoreSettings, InMemoryBindingStore,
-    };
-    use aenv_core::node_registry::types::Node;
+    use crate::binding_store::{Binding, BindingState, BindingStoreSettings, InMemoryBindingStore};
+    use crate::node_registry::types::Node;
     use axum::http::header;
 
     use super::*;

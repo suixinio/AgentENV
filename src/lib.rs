@@ -1,19 +1,16 @@
 pub mod api;
-pub mod binding_store;
 pub mod cfg;
 pub mod digest;
 pub mod identity;
 pub mod image;
 pub mod leader_task;
 pub mod logging;
-pub mod node_client;
-pub mod node_registry;
 pub mod observability;
 pub mod orchestrator;
 pub mod privileges;
 pub mod proto;
-#[cfg(test)]
-mod redis_test_server;
+#[cfg(any(test, feature = "test-support"))]
+pub mod redis_test_server;
 pub mod runtime_snapshot;
 pub mod sandbox;
 pub mod scheduler_endpoint;

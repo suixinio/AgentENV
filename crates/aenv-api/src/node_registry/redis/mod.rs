@@ -11,7 +11,7 @@
 //! Pulls resolve it before returning records and accept inline legacy records during rollout.
 
 #[cfg(test)]
-pub(crate) mod harness;
+pub mod harness;
 #[cfg(test)]
 mod tests;
 

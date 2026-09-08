@@ -38,8 +38,7 @@ pub use service::NodeSandboxService;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Test-only ownership predicate shared with node-client wire tests.
-#[cfg(test)]
+/// The reconciliation predicate `service.rs` filters a roster with.
 pub use ownership::owned_by_control_plane;
 
 /// Builds the node gRPC server with template-building support, behind the

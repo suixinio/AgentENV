@@ -51,7 +51,8 @@ mod tests {
             static_discovery_nodes: Vec<ClusterStaticDiscoveryNode>,
         }
 
-        let raw = include_str!("../../deploy/docker/config/cluster-static-discovery-overlay.toml");
+        let raw =
+            include_str!("../../../../deploy/docker/config/cluster-static-discovery-overlay.toml");
         let overlay: Overlay =
             toml::from_str(raw).expect("cluster-static-discovery-overlay.toml is valid TOML");
         let configured = overlay.cluster.static_discovery_nodes;

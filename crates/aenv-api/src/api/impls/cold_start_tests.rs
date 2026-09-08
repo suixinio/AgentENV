@@ -11,9 +11,9 @@ use http::Method;
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 
+use super::ApiImpl;
 use crate::orchestrator::{InMemoryMetadataStore, Orchestrator};
 use crate::sandbox::mock::MockBackendFactory;
-use aenv_core::api::impls::ApiImpl;
 
 // Fully qualified reserved-domain reference keeps the fake resolver probe deterministic.
 const IMAGE: &str = "registry.invalid/agentenv/cold-start:pinned";
@@ -63,7 +63,7 @@ async fn surface() -> Surface {
         Arc::clone(&snapshot_manager),
         None,
         Vec::new(),
-        aenv_core::api::ResumeWiring::api_half_for_test(),
+        crate::api::ResumeWiring::api_half_for_test(),
     ));
 
     // Keep the temporary configuration and fake executable alive for the process.
@@ -72,8 +72,8 @@ async fn surface() -> Surface {
     Surface { api, regctl_dir }
 }
 
-fn claims() -> aenv_core::api::impls::Claims {
-    aenv_core::api::impls::Claims
+fn claims() -> super::Claims {
+    super::Claims
 }
 
 fn host() -> Host {

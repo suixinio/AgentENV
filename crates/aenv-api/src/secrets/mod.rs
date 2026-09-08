@@ -1,13 +1,15 @@
 //! The api half's secrets: names and versions in PostgreSQL, values in the
 //! same database, encrypted under a key it reads from a file.
 
+pub use aenv_core::secrets::*;
+
 pub mod envelope;
 pub mod pg;
 
 use std::sync::Arc;
 
 use aenv_core::cfg::{AppConfig, SecretsBackendKind};
-use aenv_core::secrets::SecretsService;
+pub use aenv_core::secrets::SecretsService;
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 

@@ -13,11 +13,11 @@ use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 
 use super::super::attached_drives::unresolved_attached_drives;
-use super::conversions::{
+use super::{duration_from_secs, ApiImpl, RoutingHeaders};
+use aenv_core::api::wire::{
     base_policy_from_allow_internet_access, endpoints_from_model, params_model_to_map,
     rules_from_model,
 };
-use super::{duration_from_secs, ApiImpl, RoutingHeaders};
 
 /// The token a create mints when its caller asked for a locked sandbox.
 ///

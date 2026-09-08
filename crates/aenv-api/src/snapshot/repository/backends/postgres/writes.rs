@@ -193,6 +193,10 @@ struct CommitArgs<'a> {
     source: SnapshotSource,
     // The node that staged the bytes; recorded whether or not they are published.
     origin_node_id: Option<String>,
+    // Whether the payload carries a pause configuration. Only the caller can
+    // say: the payload is opaque to this file, and the schema needs the answer
+    // as a column to hold one pause per sandbox.
+    is_pause: bool,
 }
 
 async fn commit_snapshot(
@@ -215,6 +219,22 @@ async fn commit_snapshot(
         .await
         .map_err(backend_error("commit_snapshot"))?;
 
+    // The upsert half of one pause per sandbox: the row this commit replaces
+    // goes in the same transaction that makes the new one ready, so the unique
+    // index is never met by two live pauses and a reader never sees zero.
+    if args.is_pause {
+        if let SnapshotSource::Sandbox { source_sandbox_id } = &args.source {
+            retire_previous_pauses(
+                &mut tx,
+                cluster_id,
+                source_sandbox_id,
+                args.id,
+                updated_at_ms,
+            )
+            .await?;
+        }
+    }
+
     let updated: Option<(String, i64, i64)> = sqlx::query_as(
         "UPDATE snapshots
             SET status                  = 'ready',
@@ -225,7 +245,8 @@ async fn commit_snapshot(
                 updated_at_ms           = $7,
                 cpu_count               = COALESCE($8, cpu_count),
                 memory_mib              = COALESCE($9, memory_mib),
-                disk_size_mib           = COALESCE($10, disk_size_mib)
+                disk_size_mib           = COALESCE($10, disk_size_mib),
+                is_pause                = $11
           WHERE id = $1
             AND cluster_id = $2
             AND deleted_at_ms IS NULL
@@ -242,6 +263,7 @@ async fn commit_snapshot(
     .bind(args.resources.cpu_count as i32)
     .bind(args.resources.memory_mib as i32)
     .bind(args.resources.disk_size_mib as i32)
+    .bind(args.is_pause)
     .fetch_optional(&mut *tx)
     .await
     .map_err(backend_error("commit_snapshot"))?;
@@ -381,6 +403,43 @@ async fn fail_snapshot(
 }
 
 // Soft-deletes the row and alias idempotently.
+/// Soft-deletes every other live pause row of one sandbox, with its alias, so
+/// the row this commit is about to make ready is the sandbox's only pause.
+///
+/// The bytes of a retired row stay: a pause's memory layers stack on the layers
+/// of the pause before it, and the row that replaced it still reads them.
+async fn retire_previous_pauses(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    cluster_id: Uuid,
+    source_sandbox_id: &str,
+    keep: &SnapshotId,
+    now_ms: i64,
+) -> RepositoryResult<()> {
+    sqlx::query(
+        "WITH superseded AS (
+            UPDATE snapshots
+               SET deleted_at_ms = $4, updated_at_ms = $4
+             WHERE cluster_id = $1
+               AND source_sandbox_id = $2
+               AND is_pause
+               AND deleted_at_ms IS NULL
+               AND id <> $3
+            RETURNING id, cluster_id
+         )
+         DELETE FROM aliases a
+          USING superseded
+          WHERE a.snapshot_id = superseded.id AND a.cluster_id = superseded.cluster_id",
+    )
+    .bind(cluster_id)
+    .bind(source_sandbox_id)
+    .bind(keep.to_uuid())
+    .bind(now_ms)
+    .execute(&mut **tx)
+    .await
+    .map_err(backend_error("retire_previous_pauses"))?;
+    Ok(())
+}
+
 async fn delete_snapshot(
     pool: &PgPool,
     cluster_id: Uuid,
@@ -612,6 +671,7 @@ pub async fn publish_commit(
             resources: commit.resources,
             source: opening.source,
             origin_node_id: commit.origin_node_id.clone(),
+            is_pause: commit.committed.paused_sandbox.is_some(),
         },
         true,
         node_id,
@@ -732,6 +792,66 @@ pub async fn set_origin_node_id(
     .await
     .map_err(backend_error("set_origin_node_id"))?;
     Ok(())
+}
+
+/// Removes every pause row of one sandbox in one statement, with its aliases.
+///
+/// The read spans soft-deleted rows too: a pause superseded by a later one owns
+/// bytes that nothing else will ever reclaim, and this is where its sandbox's
+/// deletion collects them.
+pub async fn delete_sandbox_pauses(
+    pool: &PgPool,
+    cluster_id: Uuid,
+    source_sandbox_id: &str,
+) -> RepositoryResult<Vec<SnapshotRecord>> {
+    use super::reads::{ALIAS_JOIN, SNAPSHOT_COLUMNS};
+
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(backend_error("delete_sandbox_pauses"))?;
+
+    let sql = format!(
+        "SELECT {SNAPSHOT_COLUMNS}\n  FROM snapshots s\n  {ALIAS_JOIN}\n \
+         WHERE s.cluster_id = $1 AND s.source_sandbox_id = $2 AND s.is_pause"
+    );
+    let rows: Vec<super::convert::CatalogRow> = sqlx::query_as(&sql)
+        .bind(cluster_id)
+        .bind(source_sandbox_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(backend_error("delete_sandbox_pauses"))?;
+    // Decoded before anything is written, so a row this build cannot read
+    // leaves the catalog as it was rather than half-deleted.
+    let removed: Vec<SnapshotRecord> = rows
+        .into_iter()
+        .map(|row| super::convert::decode_row(row, cluster_id))
+        .collect::<RepositoryResult<Vec<_>>>()?;
+
+    sqlx::query(
+        "WITH gone AS (
+            UPDATE snapshots
+               SET deleted_at_ms = COALESCE(deleted_at_ms, $3), updated_at_ms = $3
+             WHERE cluster_id = $1
+               AND source_sandbox_id = $2
+               AND is_pause
+            RETURNING id, cluster_id
+         )
+         DELETE FROM aliases a
+          USING gone
+          WHERE a.snapshot_id = gone.id AND a.cluster_id = gone.cluster_id",
+    )
+    .bind(cluster_id)
+    .bind(source_sandbox_id)
+    .bind(now_ms())
+    .execute(&mut *tx)
+    .await
+    .map_err(backend_error("delete_sandbox_pauses"))?;
+
+    tx.commit()
+        .await
+        .map_err(backend_error("delete_sandbox_pauses"))?;
+    Ok(removed)
 }
 
 pub async fn delete_record(

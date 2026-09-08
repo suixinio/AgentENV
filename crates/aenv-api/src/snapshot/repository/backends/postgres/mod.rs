@@ -140,6 +140,16 @@ impl SnapshotCatalog for PostgresSnapshotCatalog {
         )
     }
 
+    async fn delete_sandbox_pauses(
+        &self,
+        source_sandbox_id: &str,
+    ) -> RepositoryResult<Vec<SnapshotRecord>> {
+        metrics::record_catalog_outcome(
+            "delete_sandbox_pauses",
+            writes::delete_sandbox_pauses(&self.pool, self.cluster_id, source_sandbox_id).await,
+        )
+    }
+
     async fn set_origin_node_id(
         &self,
         id: &SnapshotId,
@@ -425,6 +435,119 @@ mod pg {
                  fabricate a template: {other:?}"
             ),
         }
+    }
+
+    fn sandbox_commit_for(sandbox_id: &str, paused: bool) -> SnapshotCommit {
+        let mut committed = CommittedSnapshot::mock();
+        if paused {
+            committed.paused_sandbox =
+                Some(aenv_core::snapshot::mock::mock_paused_sandbox_config());
+        }
+        SnapshotCommit {
+            id: SnapshotId::generate(),
+            alias: None,
+            source: SnapshotPublishSource::Sandbox {
+                source_sandbox_id: sandbox_id.to_string(),
+            },
+            resources: resources(),
+            created_at_unix_ms: None,
+            committed,
+            origin_node_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_pause_of_one_sandbox_retires_the_first() {
+        let catalog = catalog!("a_second_pause_of_one_sandbox_retires_the_first");
+        let first = catalog
+            .publish_commit(sandbox_commit_for("sbx-pause", true))
+            .await
+            .expect("the first pause commits");
+        let second = catalog
+            .publish_commit(sandbox_commit_for("sbx-pause", true))
+            .await
+            .expect("the second pause commits over the first");
+
+        assert!(
+            catalog.get(&first.id.to_string()).await.unwrap().is_none(),
+            "the pause a later one replaced must not be resumable any more"
+        );
+        assert!(
+            catalog.get(&second.id.to_string()).await.unwrap().is_some(),
+            "the pause that replaced it is the sandbox's one live row"
+        );
+        let live = catalog
+            .list_page_scoped(
+                SnapshotListFilter::sandbox_snapshots(Some("sbx-pause".to_string()), None),
+                CatalogReadScope::AnyStatus,
+            )
+            .await
+            .expect("listing should succeed");
+        let ids: Vec<String> = live.items.iter().map(|row| row.id.to_string()).collect();
+        assert_eq!(ids, vec![second.id.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_is_not_a_pause_and_many_of_one_sandbox_coexist() {
+        let catalog = catalog!("a_checkpoint_is_not_a_pause_and_many_of_one_sandbox_coexist");
+        let pause = catalog
+            .publish_commit(sandbox_commit_for("sbx-mixed", true))
+            .await
+            .expect("the pause commits");
+        let first = catalog
+            .publish_commit(sandbox_commit_for("sbx-mixed", false))
+            .await
+            .expect("a checkpoint of a running sandbox commits");
+        let second = catalog
+            .publish_commit(sandbox_commit_for("sbx-mixed", false))
+            .await
+            .expect("a sandbox may be checkpointed more than once");
+
+        for id in [&pause.id, &first.id, &second.id] {
+            assert!(
+                catalog.get(&id.to_string()).await.unwrap().is_some(),
+                "one pause per sandbox must not cost the sandbox its checkpoints"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_a_sandboxs_pauses_takes_the_superseded_ones_and_leaves_checkpoints() {
+        let catalog =
+            catalog!("deleting_a_sandboxs_pauses_takes_the_superseded_ones_and_leaves_checkpoints");
+        let first = catalog
+            .publish_commit(sandbox_commit_for("sbx-forget", true))
+            .await
+            .expect("the first pause commits");
+        let second = catalog
+            .publish_commit(sandbox_commit_for("sbx-forget", true))
+            .await
+            .expect("the second pause commits");
+        let checkpoint = catalog
+            .publish_commit(sandbox_commit_for("sbx-forget", false))
+            .await
+            .expect("a checkpoint commits");
+
+        let removed = catalog
+            .delete_sandbox_pauses("sbx-forget")
+            .await
+            .expect("deleting the sandbox's pauses should succeed");
+        let mut removed_ids: Vec<String> = removed.iter().map(|row| row.id.to_string()).collect();
+        removed_ids.sort();
+        let mut expected = vec![first.id.to_string(), second.id.to_string()];
+        expected.sort();
+        assert_eq!(
+            removed_ids, expected,
+            "a superseded pause still owns bytes, so its sandbox's deletion has to name it"
+        );
+        assert!(
+            catalog
+                .get(&checkpoint.id.to_string())
+                .await
+                .unwrap()
+                .is_some(),
+            "a checkpoint is a template of the sandbox, not a pause of it"
+        );
     }
 
     #[tokio::test]

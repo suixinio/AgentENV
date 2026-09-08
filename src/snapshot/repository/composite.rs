@@ -254,6 +254,26 @@ impl SnapshotRepository {
         Ok(())
     }
 
+    /// Deletes every pause of one sandbox in one catalog write, then cleans the
+    /// artifacts of each row it removed. Returns how many rows went away.
+    pub async fn delete_sandbox_pauses(&self, source_sandbox_id: &str) -> RepositoryResult<usize> {
+        let removed = self
+            .catalog
+            .delete_sandbox_pauses(source_sandbox_id)
+            .await?;
+        for record in &removed {
+            let publications = record
+                .committed
+                .as_ref()
+                .map(|committed| committed.disk_publications.as_slice())
+                .unwrap_or_default();
+            self.artifacts
+                .delete_artifacts(&record.id, publications)
+                .await;
+        }
+        Ok(removed.len())
+    }
+
     /// Resolves a human-readable alias to the current snapshot id.
     pub async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
         self.catalog.resolve_alias(alias).await

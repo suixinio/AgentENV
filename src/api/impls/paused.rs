@@ -132,38 +132,20 @@ impl ApiImpl {
 
     /// Deletes every snapshot paused from `sandbox_id`. Returns how many rows
     /// went away; zero means the sandbox had no pause to forget.
+    ///
+    /// One catalog write, not one per row: a walk that failed partway left
+    /// rows behind, and a sandbox whose delete reported success came back as a
+    /// resumable paused sandbox.
     pub(in crate::api) async fn forget_paused_snapshots(
         &self,
         sandbox_id: SandboxId,
     ) -> anyhow::Result<usize> {
-        let filter = SnapshotListFilter::sandbox_snapshots(Some(sandbox_id.to_string()), None);
-        let mut deleted = 0usize;
-        loop {
-            let page = self
-                .snapshot_manager
-                .list_page_scoped(filter.clone(), CatalogReadScope::AnyStatus)
-                .await?;
-            let paused: Vec<SnapshotId> = page
-                .items
-                .iter()
-                .filter(|record| record.paused_sandbox().is_some())
-                .map(|record| record.id.clone())
-                .collect();
-            if paused.is_empty() {
-                break;
-            }
-            for snapshot_id in paused {
-                match self.snapshot_manager.delete(snapshot_id.to_string()).await {
-                    Ok(()) => deleted += 1,
-                    Err(err) => {
-                        warn!(%sandbox_id, %snapshot_id, error = %format_args!("{err:#}"), "failed to delete a paused snapshot");
-                        return Err(err);
-                    }
-                }
-            }
-            // Deleting shifts the page window; start over from the newest.
-        }
-        Ok(deleted)
+        self.snapshot_manager
+            .delete_sandbox_pauses(&sandbox_id.to_string())
+            .await
+            .inspect_err(|err| {
+                warn!(%sandbox_id, error = %format_args!("{err:#}"), "failed to delete this sandbox's paused snapshots");
+            })
     }
 
     /// The request that rebuilds a paused sandbox from its row, under its own

@@ -61,6 +61,12 @@ test-support = []
 # ask for the feature), and cargo rebuilds the entire dependency graph a
 # second time whenever a developer alternates between the two.
 aenv-core = { path = ".", features = ["test-support"] }
+# `#[tokio::test(start_paused = true)]` needs `test-util`, which tokio's `full`
+# does not include. Stated here so `cargo test -p aenv-core` compiles on its
+# own: without it only a run that also builds a sibling asking for the feature
+# does, which is how `make test-with-redis` and `make test-with-postgres` came
+# to build nothing at all.
+tokio = { version = "1", features = ["test-util"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

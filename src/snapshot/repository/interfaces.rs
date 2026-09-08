@@ -397,6 +397,41 @@ pub trait SnapshotCatalog: Send + Sync {
     /// every backend re-read the row it was handed.
     async fn delete_record(&self, record: &SnapshotRecord) -> RepositoryResult<()>;
 
+    /// Removes every pause row of one sandbox and returns the records removed,
+    /// so their artifacts can follow. A checkpoint of the same sandbox is a
+    /// template of it and is left where it is.
+    ///
+    /// One sandbox has at most one live pause row, but a backend that retired
+    /// earlier ones still owns their bytes, so the answer includes those too.
+    /// The default walks the listing, which is what a backend with no
+    /// set-at-a-time delete can do.
+    async fn delete_sandbox_pauses(
+        &self,
+        source_sandbox_id: &str,
+    ) -> RepositoryResult<Vec<SnapshotRecord>> {
+        let filter =
+            SnapshotListFilter::sandbox_snapshots(Some(source_sandbox_id.to_string()), None);
+        let mut removed = Vec::new();
+        loop {
+            let page = self
+                .list_page_scoped(filter.clone(), CatalogReadScope::AnyStatus)
+                .await?;
+            let paused: Vec<SnapshotRecord> = page
+                .items
+                .into_iter()
+                .filter(|record| record.paused_sandbox().is_some())
+                .collect();
+            if paused.is_empty() {
+                return Ok(removed);
+            }
+            for record in paused {
+                self.delete_record(&record).await?;
+                removed.push(record);
+            }
+            // Deleting shifts the page window; start over from the newest.
+        }
+    }
+
     /// Resolves a human-readable alias to the current snapshot id.
     ///
     /// Resolvable rows only. See [`Self::resolve_alias_scoped`].

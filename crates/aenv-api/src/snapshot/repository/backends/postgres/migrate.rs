@@ -32,6 +32,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_secret_values.sql",
         body: include_str!("migrations/0003_secret_values.sql"),
     },
+    Migration {
+        version: 4,
+        name: "0004_one_pause_per_sandbox.sql",
+        body: include_str!("migrations/0004_one_pause_per_sandbox.sql"),
+    },
 ];
 
 // Every table these migrations create, in the order the rollback drops
@@ -122,6 +127,9 @@ const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[
     ),
     (2, &["secret_refs"]),
     (3, &["secret_values", "secret_grants"]),
+    // An index, not a table: it is the whole point of the version, and
+    // `to_regclass` resolves it the same way.
+    (4, &["snapshots_one_pause_per_sandbox"]),
 ];
 
 // `to_regclass` resolves against this connection's search path.
@@ -302,7 +310,7 @@ mod pg {
                 .fetch_all(&pool)
                 .await
                 .expect("reading the ledger should succeed");
-        assert_eq!(recorded, vec![1, 2, 3]);
+        assert_eq!(recorded, vec![1, 2, 3, 4]);
     }
 
     #[tokio::test]
@@ -364,7 +372,7 @@ mod pg {
                 .expect("reading the ledger should succeed");
         assert_eq!(
             recorded,
-            vec![1, 2, 3],
+            vec![1, 2, 3, 4],
             "no duplicate or missing ledger rows"
         );
     }
@@ -426,7 +434,7 @@ mod pg {
                 .expect("reading the ledger should succeed");
         assert_eq!(
             recorded,
-            vec![1, 3],
+            vec![1, 3, 4],
             "a refused preflight must not record the version it refused"
         );
     }
@@ -469,6 +477,123 @@ mod pg {
         migrate(&pool)
             .await
             .expect("a ledger row this build does not recognize must not block a start");
+    }
+
+    // Inserts a committed sandbox-source row directly, bypassing the write path,
+    // so a database that predates one-pause-per-sandbox can be reproduced.
+    async fn seed_committed_sandbox_row(
+        pool: &sqlx::PgPool,
+        cluster_id: uuid::Uuid,
+        source_sandbox_id: &str,
+        created_at_ms: i64,
+        payload_json: &str,
+    ) -> uuid::Uuid {
+        let id = uuid::Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO snapshots (
+                id, cluster_id, source_kind, source_sandbox_id,
+                cpu_count, memory_mib, disk_size_mib,
+                status, status_group, published,
+                created_at_ms, updated_at_ms,
+                committed_payload, committed_schema
+             ) VALUES (
+                $1, $2, 'sandbox', $3,
+                1, 512, 1024,
+                'ready', 'pending', true,
+                $4, $4,
+                convert_to($5, 'UTF8'), 1
+             )",
+        )
+        .bind(id)
+        .bind(cluster_id)
+        .bind(source_sandbox_id)
+        .bind(created_at_ms)
+        .bind(payload_json)
+        .execute(pool)
+        .await
+        .expect("seeding a pre-migration row should succeed");
+        id
+    }
+
+    async fn is_live(pool: &sqlx::PgPool, id: uuid::Uuid) -> bool {
+        sqlx::query_scalar::<_, bool>("SELECT deleted_at_ms IS NULL FROM snapshots WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("the seeded row should still exist")
+    }
+
+    #[tokio::test]
+    async fn the_pause_migration_keeps_the_newest_ready_duplicate_and_retires_the_rest() {
+        let pool = isolated_schema_pool_or_skip!(
+            "the_pause_migration_keeps_the_newest_ready_duplicate_and_retires_the_rest"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+
+        // Rewind to the state a database that never ran this version is in.
+        sqlx::raw_sql(
+            "DROP INDEX IF EXISTS snapshots_one_pause_per_sandbox;\
+             ALTER TABLE snapshots DROP CONSTRAINT IF EXISTS snapshots_pause_axis;\
+             ALTER TABLE snapshots DROP COLUMN IF EXISTS is_pause;\
+             DELETE FROM catalog_schema_migrations WHERE version = 4;",
+        )
+        .execute(&pool)
+        .await
+        .expect("rewinding to the pre-migration schema should succeed");
+
+        let cluster_id = uuid::Uuid::new_v4();
+        let older = seed_committed_sandbox_row(
+            &pool,
+            cluster_id,
+            "sbx-dup",
+            1_000,
+            r#"{"paused_sandbox":{}}"#,
+        )
+        .await;
+        let newer = seed_committed_sandbox_row(
+            &pool,
+            cluster_id,
+            "sbx-dup",
+            2_000,
+            r#"{"paused_sandbox":{}}"#,
+        )
+        .await;
+        let checkpoint = seed_committed_sandbox_row(
+            &pool,
+            cluster_id,
+            "sbx-dup",
+            3_000,
+            r#"{"rootfs_layers":[]}"#,
+        )
+        .await;
+
+        migrate(&pool)
+            .await
+            .expect("a database that already holds duplicates must still migrate");
+
+        assert!(
+            is_live(&pool, newer).await,
+            "the newest ready pause is the one a resume would have read, so it survives"
+        );
+        assert!(
+            !is_live(&pool, older).await,
+            "a duplicate the constraint cannot hold is retired, not left to block the upgrade"
+        );
+        assert!(
+            is_live(&pool, checkpoint).await,
+            "a checkpoint of the same sandbox is not a pause and is not a duplicate"
+        );
+
+        let pauses: Vec<bool> =
+            sqlx::query_scalar("SELECT is_pause FROM snapshots ORDER BY created_at_ms")
+                .fetch_all(&pool)
+                .await
+                .expect("reading the backfilled column should succeed");
+        assert_eq!(
+            pauses,
+            vec![true, true, false],
+            "the backfill reads the payload's key, not the row's source kind"
+        );
     }
 
     async fn schema_facts(pool: &sqlx::PgPool, sql: &str) -> Vec<String> {
@@ -553,6 +678,7 @@ mod pg {
                 "snapshots.snapshots_error_axis (c)",
                 "snapshots.snapshots_memory_mib_check (c)",
                 "snapshots.snapshots_origin_axis (c)",
+                "snapshots.snapshots_pause_axis (c)",
                 "snapshots.snapshots_pkey (p)",
                 "snapshots.snapshots_ready_has_disk_size (c)",
                 "snapshots.snapshots_ready_is_committed (c)",
@@ -599,6 +725,7 @@ mod pg {
                 "secret_refs_pkey unique=true partial=false",
                 "secret_values_pkey unique=true partial=false",
                 "snapshots_list_idx unique=false partial=true",
+                "snapshots_one_pause_per_sandbox unique=true partial=true",
                 "snapshots_pkey unique=true partial=false",
                 "snapshots_source_sandbox_idx unique=false partial=true",
                 "snapshots_unpublished_idx unique=false partial=true",

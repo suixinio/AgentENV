@@ -16,7 +16,7 @@ use super::convert::{decode_row, CatalogRow};
 const READY_PREDICATE: &str = "s.status_group = 'ready'";
 
 // Columns scanned by `CatalogRow`, including text-cast UUIDs for cursor parity.
-const SNAPSHOT_COLUMNS: &str = "s.id::text                AS id,
+pub(super) const SNAPSHOT_COLUMNS: &str = "s.id::text                AS id,
        s.cluster_id::text        AS cluster_id,
        s.source_kind             AS source_kind,
        s.source_sandbox_id       AS source_sandbox_id,
@@ -35,7 +35,7 @@ const SNAPSHOT_COLUMNS: &str = "s.id::text                AS id,
        s.origin_node_id          AS origin_node_id";
 
 // Schema guarantees at most one alias per snapshot, so the join cannot duplicate rows.
-const ALIAS_JOIN: &str =
+pub(super) const ALIAS_JOIN: &str =
     "LEFT JOIN aliases a ON a.snapshot_id = s.id AND a.cluster_id = s.cluster_id";
 
 fn scope_predicate(scope: CatalogReadScope) -> &'static str {

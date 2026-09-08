@@ -380,6 +380,16 @@ impl SnapshotManager {
             })
     }
 
+    /// Deletes every pause of one sandbox, returning how many rows went away.
+    pub async fn delete_sandbox_pauses(&self, source_sandbox_id: &str) -> anyhow::Result<usize> {
+        self.repository
+            .delete_sandbox_pauses(source_sandbox_id)
+            .await
+            .with_context(|| {
+                format!("delete the paused snapshots of sandbox '{source_sandbox_id}'")
+            })
+    }
+
     /// Resolves an alias to its committed snapshot id.
     pub async fn resolve_committed_alias(&self, alias: &str) -> anyhow::Result<Option<SnapshotId>> {
         self.resolve_alias_scoped(alias, CatalogReadScope::Resolvable)

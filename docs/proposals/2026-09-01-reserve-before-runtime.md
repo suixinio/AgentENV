@@ -35,8 +35,10 @@ e2b 让"从未记录"在结构上不可观测，于是不需要区分：
 1. **create 占位**：api 半边选定节点后、发出节点 create RPC **前**，向 binding
    store 写占位绑定（状态 `Starting`、holder=选定节点、TTL≈create 超时预算）。
    节点创建成功 → 占位翻正为既有的正常绑定；失败/超时 → 撤销占位。api 副本
-   中途崩死由 TTL 兜底（e2b 的 reservation 在内存里随进程消失，我们在 Redis，
-   TTL 是等价物）。
+   中途崩死由 TTL 兜底。e2b 的预留同样落在 Redis 里
+   （`packages/api/internal/sandbox/reservations/redis/`，`fdc33599b`：pending
+   zset + Lua 原子脚本，`staleTTL = 90s` 专为"某个 api 副本创建途中崩死"清理
+   pending 项）——占位存在 Redis 并以 TTL 兜底是与参照实现收敛，不是偏离。
 2. **resume/重建路径已满足不变量**：pg 的 claim 行先于 restore 存在（claim CAS
    即该路径的 Reserve）——实施时核实并用测试钉住这一论断，而不是默认成立。
 3. **并发同 ID create**：沙箱 ID 为服务端生成，该竞态理论不可达——核实 fork

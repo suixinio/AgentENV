@@ -16,7 +16,6 @@ use std::sync::Arc;
 use anyhow::Error as AnyhowError;
 use async_trait::async_trait;
 
-use super::proxy::{build_proxy_client, ProxyClient};
 use crate::node_client::NodePlacement;
 use crate::node_registry::fleet::NodeFleetView;
 use crate::node_registry::registry::NodeRegistry;
@@ -42,7 +41,6 @@ pub struct ApiImpl {
     orchestrator: Arc<dyn SandboxOrchestration>,
     snapshot_manager: Arc<SnapshotManager>,
     observability: Option<Arc<ObservabilityService>>,
-    proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
     /// Placement and wake-site policy for data-plane resume.
     resume_wiring: ResumeWiring,
@@ -66,7 +64,6 @@ impl ApiImpl {
             orchestrator,
             snapshot_manager,
             observability,
-            proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
             resume_wiring,
             node_placement: None,
@@ -128,10 +125,6 @@ impl ApiImpl {
 
     pub fn orchestrator(&self) -> Arc<dyn SandboxOrchestration> {
         Arc::clone(&self.orchestrator)
-    }
-
-    pub fn proxy_client(&self) -> &ProxyClient {
-        &self.proxy_client
     }
 
     pub fn sandbox_proxy_domains(&self) -> &[String] {

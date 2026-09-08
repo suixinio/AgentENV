@@ -4,24 +4,35 @@ use axum::{middleware, routing::get, Router};
 
 use super::control_plane_gate::{require_control_plane, ControlPlaneGate};
 use super::role_gate;
-use super::{proxy, ApiImpl};
+use super::ApiImpl;
 use crate::observability::prometheus;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
 
-/// Whether this process mounts the local sandbox HTTP data plane.
+/// The local sandbox HTTP data plane a process mounts: the routes that carry
+/// sandbox traffic, and the host classifier that rewrites host-named traffic
+/// onto them.
 ///
-/// This is caller-selected independently of user-facing REST ownership.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DataPlane {
-    /// Local sandbox proxy routes are mounted.
-    Served,
-    /// No local sandbox proxy routes or host classifier are mounted.
-    Absent,
+/// The routes are the running half's; this is the shape the composition needs
+/// of them. The classifier is applied where it was composed, inside the
+/// metrics layer, so what the metrics see is the classified request.
+pub struct DataPlane {
+    routes: Router,
+    classify: Box<dyn FnOnce(Router) -> Router + Send>,
 }
 
-/// Builds the node router with generated control plane and local sandbox data plane.
-pub fn new<I, A, E, C>(api_impl: I) -> Router
+impl DataPlane {
+    pub fn new(routes: Router, classify: impl FnOnce(Router) -> Router + Send + 'static) -> Self {
+        Self {
+            routes,
+            classify: Box::new(classify),
+        }
+    }
+}
+
+/// Builds the node router with generated control plane and the caller's local
+/// sandbox data plane.
+pub fn new<I, A, E, C>(api_impl: I, data_plane: DataPlane) -> Router
 where
     I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
     A: apis::admin::Admin<E, Claims = C>
@@ -40,7 +51,7 @@ where
 {
     compose::<I, A, E, C>(
         api_impl,
-        DataPlane::Served,
+        Some(data_plane),
         Router::new(),
         Arc::new(ControlPlaneGate::from_global_config()),
     )
@@ -72,7 +83,7 @@ where
 {
     compose::<I, A, E, C>(
         api_impl,
-        DataPlane::Absent,
+        None,
         extra_control_plane_routes,
         Arc::new(ControlPlaneGate::from_global_config()),
     )
@@ -82,7 +93,7 @@ where
 /// then merges the independently selected data plane.
 fn compose<I, A, E, C>(
     api_impl: I,
-    data_plane: DataPlane,
+    data_plane: Option<DataPlane>,
     extra_control_plane_routes: Router,
     gate: Arc<ControlPlaneGate>,
 ) -> Router
@@ -106,9 +117,9 @@ where
     let serves_user_facing_rest = AsRef::<ApiImpl>::as_ref(&api_impl).owns_sandboxes();
 
     // An empty data-plane router contributes neither routes nor fallback.
-    let mounted_data_plane = match data_plane {
-        DataPlane::Served => proxy::router(api_impl.clone()),
-        DataPlane::Absent => Router::new(),
+    let (mounted_data_plane, classify) = match data_plane {
+        Some(DataPlane { routes, classify }) => (routes, Some(classify)),
+        None => (Router::new(), None),
     };
 
     // Merge all control-plane routes before gates, then merge the data plane.
@@ -122,12 +133,9 @@ where
     .route("/metrics", get(metrics_handler));
 
     // Attach host classification only when its proxy routes exist.
-    let router = match data_plane {
-        DataPlane::Served => router.layer(middleware::from_fn_with_state(
-            api_impl,
-            proxy::sandbox_proxy_classifier::<I>,
-        )),
-        DataPlane::Absent => router,
+    let router = match classify {
+        Some(classify) => classify(router),
+        None => router,
     };
 
     router.layer(middleware::from_fn(prometheus::http_metrics_middleware))
@@ -159,13 +167,44 @@ mod tests {
     use super::*;
 
     use axum::body::Body;
-    use axum::http::{Method, Request as HttpRequest, StatusCode};
-    use axum::routing::{get, post};
+    use axum::extract::Request as AxumRequest;
+    use axum::http::{header, Method, Request as HttpRequest, StatusCode};
+    use axum::middleware::Next;
+    use axum::response::{IntoResponse, Response as AxumResponse};
+    use axum::routing::{any, get, post};
     use tower::ServiceExt;
 
     use super::super::control_plane_gate::CONTROL_PLANE_HEADER;
 
     const TOKEN: &str = "control-plane-token";
+
+    /// Two answers nothing else in the composition produces, so mounting the
+    /// data plane is observable and leaving it out is too. The routes the
+    /// running half actually mounts are `aenv-node`'s.
+    const DATA_PLANE_ROUTE: StatusCode = StatusCode::IM_A_TEAPOT;
+    const DATA_PLANE_CLASSIFIER: StatusCode = StatusCode::MISDIRECTED_REQUEST;
+    const CLASSIFIED_HOST: &str = "8080-sandbox.data-plane.example.invalid";
+
+    async fn classify_stand_in_host(request: AxumRequest, next: Next) -> AxumResponse {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|host| host.to_str().ok());
+        if host == Some(CLASSIFIED_HOST) {
+            return DATA_PLANE_CLASSIFIER.into_response();
+        }
+        next.run(request).await
+    }
+
+    fn stand_in_data_plane_mount() -> DataPlane {
+        let routes = Router::new()
+            .route("/proxy", any(|| async { DATA_PLANE_ROUTE }))
+            .route("/proxy/{*rest}", any(|| async { DATA_PLANE_ROUTE }))
+            .fallback(any(|| async { DATA_PLANE_ROUTE }));
+        DataPlane::new(routes, |router| {
+            router.layer(middleware::from_fn(classify_stand_in_host))
+        })
+    }
 
     fn stand_in_control_plane() -> Router {
         Router::new()
@@ -400,10 +439,6 @@ mod tests {
     }
 
     async fn build_api_impl_for_gate_test() -> Arc<ApiImpl> {
-        build_api_impl_with_proxy_domains(Vec::new()).await
-    }
-
-    async fn build_api_impl_with_proxy_domains(domains: Vec<String>) -> Arc<ApiImpl> {
         let orchestrator = crate::orchestrator::Orchestrator::with_in_memory_store(
             crate::sandbox::mock::MockBackendFactory::new(),
         )
@@ -413,7 +448,7 @@ mod tests {
             orchestrator,
             snapshot_manager,
             None,
-            domains,
+            Vec::new(),
             crate::api::ResumeWiring::api_half_for_test(),
         ))
     }
@@ -424,11 +459,11 @@ mod tests {
         let gate = Arc::new(ControlPlaneGate::new(vec![TOKEN.to_string()], ""));
         let sandbox_path = "/sandboxes/0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c07/pause";
 
-        for data_plane in [DataPlane::Served, DataPlane::Absent] {
+        for mounts_data_plane in [true, false] {
             let router = || {
                 compose(
                     Arc::clone(&api_impl),
-                    data_plane,
+                    mounts_data_plane.then(stand_in_data_plane_mount),
                     Router::new(),
                     Arc::clone(&gate),
                 )
@@ -438,62 +473,56 @@ mod tests {
                 status(router(), Method::POST, sandbox_path, None).await,
                 StatusCode::FORBIDDEN,
                 "this impl owns user-facing REST, so a configured credential must gate \
-                 nothing on it ({data_plane:?})"
+                 nothing on it (data plane mounted: {mounts_data_plane})"
             );
             assert_ne!(
                 status(router(), Method::GET, "/health", None).await,
                 StatusCode::FORBIDDEN,
-                "/health must stay ungated regardless ({data_plane:?})"
+                "/health must stay ungated regardless (data plane mounted: {mounts_data_plane})"
             );
         }
     }
 
     #[tokio::test]
     async fn the_sandbox_data_plane_is_mounted_only_where_sandboxes_run() {
-        const DOMAIN: &str = "sandbox.example.invalid";
-        let api_impl = build_api_impl_with_proxy_domains(vec![DOMAIN.to_string()]).await;
+        let api_impl = build_api_impl_for_gate_test().await;
         // An explicitly-off gate: what is under test here is which routes and
         // layers the composition carries, and a credential check answering
         // first would mask exactly that.
-        let router = |data_plane| {
+        let router = |mounted: bool| {
             compose(
                 Arc::clone(&api_impl),
-                data_plane,
+                mounted.then(stand_in_data_plane_mount),
                 Router::new(),
                 Arc::new(ControlPlaneGate::new(Vec::new(), "")),
             )
         };
 
-        // 1. The `/proxy/*` entrypoints. 400 is the data plane's own handler
-        //    answering ("missing sandbox routing header"); 404 is the route not
-        //    being there at all.
+        // 1. The `/proxy/*` entrypoints. The data plane's own handler answers,
+        //    or the route is not there at all.
         assert_eq!(
-            status(router(DataPlane::Served), Method::GET, "/proxy/hello", None).await,
-            StatusCode::BAD_REQUEST,
-            "aenv-node must keep serving /proxy/* from the data plane's own handler"
+            status(router(true), Method::GET, "/proxy/hello", None).await,
+            DATA_PLANE_ROUTE,
+            "aenv-node must serve /proxy/* from the data plane's own handler"
         );
         assert_eq!(
-            status(router(DataPlane::Absent), Method::GET, "/proxy/hello", None).await,
+            status(router(false), Method::GET, "/proxy/hello", None).await,
             StatusCode::NOT_FOUND,
             "aenv-api must not carry a /proxy route at all"
         );
 
-        // 2. The host classifier. A sandbox proxy domain carrying an
-        //    unparseable sandbox id is refused by the classifier itself (400,
-        //    "invalid sandbox data-plane host"), so a 400 here means the layer
-        //    ran. Without the layer the same request is just an unmatched path.
-        let via_host = |data_plane| {
-            let router = router(data_plane);
+        // 2. The host classifier, which only the mounted data plane brings
+        //    with it. Without the layer the same request is just an unmatched
+        //    path.
+        let via_host = |mounted: bool| {
+            let router = router(mounted);
             async move {
                 router
                     .oneshot(
                         HttpRequest::builder()
                             .method(Method::GET)
                             .uri("/not-a-control-plane-route")
-                            .header(
-                                axum::http::header::HOST,
-                                format!("8080-not-a-sandbox-id.{DOMAIN}"),
-                            )
+                            .header(header::HOST, CLASSIFIED_HOST)
                             .body(Body::empty())
                             .unwrap(),
                     )
@@ -503,12 +532,12 @@ mod tests {
             }
         };
         assert_eq!(
-            via_host(DataPlane::Served).await,
-            StatusCode::BAD_REQUEST,
-            "aenv-node must still classify a sandbox proxy domain into the data plane"
+            via_host(true).await,
+            DATA_PLANE_CLASSIFIER,
+            "aenv-node must run the data plane's host classifier"
         );
         assert_eq!(
-            via_host(DataPlane::Absent).await,
+            via_host(false).await,
             StatusCode::NOT_FOUND,
             "aenv-api must not run the sandbox host classifier: with no /proxy routes to \
              rewrite into, the only thing it can produce is a 404 the router already had"
@@ -519,34 +548,36 @@ mod tests {
         //    status, because what matters is that dropping the data plane
         //    changed nothing outside it — and a generated route answering the
         //    same way on both is exactly that.
-        let health = |data_plane| status(router(data_plane), Method::GET, "/health", None);
-        let health_on_node = health(DataPlane::Served).await;
+        let health = |mounted| status(router(mounted), Method::GET, "/health", None);
+        let health_on_node = health(true).await;
         assert_ne!(
             health_on_node,
             StatusCode::NOT_FOUND,
             "kubelet's probe must exist at all, or the comparison below is vacuous"
         );
         assert_eq!(
-            health(DataPlane::Absent).await,
+            health(false).await,
             health_on_node,
             "the generated routes must answer identically with and without the data plane"
         );
 
-        // 4. ...and the two public entry points actually pass those two values,
-        //    which is the only thing that makes any of the above a fact about
-        //    the two binaries rather than about `compose`'s parameter.
+        // 4. ...and the two public entry points differ the same way, which is
+        //    the only thing that makes any of the above a fact about the two
+        //    binaries rather than about `compose`'s parameter. `new` takes a
+        //    data plane and mounts it; `new_control_plane_only` has no
+        //    parameter that could carry one.
         assert_eq!(
             status(
-                new(Arc::clone(&api_impl)),
+                new(Arc::clone(&api_impl), stand_in_data_plane_mount()),
                 Method::GET,
                 "/proxy/hello",
                 None
             )
             .await,
-            StatusCode::BAD_REQUEST,
-            "server::new — what aenv-node calls — must carry the data plane"
+            DATA_PLANE_ROUTE,
+            "server::new — what aenv-node calls — must mount the data plane it is handed"
         );
-        assert_ne!(
+        assert_eq!(
             status(
                 new_control_plane_only(Arc::clone(&api_impl), Router::new()),
                 Method::GET,
@@ -554,7 +585,7 @@ mod tests {
                 None
             )
             .await,
-            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
             "server::new_control_plane_only — what aenv-api calls — must not"
         );
     }

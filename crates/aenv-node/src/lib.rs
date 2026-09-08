@@ -2,7 +2,7 @@
 //! resolution, snapshots, and templates.
 
 pub use aenv_core::{
-    api, binding_store, cfg, digest, identity, leader_task, logging, node_client, node_registry,
+    binding_store, cfg, digest, identity, leader_task, logging, node_client, node_registry,
     observability, orchestrator, p2p, privileges, proto, record_dir, runtime_snapshot,
     scheduler_endpoint, server_main, types, virtualization,
 };
@@ -12,6 +12,7 @@ mod node_client_tests;
 #[cfg(test)]
 mod tests;
 
+pub mod api;
 pub mod image;
 pub mod node_reclaim;
 pub mod node_server;

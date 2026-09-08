@@ -407,7 +407,7 @@ impl ApiImpl {
             Err(err) => return DataPlaneResume::Failed(err.to_string()),
         };
         let attempt = tokio::time::timeout(
-            crate::api::proxy::auto_resume_deadline(),
+            auto_resume_deadline(),
             self.orchestrator()
                 .restore_or_join_launch(sandbox_id, request),
         )
@@ -417,7 +417,7 @@ impl ApiImpl {
             Err(_) => {
                 warn!(
                     %sandbox_id,
-                    timeout_ms = crate::api::proxy::auto_resume_deadline().as_millis(),
+                    timeout_ms = auto_resume_deadline().as_millis(),
                     "waking a sandbox for the data plane timed out"
                 );
                 return DataPlaneResume::TimedOut;
@@ -595,12 +595,28 @@ impl From<PlacementRefusal> for DataPlaneResume {
     }
 }
 
+/// Bounds request-driven wake-up before the caller is told it failed.
+fn auto_resume_deadline() -> std::time::Duration {
+    #[cfg(test)]
+    const DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
+    #[cfg(not(test))]
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    DEADLINE
+}
+
 /// The floor a woken sandbox's timeout is raised to.
-///
-/// Declared in `crate::api::proxy` beside the other `auto_resume_*` settings
-/// and read here rather than restated.
 fn auto_resume_min_sandbox_timeout() -> std::time::Duration {
-    crate::api::proxy::auto_resume_min_sandbox_timeout()
+    static AUTO_RESUME_MIN_SANDBOX_TIMEOUT: std::sync::OnceLock<std::time::Duration> =
+        std::sync::OnceLock::new();
+
+    *AUTO_RESUME_MIN_SANDBOX_TIMEOUT.get_or_init(|| {
+        std::time::Duration::from_secs(
+            ConfigManager::global_config()
+                .orchestrator
+                .auto_resume_min_sandbox_timeout_secs,
+        )
+    })
 }
 
 #[cfg(test)]

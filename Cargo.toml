@@ -99,7 +99,7 @@ agentenv-observability = { path = "crates/observability" }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 agentenv_http_server = { path = "src/api/generated" }
 async-trait = "0.1"
-axum = { version = "0.8", features = ["multipart", "ws"] }
+axum = { version = "0.8", features = ["multipart"] }
 axum-extra = { version = "0.12", features = [
     "cookie",
     "query",
@@ -116,7 +116,6 @@ shell-util = { path = "crates/shell-util" }
 linux-cap = { path = "crates/linux-cap" }
 warm-pool = { path = "crates/warm-pool" }
 dashmap = "6.1.0"
-tokio-tungstenite = "0.28"
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"

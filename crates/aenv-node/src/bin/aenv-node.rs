@@ -10,7 +10,7 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,backgr
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use aenv_node::api::{server, ApiImpl, ResumeWiring};
+use aenv_node::api::{proxy, server, ApiImpl, ResumeWiring};
 use aenv_node::cfg::AppConfig;
 use aenv_node::identity::NodeIdentity;
 use aenv_node::image::ImageResolver;
@@ -359,7 +359,10 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
     ));
 
     Ok(Assembly {
-        app: server::new(api_impl),
+        app: server::new(
+            Arc::clone(&api_impl),
+            proxy::data_plane(Arc::clone(&api_impl)),
+        ),
         orchestration,
         upkeep: Vec::new(),
         pg_singleton_tasks: Vec::new(),

@@ -19,6 +19,7 @@ vendored-openssl = ["aenv-core/vendored-openssl"]
 aenv-core = { path = "../.." }
 aenv-egress = { path = "../aenv-egress", features = ["local"] }
 agentenv-observability = { path = "../observability" }
+agentenv_http_server = { path = "../../src/api/generated" }
 anyhow = "1.0.100"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
@@ -29,6 +30,7 @@ envd = { version = "0.1.0", path = "../../thirdparty/envd" }
 firecracker_client = { version = "1.15.1", path = "../../thirdparty/firecracker-client" }
 flate2 = "1"
 futures = "0.3"
+http = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
@@ -53,6 +55,7 @@ thiserror = "2.0.18"
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.28"
 toml = "0.9.11"
 tonic = "0.14.2"
 tower = "0.5.2"
@@ -67,13 +70,9 @@ which = "8.0.0"
 
 [dev-dependencies]
 aenv-core = { path = "../..", features = ["test-support"] }
-# The moved `aenv-core` API tests (see `src/tests/`) drive the generated server
-# traits directly.
-agentenv_http_server = { path = "../../src/api/generated" }
 agentenv-test-support = { path = "../test-support" }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
 headers = "0.4"
-http = "1"
 # Test-only: `snapshot/p2p.rs`'s `#[cfg(test)]` module spins up an io_uring
 # worker to build a real overlaybd layer. Nothing in this crate's production
 # code touches either -- ublk and the io_uring rings live in the daemon

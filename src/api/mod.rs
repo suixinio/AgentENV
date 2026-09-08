@@ -6,7 +6,6 @@ pub mod grpc;
 pub mod impls;
 /// The public pagination token's codec.
 pub use impls::{snapshot_cursor_from_token, snapshot_next_token, PaginationError};
-mod proxy;
 mod role_gate;
 pub mod server;
 

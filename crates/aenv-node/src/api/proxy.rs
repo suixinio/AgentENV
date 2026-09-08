@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    api::ApiImpl,
+    api::{server::DataPlane, ApiImpl},
     cfg::ConfigManager,
     observability::prometheus::HttpRouteSource,
     orchestrator::{OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxState},
@@ -129,27 +129,10 @@ const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bounds request-driven wake-up before the caller is told it failed.
-pub(in crate::api) fn auto_resume_deadline() -> Duration {
-    #[cfg(test)]
-    const DEADLINE: Duration = Duration::from_millis(100);
-    #[cfg(not(test))]
-    const DEADLINE: Duration = Duration::from_secs(60);
-
-    DEADLINE
-}
-
-pub(in crate::api) fn auto_resume_min_sandbox_timeout() -> Duration {
-    static AUTO_RESUME_MIN_SANDBOX_TIMEOUT: std::sync::OnceLock<Duration> =
-        std::sync::OnceLock::new();
-
-    *AUTO_RESUME_MIN_SANDBOX_TIMEOUT.get_or_init(|| {
-        Duration::from_secs(
-            ConfigManager::global_config()
-                .orchestrator
-                .auto_resume_min_sandbox_timeout_secs,
-        )
-    })
+/// The outbound pool every proxied request shares.
+fn proxy_client() -> &'static ProxyClient {
+    static PROXY_CLIENT: std::sync::OnceLock<ProxyClient> = std::sync::OnceLock::new();
+    PROXY_CLIENT.get_or_init(build_proxy_client)
 }
 
 pub fn build_proxy_client() -> ProxyClient {
@@ -163,6 +146,20 @@ pub fn build_proxy_client() -> ProxyClient {
     Client::builder(TokioExecutor::new())
         .pool_max_idle_per_host(0)
         .build(connector)
+}
+
+/// The node's sandbox data plane, as `server::new` takes it.
+pub fn data_plane<I>(api_impl: I) -> DataPlane
+where
+    I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
+{
+    let classified = api_impl.clone();
+    DataPlane::new(router(api_impl), move |router| {
+        router.layer(axum::middleware::from_fn_with_state(
+            classified,
+            sandbox_proxy_classifier::<I>,
+        ))
+    })
 }
 
 pub fn router<I>(api_impl: I) -> Router
@@ -459,7 +456,7 @@ async fn proxy_request(
     let response = if is_websocket_request {
         proxy_websocket_request(websocket_upgrade, parts, resolved).await
     } else {
-        proxy_http_request(api_impl, parts, body, resolved).await
+        proxy_http_request(parts, body, resolved).await
     };
 
     echo_execution(response, served_by)
@@ -551,7 +548,6 @@ fn has_routing_header(headers: &HeaderMap) -> bool {
 
 /// Proxies a standard HTTP request to the resolved upstream URI and returns the response.
 async fn proxy_http_request(
-    api_impl: &ApiImpl,
     mut parts: http::request::Parts,
     body: Body,
     resolved: ResolvedProxyRequest,
@@ -600,7 +596,7 @@ async fn proxy_http_request(
     let (body, activity_rx) = track_request_body_activity(body);
     let upstream_request = Request::from_parts(parts, body);
     let upstream_response_result = match wait_for_upstream_response_headers_with_activity_timeout(
-        api_impl.proxy_client().request(upstream_request),
+        proxy_client().request(upstream_request),
         activity_rx,
     )
     .await
@@ -2012,6 +2008,12 @@ mod tests {
         )
     }
 
+    /// The router `aenv-node` assembles: the generated control plane plus this
+    /// module's own data plane.
+    pub fn node_app(api: Arc<ApiImpl>) -> axum::Router {
+        server::new(Arc::clone(&api), data_plane(api))
+    }
+
     pub async fn build_api() -> Arc<ApiImpl> {
         build_api_with(Vec::new(), api_half()).await
     }
@@ -2062,7 +2064,7 @@ mod tests {
             .set_auto_resume_for_test(sandbox_id, auto_resume)
             .await
             .unwrap();
-        server::new(api)
+        node_app(api)
     }
 
     async fn proxy_app_for_sandbox(sandbox_id: &SandboxId) -> axum::Router {
@@ -2086,7 +2088,7 @@ mod tests {
                 crate::orchestrator::SandboxState::Running,
             )
             .await;
-        server::new(api)
+        node_app(api)
     }
 
     async fn proxy_app_for_running_sandbox_without_route(sandbox_id: &SandboxId) -> axum::Router {
@@ -2098,7 +2100,7 @@ mod tests {
         api.orchestrator()
             .remove_proxy_route_for_test(sandbox_id)
             .await;
-        server::new(api)
+        node_app(api)
     }
 
     async fn start_proxy_server(sandbox_id: &SandboxId) -> SocketAddr {
@@ -2223,14 +2225,14 @@ mod tests {
                 .unwrap()
         };
 
-        let node = server::new(build_api_as(node_half()).await);
+        let node = node_app(build_api_as(node_half()).await);
         assert_eq!(
             node.clone().oneshot(create()).await.unwrap().status(),
             StatusCode::NOT_FOUND,
             "a node must answer the user-facing create as if the route were not there"
         );
 
-        let api = server::new(build_api().await);
+        let api = node_app(build_api().await);
         assert_ne!(
             api.oneshot(create()).await.unwrap().status(),
             StatusCode::NOT_FOUND,
@@ -2273,7 +2275,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_route_is_indistinguishable_from_one_that_never_existed() {
-        let node = server::new(build_api_as(node_half()).await);
+        let node = node_app(build_api_as(node_half()).await);
         let answer = |path: &'static str| {
             let node = node.clone();
             async move {
@@ -2314,7 +2316,7 @@ mod tests {
             "a node's refusal must not be tellable from a route that never existed"
         );
 
-        let all = server::new(build_api().await);
+        let all = node_app(build_api().await);
         assert_ne!(
             all.oneshot(
                 Request::builder()
@@ -2333,7 +2335,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_requires_routing_headers() {
-        let app = server::new(build_api().await);
+        let app = node_app(build_api().await);
 
         let response = app
             .clone()
@@ -2845,7 +2847,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_fallback_returns_not_found_without_routing_header() {
-        let app = server::new(build_api().await);
+        let app = node_app(build_api().await);
 
         let response = app
             .oneshot(
@@ -3322,10 +3324,9 @@ mod execution_fencing_tests {
     use axum::routing::get;
     use tower::ServiceExt;
 
-    use crate::api::server;
     use crate::orchestrator::{ProxyTarget, SandboxState};
 
-    use super::tests::{build_api, spawn_upstream};
+    use super::tests::{build_api, node_app, spawn_upstream};
 
     async fn start_counting_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
@@ -3346,7 +3347,7 @@ mod execution_fencing_tests {
         api.orchestrator()
             .set_live_execution_for_test(sandbox_id, ProxyTarget::new(Ipv4Addr::LOCALHOST), live)
             .await;
-        server::new(api)
+        node_app(api)
     }
 
     fn proxy_request(sandbox_id: SandboxId, port: u16, expect: Option<ExecutionId>) -> Request {
@@ -3437,7 +3438,7 @@ mod execution_fencing_tests {
         let sandbox_id = SandboxId::new();
         let app = {
             let api = build_api().await;
-            server::new(api)
+            node_app(api)
         };
 
         let response = app
@@ -3465,7 +3466,7 @@ mod execution_fencing_tests {
                     SandboxState::Pausing,
                 )
                 .await;
-            server::new(api)
+            node_app(api)
         };
 
         let response = app

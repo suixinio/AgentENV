@@ -16,11 +16,11 @@ use super::launch_claim::RestoredSandbox;
 use super::metrics::OrchestratorMetrics;
 use super::pause_publisher::PausePublisher;
 use super::proxy::ProxyLookupResult;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use super::proxy::ProxyTarget;
 use super::service::Orchestrator;
 use super::store::{MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use super::types::SandboxState;
 use super::types::{
     CreateSandboxRequest, ForkChildren, LiveSandbox, PauseOutcome, SandboxLifecycleEvent,
@@ -193,24 +193,24 @@ orchestration_surface! {
         fn metrics_snapshot() -> Result<OrchestratorMetrics>;
 
         // Test-only facade seed helpers.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         fn set_proxy_target_for_test(
             sandbox_id: SandboxId,
             target: ProxyTarget,
             state: SandboxState,
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         fn set_metadata_state_for_test(sandbox_id: SandboxId, state: SandboxState) -> Result<()>;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         fn remove_sandbox_for_test(sandbox_id: &SandboxId) -> Result<()>;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         fn set_auto_resume_for_test(
             sandbox_id: &SandboxId,
             auto_resume_enabled: bool,
         ) -> Result<()>;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         fn remove_proxy_route_for_test(sandbox_id: &SandboxId);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         fn set_live_execution_for_test(
             sandbox_id: SandboxId,
             target: ProxyTarget,

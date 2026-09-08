@@ -24,13 +24,14 @@ use crate::node_registry::registry::AtomicNodeRegistry;
 use crate::node_registry::types::Node;
 use crate::node_registry::warmup::WarmupGate;
 use crate::orchestrator::{
-    CommittingPausePublisher, CreateSandboxRequest, InMemoryMetadataStore, Orchestrator,
-    SandboxExpiry, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
+    CommittingPausePublisher, CreateSandboxRequest, GrantIssuer, InMemoryMetadataStore,
+    Orchestrator, SandboxExpiry, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
     NodeSandboxService, NodeSandboxServiceServer,
 };
+use crate::proto::scheduler::scheduler_server::Scheduler;
 use crate::sandbox::AccessTokenSeedPolicy;
 use crate::snapshot::mock::{recording_snapshot_manager, RecordingSnapshotRepository};
 use crate::snapshot::repository::{SnapshotCommit, StagedSnapshot};
@@ -38,6 +39,7 @@ use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotPublishSource, Snap
 use crate::types::{ExecutionId, SandboxId};
 
 const NODE_ID: &str = "node-under-test";
+const CLUSTER_ID: &str = "cluster-under-test";
 
 /// The api half as `bin/aenv-api.rs` wires it, plus the two doubles the test
 /// reads its decisions out of.
@@ -45,9 +47,42 @@ struct ApiHalf {
     orchestrator: Arc<Orchestrator<InMemoryMetadataStore, RemoteSandboxBackendFactory>>,
     bindings: Arc<InMemoryBindingStore>,
     snapshots: Arc<RecordingSnapshotRepository>,
+    grants: Arc<RecordingGrants>,
     calls: Arc<Mutex<Vec<String>>>,
     node: Arc<ScriptedNode>,
     _node_shutdown: oneshot::Sender<()>,
+}
+
+/// Records what the orchestrator granted and revoked, in order.
+#[derive(Default)]
+struct RecordingGrants {
+    granted: Mutex<Vec<(SandboxId, ExecutionId, Vec<String>)>>,
+    revoked: Mutex<Vec<(SandboxId, ExecutionId)>>,
+}
+
+#[async_trait::async_trait]
+impl GrantIssuer for RecordingGrants {
+    async fn grant(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+        names: &std::collections::BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        self.granted.lock().expect("lock").push((
+            sandbox_id,
+            execution_id,
+            names.iter().cloned().collect(),
+        ));
+        Ok(())
+    }
+
+    async fn revoke(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> anyhow::Result<()> {
+        self.revoked
+            .lock()
+            .expect("lock")
+            .push((sandbox_id, execution_id));
+        Ok(())
+    }
 }
 
 impl ApiHalf {
@@ -72,6 +107,14 @@ impl ApiHalf {
 
     fn creates_seen(&self) -> Vec<pb::SandboxCreateRequest> {
         self.node.seen_create.lock().expect("lock").clone()
+    }
+
+    fn granted(&self) -> Vec<(SandboxId, ExecutionId, Vec<String>)> {
+        self.grants.granted.lock().expect("lock").clone()
+    }
+
+    fn revoked(&self) -> Vec<(SandboxId, ExecutionId)> {
+        self.grants.revoked.lock().expect("lock").clone()
     }
 }
 
@@ -380,13 +423,36 @@ async fn api_half() -> ApiHalf {
     ));
     warmup.reported_in(SystemTime::now());
     let bindings = Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default()));
+    // The deployed values, read from the shipped defaults rather than picked:
+    // `projection_authoritative` decides what a heartbeat does to a binding's
+    // deadline, and no deployment turns it on.
+    let binding_config = crate::cfg::AppConfig::default().binding_store;
     let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup))
         .with_binding_store(
             Arc::clone(&bindings) as Arc<dyn BindingStore>,
-            true,
-            Duration::ZERO,
+            binding_config.projection_authoritative,
+            Duration::from_secs(binding_config.max_projection_ttl_secs),
         );
     *node.binding_store.lock().expect("lock") = Some(Arc::clone(&bindings));
+
+    // The node reports in the way a real one does. A policy that names a secret
+    // is placed only on a node whose latest heartbeat says it can broker.
+    Scheduler::heartbeat(
+        &grpc_service,
+        Request::new(crate::proto::scheduler::HeartbeatRequest {
+            node_id: NODE_ID.to_string(),
+            cluster_id: CLUSTER_ID.to_string(),
+            service_instance_id: format!("{NODE_ID}-instance"),
+            snapshot: Some(crate::proto::scheduler::NodeSnapshot {
+                status: crate::proto::scheduler::NodeStatus::Ready as i32,
+                egress_broker: crate::proto::scheduler::EgressBrokerState::LocalOk as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("the node under test reports in");
 
     let calls: Arc<Mutex<Vec<String>>> = Arc::default();
     let placement: Arc<dyn NodePlacement> = Arc::new(RecordingPlacement {
@@ -412,6 +478,8 @@ async fn api_half() -> ApiHalf {
     .await
     .expect("the api half assembles");
     orchestrator.set_runtime_routing(PlacementRuntimeRouting::shared(Arc::clone(&placement)));
+    let grants = Arc::new(RecordingGrants::default());
+    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn GrantIssuer>);
     let (snapshot_manager, snapshots) = recording_snapshot_manager();
     orchestrator.set_pause_publisher(Arc::new(CommittingPausePublisher::new(Arc::new(
         snapshot_manager,
@@ -421,6 +489,7 @@ async fn api_half() -> ApiHalf {
         orchestrator,
         bindings,
         snapshots,
+        grants,
         calls,
         node,
         _node_shutdown: shutdown_tx,
@@ -450,6 +519,33 @@ fn cold_create() -> CreateSandboxRequest {
         control_plane_config: None,
         execution_id: None,
         preferred_node_id: None,
+    }
+}
+
+/// A create whose policy names one secret: the shape in which starting a
+/// sandbox includes issuing a grant for it.
+fn cold_create_naming_a_secret() -> CreateSandboxRequest {
+    let mut rules = std::collections::BTreeMap::new();
+    rules.insert(
+        "api.example.com".to_string(),
+        vec![crate::sandbox::network::policy::DomainRule {
+            transform: crate::sandbox::network::policy::HeaderTransform {
+                headers: [(
+                    "authorization".to_string(),
+                    "Bearer ${aenv.secrets.openai}".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        }],
+    );
+    CreateSandboxRequest {
+        network_policy: crate::sandbox::SandboxNetworkPolicy::new(
+            Default::default(),
+            crate::sandbox::SandboxNetworkEgressPolicy::with_rules(None, None, Some(rules))
+                .expect("the policy validates"),
+        ),
+        ..cold_create()
     }
 }
 
@@ -691,6 +787,73 @@ async fn a_pause_the_node_refuses_leaves_the_sandbox_running_and_routable() {
     assert!(
         half.snapshots.committed().is_empty(),
         "a pause that never staged anything committed a row"
+    );
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        Some(SandboxState::Running),
+        "the sandbox the node would not pause is still running, and its record has to say so"
+    );
+    let binding = half
+        .binding(metadata.id)
+        .await
+        .expect("a sandbox that is still running is still routable");
+    assert_eq!(binding.state, BindingState::Confirmed);
+    assert_eq!(binding.execution_id, metadata.execution_id.to_string());
+}
+
+#[tokio::test]
+async fn a_create_grants_the_secrets_its_policy_names_and_a_delete_revokes_them() {
+    let half = api_half().await;
+
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create_naming_a_secret())
+        .await
+        .expect("the api half creates a sandbox whose policy names a secret");
+
+    assert_eq!(
+        half.granted(),
+        vec![(
+            metadata.id,
+            metadata.execution_id,
+            vec!["openai".to_string()]
+        )],
+        "the incarnation started without the grant its policy needs"
+    );
+    assert!(
+        half.revoked().is_empty(),
+        "a running sandbox's grant was revoked under it"
+    );
+
+    Arc::clone(&half.orchestrator)
+        .delete_sandbox(metadata.id)
+        .await
+        .expect("the api half deletes the sandbox");
+
+    assert_eq!(
+        half.revoked(),
+        vec![(metadata.id, metadata.execution_id)],
+        "a deleted incarnation whose grant still resolves is one the broker still serves"
+    );
+}
+
+#[tokio::test]
+async fn a_pause_revokes_the_grant_the_create_issued() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create_naming_a_secret())
+        .await
+        .expect("a sandbox to pause");
+    *half.node.pause.lock().expect("lock") = Some(Ok(staged_by_the_node(metadata.id)));
+
+    Arc::clone(&half.orchestrator)
+        .pause_sandbox(metadata.id)
+        .await
+        .expect("the api half pauses the sandbox");
+
+    assert_eq!(
+        half.revoked(),
+        vec![(metadata.id, metadata.execution_id)],
+        "a paused sandbox has no runtime to read a secret, so its grant goes with it"
     );
 }
 

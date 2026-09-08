@@ -747,6 +747,19 @@ mod tests {
     }
 
     #[test]
+    fn the_node_half_accepts_what_only_the_api_half_reads() {
+        let mut config = AppConfig::default();
+        config.cluster.placement_shadow_k = 0;
+        config.secrets.backend = SecretsBackendKind::Postgres;
+        config.secrets.pg.key_file = None;
+
+        validate_node_half(&config).expect(
+            "the node half reads none of these sections, so a file that carries them must \
+             still start it",
+        );
+    }
+
+    #[test]
     fn the_shipped_default_config_passes_the_node_half_checks() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         ConfigManager::new_from_path(&workspace.join("config/default.toml"), validate_node_half)

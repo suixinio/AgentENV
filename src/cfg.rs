@@ -2788,6 +2788,23 @@ endpoint = "http://second:9000"
     }
 
     #[test]
+    fn the_api_half_accepts_what_only_the_node_half_reads() {
+        let mut config = AppConfig::default();
+        config.ublk.overlaybd.resize_timeout_secs = 0;
+        config.memory_snapshot.background_download.concurrency = 0;
+        config.pool.low_watermark = 64;
+        config.pool.high_watermark = 32;
+
+        config
+            .validate_shared()
+            .expect("none of these sections is shared");
+        validate_api_half(&config).expect(
+            "the api half reads none of these sections, so a file that carries them must \
+             still start it",
+        );
+    }
+
+    #[test]
     fn validate_rejects_a_zero_placement_shadow_k() {
         let mut config = AppConfig::default();
         config.cluster.placement_shadow_k = 0;

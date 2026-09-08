@@ -16,7 +16,7 @@
   `FirecrackerSandboxFactory`，`sandboxes` 表里是真 VM 句柄。
 - `crates/aenv-api/src/bin/aenv-api.rs:209`：`RedisMetadataStore` +
   `RemoteSandboxBackendFactory`，`sandboxes` 表里是**一次 gRPC 调用**
-  （`RemoteSandboxStub`，`src/node_client/stub.rs:650`）。
+  （`RemoteSandboxStub`，`crates/aenv-api/src/node_client/stub.rs:52,650`）。
 
 这个"换一个类型参数就把本地编排变成集群编排"的选择写在
 `git show 3347c0c`（2026-08-21，`feat(node): drive a sandbox on another machine`）的
@@ -28,8 +28,8 @@
 
 | 字段 | `service.rs` | api 半边上是什么 |
 |---|---|---|
-| `sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>` | :129 | 一张网络桩表，句柄不代表任何进程内资源 |
-| `proxy_routes: RwLock<ProxyRouteTable>` | :130 | 永不被服务（`server.rs` 的 `new_control_plane_only` 不挂数据面） |
+| `sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>` | :130 | 一张网络桩表，句柄不代表任何进程内资源 |
+| `proxy_routes: RwLock<ProxyRouteTable>` | :131 | 永不被服务（`server.rs` 的 `new_control_plane_only` 不挂数据面） |
 | `launch_claims: Arc<LaunchClaims>` | :158 | 进程内单激活，而真正的单激活是 binding store 的 `Starting` 预留 |
 | `image_refs: Arc<dyn RuntimeImageRefs>` | :142 | `DisabledRuntimeImageRefs`（`src/image/contract.rs:103`） |
 
@@ -40,20 +40,33 @@
 |---|---|
 | `NoSnapshotCatalog` | `src/snapshot/repository/no_catalog.rs:17` |
 | `DisabledRuntimeImageRefs` | `src/image/contract.rs:103` |
-| `EmptyRuntimeArtifactLease` | `src/runtime_snapshot.rs:92` |
-| `UnknownRecordOwner` | `src/node_client/record_owner.rs:22` |
+| `UnknownRecordOwner` | `crates/aenv-api/src/node_client/record_owner.rs:22` |
+
+三个，不是四个。`EmptyRuntimeArtifactLease`（`src/runtime_snapshot.rs:90-101`）
+连同它的 `default_runtime_artifact_lease` 已经门控在
+`#[cfg(any(test, feature = "test-support"))]` 之下，不在任何发布二进制里，
+因此不是运行期的角色降级，也不该被步骤 3 的判据点名。
+
+`NoSnapshotCatalog` 也不能整体删除：节点侧有四个生产调用方
+（`src/snapshot/repository/backends/{oss/durable.rs:46,posixfs/durable.rs:14}`、
+`crates/aenv-node/src/snapshot/repository/backends/{oss/backend.rs:65,posixfs/backend.rs:96}`）。
+要删的是 api 半边**装配**里那一个，不是这个类型。
 
 `NoSnapshotCatalog` 的直接后果写在 `src/snapshot/repository/backends/mod.rs:66-72`：
 api 半边先用 `build_catalog_only_storage` 造一个塞了 `NoSnapshotCatalog` 的
 `SnapshotRepository`，唯一用途是把 artifact store 装在一个必须要有 catalog 的类型里搬运一次，
 然后 `build_snapshot_backend` 立刻把它丢掉、只取 `.artifacts()` 重建。
 
-判据缺失：`Orchestrator<RedisMetadataStore, RemoteSandboxBackendFactory>` 这个组合
-全 workspace 零测试。`src/orchestrator/tests.rs` 的 6,580 行用的是
-`MockBackendFactory`，它实现的工厂方法与 `RemoteSandboxBackendFactory` 独有的四个开关
+判据缺失，但不是"零测试"：`crates/aenv-api/src/node_client/tests.rs` 有 57 个
+`#[tokio::test]`，构造的正是 `Orchestrator<InMemoryMetadataStore,
+RemoteSandboxBackendFactory>` 并驱动 create/pause/跨副本账本。真正为零的是
+**Redis 元数据存储参与的那个组合**，而步骤 1 的新测试用的也是内存存储
+（`crates/aenv-api/src/control_path_tests.rs` 开头写明了这一点），所以这个缺口在
+C6 完成后依然为零。另一半是对的：`src/orchestrator/tests.rs` 用
+`MockBackendFactory`，它与 `RemoteSandboxBackendFactory` 独有的四个开关
 （`build` / `build_from_snapshot` / `build_from_snapshot_record` / `build_from_image_ref`，
-`src/node_client/factory.rs:52,65,76,139`）不相交；冷创建入口 `UnresolvedImage`
-在那 6,580 行里出现 0 次。
+`crates/aenv-api/src/node_client/factory.rs:52,65,76,139`）不相交；冷创建入口
+`UnresolvedImage` 在那 6,580 行里出现 0 次，所以编排器层的冷创建此前确实无覆盖。
 
 `docs/` 里没有任何一处论证过"两个半边共享一台状态机"。本稿是那个裁决。
 
@@ -65,22 +78,46 @@ e2b 的 api 半边也有一个叫 `Orchestrator` 的类型
 **没有 VM 句柄表、没有代理路由表、没有 backend 工厂**。每个操作是一条
 "放置 → store 写 → gRPC → store 写"的直线：
 
-- `create_instance.go:187`：先 `o.sandboxStore.Reserve(...)` 拿到
-  `finishStart`/`waitForStart` 一对闭包（占位先于运行时），再
-  `placement.PlaceSandbox(...)`（:365），再 `client.Sandbox.Create(...)`。
-  并发同 id 由 `waitForStart` 等待，不由进程内 map。
-- `pause_instance.go:31`：`throttledUpsertSnapshot(buildUpsertSnapshotParams(...))`
+- `create_instance.go:197`：先 `o.sandboxStore.Reserve(...)` 拿到
+  `finishStart`/`waitForStart` 一对闭包（占位先于放置，键是 `(teamID, sandboxID)`，
+  与节点无关，实现是一段 Lua 原子脚本，
+  `packages/api/internal/sandbox/reservations/redis/reservation.go:50`），再
+  `placement.PlaceSandbox(...)`（:388）。并发同 id 拿到 `waitForStart` 去 join
+  （:221-239），不由进程内 map；`finishStart` 在 :263-265 一次性收口。
+  **`client.Sandbox.Create` 在 `PlaceSandbox` 里面，不在它之后**：
+  `placement/placement.go:166 node.SandboxCreate(...)` →
+  `nodemanager/sandbox_create.go:12 client.Sandbox.Create(...)`，
+  失败按 gRPC code 分流并**换节点重试**（`placement.go:185-208`：
+  `ResourceExhausted` 记 refusal 不计 attempt，其余把节点加入 `nodesExcluded`
+  并 `attempt++`）。**记录写在节点调用之后**：`create_instance.go:496
+  o.sandboxStore.Add(...)`，写失败时异步 kill 掉已经起来的沙箱（:503-518）。
+  我们的 `place_new` + `reserve_placement` + `RemoteSandboxStub::start` 是三步分开的，
+  重试语义因此不同——目标形状必须写明照抄哪一种（见 §3 的裁决）。
+- `pause_instance.go:35`：`throttledUpsertSnapshot(buildUpsertSnapshotParams(...))`
   写 PG 行 → `snapshotInstance(...)` 一次 `client.Sandbox.Pause` gRPC →
   `finishSnapshotBuild(...)`。
-- `delete_instance.go:22`：`o.sandboxStore.StartRemoving(...)` 一次 store 调用完成状态迁移，
-  `removeSandboxFromNode(...)` 里 `routingCatalog.DeleteSandbox(...)` +
-  `client.Sandbox.Delete(...)`。
+- `delete_instance.go:26`：`o.sandboxStore.StartRemoving(...)` 拿到状态迁移与它的
+  收口闭包，`removeSandboxFromNode(...)` 里 `routingCatalog.DeleteSandbox(...)`
+  （:152）+ `client.Sandbox.Delete(...)`。
 - `checkpoint_instance.go:30`：同样是 `StartRemoving` 一行拿到 `finishSnapshotting`
   闭包，其余是 upsert + 一次 `client.Sandbox.Checkpoint`。
 
-**状态迁移在 e2b 是一次 store 调用**（`StartRemoving` / `Reserve`），
-不是一台带回滚臂的状态机。VM 的状态机住在 orchestrator 进程
-（`packages/orchestrator/`），api 进程根本不链接它。
+**状态迁移在 e2b 住在 store 里，以两阶段闭包表达，而不是住在一台泛型编排器里、
+以 backend 句柄表达**——但它有回滚臂，而且是显式的：`StartRemoving` 返回
+四元组 `(sbx, alreadyDone, finish, err)`（`delete_instance.go:26`、
+`checkpoint_instance.go:30`），`finish(err)` 就是那条臂，注释逐字写明
+"On success (nil) it restores the sandbox to Running. On error it leaves the
+state as Snapshotting"（`checkpoint_instance.go:47-57`），并按 gRPC code 分别
+决定恢复 Running（:92、:97、:112）还是留在 Snapshotting 后 kill。
+`packages/api/internal/sandbox/sandboxtypes/states.go:95-99` 是一张显式的
+`AllowedTransitions` 表，`:11-20` 的 `TransitionEffect{Expires, Transient}`
+就是"终态 / 成功后回到原状态"。
+
+这条必须写准，否则 `SandboxControl` 会被实现成一条没有回滚臂的直线，把
+`OrchestratorError::PausePublicationFailed`（发布失败把 VM 放回 Running，
+CLAUDE.md 与 `src/orchestrator/service.rs:2060` 的 `rollback_pause_to_running`
+都依赖它）丢掉。VM 自身的状态机住在 orchestrator 进程
+（`packages/orchestrator/`），api 进程根本不链接它——这一半成立。
 
 ## 3. 目标形状
 
@@ -94,15 +131,41 @@ crates/aenv-api      SandboxControl（放置 → binding 预留 → node gRPC �
                      api/impls、node_registry、binding_store、node_client、PG
 ```
 
-`SandboxControl` 的每个方法是 e2b 那条直线，构造参数直接接收今天靠三个
+`SandboxControl` 的每个方法是 e2b 那条直线**加上它的回滚臂**（见 §2 的 `finish`
+闭包）：`PausePublicationFailed` 必须活下来。构造参数直接接收今天靠三个
 `set_*` 后置注入的协作者（`set_pause_publisher` / `set_grant_issuer` /
 `set_runtime_routing`，`service.rs:1629,1636,1643`）—— 一个装配完就不可变的类型
-不需要 `OnceCell`。
+不需要 `OnceCell`，而那三个 `OnceCell`（`service.rs:147,150,154`）今天正是
+"我是不是节点半边"的运行期判定：`service.rs:1654` 与 `:1817` 都以
+`runtime_routing.get().is_none()` 分流。删掉它们等于消掉三处运行期角色分支。
 
-**与 e2b 的偏离**：e2b 的 api 半边没有等价于我们 `keep_alive_for` 里那段
-"记录不在本进程时向持有节点转发"的逻辑，因为它的 `sandboxStore` 就是集群真相；
-我们的 `RedisMetadataStore` 同样是集群真相，所以这条转发在目标形状里消失，
-不是移植过去。这是收敛，记录在此以免被读成漏移。
+**单激活的顺序：预留先于放置。** 今天是 `place_new → reserve_placement →
+节点 create → record_placement`（`crates/aenv-api/src/control_path_tests.rs`
+的冷创建用例断言的正是这个顺序），预留在选节点之后且键里含节点
+（`node_registry/grpc_service.rs` 写 `Binding{node, execution_id, state: Starting}`）。
+e2b 相反：`Reserve` 在选节点之前，键是 `(teamID, sandboxID)`、与节点无关。
+本稿裁决**与 e2b 收敛**：把预留提到放置之前，键只含沙箱 id，节点在
+`record_placement` 时才写进去。理由有三条，都不是审美：
+
+1. 今天"先放置再预留"意味着并发的同 id 创建会各自先跑一遍放置——两次调度决策、
+   两次资源乐观扣减，然后其中一个才在预留上失败。预留先行让第二个请求在拿到
+   任何节点之前就知道自己是后来者。
+2. 单激活因此有**一个**真相源。今天有两个：进程内的 `launch_claims`
+   （`service.rs:158`）与 binding store 的 `Starting` 预留，前者只在一个副本内成立。
+3. 于是步骤 3 **删掉 `launch_claims`**：它今天是唯一"先于任何分配拿 id"的东西
+   （dev 的 406bc6f 就是为此而来），而预留提前之后，它守的正是预留在守的东西，
+   只是守在单个进程里。`LaunchHeldElsewhere` + `LAUNCH_ELSEWHERE_POLL`
+   （`service.rs:52,468,573`）的轮询是我们替代 e2b `waitForStart` join 的方式，
+   保留，但它等待的对象改成预留而不是进程内 map。
+
+**与 e2b 的偏离**：e2b 的 keep-alive **有**一段向持有节点的转发
+（`keep_alive.go:60` → `update_instance.go:34,40`：`getOrConnectNode` 后
+`client.Sandbox.Update`），因为它的节点自己持 deadline。我们没有这段代码可删——
+`src/orchestrator/service.rs:1336` 的 `keep_alive_for` 全文只有 store 读写与
+`runtime_confirmed_gone`，没有任何节点转发。真正的偏离是反向的、且是物理约束：
+远端 create 发 `Expiry::CallerKept`（`crates/aenv-api/src/node_client/factory.rs:95,177`，
+注释原文"The orchestrator owns expiry; the node must not invent another deadline"），
+节点因此不持 deadline，也就不需要被通知。这条要写在目标形状里，不是"收敛"。
 
 ## 4. 步骤与各步删除的东西
 
@@ -115,10 +178,10 @@ delete，以及每条路径上的节点侧失败。**删除：无。** 这是步
 
 ### 步骤 2：拆掉 `ApiImpl` 互锁，收尾 C4
 
-node 今天为了 `server::new` 造一个 `ApiImpl`（`aenv-node.rs:355`），而它服务的
-生成路由只有三条（`src/api/role_gate.rs:55-63`：`/health`、`GET /nodes`、
-`GET|POST /nodes/{id}`），其余 25 条被 404。这个 `ApiImpl` 是
-`src/api/impls` 留在 core 里的唯一原因。
+（已落地。）node 为了 `server::new` 造一个 `ApiImpl`，而它服务的生成路由只有三条
+（`/health`、`GET /nodes`、`GET|POST /nodes/{id}`），其余 25 条被角色门 404。
+那个 `ApiImpl` 是 `src/api/impls` 留在 core 里的唯一原因；角色门本身
+（`src/api/role_gate.rs`）随本步一起删除。
 
 - node 自建路由（`crates/aenv-node/src/api/`），不再构造 `ApiImpl`；
 - `git mv` `src/api/impls`、`src/node_registry`、`src/binding_store`、
@@ -136,28 +199,56 @@ node 今天为了 `server::new` 造一个 `ApiImpl`（`aenv-node.rs:355`），�
 crates/aenv-node（只留 REST 层要映射的 `SandboxMetadata`/状态枚举/
 `OrchestratorError` 形状在 core）。
 
-**删除**：四个 no-op impl；`RoleStorage` 与 `build_catalog_only_storage` 的
-"造了再丢"（`backends/mod.rs:66-72`）；api 侧的 `sandboxes` 桩表、`proxy_routes`、
-`launch_claims`；`ApiImpl::runs_sandbox_runtime` / `owns_sandboxes` 与 handler 里
-9 处运行期角色分支（角色成为二进制常量）；`WakeSite`（若无剩余读取方）。
-三个 `set_*` 变成构造参数。
+**删除**：api 半边装配里的 `DisabledRuntimeImageRefs` 与 `UnknownRecordOwner`
+两个 no-op，以及那个塞了 `NoSnapshotCatalog` 的 `RoleStorage`（类型本身留给节点侧，
+见 §1）；`build_catalog_only_storage` 的"造了再丢"（`backends/mod.rs:68-76`）；
+api 侧的 `sandboxes` 桩表、`proxy_routes`；**`launch_claims`**（连同它在 node 侧的
+用法——预留提前之后单激活只剩一个真相源，见 §3 的裁决）；`RemoteSandboxBackendFactory::build`
+那条"拒绝式"实现（`crates/aenv-api/src/node_client/factory.rs:52-64`）随 backend
+工厂一起消失。三个 `set_*` 变成构造参数，`service.rs:1654`、`:1817` 的
+`OnceCell` 分流随之消失。
+
+`ApiImpl::runs_sandbox_runtime` / `owns_sandboxes` / `WakeSite` 与 `role_gate`
+已在步骤 2 删除（commit 270d858），不再是本步的工作。
 
 ### 步骤 4：文档
 
-CLAUDE.md 的 aenv-api 条、Orchestrator 条、Workspace Crates、
-"runtime-role distinction survives in one place" 那句，
-以及 `docs/src/internals/architecture.md`。
+CLAUDE.md 的 aenv-api 条、Orchestrator 条、Workspace Crates，以及讲"哪一半是二进制
+的常量"的那句（今天在编排器层还有三处 `OnceCell` 例外，见 §6 第 2 条）；
+`docs/src/internals/architecture.md` 的子系统表与树状图。
 
 ## 5. 回滚
 
-零迁移、零 schema 变更、零 feature flag、零双写腿。两个二进制的线上契约
-（REST 面、`scheduler.v1`、node gRPC 面、Redis 与 PG 的键与列）都不变，
-所以回滚手段是**镜像 digest**：把 Deployment/DaemonSet 的镜像换回上一版即可，
-不需要开关，也不存在"回滚后数据读不回来"的方向性。这与 CLAUDE.md
+**这一节的作用域是 C6 本身，不是承载它的分支。** C6：零迁移、零 schema 变更、
+零 feature flag、零双写腿。两个二进制的线上契约（REST 面、`scheduler.v1`、
+node gRPC 面、Redis 与 PG 的键与列）都不变，所以回滚手段是**镜像 digest**：
+把 Deployment/DaemonSet 的镜像换回上一版即可，不需要开关。这与 CLAUDE.md
 "Rolling this half back is an image digest change on its Deployment, no flags"
 是同一条。
 
-## 6. 验收判据
+承载它的分支不是这样，读者不要把上一段读成对整个分支的背书：
+`crates/aenv-api/src/snapshot/repository/backends/postgres/migrations/0004_one_pause_per_sandbox.sql`
+加了 `is_pause` 列与唯一部分索引，**软删了每个沙箱除最新 ready 之外的全部 pause 行，
+并硬删了它们的别名**。回滚镜像不会把它们带回来：旧构建读"最新 ready 行"仍找到
+幸存者，所以每个沙箱仍可 resume，但它会列出的那段 pause 历史没了。
+列与触发器留在库里是无害的——`snapshots_pause_axis_trg` 正是为了让不认识
+`is_pause` 的构建（也就是回滚目标）继续写出可被识别的 pause 行，
+它的退役步骤写在 `services/README.md`。
+
+## 6. 剩余耦合清单
+
+步骤 3 之后 core 上还留着的、只有一个半边用得上的东西。每条都在 HEAD 上核过。
+
+| # | 耦合 | 位置 | 为什么它属于这份清单 |
+|---|---|---|---|
+| 1 | `src/orchestrator/store/redis/`（4,671 行，含自带测试） | 唯一生产调用方 `crates/aenv-api/src/bin/aenv-api.rs:193` | `crates/aenv-node` 对 `RedisMetadataStore` 的引用数为 **0**，却链进 node 二进制。步骤 3 若只搬 `service.rs`，它还留在那儿 |
+| 2 | 三个 `OnceCell` 就是运行期角色分支 | `src/orchestrator/service.rs:147,150,154`；判定点 `:1654`、`:1817` | 与四个 no-op 同一诊断：编译期可判定的差异降级成运行期的 `None` 分支 |
+| 3 | `SandboxOrchestration` facade（38 个方法） | `src/orchestrator/facade.rs`；消费者 `ApiImpl::new`、`ObservabilityService::new` | `SandboxControl` 要么实现同一 trait，要么同时改这两个构造点与其下的 handler 调用 |
+| 4 | `src/sandbox/network/iptables_util.rs`（290 行） | 引用方 `crates/aenv-node/src/sandbox/network/{manager.rs:18,slot.rs:26}` 与 core 自己的 `policy.rs:8` | node 独用，链进 api 二进制且永不执行。C4 的尾巴 |
+| 5 | `src/secrets/mod.rs`（1,728 行）中只有 `SecretKind` 真共享 | node 侧对 `secrets::` 的引用数为 **0**；core 内部消费者 `orchestrator/grants.rs`、`sandbox/network/policy.rs` | 其余整块是 api 独用，只因一个枚举留在 core |
+| 6 | `RemoteSandboxBackendFactory::build` 的拒绝式实现 | `crates/aenv-api/src/node_client/factory.rs:52-64` | 第五份 no-op：冷创建在 api 半边"没有东西可发"，只能 `bail!` |
+
+## 7. 验收判据
 
 1. 步骤 1 的测试在步骤 2、3 之后**逐字不改**仍通过；任何必须改的测试要在
    提交信息里写明为什么它测的是被删掉的形状。
@@ -166,7 +257,12 @@ CLAUDE.md 的 aenv-api 条、Orchestrator 条、Workspace Crates、
 3. `make test-with-redis`、`make test-with-postgres` 零 `SKIPPED`。
 4. `cargo tree -p aenv-node -e normal` 不再含 `kube`/`k8s-openapi`；
    `cargo tree -p aenv-api -e normal` 的依赖数下降。
-5. `grep -rn "NoSnapshotCatalog\|DisabledRuntimeImageRefs\|EmptyRuntimeArtifactLease\|UnknownRecordOwner" src/ crates/`
-   在步骤 3 完成后无生产命中。
+5. 步骤 3 完成后，api 半边的装配（`crates/aenv-api/src/bin/aenv-api.rs`）不再构造
+   `DisabledRuntimeImageRefs`（今天在 :213）、`UnknownRecordOwner`
+   （今天经 `node_client/factory.rs:34` 的默认值）与带 `NoSnapshotCatalog` 的
+   `RoleStorage`（今天经 `backends/mod.rs:68-76`）。
+   **不是**"全树 grep 无命中"：`NoSnapshotCatalog` 有四个节点侧生产调用方，
+   `EmptyRuntimeArtifactLease` 已门控在 `cfg(any(test, feature = "test-support"))`
+   之下（见 §1）。
 6. 新增的模块级守卫有双向变异证据（破坏 → 出现 FAILED 行；复原 → ok；
    `git status` 干净）。

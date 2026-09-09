@@ -94,8 +94,7 @@ BEGIN
     -- off the parse below, and it is what confines the classification, and the
     -- refusal it can raise, to a write that brings a payload.
     IF TG_OP = 'UPDATE'
-       AND NEW.committed_payload IS NOT DISTINCT FROM OLD.committed_payload
-       AND OLD.is_pause IS NOT NULL THEN
+       AND NEW.committed_payload IS NOT DISTINCT FROM OLD.committed_payload THEN
         RETURN NEW;
     END IF;
 

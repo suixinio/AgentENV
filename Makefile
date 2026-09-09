@@ -190,10 +190,25 @@ HALF_OWNED_MODULES := aenv-node:orchestrator aenv-api:orchestrator
 # control proving the pattern still matches something read the same spelling.
 # Every tree is `--prefix none | sort -u`, so a pattern anchored at `^` names a
 # package rather than a position in a drawn tree, and a name that merely
-# contains the word -- `deadpool-redis`, `tokio-postgres` -- is not a way past.
+# contains the word -- `deadpool-redis`, `tokio-postgres` -- is caught rather
+# than let past. That reading holds for the exclusion only: on the control side
+# a substring is a way through, so any crate whose name happens to carry
+# `redis` or `postgres` would satisfy a control the real driver has stopped
+# satisfying.
 DEP_BYTE_HALF := ^(overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util) v[0-9]
-DEP_POSTGRES := ^([A-Za-z0-9_-]*postgres[A-Za-z0-9_-]*|sqlx([_-][a-z0-9]+)?|diesel([_-][a-z0-9]+)?|sea-orm) v[0-9]
-DEP_REDIS := ^([A-Za-z0-9_-]*redis[A-Za-z0-9_-]*|fred|rustis) v[0-9]
+# The two driver rules are spelled one alternative at a time so that each name
+# the api half really carries gets a control of its own: a control over the
+# whole alternation is satisfied by any single live name while every other name
+# in it rots unnoticed.
+DEP_POSTGRES_NAMED := ^[A-Za-z0-9_-]*postgres[A-Za-z0-9_-]* v[0-9]
+DEP_POSTGRES_SQLX := ^sqlx([_-][a-z0-9]+)? v[0-9]
+# No half carries these, so for them the rule is a closed blacklist with no
+# control to prove it, the way DEP_EMBEDDED_DB is for its whole list.
+DEP_POSTGRES_ABSENT := ^(diesel([_-][a-z0-9]+)?|sea-orm) v[0-9]
+DEP_POSTGRES := $(DEP_POSTGRES_NAMED)|$(DEP_POSTGRES_SQLX)|$(DEP_POSTGRES_ABSENT)
+DEP_REDIS_NAMED := ^[A-Za-z0-9_-]*redis[A-Za-z0-9_-]* v[0-9]
+DEP_REDIS_ABSENT := ^(fred|rustis) v[0-9]
+DEP_REDIS := $(DEP_REDIS_NAMED)|$(DEP_REDIS_ABSENT)
 # `redb` is deliberately not on this list: `iroh-blobs` carries it as its own
 # blob store, so it is in the tree for a reason that is not node metadata, and
 # adding it here would make the rule false rather than stricter.
@@ -238,13 +253,14 @@ check-crate-boundaries:
 	  echo "aenv-node links a PostgreSQL driver; a node must never hold database credentials."; \
 	  fail=1; \
 	fi; \
-	control '$(DEP_POSTGRES)' "a PostgreSQL driver" "$$api_tree" "aenv-api's own tree"; \
+	control '$(DEP_POSTGRES_NAMED)' "a driver whose name carries PostgreSQL" "$$api_tree" "aenv-api's own tree"; \
+	control '$(DEP_POSTGRES_SQLX)' "sqlx" "$$api_tree" "aenv-api's own tree"; \
 	if matches '$(DEP_REDIS)' "$$node_tree"; then \
 	  echo "aenv-node links a Redis client. The metadata store every replica reads is the api"; \
 	  echo "half's, and a node's own records live in its process; a node opens no Redis."; \
 	  fail=1; \
 	fi; \
-	control '$(DEP_REDIS)' "a Redis client" "$$api_tree" "aenv-api's own tree"; \
+	control '$(DEP_REDIS_NAMED)' "a client whose name carries Redis" "$$api_tree" "aenv-api's own tree"; \
 	egress_tree=$$($(CARGO) tree -p aenv-egress -e normal --all-features --prefix none | sort -u) || { echo "cargo tree -p aenv-egress failed"; exit 1; }; \
 	if matches '$(DEP_EGRESS_FORBIDDEN)' "$$egress_tree"; then \
 	  echo "aenv-egress links a database, the byte half, aenv-core or a second TLS stack; the broker contract is a leaf on openssl only."; \

@@ -177,6 +177,27 @@ claimed / held-elsewhere / expired，窗口取 `LAUNCH_RESERVATION_EXCLUSIVE_TTL
 `LAUNCH_ELSEWHERE_POLL`），预留只回答"谁在启动"。理由是这条记录本来就是 resume
 与 connect 的判据，再存一份结果会多出一个可以互相矛盾的真相源。
 
+**排他区间是整条 launch，不是其中一段。** `SandboxControl::launch` 的第一件事是
+`reserve_launch`——在读"这个 id 是否已被记录"之前；最后一件事是 `release_launch`——在
+`store.add` 写下记录之后，成败两路都放。节点会话不再自己预留，`RemoteSandboxStub::start`
+收到的是一个已经被持有的 id。e2b 是同一形状：`reserveScript` 把 storage index 的
+`SISMEMBER` 与 pending 的 `ZSCORE` 判进同一段 Lua（`reservations/redis/scripts.go:37-46`），
+`finishStart` 在 `defer` 里、晚于 `sandboxStore.Add`（`create_instance.go:496`）。
+于是"读到无记录"这件事只可能发生在持有 id 的那个 launch 里。
+
+节点侧的 `launch_claims` 仍然必要，理由收窄成两条，两条都是"预留的窗口是有限的"：
+
+1. **窗口过期。** 冷创建的镜像拉取与转换可以超过
+   `LAUNCH_RESERVATION_EXCLUSIVE_TTL`（120s，`binding_store/mod.rs:84`）。A 的预留到点被
+   Lua 的 `PX` 删掉，B 拿到 `ClaimedFromExpired`；B 的放置若又选到同一节点 N
+   （resume 带 `origin_node_id` 提示时尤其容易），N 上就同时有 execA 与 execB。
+2. **持有者中途死亡。** 写下预留的 api 副本消失，它发出的节点 create 仍在进行；预留在
+   120s 后被清扫器或下一个 `ClaimedFromExpired` 收走，下一个 launch 同样可能落到同一节点。
+
+两条都是同一节点上两个不同 execution id 的并发 create，`launch_claims.claim`
+（`crates/aenv-node/src/orchestrator/launch_claim.rs`）在分配任何资源之前取 id，是唯一
+答得对的一层。跨节点那一条不在此列：它靠的是预留本身，而预留现在覆盖整条 launch。
+
 **与 e2b 的偏离**：e2b 的 keep-alive **有**一段向持有节点的转发
 （`keep_alive.go:60` → `update_instance.go:34,40`：`getOrConnectNode` 后
 `client.Sandbox.Update`），因为它的节点自己持 deadline。我们没有这段代码可删——
@@ -246,8 +267,7 @@ api 侧的 `sandboxes` 桩表、`proxy_routes`；**`launch_claims`**（连同它
 自己的句柄表就是答案）。
 
 `launch_claims` 在**节点侧**必须保留：它守的是同一节点上两个不同 execution id
-的并发 create（dev 的 406bc6f），预留只保证一个 api 副本在一个时刻持有一个
-sandbox id，覆盖不到这一条。
+的并发 create（dev 的 406bc6f），预留的窗口有限，两条到得了那里的路径写在 §3。
 
 **与本稿的两处偏离，各有理由**：
 

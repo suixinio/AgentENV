@@ -802,9 +802,46 @@ impl<S: MetadataStore + 'static> SandboxControl<S> {
         })
     }
 
+    /// Takes the sandbox id for this launch, runs it, and gives the id back.
+    ///
+    /// The reservation brackets the whole launch: it is held before the record
+    /// under this id is read and given back only once that record is written,
+    /// so a concurrent launch of the same id cannot read "no record" through
+    /// the window this one needs to write one.
     async fn launch(self: &Arc<Self>, plan: ApiLaunch) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
 
+        let sandbox_id = plan.sandbox_id;
+        let execution_id = plan.execution_id;
+
+        if let Err(source) = self
+            .placement
+            .reserve_launch(sandbox_id, execution_id)
+            .await
+        {
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Start,
+                source: source.context(format!("reserve the launch of sandbox {sandbox_id}")),
+            });
+        }
+        let launched = self.launch_holding_the_id(plan).await;
+        if let Err(error) = self
+            .placement
+            .release_launch(sandbox_id, execution_id)
+            .await
+        {
+            warn!(
+                %sandbox_id,
+                %execution_id,
+                error = %format_args!("{error:#}"),
+                "could not give back the launch reservation of this sandbox; it expires on its own"
+            );
+        }
+        launched
+    }
+
+    async fn launch_holding_the_id(self: &Arc<Self>, plan: ApiLaunch) -> Result<SandboxMetadata> {
         let sandbox_id = plan.sandbox_id;
         let execution_id = plan.execution_id;
 

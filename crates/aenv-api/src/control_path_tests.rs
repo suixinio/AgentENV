@@ -23,6 +23,7 @@ use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::node_registry::registry::AtomicNodeRegistry;
 use crate::node_registry::types::Node;
 use crate::node_registry::warmup::WarmupGate;
+use crate::orchestrator::store::SandboxMetadata;
 use crate::orchestrator::{
     CommittingPausePublisher, CreateSandboxRequest, GrantIssuer, InMemoryMetadataStore,
     MetadataStore, SandboxExpiry, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
@@ -48,8 +49,9 @@ const DEPLOYED_PROJECTION_AUTHORITATIVE: bool = true;
 /// The api half as `bin/aenv-api.rs` wires it, plus the two doubles the test
 /// reads its decisions out of.
 struct ApiHalf {
-    orchestrator: Arc<SandboxControl<InMemoryMetadataStore>>,
+    orchestrator: Arc<SandboxControl<TimelineStore>>,
     routing: Arc<RecordingRouting>,
+    store: TimelineStore,
     bindings: Arc<InMemoryBindingStore>,
     snapshots: Arc<RecordingSnapshotRepository>,
     grants: Arc<RecordingGrants>,
@@ -171,6 +173,157 @@ impl crate::orchestrator::RuntimeRouting for RecordingRouting {
             .expect("lock")
             .push((sandbox_id, execution_id, record_present));
         self.inner.forget(sandbox_id, execution_id).await
+    }
+}
+
+/// The in-memory store with two seams: every record write lands on the launch
+/// timeline beside the reservation calls, and one launch can be stopped inside
+/// `add` so a test can see what the sandbox id still holds while it is there.
+#[derive(Clone)]
+struct TimelineStore {
+    inner: InMemoryMetadataStore,
+    timeline: Arc<Mutex<Vec<String>>>,
+    add_gate: Arc<Mutex<Option<AddGate>>>,
+}
+
+/// Holds the next `add` until the test lets it through.
+struct AddGate {
+    reached: oneshot::Sender<()>,
+    proceed: oneshot::Receiver<()>,
+}
+
+impl TimelineStore {
+    /// Stops the next record write and reports when it is standing there.
+    fn stop_the_next_add(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (reached, reached_rx) = oneshot::channel();
+        let (proceed_tx, proceed) = oneshot::channel();
+        *self.add_gate.lock().expect("lock") = Some(AddGate { reached, proceed });
+        (reached_rx, proceed_tx)
+    }
+}
+
+#[async_trait::async_trait]
+impl MetadataStore for TimelineStore {
+    async fn add(&self, metadata: SandboxMetadata) -> crate::orchestrator::store::Result<()> {
+        self.timeline
+            .lock()
+            .expect("lock")
+            .push("store.add".to_string());
+        let gate = self.add_gate.lock().expect("lock").take();
+        if let Some(gate) = gate {
+            let _ = gate.reached.send(());
+            let _ = gate.proceed.await;
+        }
+        self.inner.add(metadata).await
+    }
+
+    async fn update(&self, metadata: SandboxMetadata) -> crate::orchestrator::store::Result<()> {
+        self.inner.update(metadata).await
+    }
+
+    async fn update_state_if_state(
+        &self,
+        sandbox_id: &SandboxId,
+        new_state: SandboxState,
+        expected_states: &[SandboxState],
+    ) -> crate::orchestrator::store::Result<SandboxState> {
+        self.inner
+            .update_state_if_state(sandbox_id, new_state, expected_states)
+            .await
+    }
+
+    async fn update_if_state<F>(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_states: &[SandboxState],
+        update: F,
+    ) -> crate::orchestrator::store::Result<crate::orchestrator::store::MetadataUpdateResult>
+    where
+        F: FnOnce(&mut SandboxMetadata) + Send,
+    {
+        self.inner
+            .update_if_state(sandbox_id, expected_states, update)
+            .await
+    }
+
+    async fn get(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> crate::orchestrator::store::Result<Option<SandboxMetadata>> {
+        self.inner.get(sandbox_id).await
+    }
+
+    async fn remove(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> crate::orchestrator::store::Result<Option<SandboxMetadata>> {
+        self.inner.remove(sandbox_id).await
+    }
+
+    async fn remove_if_execution(
+        &self,
+        sandbox_id: &SandboxId,
+        expected_execution_id: ExecutionId,
+        expected_states: &[SandboxState],
+    ) -> crate::orchestrator::store::Result<crate::orchestrator::store::FencedRemoval> {
+        self.inner
+            .remove_if_execution(sandbox_id, expected_execution_id, expected_states)
+            .await
+    }
+
+    async fn list(&self) -> crate::orchestrator::store::Result<Vec<SandboxMetadata>> {
+        self.inner.list().await
+    }
+
+    async fn list_with_callback<F>(&self, callback: F) -> crate::orchestrator::store::Result<()>
+    where
+        F: FnMut(&SandboxMetadata) + Send,
+    {
+        self.inner.list_with_callback(callback).await
+    }
+
+    async fn list_filtered(
+        &self,
+        filter: crate::orchestrator::store::SandboxListFilter,
+    ) -> crate::orchestrator::store::Result<Vec<SandboxMetadata>> {
+        self.inner.list_filtered(filter).await
+    }
+
+    async fn list_expired(
+        &self,
+        now: SystemTime,
+    ) -> crate::orchestrator::store::Result<Vec<SandboxMetadata>> {
+        self.inner.list_expired(now).await
+    }
+
+    async fn list_ids(&self) -> crate::orchestrator::store::Result<Vec<SandboxId>> {
+        self.inner.list_ids().await
+    }
+
+    async fn expired_batch(
+        &self,
+        now: SystemTime,
+        limit: usize,
+    ) -> crate::orchestrator::store::Result<Vec<SandboxMetadata>> {
+        self.inner.expired_batch(now, limit).await
+    }
+
+    async fn start_transition(
+        &self,
+        sandbox_id: &SandboxId,
+        request: crate::orchestrator::store::TransitionRequest,
+    ) -> crate::orchestrator::store::Result<crate::orchestrator::store::TransitionOutcome> {
+        self.inner.start_transition(sandbox_id, request).await
+    }
+
+    async fn wait_while_in_states(
+        &self,
+        sandbox_id: &SandboxId,
+        transitional_states: &[SandboxState],
+    ) -> crate::orchestrator::store::Result<Option<SandboxMetadata>> {
+        self.inner
+            .wait_while_in_states(sandbox_id, transitional_states)
+            .await
     }
 }
 
@@ -551,13 +704,18 @@ async fn api_half() -> ApiHalf {
         launch_calls: Arc::clone(&launch_calls),
     });
 
-    let store = InMemoryMetadataStore::new();
+    let inner_store = InMemoryMetadataStore::new();
+    let store = TimelineStore {
+        inner: inner_store.clone(),
+        timeline: Arc::clone(&launch_calls),
+        add_gate: Arc::default(),
+    };
     let record_owner = StoreRecordOwner::shared(store.clone());
     let grants = Arc::new(RecordingGrants::default());
     let (snapshot_manager, snapshots) = recording_snapshot_manager();
     let routing = Arc::new(RecordingRouting {
         inner: PlacementRuntimeRouting::shared(Arc::clone(&placement)),
-        store: store.clone(),
+        store: inner_store,
         forgotten: Mutex::new(Vec::new()),
         routed: Mutex::new(None),
     });
@@ -565,7 +723,7 @@ async fn api_half() -> ApiHalf {
         // The one thing this assembly cannot reproduce: `MustBeConfigured`
         // needs the shared seed, which no test process has.
         access_token_seed_policy: AccessTokenSeedPolicy::MayGenerate,
-        store,
+        store: store.clone(),
         placement: Arc::clone(&placement),
         record_owner,
         routing: Arc::clone(&routing) as Arc<dyn crate::orchestrator::RuntimeRouting>,
@@ -578,6 +736,7 @@ async fn api_half() -> ApiHalf {
     ApiHalf {
         orchestrator,
         routing,
+        store,
         bindings,
         snapshots,
         grants,
@@ -1084,8 +1243,12 @@ async fn a_cold_create_gives_the_sandbox_id_back_once_a_routing_record_fences_it
 
     assert_eq!(
         half.launch_reservation_calls(),
-        vec!["reserve_launch".to_string(), "release_launch".to_string()],
-        "the id is taken for the launch and given back when the launch settles"
+        vec![
+            "reserve_launch".to_string(),
+            "store.add".to_string(),
+            "release_launch".to_string()
+        ],
+        "the id is taken for the launch and given back once the record fences it"
     );
     assert_eq!(
         half.bindings
@@ -1350,4 +1513,71 @@ async fn a_caller_waiting_out_a_launch_of_a_sandbox_being_deleted_is_told_it_is_
         matches!(err, crate::orchestrator::OrchestratorError::SandboxNotFound(id) if id == created.id),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+async fn a_launch_of_an_id_a_record_already_names_took_the_id_before_it_read_that_record() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox whose id is already recorded");
+
+    Arc::clone(&half.orchestrator)
+        .restore_sandbox(metadata.id, cold_create())
+        .await
+        .expect_err("an id this control plane already records is not another launch's to take");
+
+    assert_eq!(
+        half.launch_reservation_calls(),
+        vec![
+            "reserve_launch".to_string(),
+            "store.add".to_string(),
+            "release_launch".to_string(),
+            "reserve_launch".to_string(),
+            "release_launch".to_string(),
+        ],
+        "the reservation has to be held across the read of the record that refuses the launch, \
+         or a concurrent launch reads that record between the two"
+    );
+}
+
+#[tokio::test]
+async fn a_second_launch_of_one_id_is_held_until_the_first_has_recorded_it() {
+    let half = api_half().await;
+    let sandbox_id = SandboxId::new();
+    let (reached_the_write, let_the_write_through) = half.store.stop_the_next_add();
+
+    let first = tokio::spawn({
+        let orchestrator = Arc::clone(&half.orchestrator);
+        async move {
+            orchestrator
+                .restore_sandbox(sandbox_id, cold_create())
+                .await
+        }
+    });
+    reached_the_write
+        .await
+        .expect("the first launch reaches the record write");
+
+    let refusal = Arc::clone(&half.orchestrator)
+        .restore_sandbox(sandbox_id, cold_create())
+        .await
+        .expect_err("an id a launch has not finished recording is not a second launch's to take");
+    assert!(
+        crate::orchestrator::LaunchHeldElsewhere::refused(&refusal),
+        "the second launch has to read this as a launch to wait out, not a failure: {refusal:#}"
+    );
+    assert_eq!(
+        half.creates_seen().len(),
+        1,
+        "a second node create under an id whose record is still being written runs the same \
+         sandbox twice"
+    );
+
+    let _ = let_the_write_through.send(());
+    first
+        .await
+        .expect("the first launch task finishes")
+        .expect("the first launch records its sandbox");
 }

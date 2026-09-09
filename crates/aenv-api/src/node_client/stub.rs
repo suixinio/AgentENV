@@ -442,23 +442,6 @@ impl RemoteSandboxStub {
         }
     }
 
-    /// Gives the sandbox id back. Best-effort: a reservation nothing releases
-    /// is retired by its own window.
-    async fn release_launch(&self) {
-        if let Err(error) = self
-            .placement
-            .release_launch(self.sandbox_id, self.execution_id)
-            .await
-        {
-            warn!(
-                sandbox_id = %self.sandbox_id,
-                execution_id = %self.execution_id,
-                error = %error,
-                "could not give back the launch reservation of this sandbox; it expires on its own"
-            );
-        }
-    }
-
     async fn withdraw_reservation(&self) {
         if let Err(error) = self
             .placement
@@ -822,21 +805,10 @@ impl RemoteSandboxStub {
             } => ((**request).clone(), preferred_node_id.clone(), *needs),
         };
 
-        // Take the id before any node is chosen: a concurrent launch of the
-        // same id must learn it is the later one before it spends a placement
-        // decision and an optimistic resource deduction on it.
-        self.placement
-            .reserve_launch(self.sandbox_id, self.execution_id)
+        // The sandbox id is already held: the caller reserves it before it
+        // reads anything under it and gives it back once the record is written.
+        self.start_on_a_node(request, preferred_node_id, needs)
             .await
-            .with_context(|| format!("reserve the launch of sandbox {}", self.sandbox_id))?;
-        let started = self
-            .start_on_a_node(request, preferred_node_id, needs)
-            .await;
-        // Either way the reservation has done its work: a launch that got as
-        // far as a routing record is fenced by that record, and one that failed
-        // must not keep the id until the window runs out.
-        self.release_launch().await;
-        started
     }
 
     /// Pauses on the node, which stages the capture and forgets the sandbox.

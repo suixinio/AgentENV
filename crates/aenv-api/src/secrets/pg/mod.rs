@@ -8,7 +8,7 @@ pub mod values;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aenv_core::secrets::{SecretMetadata, SecretRef, SecretRefStore, SecretsError};
+use crate::secrets::{SecretMetadata, SecretRef, SecretRefStore, SecretsError};
 use async_trait::async_trait;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};

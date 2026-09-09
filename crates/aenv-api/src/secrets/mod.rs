@@ -1,15 +1,15 @@
 //! The api half's secrets: names and versions in PostgreSQL, values in the
 //! same database, encrypted under a key it reads from a file.
 
-pub use aenv_core::secrets::*;
-
 pub mod envelope;
 pub mod pg;
+pub mod service;
+
+pub use service::*;
 
 use std::sync::Arc;
 
 use aenv_core::cfg::{AppConfig, SecretsBackendKind};
-pub use aenv_core::secrets::SecretsService;
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 
@@ -41,7 +41,7 @@ pub fn build_secrets_service(config: &AppConfig, pool: &PgPool) -> Result<Option
             Ok(Some(SecretsAssembly {
                 service: Arc::new(SecretsService::new(
                     Arc::new(PgSecretRefStore::new(pool.clone())),
-                    Arc::clone(&values) as Arc<dyn aenv_core::secrets::SecretsBackend>,
+                    Arc::clone(&values) as Arc<dyn SecretsBackend>,
                 )),
                 values,
             }))

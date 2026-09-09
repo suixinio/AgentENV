@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::secrets::SecretKind;
+use crate::secret_kind::SecretKind;
 use crate::types::{ExecutionId, SandboxId};
 
 /// Records which secret names one incarnation of a sandbox may read. The
@@ -121,7 +121,7 @@ pub mod recording {
     use async_trait::async_trait;
 
     use super::GrantIssuer;
-    use crate::secrets::SecretKind;
+    use crate::secret_kind::SecretKind;
     use crate::types::{ExecutionId, SandboxId};
 
     #[derive(Clone, Debug, PartialEq, Eq)]

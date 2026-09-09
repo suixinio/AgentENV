@@ -157,7 +157,8 @@ API_EXILED_PATHS := \
 	src/api/server.rs:crates/aenv-api/src/api/server.rs \
 	src/binding_store:crates/aenv-api/src/binding_store \
 	src/node_client:crates/aenv-api/src/node_client \
-	src/node_registry:crates/aenv-api/src/node_registry
+	src/node_registry:crates/aenv-api/src/node_registry \
+	src/secrets:crates/aenv-api/src/secrets
 
 # The third half of the same rule: what each half re-exports from `aenv-core`.
 # Read from `crates/<half>/src/lib.rs` with line comments stripped: every

@@ -117,7 +117,7 @@ async fn resolve(
     };
     // A name the store could never hold is refused before it reaches a
     // query, and refused the way an ungranted one is.
-    if aenv_core::secrets::validate_name(&request.name).is_err()
+    if crate::secrets::validate_name(&request.name).is_err()
         || request.sandbox_id.is_empty()
         || request.execution_id.is_empty()
     {
@@ -185,8 +185,8 @@ async fn resolve(
 
 #[cfg(test)]
 mod tests {
-    use aenv_core::secrets::SecretsBackend;
-    use aenv_core::secrets::{SecretMetadata, SecretRefStore, SecretString, SecretValue};
+    use crate::secrets::SecretsBackend;
+    use crate::secrets::{SecretMetadata, SecretRefStore, SecretString, SecretValue};
 
     use crate::binding_store::{Binding, BindingState, BindingStoreSettings, InMemoryBindingStore};
     use crate::node_registry::types::Node;

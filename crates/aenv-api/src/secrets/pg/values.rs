@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aenv_core::secrets::{Grant, SecretKind, SecretValue, SecretsBackend, SecretsError};
+use crate::secrets::{Grant, SecretKind, SecretValue, SecretsBackend, SecretsError};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
@@ -338,7 +338,7 @@ impl SecretsBackend for PgSecretValues {
 
 #[cfg(test)]
 mod tests {
-    use aenv_core::secrets::{SecretMetadata, SecretRefStore, SecretString};
+    use crate::secrets::{SecretMetadata, SecretRefStore, SecretString};
 
     use super::*;
     use crate::pg::harness::isolated_schema_pool_or_skip;

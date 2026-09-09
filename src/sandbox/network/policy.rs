@@ -9,7 +9,7 @@ use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, Open
 use tracing::{debug, warn};
 
 use crate::cfg::network::normalize_dns_name;
-use crate::secrets::SecretKind;
+use crate::secret_kind::SecretKind;
 
 pub const ALL_INTERNET_TRAFFIC_CIDR: &str = "0.0.0.0/0";
 

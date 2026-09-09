@@ -1,5 +1,9 @@
-//! The api half's view of secrets: names, versions and grants. Values pass
-//! through [`SecretsBackend`] and are never stored, logged or returned here.
+//! Names, versions and grants. Values pass through [`SecretsBackend`] and are
+//! never stored, logged or returned here.
+//!
+//! Only the deciding half serves any of this: a node holds no secret store and
+//! never learns a name, which is why [`SecretKind`] is the one piece that stays
+//! in `aenv-core`, where the policy check and the grant issuer read it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -12,6 +16,8 @@ use zeroize::Zeroizing;
 use crate::orchestrator::grants::GrantIssuer;
 use crate::sandbox::network::policy::{is_valid_secret_name, MAX_SECRET_NAME_LEN};
 use crate::types::{ExecutionId, SandboxId};
+
+pub use aenv_core::secret_kind::SecretKind;
 
 pub const SECRET_ID_PREFIX: &str = "sec_";
 pub const MAX_METADATA_ENTRIES: usize = 32;
@@ -55,40 +61,6 @@ pub type SecretFields = BTreeMap<String, SecretString>;
 
 pub const MAX_SECRET_FIELDS: usize = 32;
 pub const MAX_SECRET_FIELD_KEY_LEN: usize = 64;
-
-/// The shape of a stored secret. A secret keeps the shape it was created
-/// with: a header substitution reads `Opaque` and a protocol handler reads
-/// `Fields`, and a policy is checked against the stored shape before the
-/// sandbox is placed rather than at connection time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum SecretKind {
-    Opaque,
-    Fields,
-}
-
-impl SecretKind {
-    /// The spelling a store records alongside the ciphertext.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Opaque => "opaque",
-            Self::Fields => "fields",
-        }
-    }
-
-    pub fn parse(kind: &str) -> Option<Self> {
-        match kind {
-            "opaque" => Some(Self::Opaque),
-            "fields" => Some(Self::Fields),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for SecretKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
 
 /// What a `/secrets` write carries. `Opaque` is one value substituted into a
 /// header; `Fields` is a credential a protocol handler takes apart itself,

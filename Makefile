@@ -201,6 +201,11 @@ DEP_EMBEDDED_DB := ^(rocksdb|librocksdb-sys|sled|heed3?|libmdbx([_-][a-z0-9]+)?|
 DEP_P2P_OR_GUEST := ^(iroh([_-][a-z0-9]+)?|envd) v[0-9]
 DEP_EGRESS_FORBIDDEN := ^(sqlx|deadpool-postgres|overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util|aenv-core|rustls|tokio-rustls|hyper-rustls|rcgen) v[0-9]
 DEP_EGRESS_TLS_FEATURE := ^aenv-egress feature "tls"
+# `aenv-core`'s test seeds are gated on its `test-support` feature, which only
+# the halves' dev-dependencies may turn on. `{p} {f}` prints one line per
+# package with the features enabled on it, so this names the feature on the
+# package rather than anywhere in a tree.
+DEP_CORE_TEST_SUPPORT := ^aenv-core v[0-9].*[ ,]test-support([ ,]|$$)
 # The control for the rule above: a feature tree that names no aenv-egress
 # feature at all cannot be read for the one feature that is forbidden.
 DEP_EGRESS_FEATURE_SHAPE := ^aenv-egress feature "(core|local|resolver|tls)"
@@ -267,6 +272,18 @@ check-crate-boundaries:
 	  fail=1; \
 	fi; \
 	control '$(DEP_P2P_OR_GUEST)' "the peer-to-peer transport or the guest agent client" "$$node_tree" "aenv-node's own tree"; \
+	for half in aenv-api aenv-node; do \
+	  shipped=$$($(CARGO) tree -p $$half -e normal --prefix none -f '{p} {f}' | sort -u) || { echo "cargo tree -p $$half -e normal -f '{p} {f}' failed"; exit 1; }; \
+	  tested=$$($(CARGO) tree -p $$half -e normal,dev --prefix none -f '{p} {f}' | sort -u) || { echo "cargo tree -p $$half -e normal,dev -f '{p} {f}' failed"; exit 1; }; \
+	  if matches '$(DEP_CORE_TEST_SUPPORT)' "$$shipped"; then \
+	    echo "$$half turns on aenv-core's test-support feature over a normal dependency edge."; \
+	    echo "That feature is what gates the orchestration surface's three test seeds, and cargo"; \
+	    echo "unifies features across one invocation: a normal edge puts the seeds into the"; \
+	    echo "shipped binary's own aenv-core, not just into a test target's."; \
+	    fail=1; \
+	  fi; \
+	  control '$(DEP_CORE_TEST_SUPPORT)' "aenv-core's test-support feature" "$$tested" "$$half's tree with its dev edges, where the feature is turned on"; \
+	done; \
 	for pair in $(CORE_EXILED_PATHS); do \
 	  path=$${pair%%:*}; home=$${pair#*:}; stem=$${path%.rs}; \
 	  back=""; \

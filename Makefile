@@ -142,6 +142,8 @@ clippy:
 CORE_EXILED_PATHS := \
 	src/api/proxy.rs:crates/aenv-node/src/api/proxy.rs \
 	src/observability/reporter.rs:crates/aenv-node/src/observability/reporter.rs \
+	src/sandbox/network/iptables_util.rs:crates/aenv-node/src/sandbox/network/iptables_util.rs \
+	src/sandbox/network/policy_apply.rs:crates/aenv-node/src/sandbox/network/policy_apply.rs \
 	src/orchestrator/launch_claim.rs:crates/aenv-node/src/orchestrator/launch_claim.rs \
 	src/orchestrator/launch_plan.rs:crates/aenv-node/src/orchestrator/launch_plan.rs \
 	src/orchestrator/proxy.rs:crates/aenv-node/src/orchestrator/proxy.rs \

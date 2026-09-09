@@ -4,7 +4,9 @@
 pub use aenv_core::sandbox::network::*;
 
 mod address_plan;
+pub mod iptables_util;
 mod manager;
+pub mod policy_apply;
 mod slot;
 
 use std::path::Path;

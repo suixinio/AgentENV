@@ -24,10 +24,11 @@ use rtnetlink::{new_connection, Handle};
 use tracing::{debug, info, warn};
 
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
-use super::policy::{
+use super::policy::SandboxNetworkPolicy;
+use super::policy_apply::{
     initialize_namespace_egress_chain, install_namespace_intercept,
     log_guest_to_node_probe_counters, remove_namespace_intercept, set_namespace_egress_policy,
-    InterceptTarget, SandboxNetworkPolicy,
+    InterceptTarget,
 };
 use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS_PREFIX};
 

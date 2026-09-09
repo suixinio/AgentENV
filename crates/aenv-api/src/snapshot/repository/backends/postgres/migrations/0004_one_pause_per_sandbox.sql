@@ -43,6 +43,13 @@ ALTER TABLE snapshots
 -- unreachable for a payload this catalog wrote; neither is worth a permanently
 -- unstartable deployment, nor a 500 on every list that filters on metadata, if
 -- one turns out to be reachable. Kept, not dropped: `reads.rs` calls it.
+--
+-- The wrapping is what it costs. A plpgsql EXCEPTION block opens a
+-- subtransaction, which a parallel worker cannot do, so the function is
+-- PARALLEL UNSAFE and cannot be marked SAFE: a listing whose predicate calls it
+-- gets no parallel plan, on top of one call and one subtransaction per row that
+-- reaches it. `reads.rs` keeps the call behind the `is_pause` column for that
+-- reason.
 CREATE OR REPLACE FUNCTION catalog_try_jsonb(payload BYTEA)
 RETURNS JSONB AS $$
 BEGIN

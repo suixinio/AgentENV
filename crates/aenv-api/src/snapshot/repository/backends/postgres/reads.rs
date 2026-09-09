@@ -301,6 +301,15 @@ fn append_filters(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFi
 // every other backend reads. The metadata half of it decodes the payload
 // through `catalog_try_jsonb`, whose NULL for anything undecodable leaves that
 // row unmatched instead of raising and failing the listing.
+//
+// `AND s.is_pause` is emitted ahead of the call to keep the rows that reach a
+// PARALLEL UNSAFE per-row subtransaction down, but a conjunction is a set and
+// the planner is free to evaluate it in any order.
+//
+// The call is unqualified: the migration creates the function in whichever
+// schema the catalog's search_path names, and that is the search_path this
+// connection reads through. The trigger body cannot borrow the same assumption,
+// because it runs under the search_path of whichever session does the write.
 fn append_pause_axis(sql: &mut String, binder: &mut Binder, filter: &SnapshotListFilter) {
     if filter.pauses_only || filter.user_metadata.is_some() {
         sql.push_str("\n   AND s.is_pause");

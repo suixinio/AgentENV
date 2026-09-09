@@ -278,6 +278,12 @@ Consequences for an operator:
   build retires the previous row first. The alternative was the older behaviour
   — a second live pause row nobody would ever resume — so this is a loud
   failure replacing a silent one, for as long as the roll takes.
+- The same trigger refuses a write whose `committed_payload` it cannot decode
+  on a sandbox-source row: SQLSTATE `22000`, with the original SQLSTATE in
+  `DETAIL`. Such a payload is unreadable to every reader of the catalog, so the
+  row would be neither a pause nor a checkpoint to anyone; the refusal keeps it
+  out. A writer of this image never reaches that branch, because it states
+  `is_pause` itself.
 - **Retiring the trigger.** It exists for that window and for nothing else. Once
   no replica older than this image can run again, and only then, it can go:
 

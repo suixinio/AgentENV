@@ -186,50 +186,87 @@ HALF_OWNED_MODULES := aenv-node:orchestrator aenv-api:orchestrator
 # the half also declares is one path with two owners -- rustc refuses that pair
 # only when both sit in the same module, so an inline-module re-export is a
 # shape it compiles and this arm does not.
+# The dependency-graph rules' patterns, each named once so its exclusion and the
+# control proving the pattern still matches something read the same spelling.
+# Every tree is `--prefix none | sort -u`, so a pattern anchored at `^` names a
+# package rather than a position in a drawn tree, and a name that merely
+# contains the word -- `deadpool-redis`, `tokio-postgres` -- is not a way past.
+DEP_BYTE_HALF := ^(overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util) v[0-9]
+DEP_POSTGRES := ^([A-Za-z0-9_-]*postgres[A-Za-z0-9_-]*|sqlx([_-][a-z0-9]+)?|diesel([_-][a-z0-9]+)?|sea-orm) v[0-9]
+DEP_REDIS := ^([A-Za-z0-9_-]*redis[A-Za-z0-9_-]*|fred|rustis) v[0-9]
+# `redb` is deliberately not on this list: `iroh-blobs` carries it as its own
+# blob store, so it is in the tree for a reason that is not node metadata, and
+# adding it here would make the rule false rather than stricter.
+DEP_EMBEDDED_DB := ^(rocksdb|librocksdb-sys|sled|heed3?|libmdbx([_-][a-z0-9]+)?|persy|fjall) v[0-9]
+DEP_P2P_OR_GUEST := ^(iroh([_-][a-z0-9]+)?|envd) v[0-9]
+DEP_EGRESS_FORBIDDEN := ^(sqlx|deadpool-postgres|overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util|aenv-core|rustls|tokio-rustls|hyper-rustls|rcgen) v[0-9]
+DEP_EGRESS_TLS_FEATURE := ^aenv-egress feature "tls"
+# The control for the rule above: a feature tree that names no aenv-egress
+# feature at all cannot be read for the one feature that is forbidden.
+DEP_EGRESS_FEATURE_SHAPE := ^aenv-egress feature "(core|local|resolver|tls)"
+
 check-crate-boundaries:
 	@fail=0; \
-	api_tree=$$($(CARGO) tree -p aenv-api -e normal) || { echo "cargo tree -p aenv-api failed"; exit 1; }; \
-	node_tree=$$($(CARGO) tree -p aenv-node -e normal) || { echo "cargo tree -p aenv-node failed"; exit 1; }; \
-	if printf '%s\n' "$$api_tree" | grep -E 'overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util'; then \
+	matches() { \
+	  printf '%s\n' "$$2" | grep -E "$$1"; \
+	}; \
+	control() { \
+	  if ! printf '%s\n' "$$3" | grep -qE "$$1"; then \
+	    echo "the pattern excluding $$2 names nothing in $$4, where it must. An exclusion whose"; \
+	    echo "pattern has stopped matching anything -- a crate renamed, a tree read the wrong way --"; \
+	    echo "passes whatever the graph it guards holds."; \
+	    fail=1; \
+	  fi; \
+	}; \
+	api_tree=$$($(CARGO) tree -p aenv-api -e normal --prefix none | sort -u) || { echo "cargo tree -p aenv-api failed"; exit 1; }; \
+	node_tree=$$($(CARGO) tree -p aenv-node -e normal --prefix none | sort -u) || { echo "cargo tree -p aenv-node failed"; exit 1; }; \
+	if matches '$(DEP_BYTE_HALF)' "$$api_tree"; then \
 	  echo "aenv-api links the byte half; the api half runs no sandboxes and must not."; \
 	  fail=1; \
 	fi; \
-	if printf '%s\n' "$$node_tree" | grep -E 'sqlx|deadpool-postgres'; then \
+	control '$(DEP_BYTE_HALF)' "the byte half" "$$node_tree" "aenv-node's own tree"; \
+	if matches '$(DEP_POSTGRES)' "$$node_tree"; then \
 	  echo "aenv-node links a PostgreSQL driver; a node must never hold database credentials."; \
 	  fail=1; \
 	fi; \
-	if printf '%s\n' "$$node_tree" | grep -E '^[^a-z]*redis v[0-9]'; then \
+	control '$(DEP_POSTGRES)' "a PostgreSQL driver" "$$api_tree" "aenv-api's own tree"; \
+	if matches '$(DEP_REDIS)' "$$node_tree"; then \
 	  echo "aenv-node links a Redis client. The metadata store every replica reads is the api"; \
 	  echo "half's, and a node's own records live in its process; a node opens no Redis."; \
 	  fail=1; \
 	fi; \
-	egress_tree=$$($(CARGO) tree -p aenv-egress -e normal --all-features --prefix none) || { echo "cargo tree -p aenv-egress failed"; exit 1; }; \
-	if printf '%s\n' "$$egress_tree" | sort -u | grep -E '^(sqlx|deadpool-postgres|overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util|aenv-core|rustls|tokio-rustls|hyper-rustls|rcgen) v[0-9]'; then \
+	control '$(DEP_REDIS)' "a Redis client" "$$api_tree" "aenv-api's own tree"; \
+	egress_tree=$$($(CARGO) tree -p aenv-egress -e normal --all-features --prefix none | sort -u) || { echo "cargo tree -p aenv-egress failed"; exit 1; }; \
+	if matches '$(DEP_EGRESS_FORBIDDEN)' "$$egress_tree"; then \
 	  echo "aenv-egress links a database, the byte half, aenv-core or a second TLS stack; the broker contract is a leaf on openssl only."; \
 	  fail=1; \
 	fi; \
+	control '$(DEP_EGRESS_FORBIDDEN)' "a database, the byte half, aenv-core or a second TLS stack" "$$api_tree" "aenv-api's own tree"; \
+	control '^openssl v[0-9]' "nothing (the tree itself)" "$$egress_tree" "aenv-egress's own tree"; \
 	for feature in core resolver local tls; do \
 	  $(CARGO) check -q -p aenv-egress --no-default-features --features $$feature >/dev/null 2>&1 || { \
 	    echo "aenv-egress does not build with only its \"$$feature\" feature. Every build in the tree turns on either one feature or all of them, so a reference from one optional module into another compiles everywhere and fails for whoever enables just the one."; \
 	    fail=1; }; \
 	done; \
-	node_features=$$($(CARGO) tree -p aenv-node -e features --prefix none) || { echo "cargo tree -p aenv-node -e features failed"; exit 1; }; \
-	if printf '%s\n' "$$node_features" | grep -E '^aenv-egress feature "tls"'; then \
+	node_features=$$($(CARGO) tree -p aenv-node -e features --prefix none | sort -u) || { echo "cargo tree -p aenv-node -e features failed"; exit 1; }; \
+	if matches '$(DEP_EGRESS_TLS_FEATURE)' "$$node_features"; then \
 	  echo "aenv-node enables aenv-egress's tls feature; the node relays bytes and terminates no TLS."; \
 	  fail=1; \
 	fi; \
-	workspace_tree=$$($(CARGO) tree --workspace -e normal,build,dev --prefix none) || { echo "cargo tree --workspace failed"; exit 1; }; \
-	if printf '%s\n' "$$workspace_tree" | sort -u | grep -E '^(rocksdb|librocksdb-sys) v[0-9]'; then \
+	control '$(DEP_EGRESS_FEATURE_SHAPE)' "aenv-egress's tls feature" "$$node_features" "the feature tree that rule reads"; \
+	workspace_tree=$$($(CARGO) tree --workspace -e normal,build,dev --prefix none | sort -u) || { echo "cargo tree --workspace failed"; exit 1; }; \
+	if matches '$(DEP_EMBEDDED_DB)' "$$workspace_tree"; then \
 	  echo "the workspace links an embedded database; node-local metadata is derived from the"; \
 	  echo "cache layout or written as JSON records, and nothing here needs one."; \
 	  fail=1; \
 	fi; \
-	api_flat=$$($(CARGO) tree -p aenv-api -e normal --prefix none) || { echo "cargo tree -p aenv-api --prefix none failed"; exit 1; }; \
-	if printf '%s\n' "$$api_flat" | sort -u | grep -E '^(iroh|iroh-blobs|envd) v[0-9]'; then \
+	control '$(DEP_POSTGRES)' "a PostgreSQL driver" "$$workspace_tree" "the workspace tree the embedded-database rule reads"; \
+	if matches '$(DEP_P2P_OR_GUEST)' "$$api_tree"; then \
 	  echo "aenv-api links the peer-to-peer transport or the guest agent client; the api half"; \
 	  echo "moves no artifact bytes and speaks to no guest, so both are aenv-node's alone."; \
 	  fail=1; \
 	fi; \
+	control '$(DEP_P2P_OR_GUEST)' "the peer-to-peer transport or the guest agent client" "$$node_tree" "aenv-node's own tree"; \
 	for pair in $(CORE_EXILED_PATHS); do \
 	  path=$${pair%%:*}; home=$${pair#*:}; stem=$${path%.rs}; \
 	  back=""; \

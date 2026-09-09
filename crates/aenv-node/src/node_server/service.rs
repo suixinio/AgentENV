@@ -12,8 +12,8 @@ use tracing::{debug, info, warn};
 use crate::image::ImageResolver;
 use crate::orchestrator::{
     CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, NewTimeout,
-    OrchestratorError, PublishedPause, SandboxLaunchSource, SandboxMetadata, SandboxOperation,
-    SandboxOrchestration,
+    NodeOrchestration, OrchestratorError, PublishedPause, SandboxLaunchSource, SandboxMetadata,
+    SandboxOperation,
 };
 use crate::proto::node as pb;
 use crate::sandbox::{
@@ -31,7 +31,7 @@ use super::ownership::owned_by_control_plane;
 
 /// Serves node sandbox RPCs from one orchestrator.
 pub struct NodeSandboxService {
-    orchestration: Arc<dyn SandboxOrchestration>,
+    orchestration: Arc<dyn NodeOrchestration>,
     // Snapshot resolution remains node-local because it opens local artifacts.
     snapshots: Arc<SnapshotManager>,
     node_id: String,
@@ -47,7 +47,7 @@ struct TemplateBuildWiring {
 
 impl NodeSandboxService {
     pub fn new(
-        orchestration: Arc<dyn SandboxOrchestration>,
+        orchestration: Arc<dyn NodeOrchestration>,
         snapshots: Arc<SnapshotManager>,
         node_id: String,
     ) -> Self {

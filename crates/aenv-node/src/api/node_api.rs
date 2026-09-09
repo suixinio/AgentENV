@@ -7,13 +7,13 @@
 use std::sync::Arc;
 
 use aenv_core::observability::{node_detail, ObservabilityService};
-use aenv_core::orchestrator::SandboxOrchestration;
+use aenv_core::orchestrator::NodeOrchestration;
 use agentenv_http_server::models;
 
 /// The node's HTTP state: what it runs, what it reports, and the domains its
 /// data plane answers for.
 pub struct NodeApi {
-    orchestration: Arc<dyn SandboxOrchestration>,
+    orchestration: Arc<dyn NodeOrchestration>,
     /// `None` when `observability.enabled = false`; the report endpoints then
     /// answer as if this node had no details to give.
     observability: Option<Arc<ObservabilityService>>,
@@ -35,7 +35,7 @@ pub struct DerivedStatus;
 
 impl NodeApi {
     pub fn new(
-        orchestration: Arc<dyn SandboxOrchestration>,
+        orchestration: Arc<dyn NodeOrchestration>,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
     ) -> Self {
@@ -46,7 +46,7 @@ impl NodeApi {
         }
     }
 
-    pub fn orchestration(&self) -> &Arc<dyn SandboxOrchestration> {
+    pub fn orchestration(&self) -> &Arc<dyn NodeOrchestration> {
         &self.orchestration
     }
 

@@ -16,7 +16,7 @@ use std::time::SystemTime;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
-pub use facade::SandboxOrchestration;
+pub use facade::{NodeOrchestration, SandboxOrchestration};
 pub use grants::{GrantIssuer, GrantsIssuedUpstream, NoGrants};
 pub use launch_claim::{LaunchFailure, LaunchHeldElsewhere, LaunchSettlement, RestoredSandbox};
 pub use metrics::OrchestratorMetrics;

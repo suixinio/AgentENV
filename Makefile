@@ -250,6 +250,17 @@ check-crate-boundaries:
 	    fail=1;; \
 	  esac; \
 	done; \
+	if grep -qE '^[[:space:]]+orchestrator: Arc<dyn NodeOrchestration>' crates/aenv-api/src/api/impls/mod.rs; then \
+	  echo "ApiImpl holds the node orchestration surface. The REST layer asks for records,"; \
+	  echo "placement and lifecycle transitions; the handle table, the proxy route table and"; \
+	  echo "the launches in flight are a running process's, and no deciding half has them."; \
+	  fail=1; \
+	fi; \
+	if ! grep -qE '^[[:space:]]+orchestrator: Arc<dyn SandboxOrchestration>,' crates/aenv-api/src/api/impls/mod.rs; then \
+	  echo "crates/aenv-api/src/api/impls/mod.rs declares no orchestration field in the shape"; \
+	  echo "this rule reads, so the rule above is watching nothing. Name the field, or drop it."; \
+	  fail=1; \
+	fi; \
 	for half in aenv-api aenv-node; do \
 	  flat=$$(sed 's|//.*||' crates/$$half/src/lib.rs | tr '\n' ' '); \
 	  braced=$$(printf '%s' "$$flat" | grep -oE 'pub use aenv_core::\{[^}]*\}' | sed -e 's/.*{//' -e 's/}//' | tr -d ' \t' | tr ',' '\n' || true); \

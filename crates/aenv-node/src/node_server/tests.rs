@@ -7,8 +7,8 @@ use tonic::{Code, Request, Status};
 
 use crate::orchestrator::{
     ControlPlaneConfig, CreateSandboxRequest, ForkChildAssignment, ForkChildren,
-    InMemoryMetadataStore, MetadataStore, NewTimeout, Orchestrator, SandboxExpiry,
-    SandboxLaunchSource, SandboxMetadata, SandboxOrchestration, SandboxTimeoutAction,
+    InMemoryMetadataStore, MetadataStore, NewTimeout, NodeOrchestration, Orchestrator,
+    SandboxExpiry, SandboxLaunchSource, SandboxMetadata, SandboxTimeoutAction,
     StagingPausePublisher,
 };
 use crate::proto::node as pb;
@@ -26,13 +26,13 @@ use super::service::NodeSandboxService;
 
 const NODE: &str = "node-under-test";
 
-async fn service() -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
+async fn service() -> (Arc<dyn NodeOrchestration>, NodeSandboxService) {
     service_with(MockBackendFactory::new()).await
 }
 
 async fn service_with(
     factory: MockBackendFactory,
-) -> (Arc<dyn SandboxOrchestration>, NodeSandboxService) {
+) -> (Arc<dyn NodeOrchestration>, NodeSandboxService) {
     let orchestrator = orchestrator_with(InMemoryMetadataStore::new(), factory).await;
     serve_node(orchestrator, mock_snapshot_manager())
 }
@@ -57,20 +57,20 @@ where
 fn serve_node<S, F>(
     orchestrator: Arc<Orchestrator<S, F>>,
     manager: SnapshotManager,
-) -> (Arc<dyn SandboxOrchestration>, NodeSandboxService)
+) -> (Arc<dyn NodeOrchestration>, NodeSandboxService)
 where
     S: MetadataStore + 'static,
     F: SandboxBackendFactory,
 {
     let manager = Arc::new(manager);
     orchestrator.set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(&manager))));
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let orchestration: Arc<dyn NodeOrchestration> = orchestrator;
     let service = NodeSandboxService::new(Arc::clone(&orchestration), manager, NODE.to_string());
     (orchestration, service)
 }
 
 async fn service_with_catalog() -> (
-    Arc<dyn SandboxOrchestration>,
+    Arc<dyn NodeOrchestration>,
     NodeSandboxService,
     Arc<crate::snapshot::mock::MockSnapshotCatalog>,
 ) {
@@ -101,7 +101,7 @@ fn launch(marker: Option<&[u8]>) -> CreateSandboxRequest {
 }
 
 async fn start(
-    orchestration: &Arc<dyn SandboxOrchestration>,
+    orchestration: &Arc<dyn NodeOrchestration>,
     marker: Option<&[u8]>,
 ) -> SandboxMetadata {
     Arc::clone(orchestration)
@@ -1595,7 +1595,7 @@ fn classification(status: &Status) -> Option<bool> {
 }
 
 struct StagingHarness {
-    orchestration: Arc<dyn SandboxOrchestration>,
+    orchestration: Arc<dyn NodeOrchestration>,
     service: NodeSandboxService,
     repository: Arc<crate::snapshot::mock::RecordingSnapshotRepository>,
     behavior: Arc<MockBehavior>,

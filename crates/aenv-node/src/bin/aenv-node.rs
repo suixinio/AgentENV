@@ -16,7 +16,8 @@ use aenv_node::identity::NodeIdentity;
 use aenv_node::image::ImageResolver;
 use aenv_node::observability::{ObservabilityReporter, ObservabilityService};
 use aenv_node::orchestrator::{
-    InMemoryMetadataStore, Orchestrator, SandboxOrchestration, StagingPausePublisher,
+    InMemoryMetadataStore, NodeOrchestration, Orchestrator, SandboxOrchestration,
+    StagingPausePublisher,
 };
 use aenv_node::overlaybd::OverlaybdP2pRuntime;
 use aenv_node::p2p::P2pTransport;
@@ -268,7 +269,7 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
         Some(Arc::new(
             ObservabilityService::new(
                 identity,
-                Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>,
+                Arc::clone(&orchestrator) as Arc<dyn NodeOrchestration>,
                 config.resolved_cpu_template_helper(),
                 cluster_cpu_arc,
             )
@@ -324,8 +325,8 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
         .set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(
             &core.snapshot_manager,
         ))));
-    let orchestration: Arc<dyn SandboxOrchestration> =
-        Arc::clone(&core.orchestrator) as Arc<dyn SandboxOrchestration>;
+    let orchestration: Arc<dyn NodeOrchestration> =
+        Arc::clone(&core.orchestrator) as Arc<dyn NodeOrchestration>;
 
     // Bind before spawning so a port conflict fails process assembly.
     let grpc = {
@@ -363,7 +364,7 @@ async fn assemble_node(config: &AppConfig) -> anyhow::Result<Assembly> {
             Arc::clone(&node_api),
             proxy::data_plane(Arc::clone(&node_api)),
         ),
-        orchestration,
+        orchestration: orchestration as Arc<dyn SandboxOrchestration>,
         upkeep: Vec::new(),
         pg_singleton_tasks: Vec::new(),
         reporter: core

@@ -8,8 +8,8 @@ use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
 use crate::orchestrator::{
-    DiscardingPausePublisher, InMemoryMetadataStore, MetadataStore, Orchestrator,
-    SandboxOrchestration, StagingPausePublisher,
+    DiscardingPausePublisher, InMemoryMetadataStore, MetadataStore, NodeOrchestration,
+    Orchestrator, StagingPausePublisher,
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
@@ -39,7 +39,7 @@ use crate::node_client::wire;
 struct RunningNode {
     endpoint: NodeEndpoint,
     _shutdown: oneshot::Sender<()>,
-    orchestration: Option<Arc<dyn SandboxOrchestration>>,
+    orchestration: Option<Arc<dyn NodeOrchestration>>,
 }
 
 impl RunningNode {
@@ -48,7 +48,7 @@ impl RunningNode {
     }
 }
 
-async fn serve<S>(service: S, orchestration: Option<Arc<dyn SandboxOrchestration>>) -> RunningNode
+async fn serve<S>(service: S, orchestration: Option<Arc<dyn NodeOrchestration>>) -> RunningNode
 where
     S: NodeSandboxService,
 {
@@ -104,7 +104,7 @@ async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
     .expect("an in-memory orchestrator");
     let snapshots = Arc::new(resolvable_snapshot_manager());
     orchestrator.set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(&snapshots))));
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let orchestration: Arc<dyn NodeOrchestration> = orchestrator;
     let service = aenv_node::node_server::NodeSandboxService::new(
         Arc::clone(&orchestration),
         snapshots,
@@ -153,7 +153,7 @@ async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) 
     )
     .await
     .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let orchestration: Arc<dyn NodeOrchestration> = orchestrator;
     let service = aenv_node::node_server::NodeSandboxService::new(
         Arc::clone(&orchestration),
         Arc::new(resolvable_snapshot_manager()),
@@ -1871,7 +1871,7 @@ async fn the_gate_refuses_a_node_rpc_that_carries_no_credential() {
     )
     .await
     .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let orchestration: Arc<dyn NodeOrchestration> = orchestrator;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -1966,7 +1966,7 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
     )
     .await
     .expect("an in-memory orchestrator");
-    let orchestration: Arc<dyn SandboxOrchestration> = orchestrator;
+    let orchestration: Arc<dyn NodeOrchestration> = orchestrator;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

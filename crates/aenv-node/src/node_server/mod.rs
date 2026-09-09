@@ -19,7 +19,7 @@ use anyhow::Context;
 use tracing::info;
 
 use crate::image::ImageResolver;
-use crate::orchestrator::SandboxOrchestration;
+use crate::orchestrator::NodeOrchestration;
 use crate::proto::node::node_sandbox_service_server::NodeSandboxServiceServer;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
@@ -44,7 +44,7 @@ pub use ownership::owned_by_control_plane;
 /// Builds the node gRPC server with template-building support, behind the
 /// credential gate: the surface is reachable from inside a sandbox namespace.
 pub fn server(
-    orchestration: Arc<dyn SandboxOrchestration>,
+    orchestration: Arc<dyn NodeOrchestration>,
     snapshots: Arc<SnapshotManager>,
     node_id: String,
     image_resolver: Arc<ImageResolver>,
@@ -62,7 +62,7 @@ pub fn server(
 
 /// The same server behind credentials the caller resolved itself.
 pub fn server_with_gate(
-    orchestration: Arc<dyn SandboxOrchestration>,
+    orchestration: Arc<dyn NodeOrchestration>,
     snapshots: Arc<SnapshotManager>,
     node_id: String,
     image_resolver: Arc<ImageResolver>,
@@ -82,7 +82,7 @@ pub fn server_with_gate(
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_on(
     listener: tokio::net::TcpListener,
-    orchestration: Arc<dyn SandboxOrchestration>,
+    orchestration: Arc<dyn NodeOrchestration>,
     snapshots: Arc<SnapshotManager>,
     node_id: String,
     image_resolver: Arc<ImageResolver>,

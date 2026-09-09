@@ -2,7 +2,7 @@
 //!
 //! Refusal cases are paired with admitted cases to avoid vacuous tests.
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,7 +15,7 @@ use crate::cfg::ConfigManager;
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use crate::node_registry::warmup::WarmupGate;
-use crate::orchestrator::{Orchestrator, ProxyTarget, SandboxMetadata, SandboxState};
+use crate::orchestrator::{Orchestrator, SandboxMetadata, SandboxState};
 use crate::proto::apiproxy::{
     self as pb, sandbox_resume_service_client::SandboxResumeServiceClient,
 };
@@ -141,14 +141,12 @@ impl RunningApi {
 
     async fn running(&self, auto_resume: bool) -> SandboxId {
         let sandbox_id = SandboxId::new();
+        // A running record, not a proxy route: nothing in this half serves one.
         self.api
             .orchestrator()
-            .set_proxy_target_for_test(
-                sandbox_id,
-                ProxyTarget::new(Ipv4Addr::LOCALHOST),
-                SandboxState::Running,
-            )
-            .await;
+            .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+            .await
+            .expect("seed a running sandbox");
         self.api
             .orchestrator()
             .set_auto_resume_for_test(&sandbox_id, auto_resume)

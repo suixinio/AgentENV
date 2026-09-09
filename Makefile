@@ -156,6 +156,14 @@ API_EXILED_PATHS := \
 	src/node_client:crates/aenv-api/src/node_client \
 	src/node_registry:crates/aenv-api/src/node_registry
 
+# The third half of the same rule: what each half re-exports from `aenv-core`.
+# Read from `crates/<half>/src/lib.rs` with line comments stripped: every
+# `pub use aenv_core::`, braced list or single name, alias or nested in an
+# inline module, against that file's own top-level `pub mod` list. A name
+# `aenv-core` does not have is a module published from the wrong crate. A name
+# the half also declares is one path with two owners -- rustc refuses that pair
+# only when both sit in the same module, so an inline-module re-export is a
+# shape it compiles and this arm does not.
 check-crate-boundaries:
 	@fail=0; \
 	api_tree=$$($(CARGO) tree -p aenv-api -e normal) || { echo "cargo tree -p aenv-api failed"; exit 1; }; \

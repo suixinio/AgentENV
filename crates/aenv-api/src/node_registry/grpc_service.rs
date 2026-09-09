@@ -722,7 +722,7 @@ impl Scheduler for NodeRegistryGrpcService {
                     // is one tick stale, and its liveness is already recorded.
                     // The unabsorbed roster shuts the gate instead, so a lookup
                     // answers "unavailable" rather than absence until one lands.
-                    self.warmup.roster_not_absorbed(&node_key);
+                    self.warmup.roster_not_absorbed(&node_key, now);
                     Self::record_heartbeat_reconcile_failure();
                     tracing::warn!(
                         node_id = %node_id,

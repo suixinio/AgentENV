@@ -853,6 +853,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_membership_reports_gone_once_a_silent_nodes_unabsorbed_roster_expires() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![Node {
+                id: "node-a".to_string(),
+                endpoint: "http://10.0.0.7:8000".to_string(),
+                pod_name: String::new(),
+            }],
+            Duration::from_secs(30),
+        ));
+        let start = SystemTime::now() - Duration::from_secs(300);
+        let warmup = Arc::new(WarmupGate::new(
+            Arc::clone(&registry) as Arc<dyn crate::node_registry::registry::NodeRegistry>,
+            Duration::from_secs(15),
+            start,
+        ));
+        let placement = placement_with_warmup(Arc::clone(&registry), Arc::clone(&warmup));
+
+        registry
+            .heartbeat(&heartbeat("node-a"), start)
+            .expect("node-a is in discovery");
+        warmup.roster_not_absorbed("node-a", start);
+        assert!(
+            !warmup.warmed_up(start),
+            "sanity: an unabsorbed roster shuts the gate when it is recorded"
+        );
+
+        assert_eq!(
+            placement.node_membership("node-c").await.unwrap(),
+            NodeMembership::Gone,
+            "node-a stopped heartbeating long ago, so its unabsorbed roster no longer withholds \
+             Gone -- withholding it forever is how records on a dead node become unreclaimable"
+        );
+    }
+
+    #[tokio::test]
     async fn node_membership_stays_cold_past_the_deadline_when_nothing_has_ever_reported() {
         let registry = Arc::new(AtomicNodeRegistry::new(
             vec![Node {

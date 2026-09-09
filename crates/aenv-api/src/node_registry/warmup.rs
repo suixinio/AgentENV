@@ -6,60 +6,71 @@
 //! declaring every runtime gone.
 //!
 //! A roster reaches routing only by being absorbed into the binding store, so a node
-//! whose roster this replica failed to absorb shuts the gate for as long as it is
-//! discovered: its sandboxes have no binding to find, and a miss is not absence.
+//! whose roster this replica failed to absorb shuts the gate while that node is still
+//! discovered and still reporting: its sandboxes have no binding to find, and a miss
+//! is not absence. The veto expires with the node's own liveness, so a node that stops
+//! heartbeating withholds neither absence nor a placement verdict of `NodeMembership::Gone`.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
+use super::placement::score::SnapshotFreshness;
 use super::registry::NodeRegistry;
 
 pub const DEFAULT_WARMUP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Decides whether a binding-store miss may be reported as absence.
+///
+/// The unabsorbed-roster veto is process-local while observation is shared through the
+/// node-registry store: a replica that never receives node N's heartbeats records no
+/// veto for N and answers a miss on N's sandboxes as absence.
 pub struct WarmupGate {
     nodes: Arc<dyn NodeRegistry>,
     /// Rebased when the heartbeat listener becomes reachable.
     deadline: RwLock<SystemTime>,
+    /// The warm-up window, which is also how long one absorption failure vetoes for.
+    window: RwLock<Duration>,
     /// One-way warm latch; later node joins do not close the gate.
     warm: AtomicBool,
     /// Prevents empty discovery from satisfying readiness vacuously.
     reported: AtomicBool,
-    /// Nodes whose latest roster did not reach the binding store. Never latched:
-    /// absorption is a live condition, and the next one that lands clears it.
-    unabsorbed: RwLock<HashSet<String>>,
+    /// Absorption failures by node, stamped with the heartbeat that recorded them.
+    /// Never latched: absorption is a live condition, and the next roster that lands,
+    /// the window, or the node's own silence ends it.
+    unabsorbed: RwLock<HashMap<String, SystemTime>>,
 }
 
 impl WarmupGate {
     pub fn new(nodes: Arc<dyn NodeRegistry>, timeout: Duration, now: SystemTime) -> Self {
+        let window = Self::effective_window(timeout);
         Self {
             nodes,
-            deadline: RwLock::new(Self::effective_deadline(now, timeout)),
+            deadline: RwLock::new(now + window),
+            window: RwLock::new(window),
             warm: AtomicBool::new(false),
             reported: AtomicBool::new(false),
-            unabsorbed: RwLock::new(HashSet::new()),
+            unabsorbed: RwLock::new(HashMap::new()),
         }
     }
 
-    fn effective_deadline(now: SystemTime, timeout: Duration) -> SystemTime {
-        let timeout = if timeout > Duration::ZERO {
+    fn effective_window(timeout: Duration) -> Duration {
+        if timeout > Duration::ZERO {
             timeout
         } else {
             DEFAULT_WARMUP_TIMEOUT
-        };
-        now + timeout
+        }
     }
 
-    /// Rebases the deadline from the time the heartbeat listener becomes reachable.
-    ///
-    /// No effect after the gate has latched warm.
+    /// Rebases the deadline, and the veto window with it, from listener readiness.
     pub fn rebase_deadline(&self, now: SystemTime, timeout: Duration) {
-        let mut deadline = self
+        let window = Self::effective_window(timeout);
+        *self
             .deadline
             .write()
-            .expect("warmup deadline lock poisoned");
-        *deadline = Self::effective_deadline(now, timeout);
+            .expect("warmup deadline lock poisoned") = now + window;
+        *self.window.write().expect("warmup window lock poisoned") = window;
     }
 
     /// Records a heartbeat that nothing absorbs a roster from, and immediately
@@ -71,25 +82,62 @@ impl WarmupGate {
 
     /// Records that `node_id`'s roster reached the binding store.
     pub fn roster_absorbed(&self, node_id: &str, now: SystemTime) {
-        self.unabsorbed
-            .write()
-            .expect("warmup absorption lock poisoned")
-            .remove(node_id);
+        let (deadline, window) = self.veto_bounds();
+        {
+            let mut unabsorbed = self
+                .unabsorbed
+                .write()
+                .expect("warmup absorption lock poisoned");
+            unabsorbed.remove(node_id);
+            unabsorbed.retain(|_, at| Self::veto_in_force(*at, deadline, window, now));
+        }
         self.reported_in(now);
     }
 
     /// Records that `node_id`'s roster did not reach the binding store.
     ///
-    /// Its sandboxes have no binding to find, so the gate shuts until a later
-    /// roster for that node lands or the node stops being discovered.
-    pub fn roster_not_absorbed(&self, node_id: &str) {
-        self.unabsorbed
+    /// Its sandboxes have no binding to find, so the gate shuts until a later roster
+    /// for that node lands, the node stops being discovered or reporting, or this
+    /// stamp falls outside the veto window.
+    pub fn roster_not_absorbed(&self, node_id: &str, now: SystemTime) {
+        let (deadline, window) = self.veto_bounds();
+        let mut unabsorbed = self
+            .unabsorbed
             .write()
-            .expect("warmup absorption lock poisoned")
-            .insert(node_id.to_string());
+            .expect("warmup absorption lock poisoned");
+        unabsorbed.retain(|_, at| Self::veto_in_force(*at, deadline, window, now));
+        unabsorbed.insert(node_id.to_string(), now);
     }
 
-    fn holds_an_unabsorbed_roster(&self) -> bool {
+    fn veto_bounds(&self) -> (SystemTime, Duration) {
+        let deadline = *self.deadline.read().expect("warmup deadline lock poisoned");
+        let window = *self.window.read().expect("warmup window lock poisoned");
+        (deadline, window)
+    }
+
+    /// A stamp holds for one window, renewed by every failing heartbeat, and never
+    /// expires before warm-up itself could have opened the gate.
+    fn veto_in_force(
+        recorded_at: SystemTime,
+        deadline: SystemTime,
+        window: Duration,
+        now: SystemTime,
+    ) -> bool {
+        now < recorded_at.max(deadline) + window
+    }
+
+    /// A node past its own report TTL holds nothing: this replica can no longer tell
+    /// its sandboxes from those of any other node it cannot reach.
+    fn node_still_reporting(&self, node_id: &str, now: SystemTime) -> bool {
+        match self.nodes.peek_observed_with_freshness(node_id, now) {
+            // A receive time ahead of `now` is a newer report, not a missing one.
+            Some((_, SnapshotFreshness::Fresh | SnapshotFreshness::ClockSkew)) => true,
+            Some((_, SnapshotFreshness::Stale)) | None => false,
+        }
+    }
+
+    fn holds_an_unabsorbed_roster(&self, now: SystemTime) -> bool {
+        let (deadline, window) = self.veto_bounds();
         let unabsorbed = self
             .unabsorbed
             .read()
@@ -100,14 +148,19 @@ impl WarmupGate {
         self.nodes
             .snapshot(/* allow_lingering */ false)
             .iter()
-            .any(|node| unabsorbed.contains(&node.id))
+            .any(|node| {
+                unabsorbed
+                    .get(&node.id)
+                    .is_some_and(|at| Self::veto_in_force(*at, deadline, window, now))
+                    && self.node_still_reporting(&node.id, now)
+            })
     }
 
     /// Returns whether a binding miss may be reported as absent.
     ///
     /// A deadline opens only after at least one heartbeat has arrived.
     pub fn warmed_up(&self, now: SystemTime) -> bool {
-        if self.holds_an_unabsorbed_roster() {
+        if self.holds_an_unabsorbed_roster(now) {
             return false;
         }
 
@@ -308,17 +361,133 @@ mod tests {
         );
 
         observe(&registry, "node-a", now);
-        gate.roster_not_absorbed("node-a");
+        gate.roster_not_absorbed("node-a", now);
         assert!(
-            !gate.warmed_up(now + Duration::from_secs(1_000_000)),
+            !gate.warmed_up(now),
             "the registry observed node-a, but its sandboxes never reached the binding \
-             store, so a miss is not absence -- not now and not past the deadline"
+             store, so a miss is not absence"
+        );
+        assert!(
+            !gate.warmed_up(now + Duration::from_secs(20)),
+            "and not past the warm-up deadline either, while node-a is still reporting"
         );
 
         gate.roster_absorbed("node-a", now);
         assert!(
             gate.warmed_up(now),
             "the roster landed; the gate has nothing left to wait for"
+        );
+    }
+
+    #[test]
+    fn a_veto_stops_holding_the_gate_once_the_node_stops_reporting() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a")],
+            Duration::from_secs(30),
+        ));
+        let now = unix(100);
+        // A window far longer than the report TTL, so only liveness can end this veto.
+        let gate = WarmupGate::new(
+            registry.clone() as Arc<dyn NodeRegistry>,
+            Duration::from_secs(300),
+            now,
+        );
+
+        observe(&registry, "node-a", now);
+        gate.roster_not_absorbed("node-a", now);
+        assert!(!gate.warmed_up(now), "node-a's roster is unabsorbed");
+
+        assert!(
+            gate.warmed_up(now + Duration::from_secs(31)),
+            "node-a has not heartbeated within its report TTL: this replica can no longer \
+             claim its sandboxes are real, and a permanent refusal is worse than absence"
+        );
+    }
+
+    #[test]
+    fn a_veto_expires_on_the_warmup_window_even_while_a_shared_observation_stays_fresh() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a")],
+            Duration::from_secs(30),
+        ));
+        let now = unix(100);
+        let gate = WarmupGate::new(
+            registry.clone() as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            now,
+        );
+
+        observe(&registry, "node-a", now);
+        gate.roster_not_absorbed("node-a", now);
+
+        // A heartbeat this process never saw, arriving through the shared store.
+        let later = now + Duration::from_secs(31);
+        observe(&registry, "node-a", later);
+
+        assert!(
+            gate.warmed_up(later),
+            "node-a looks fresh, but no failure has renewed the veto for a window: a veto \
+             this replica cannot refresh must not outlive one"
+        );
+    }
+
+    #[test]
+    fn a_fresh_failure_renews_the_veto_past_the_deadline() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a")],
+            Duration::from_secs(30),
+        ));
+        let now = unix(100);
+        let gate = WarmupGate::new(
+            registry.clone() as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            now,
+        );
+
+        observe(&registry, "node-a", now);
+        gate.roster_not_absorbed("node-a", now);
+
+        let renewed_at = now + Duration::from_secs(29);
+        observe(&registry, "node-a", renewed_at);
+        gate.roster_not_absorbed("node-a", renewed_at);
+
+        assert!(
+            !gate.warmed_up(renewed_at + Duration::from_secs(14)),
+            "node-a is still reporting and its roster still does not land, so the gate stays \
+             shut a full window past the renewal"
+        );
+        assert!(
+            gate.warmed_up(renewed_at + Duration::from_secs(15)),
+            "and opens one window after the last failure, not one after the first"
+        );
+    }
+
+    #[test]
+    fn an_unabsorbed_roster_on_one_node_withholds_absence_for_sandboxes_on_every_node() {
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a"), node("node-b")],
+            Duration::from_secs(30),
+        ));
+        let now = unix(100);
+        let gate = WarmupGate::new(
+            registry.clone() as Arc<dyn NodeRegistry>,
+            Duration::from_secs(15),
+            now,
+        );
+
+        observe(&registry, "node-a", now);
+        observe(&registry, "node-b", now);
+        gate.roster_absorbed("node-a", now);
+        gate.roster_not_absorbed("node-b", now);
+
+        assert!(
+            !gate.warmed_up(now),
+            "the gate is one answer for the whole replica: node-a's roster landed, but a miss \
+             on one of its sandboxes is still withheld while node-b's roster is missing"
+        );
+        assert!(
+            gate.warmed_up(now + Duration::from_secs(31)),
+            "once node-b stops reporting, node-a's misses are answerable again"
         );
     }
 
@@ -337,7 +506,7 @@ mod tests {
         observe(&registry, "node-a", now);
         observe(&registry, "node-b", now);
         gate.roster_absorbed("node-a", now);
-        gate.roster_not_absorbed("node-b");
+        gate.roster_not_absorbed("node-b", now);
         assert!(!gate.warmed_up(now), "node-b's roster is unabsorbed");
 
         registry.set(vec![node("node-a")], Vec::new(), now);

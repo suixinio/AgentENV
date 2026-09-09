@@ -81,6 +81,17 @@ ALTER TABLE snapshots
 -- dropped; `services/README.md` carries that as an operator step.
 CREATE OR REPLACE FUNCTION catalog_snapshots_pause_axis_trg() RETURNS TRIGGER AS $$
 BEGIN
+    -- An UPDATE that leaves the payload alone cannot reach a different answer,
+    -- and the column is total, so the stored one stands. This is what keeps
+    -- `set_origin_node_id`, `retire_previous_pauses` and `delete_sandbox_pauses`
+    -- off the parse below, and it is what confines the classification, and the
+    -- refusal it can raise, to a write that brings a payload.
+    IF TG_OP = 'UPDATE'
+       AND NEW.committed_payload IS NOT DISTINCT FROM OLD.committed_payload
+       AND OLD.is_pause IS NOT NULL THEN
+        RETURN NEW;
+    END IF;
+
     IF TG_OP = 'INSERT' THEN
         IF NEW.is_pause IS NOT NULL THEN
             RETURN NEW;

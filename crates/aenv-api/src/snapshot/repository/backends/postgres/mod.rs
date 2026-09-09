@@ -874,6 +874,93 @@ mod pg {
         );
     }
 
+    async fn seed_a_committed_row_with(
+        pool: &PgPool,
+        cluster_id: Uuid,
+        sandbox_id: &str,
+        is_pause: bool,
+        payload: &[u8],
+    ) -> SnapshotId {
+        let id = SnapshotId::generate();
+        sqlx::query(
+            "INSERT INTO snapshots (
+                id, cluster_id, source_kind, source_sandbox_id,
+                cpu_count, memory_mib, disk_size_mib,
+                status, status_group,
+                published, origin_node_id,
+                sandbox_started_at_ms, created_at_ms, updated_at_ms,
+                committed_payload, committed_schema, is_pause
+             ) VALUES (
+                $1, $2, 'sandbox', $3,
+                1, 512, 1024,
+                'ready', 'ready',
+                true, NULL,
+                NULL, 1, 1,
+                $4, 1, $5
+             )",
+        )
+        .bind(id.to_uuid())
+        .bind(cluster_id)
+        .bind(sandbox_id)
+        .bind(payload)
+        .bind(is_pause)
+        .execute(pool)
+        .await
+        .expect("seeding a committed row should succeed");
+        id
+    }
+
+    async fn stored_is_pause(pool: &PgPool, id: &SnapshotId) -> bool {
+        sqlx::query_scalar("SELECT is_pause FROM snapshots WHERE id = $1")
+            .bind(id.to_uuid())
+            .fetch_one(pool)
+            .await
+            .expect("the seeded row should still be there")
+    }
+
+    #[tokio::test]
+    async fn an_update_that_leaves_the_payload_alone_keeps_the_stored_classification() {
+        let pool = isolated_schema_pool_or_skip!(
+            "an_update_that_leaves_the_payload_alone_keeps_the_stored_classification"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+        let cluster_id = Uuid::new_v4();
+        let catalog = PostgresSnapshotCatalog::new(pool.clone(), cluster_id, "node-a".to_string());
+
+        // Column and payload disagree, so re-reading the payload is observable.
+        let checkpoint_payload =
+            convert::encode_committed(&sandbox_commit_for("sbx-stated", false).committed)
+                .expect("the payload encodes");
+        let stated =
+            seed_a_committed_row_with(&pool, cluster_id, "sbx-stated", true, &checkpoint_payload)
+                .await;
+        // Where the backfill leaves a row whose payload never decoded.
+        let corrupt = seed_a_committed_row_with(
+            &pool,
+            cluster_id,
+            "sbx-corrupt",
+            false,
+            &[0xff_u8, 0xfe, 0x00, 0x01],
+        )
+        .await;
+
+        for id in [&stated, &corrupt] {
+            catalog
+                .set_origin_node_id(id, "node-b")
+                .await
+                .expect("an update that carries no payload must not need one");
+        }
+
+        assert!(
+            stored_is_pause(&pool, &stated).await,
+            "the stored answer stands until a write brings a payload to classify"
+        );
+        assert!(
+            !stored_is_pause(&pool, &corrupt).await,
+            "and a row nothing can classify stays writable"
+        );
+    }
+
     #[tokio::test]
     async fn one_undecodable_payload_does_not_take_the_metadata_filtered_listing_with_it() {
         let pool = isolated_schema_pool_or_skip!(

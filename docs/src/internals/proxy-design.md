@@ -20,8 +20,8 @@ Current entrypoints:
 Implementation references:
 
 - `crates/aenv-node/src/api/proxy.rs`
-- `src/orchestrator/service.rs`
-- `src/orchestrator/proxy.rs`
+- `crates/aenv-node/src/orchestrator/service.rs`
+- `crates/aenv-node/src/orchestrator/proxy.rs`
 
 ## Routing Contract
 
@@ -232,7 +232,7 @@ curl -i \
 Relevant test coverage exists in:
 
 - `crates/aenv-node/src/api/proxy.rs` unit tests (HTTP, SSE, large body, websocket, headers, path preservation, error mapping)
-- `src/orchestrator/service.rs` unit tests (route publication/removal behavior and stale-handle guard)
+- `crates/aenv-node/src/orchestrator/service.rs` unit tests (route publication/removal behavior and stale-handle guard)
 - Integration lifecycle tests in `tests/integration/orchestrator.rs`
 - E2E proxy suite in `scripts/tests/e2e/suites/06_proxy.sh` (header compatibility, and paused-sandbox wake-up end to end — that suite drives `AENV_PROXY_URL`, so the wake it observes is the gateway's cold path, not the proxy's)
 

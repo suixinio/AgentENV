@@ -2,11 +2,11 @@
 //!
 //! The trait is declared here and implemented in the crate that owns each
 //! half's orchestrator, so its signature list is a macro rather than a written
-//! trait body: [`sandbox_orchestration_surface`] hands the list to an emitter,
-//! [`orchestration_trait`] is the emitter that writes the trait, and a half
-//! with a concrete orchestrator passes an emitter that writes the forwarding
-//! implementation from the same list. One list, so a signature cannot drift
-//! between the two.
+//! trait body: [`sandbox_orchestration_surface`] hands the list to an emitter
+//! and [`orchestration_trait`] is the emitter that writes the trait. The half
+//! that forwards to a concrete `Orchestrator` passes a second emitter over the
+//! same list; the half whose control path is the implementation writes it out,
+//! and a signature it does not answer is a missing method rather than a drift.
 
 /// Writes a trait from an orchestration surface's signature list.
 ///

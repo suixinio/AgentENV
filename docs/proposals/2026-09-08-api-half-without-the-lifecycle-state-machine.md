@@ -342,7 +342,7 @@ node gRPC 面、Redis 与 PG 的键与列）都不变——§3 的预留是**新
 |---|---|---|---|
 | 1 | ~~`src/orchestrator/store/redis/`（4,671 行）~~ 已搬进 `crates/aenv-api/src/orchestrator/store/redis/`，`redis` 同时变成 core 的可选依赖 | — | `check-crate-boundaries` 现在直接拒绝 `cargo tree -p aenv-node -e normal` 里出现 Redis 客户端 |
 | 2 | ~~三个 `OnceCell`~~ 已删：`pause_publisher` 与 `grants` 是构造参数，`RuntimeRouting` 整条路径不在 `Orchestrator` 里了 | `src/orchestrator/service.rs` | — |
-| 3 | ~~`SandboxOrchestration` facade（38 个方法）~~ 已拆：27 个方法的 `SandboxOrchestration` + 11 个方法的 `NodeOrchestration` | `src/orchestrator/facade.rs` | `SandboxControl` 只需实现前者；`check-crate-boundaries` 盯住 `ApiImpl` 持有的是哪一个 |
+| 3 | ~~`SandboxOrchestration` facade（38 个生产方法）~~ 已拆：`SandboxOrchestration` 22 个生产方法（25 个签名，三个在 `cfg(any(test, feature = "test-support"))` 下）+ `NodeOrchestration` 9 个生产方法（12 个签名，同样三个门控） | `src/orchestrator/facade.rs` | `SandboxControl` 只需实现前者；`check-crate-boundaries` 盯住 `ApiImpl` 持有的是哪一个 |
 | 4 | ~~`src/sandbox/network/iptables_util.rs`（290 行）~~ 已搬：`policy.rs` 的 366-714 行（施加面）连同六个只有它用的链名常量成为 `crates/aenv-node/src/sandbox/network/policy_apply.rs`，`iptables_util.rs` 随之 | — | 施加面对模型半边零引用，唯一消费者是 `slot.rs`；三十七个测试项按同一条线分成 14 + 23 |
 | 5 | ~~`src/secrets/mod.rs`（1,728 行）~~ 已搬进 `crates/aenv-api/src/secrets/service.rs`；`SecretKind` 留在 core 的 `src/secret_kind.rs` | core 消费者 `orchestrator/grants.rs`、`sandbox/network/policy.rs` | `API_EXILED_PATHS` 新增 `src/secrets`，双向变异证据在提交里 |
 | 6 | ~~`RemoteSandboxBackendFactory::build` 的拒绝式实现~~ 已删：冷创建的拒绝现在是 `SandboxControl::plan_launch` 里 `SandboxLaunchSource::Image` 那一臂，返回 `InvalidRequest` | `crates/aenv-api/src/control/mod.rs` | — |
@@ -367,12 +367,21 @@ node gRPC 面、Redis 与 PG 的键与列）都不变——§3 的预留是**新
 6. 新增的模块级守卫有双向变异证据（破坏 → 出现 FAILED 行；复原 → ok；
    `git status` 干净）。
 
-判据现状：六条全部成立。1：步骤 1 的十四个用例逐字未改（模块归位也没动它们，
-`InMemoryMetadataStore` 经 `crates/aenv-api/src/orchestrator/` 的一条
-`#[cfg(test)] pub use` 到位），另新增九个。2：测试计数守恒逐 crate 核过——搬走的
-用例在收方一个不少地出现。4：`cargo tree -p aenv-node -e normal` 不含
-`kube`/`k8s-openapi`/`sqlx`/`redis`，677 → 667；`cargo tree -p aenv-api -e normal`
-528 → 527。6：新增的三条守卫（core 的五条路径、api 的两条、每半边自有的
-`orchestrator` 模块、node 树里的 Redis 客户端）各有双向变异证据。
+判据现状：六条全部成立，数字按 QA-8/QA-9 的实测改正。
+
+1：步骤 1 的用例是**十一**个（10 个 `#[tokio::test]` + 1 个 `#[test]`），逐字节未改；
+`control_path_tests.rs` 现在 38 个，即新增 27 个。（`InMemoryMetadataStore` 经
+`crates/aenv-api/src/orchestrator/` 的一条 `#[cfg(test)] pub use` 到位。）
+2：测试计数守恒逐 crate 核过——搬走的用例在收方一个不少地出现；测试属性总数
+`src` 576 → 309、`crates/aenv-node` 660 → 823、`crates/aenv-api` 622 → 754，
+合计 1,858 → 1,886。消失的十个用例每一个都在提交正文里点名了替代品。
+4：`cargo tree -p aenv-node -e normal` 不含 `kube`/`k8s-openapi`/`sqlx`/`redis`，
+677 → 667 行、去掉 `(*)` 重复后 504 → 495，即真实少了 9 个 crate（`redis` 与它的
+八个传递依赖）。`aenv-api` 528 → 527 **行**，但依赖集合 393 → 393 完全不变：
+那一行之差是 `redis v1.6.0 (*)` 的重复标记消失。判据 4 后半句因此应读作"node 侧
+真实下降 9 个 crate，api 侧不变"。
+6：新增的守卫（core 的五条路径、api 的两条、每半边自有的 `orchestrator` 模块、
+node 树里的 Redis 客户端，以及依赖图规则各自的正控与 `aenv-core/test-support`
+不得走普通依赖边）各有双向变异证据。
 
 §6 只剩第 5 条一类的既定分工，没有待办。

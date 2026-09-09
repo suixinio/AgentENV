@@ -1024,6 +1024,11 @@ impl<S: MetadataStore + 'static> SandboxControl<S> {
         }
         if stage == FailedLaunchStage::Recorded {
             self.rollback_launch(plan).await;
+        } else {
+            // No record to take back, but the binding this launch wrote is
+            // still its own: a runtime nothing records must not stay routable.
+            self.forget_runtime_routing(plan.sandbox_id, plan.execution_id)
+                .await;
         }
     }
 }
@@ -1946,6 +1951,8 @@ impl<S: MetadataStore + 'static> SandboxControl<S> {
             if started.host_interaction_ip().is_none() {
                 warn!(%sandbox_id, "fork child started without an interaction IP");
                 stop_failed_fork(&mut started, sandbox_id).await;
+                self.forget_runtime_routing(sandbox_id, spec.execution_id)
+                    .await;
                 self.revoke_secrets(sandbox_id, spec.execution_id).await;
                 outcomes.push(Err(fork_child_error(
                     sandbox_id,
@@ -1956,6 +1963,8 @@ impl<S: MetadataStore + 'static> SandboxControl<S> {
             if let Err(err) = self.store.add(metadata.clone()).await {
                 warn!(%sandbox_id, error = ?err, "failed to register forked sandbox");
                 stop_failed_fork(&mut started, sandbox_id).await;
+                self.forget_runtime_routing(sandbox_id, spec.execution_id)
+                    .await;
                 self.revoke_secrets(sandbox_id, spec.execution_id).await;
                 outcomes.push(Err(fork_child_error(sandbox_id, anyhow::Error::new(err))));
                 continue;

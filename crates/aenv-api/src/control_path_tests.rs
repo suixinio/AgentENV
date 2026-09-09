@@ -184,6 +184,7 @@ struct TimelineStore {
     inner: InMemoryMetadataStore,
     timeline: Arc<Mutex<Vec<String>>>,
     add_gate: Arc<Mutex<Option<AddGate>>>,
+    refuse_next_add: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Holds the next `add` until the test lets it through.
@@ -193,6 +194,13 @@ struct AddGate {
 }
 
 impl TimelineStore {
+    /// Refuses the next record write, the way a store that already holds that
+    /// id does.
+    fn refuse_the_next_add(&self) {
+        self.refuse_next_add
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Stops the next record write and reports when it is standing there.
     fn stop_the_next_add(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         let (reached, reached_rx) = oneshot::channel();
@@ -213,6 +221,16 @@ impl MetadataStore for TimelineStore {
         if let Some(gate) = gate {
             let _ = gate.reached.send(());
             let _ = gate.proceed.await;
+        }
+        if self
+            .refuse_next_add
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(
+                crate::orchestrator::store::StoreError::SandboxAlreadyExists {
+                    sandbox_id: metadata.id,
+                },
+            );
         }
         self.inner.add(metadata).await
     }
@@ -753,6 +771,7 @@ async fn api_half() -> ApiHalf {
         inner: inner_store.clone(),
         timeline: Arc::clone(&launch_calls),
         add_gate: Arc::default(),
+        refuse_next_add: Arc::default(),
     };
     let record_owner = StoreRecordOwner::shared(store.clone());
     let grants = Arc::new(RecordingGrants::default());
@@ -858,6 +877,27 @@ fn checkpointed_by_the_node(sandbox_id: SandboxId) -> pb::SandboxCheckpointRespo
                     .expect("encode the staged row"),
             ),
         }),
+    }
+}
+
+/// What the node answers a fork with: one started child per requested one.
+fn forked_by_the_node(children: &[(SandboxId, ExecutionId, &str)]) -> pb::SandboxForkResponse {
+    pb::SandboxForkResponse {
+        children: children
+            .iter()
+            .map(|(sandbox_id, execution_id, host_ip)| pb::ForkChildResult {
+                sandbox_id: sandbox_id.to_string(),
+                execution_id: execution_id.to_string(),
+                outcome: Some(pb::fork_child_result::Outcome::Started(
+                    pb::SandboxCreateResponse {
+                        sandbox_id: sandbox_id.to_string(),
+                        execution_id: execution_id.to_string(),
+                        host_interaction_ip: host_ip.to_string(),
+                        ..Default::default()
+                    },
+                )),
+            })
+            .collect(),
     }
 }
 
@@ -2006,4 +2046,122 @@ async fn a_delete_the_node_refuses_keeps_the_routing_binding_of_a_live_sandbox()
         .expect("a sandbox nothing could stop is still routable");
     assert_eq!(binding.state, BindingState::Confirmed);
     assert_eq!(binding.execution_id, metadata.execution_id.to_string());
+}
+
+#[tokio::test]
+async fn a_launch_whose_record_the_store_refuses_retires_its_routing_binding() {
+    let half = api_half().await;
+    half.store.refuse_the_next_add();
+
+    Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect_err("a launch the store would not record must not look like a success");
+
+    let sandbox_id =
+        SandboxId::parse_str(&half.creates_seen()[0].sandbox_id).expect("a sandbox id");
+    assert!(
+        half.binding(sandbox_id).await.is_none(),
+        "a runtime no record names must not stay routable: the gateway would send traffic to a \
+         sandbox nothing can answer for"
+    );
+    assert_eq!(
+        half.routing
+            .forgotten()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<Vec<_>>(),
+        vec![sandbox_id]
+    );
+}
+
+#[tokio::test]
+async fn a_fork_child_whose_record_the_store_refuses_retires_its_routing_binding() {
+    let half = api_half().await;
+    let source = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to fork");
+    let child = crate::orchestrator::ForkChildAssignment {
+        sandbox_id: SandboxId::new(),
+        execution_id: Some(ExecutionId::new()),
+        control_plane_config: None,
+    };
+    let child_id = child.sandbox_id;
+    let child_execution = child.execution_id.expect("the child's incarnation");
+    *half.node.fork.lock().expect("lock") = Some(Ok(forked_by_the_node(&[(
+        child_id,
+        child_execution,
+        "10.0.0.3",
+    )])));
+    half.store.refuse_the_next_add();
+
+    let outcomes = Arc::clone(&half.orchestrator)
+        .fork_sandbox(
+            source.id,
+            crate::orchestrator::ForkChildren::Assigned(vec![child]),
+            crate::orchestrator::store::NewTimeout::UseExisting,
+        )
+        .await
+        .expect("a fork whose child the store refused still answers per child");
+    assert!(
+        outcomes[0].is_err(),
+        "a child no record names must not be answered as started"
+    );
+
+    assert!(
+        half.binding(child_id).await.is_none(),
+        "a forked child no record names must not stay routable"
+    );
+    assert!(
+        half.routing
+            .forgotten()
+            .iter()
+            .any(|(id, execution_id, _)| *id == child_id && *execution_id == child_execution),
+        "the child's own binding was left behind: {:?}",
+        half.routing.forgotten()
+    );
+}
+
+#[tokio::test]
+async fn a_fork_child_with_no_interaction_address_retires_its_routing_binding() {
+    let half = api_half().await;
+    let source = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to fork");
+    let child = crate::orchestrator::ForkChildAssignment {
+        sandbox_id: SandboxId::new(),
+        execution_id: Some(ExecutionId::new()),
+        control_plane_config: None,
+    };
+    let child_id = child.sandbox_id;
+    let child_execution = child.execution_id.expect("the child's incarnation");
+    // A child with no interaction address has nowhere for the proxy to send
+    // traffic, so it is torn down rather than recorded.
+    *half.node.fork.lock().expect("lock") =
+        Some(Ok(forked_by_the_node(&[(child_id, child_execution, "")])));
+
+    let outcomes = Arc::clone(&half.orchestrator)
+        .fork_sandbox(
+            source.id,
+            crate::orchestrator::ForkChildren::Assigned(vec![child]),
+            crate::orchestrator::store::NewTimeout::UseExisting,
+        )
+        .await
+        .expect("a fork whose child has no address still answers per child");
+    assert!(outcomes[0].is_err());
+
+    assert!(
+        half.binding(child_id).await.is_none(),
+        "a child nothing can reach must not stay routable"
+    );
+    assert!(
+        half.routing
+            .forgotten()
+            .iter()
+            .any(|(id, execution_id, _)| *id == child_id && *execution_id == child_execution),
+        "the child's own binding was left behind: {:?}",
+        half.routing.forgotten()
+    );
 }

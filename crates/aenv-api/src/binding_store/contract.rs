@@ -843,6 +843,40 @@ pub async fn reaping_removes_reservations_past_their_window_only<S: BindingStore
     );
 }
 
+pub async fn reaping_leaves_a_reservation_taken_over_since_it_expired_alone<S: BindingStore>(
+    store: &S,
+) {
+    store
+        .reserve_launch("sbx-1", "exec-1", unix(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reserve_launch("sbx-1", "exec-2", unix(601))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::ClaimedFromExpired {
+            execution_id: "exec-1".to_string()
+        },
+    );
+
+    assert_eq!(
+        store.reap_expired_launches(unix(602)).await.unwrap(),
+        0,
+        "the id is held by a launch that started after the expiry a sweep would reap"
+    );
+    assert_eq!(
+        store
+            .reserve_launch("sbx-1", "exec-3", unix(603))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::HeldElsewhere {
+            execution_id: "exec-2".to_string()
+        },
+        "a sweep that reaped this would hand the id to a third launch while the second runs"
+    );
+}
+
 pub async fn a_launch_reservation_leaves_the_routing_record_alone<S: BindingStore>(store: &S) {
     store
         .reserve_launch("sbx-1", "exec-1", unix(0))
@@ -928,6 +962,7 @@ macro_rules! binding_store_contract {
             releasing_a_launch_reservation_frees_the_id,
             releasing_another_launchs_reservation_is_refused,
             reaping_removes_reservations_past_their_window_only,
+            reaping_leaves_a_reservation_taken_over_since_it_expired_alone,
             a_launch_reservation_leaves_the_routing_record_alone,
         );
     };

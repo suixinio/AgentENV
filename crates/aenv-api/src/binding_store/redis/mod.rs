@@ -18,10 +18,7 @@ use super::record::{
     binding_key, marshal_record, node_index_key, normalize_execution_id, parse_record,
     DEFAULT_KEY_PREFIX,
 };
-use super::reservation::{
-    marshal_reservation, parse_reservation, reservation_key, still_exclusive,
-    LaunchReservationOutcome,
-};
+use super::reservation::{marshal_reservation, reservation_key, LaunchReservationOutcome};
 use super::{
     Binding, BindingDeleteOutcome, BindingState, BindingStore, BindingStoreError,
     BindingStoreSettings,
@@ -410,17 +407,17 @@ impl BindingStore for RedisBindingStore {
                 .await
                 .map_err(backend)?;
             for key in keys {
-                let raw: Option<Vec<u8>> = connection.get(&key).await.map_err(backend)?;
-                let Some(raw) = raw else {
-                    continue;
-                };
-                let expired = parse_reservation(&raw).is_none_or(|record| {
-                    !still_exclusive(record.reserved_at_ms, now_ms, window_ms)
-                });
-                if expired {
-                    let removed: i64 = connection.del(&key).await.map_err(backend)?;
-                    reaped += u64::try_from(removed).unwrap_or(0);
-                }
+                // Read and delete in one call: a reservation taken between a
+                // separate read and its delete would be reaped by the sweep
+                // that read the one before it.
+                let removed: i64 = scripts::reap_launch_script()
+                    .key(&key)
+                    .arg(now_ms)
+                    .arg(window_ms)
+                    .invoke_async(&mut connection)
+                    .await
+                    .map_err(backend)?;
+                reaped += u64::try_from(removed).unwrap_or(0);
             }
             cursor = next;
             if cursor == 0 {

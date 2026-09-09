@@ -319,6 +319,31 @@ redis.call("DEL", KEYS[1])
 return "deleted"
 "#;
 
+// KEYS: reservation. ARGV: now_ms, window_ms.
+// The window is re-read inside the same call that deletes, so a reservation
+// renewed between a sweep's read and its delete is not reaped.
+const REAP_LAUNCH_BODY: &str = r#"
+local raw = redis.call("GET", KEYS[1])
+if not raw then
+  return 0
+end
+local ok, decoded = pcall(cjson.decode, raw)
+if ok and decoded then
+  local reserved = tonumber(decoded["reserved_at_ms"])
+  local now = tonumber(ARGV[1]) or 0
+  local window = tonumber(ARGV[2]) or 0
+  if reserved and (now - reserved) < window then
+    return 0
+  end
+end
+return redis.call("DEL", KEYS[1])
+"#;
+
+pub fn reap_launch_script() -> &'static Script {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    SCRIPT.get_or_init(|| Script::new(REAP_LAUNCH_BODY))
+}
+
 pub fn release_launch_script() -> &'static Script {
     static SCRIPT: OnceLock<Script> = OnceLock::new();
     SCRIPT.get_or_init(|| Script::new(RELEASE_LAUNCH_BODY))

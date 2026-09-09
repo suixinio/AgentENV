@@ -1978,3 +1978,32 @@ async fn a_params_patch_with_no_extension_configured_never_reaches_the_node() {
         Some(SandboxState::Running)
     );
 }
+
+#[tokio::test]
+async fn a_delete_the_node_refuses_keeps_the_routing_binding_of_a_live_sandbox() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to delete");
+    *half.node.delete.lock().expect("lock") =
+        Some(Err(Status::internal("this node cannot stop that sandbox")));
+
+    Arc::clone(&half.orchestrator)
+        .delete_sandbox(metadata.id)
+        .await
+        .expect_err("a delete the node refused must not look like a success");
+
+    assert!(
+        half.routing.forgotten().is_empty(),
+        "the sandbox may still be running, and a gateway with no route to it cannot reach it: \
+         {:?}",
+        half.routing.forgotten()
+    );
+    let binding = half
+        .binding(metadata.id)
+        .await
+        .expect("a sandbox nothing could stop is still routable");
+    assert_eq!(binding.state, BindingState::Confirmed);
+    assert_eq!(binding.execution_id, metadata.execution_id.to_string());
+}

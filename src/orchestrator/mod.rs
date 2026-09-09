@@ -1,6 +1,7 @@
 mod facade;
 pub mod grants;
 mod launch_claim;
+pub mod launch_parts;
 mod launch_plan;
 
 mod metrics;
@@ -19,6 +20,10 @@ use crate::virtualization::VirtualizationMode;
 pub use facade::{NodeOrchestration, SandboxOrchestration};
 pub use grants::{GrantIssuer, GrantsIssuedUpstream, NoGrants};
 pub use launch_claim::{LaunchFailure, LaunchHeldElsewhere, LaunchSettlement, RestoredSandbox};
+pub use launch_parts::{
+    configured_runtime_versions, default_fresh_sandbox_resources, resources_with_runtime_info,
+    snapshot_create_parts, SnapshotCreateInputs, SnapshotCreateParts,
+};
 pub use metrics::OrchestratorMetrics;
 #[cfg(any(test, feature = "test-support"))]
 pub use pause_publisher::DiscardingPausePublisher;

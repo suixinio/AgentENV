@@ -473,6 +473,13 @@ struct ScriptedNode {
     create: Mutex<Option<Result<pb::SandboxCreateResponse, Status>>>,
     pause: Mutex<Option<Result<pb::SandboxPauseResponse, Status>>>,
     delete: Mutex<Option<Result<pb::SandboxDeleteResponse, Status>>>,
+    checkpoint: Mutex<Option<Result<pb::SandboxCheckpointResponse, Status>>>,
+    fork: Mutex<Option<Result<pb::SandboxForkResponse, Status>>>,
+    /// What the node says it is running under an id, one answer per call in
+    /// call order: attaching to a sandbox asks once before the operation, and
+    /// settling a capture the node did not classify asks again after it.
+    describe: Mutex<std::collections::VecDeque<Result<pb::SandboxDescribeResponse, Status>>>,
+    update_network: Mutex<Option<Result<pb::SandboxNetworkResponse, Status>>>,
     /// Read inside the create handler, so what it sees is the state the api
     /// half had reached before the node was asked to start anything.
     bindings_when_created: Mutex<Vec<Option<BindingState>>>,
@@ -480,6 +487,10 @@ struct ScriptedNode {
     seen_create: Mutex<Vec<pb::SandboxCreateRequest>>,
     seen_pause: Mutex<Vec<pb::SandboxPauseRequest>>,
     seen_delete: Mutex<Vec<pb::SandboxDeleteRequest>>,
+    seen_checkpoint: Mutex<Vec<pb::SandboxCheckpointRequest>>,
+    seen_fork: Mutex<Vec<pb::SandboxForkRequest>>,
+    seen_update_network: Mutex<Vec<pb::SandboxNetworkRequest>>,
+    seen_update_params: Mutex<Vec<pb::SandboxParamsRequest>>,
 }
 
 #[derive(Clone)]
@@ -557,29 +568,58 @@ impl NodeSandboxService for ScriptedNodeService {
 
     async fn checkpoint(
         &self,
-        _request: Request<pb::SandboxCheckpointRequest>,
+        request: Request<pb::SandboxCheckpointRequest>,
     ) -> Result<Response<pb::SandboxCheckpointResponse>, Status> {
-        Err(Status::unimplemented("no checkpoint was scripted"))
+        self.0
+            .seen_checkpoint
+            .lock()
+            .expect("lock")
+            .push(request.into_inner());
+        match self.0.checkpoint.lock().expect("lock").take() {
+            Some(answer) => answer.map(Response::new),
+            None => Err(Status::unimplemented("no checkpoint was scripted")),
+        }
     }
 
     async fn fork(
         &self,
-        _request: Request<pb::SandboxForkRequest>,
+        request: Request<pb::SandboxForkRequest>,
     ) -> Result<Response<pb::SandboxForkResponse>, Status> {
-        Err(Status::unimplemented("no fork was scripted"))
+        self.0
+            .seen_fork
+            .lock()
+            .expect("lock")
+            .push(request.into_inner());
+        match self.0.fork.lock().expect("lock").take() {
+            Some(answer) => answer.map(Response::new),
+            None => Err(Status::unimplemented("no fork was scripted")),
+        }
     }
 
     async fn update_network(
         &self,
-        _request: Request<pb::SandboxNetworkRequest>,
+        request: Request<pb::SandboxNetworkRequest>,
     ) -> Result<Response<pb::SandboxNetworkResponse>, Status> {
-        Ok(Response::new(pb::SandboxNetworkResponse {}))
+        self.0
+            .seen_update_network
+            .lock()
+            .expect("lock")
+            .push(request.into_inner());
+        match self.0.update_network.lock().expect("lock").take() {
+            Some(answer) => answer.map(Response::new),
+            None => Ok(Response::new(pb::SandboxNetworkResponse {})),
+        }
     }
 
     async fn update_params(
         &self,
-        _request: Request<pb::SandboxParamsRequest>,
+        request: Request<pb::SandboxParamsRequest>,
     ) -> Result<Response<pb::SandboxParamsResponse>, Status> {
+        self.0
+            .seen_update_params
+            .lock()
+            .expect("lock")
+            .push(request.into_inner());
         Ok(Response::new(pb::SandboxParamsResponse {}))
     }
 
@@ -587,10 +627,14 @@ impl NodeSandboxService for ScriptedNodeService {
         &self,
         request: Request<pb::SandboxDescribeRequest>,
     ) -> Result<Response<pb::SandboxDescribeResponse>, Status> {
-        Err(Status::not_found(format!(
-            "sandbox {} is not running on this node",
-            request.into_inner().sandbox_id
-        )))
+        let request = request.into_inner();
+        match self.0.describe.lock().expect("lock").pop_front() {
+            Some(answer) => answer.map(Response::new),
+            None => Err(Status::not_found(format!(
+                "sandbox {} is not running on this node",
+                request.sandbox_id
+            ))),
+        }
     }
 
     async fn list_sandboxes(
@@ -776,26 +820,8 @@ fn cold_create() -> CreateSandboxRequest {
 /// A create whose policy names one secret: the shape in which starting a
 /// sandbox includes issuing a grant for it.
 fn cold_create_naming_a_secret() -> CreateSandboxRequest {
-    let mut rules = std::collections::BTreeMap::new();
-    rules.insert(
-        "api.example.com".to_string(),
-        vec![crate::sandbox::network::policy::DomainRule {
-            transform: crate::sandbox::network::policy::HeaderTransform {
-                headers: [(
-                    "authorization".to_string(),
-                    "Bearer ${aenv.secrets.openai}".to_string(),
-                )]
-                .into_iter()
-                .collect(),
-            },
-        }],
-    );
     CreateSandboxRequest {
-        network_policy: crate::sandbox::SandboxNetworkPolicy::new(
-            Default::default(),
-            crate::sandbox::SandboxNetworkEgressPolicy::with_rules(None, None, Some(rules))
-                .expect("the policy validates"),
-        ),
+        network_policy: policy_naming("openai"),
         ..cold_create()
     }
 }
@@ -814,7 +840,62 @@ fn paused_row() -> SnapshotRecord {
 }
 
 fn staged_by_the_node(sandbox_id: SandboxId) -> pb::SandboxPauseResponse {
-    let staged = StagedSnapshot {
+    pb::SandboxPauseResponse {
+        staged: Some(pb::StagedSnapshot {
+            value: Some(
+                crate::node_client::wire::serialize(&staged_for(sandbox_id), "staged snapshot")
+                    .expect("encode the staged row"),
+            ),
+        }),
+    }
+}
+
+fn checkpointed_by_the_node(sandbox_id: SandboxId) -> pb::SandboxCheckpointResponse {
+    pb::SandboxCheckpointResponse {
+        staged: Some(pb::StagedSnapshot {
+            value: Some(
+                crate::node_client::wire::serialize(&staged_for(sandbox_id), "staged snapshot")
+                    .expect("encode the staged row"),
+            ),
+        }),
+    }
+}
+
+/// What a node answers about a sandbox it is running: complete live facts.
+fn still_running(execution_id: ExecutionId) -> pb::SandboxDescribeResponse {
+    pb::SandboxDescribeResponse {
+        execution_id: execution_id.to_string(),
+        host_interaction_ip: "10.0.0.2".to_string(),
+        rootfs_virtual_size: 1,
+        facts_from_handle: true,
+    }
+}
+
+/// A policy whose one rule spends one named secret.
+fn policy_naming(secret: &str) -> crate::sandbox::SandboxNetworkPolicy {
+    let mut rules = std::collections::BTreeMap::new();
+    rules.insert(
+        "api.example.com".to_string(),
+        vec![crate::sandbox::network::policy::DomainRule {
+            transform: crate::sandbox::network::policy::HeaderTransform {
+                headers: [(
+                    "authorization".to_string(),
+                    format!("Bearer ${{aenv.secrets.{secret}}}"),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        }],
+    );
+    crate::sandbox::SandboxNetworkPolicy::new(
+        Default::default(),
+        crate::sandbox::SandboxNetworkEgressPolicy::with_rules(None, None, Some(rules))
+            .expect("the policy validates"),
+    )
+}
+
+fn staged_for(sandbox_id: SandboxId) -> StagedSnapshot {
+    StagedSnapshot {
         commit: SnapshotCommit {
             id: SnapshotId::generate(),
             alias: None,
@@ -828,14 +909,6 @@ fn staged_by_the_node(sandbox_id: SandboxId) -> pb::SandboxPauseResponse {
         },
         staged_at_unix_ms: 1_700_000_000_000,
         origin_node_id: NODE_ID.to_string(),
-    };
-    pb::SandboxPauseResponse {
-        staged: Some(pb::StagedSnapshot {
-            value: Some(
-                crate::node_client::wire::serialize(&staged, "staged snapshot")
-                    .expect("encode the staged row"),
-            ),
-        }),
     }
 }
 
@@ -1580,4 +1653,328 @@ async fn a_second_launch_of_one_id_is_held_until_the_first_has_recorded_it() {
         .await
         .expect("the first launch task finishes")
         .expect("the first launch records its sandbox");
+}
+
+#[tokio::test]
+async fn a_capture_hands_back_what_the_node_staged_and_leaves_the_sandbox_running() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to capture");
+    *half.node.checkpoint.lock().expect("lock") = Some(Ok(checkpointed_by_the_node(metadata.id)));
+
+    let captured = Arc::clone(&half.orchestrator)
+        .capture_snapshot(metadata.id)
+        .await
+        .expect("the api half captures a snapshot of the running sandbox");
+
+    assert_eq!(captured.metadata.state, SandboxState::Running);
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        Some(SandboxState::Running),
+        "a capture leaves the sandbox running, so its record has to say so"
+    );
+    let binding = half
+        .binding(metadata.id)
+        .await
+        .expect("a captured sandbox is still routable");
+    assert_eq!(binding.state, BindingState::Confirmed);
+}
+
+#[tokio::test]
+async fn a_capture_the_node_could_not_classify_leaves_a_sandbox_it_still_runs_running() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to capture");
+    // No classification in the details: only the node holding the sandbox can
+    // say what became of it, and here it says it is still running it.
+    *half.node.checkpoint.lock().expect("lock") =
+        Some(Err(Status::internal("the capture never landed")));
+    // Attaching asks first; settling the unclassified capture asks again.
+    *half.node.describe.lock().expect("lock") = [
+        Ok(still_running(metadata.execution_id)),
+        Ok(still_running(metadata.execution_id)),
+    ]
+    .into();
+
+    Arc::clone(&half.orchestrator)
+        .capture_snapshot(metadata.id)
+        .await
+        .expect_err("a capture the node could not classify is not a success");
+
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        Some(SandboxState::Running),
+        "the sandbox is still running on its node, so its record goes back to running"
+    );
+    assert!(
+        half.node.seen_delete.lock().expect("lock").is_empty(),
+        "an unclassified capture must not stop a sandbox that is still running"
+    );
+    assert!(
+        half.routing.forgotten().is_empty(),
+        "a sandbox still running on its node has to stay routable"
+    );
+}
+
+#[tokio::test]
+async fn a_capture_the_node_could_not_classify_drops_the_record_of_a_sandbox_it_no_longer_runs() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create_naming_a_secret())
+        .await
+        .expect("a sandbox to capture");
+    *half.node.checkpoint.lock().expect("lock") =
+        Some(Err(Status::internal("the capture never landed")));
+    // The node answers that it is not running this sandbox: the default
+    // `describe` of a node that never heard of it.
+
+    Arc::clone(&half.orchestrator)
+        .capture_snapshot(metadata.id)
+        .await
+        .expect_err("a capture the node could not classify is not a success");
+
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        None,
+        "the node that held this sandbox says it is gone, which is what authorizes the removal"
+    );
+    assert!(
+        half.binding(metadata.id).await.is_none(),
+        "a sandbox nothing runs any more must not stay routable"
+    );
+    assert!(
+        half.revoked()
+            .contains(&(metadata.id, metadata.execution_id)),
+        "the grant of a sandbox nothing runs any more outlived it: {:?}",
+        half.revoked()
+    );
+}
+
+#[tokio::test]
+async fn a_capture_the_node_could_not_be_asked_about_leaves_the_record_alone() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to capture");
+    *half.node.checkpoint.lock().expect("lock") =
+        Some(Err(Status::internal("the capture never landed")));
+    // The attach is answered; the question about what became of the capture
+    // is the one the node cannot answer.
+    *half.node.describe.lock().expect("lock") = [
+        Ok(still_running(metadata.execution_id)),
+        Err(Status::internal("this node cannot answer right now")),
+    ]
+    .into();
+
+    Arc::clone(&half.orchestrator)
+        .capture_snapshot(metadata.id)
+        .await
+        .expect_err("a capture the node could not classify is not a success");
+
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        Some(SandboxState::Running),
+        "a node that could not be asked has not authorized anything; the record goes back"
+    );
+    assert!(
+        half.routing.forgotten().is_empty(),
+        "a guess about a runtime nobody could ask about must not retire its binding"
+    );
+}
+
+#[tokio::test]
+async fn a_fork_the_node_refuses_revokes_every_child_grant_it_issued() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create_naming_a_secret())
+        .await
+        .expect("a sandbox to fork");
+    let children: Vec<crate::orchestrator::ForkChildAssignment> = (0..2)
+        .map(|_| crate::orchestrator::ForkChildAssignment {
+            sandbox_id: SandboxId::new(),
+            execution_id: None,
+            control_plane_config: None,
+        })
+        .collect();
+    let child_ids: Vec<SandboxId> = children.iter().map(|child| child.sandbox_id).collect();
+    *half.node.fork.lock().expect("lock") =
+        Some(Err(Status::internal("this node cannot fork right now")));
+
+    Arc::clone(&half.orchestrator)
+        .fork_sandbox(
+            metadata.id,
+            crate::orchestrator::ForkChildren::Assigned(children),
+            crate::orchestrator::store::NewTimeout::UseExisting,
+        )
+        .await
+        .expect_err("a fork the node refused must not look like a success");
+
+    for child_id in &child_ids {
+        assert!(
+            half.granted().iter().any(|(id, _, _)| id == child_id),
+            "a child that could open a brokered connection was never granted anything"
+        );
+        assert!(
+            half.revoked().iter().any(|(id, _)| id == child_id),
+            "the grant of a child that never started outlived the fork: {:?}",
+            half.revoked()
+        );
+    }
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        Some(SandboxState::Running),
+        "the source sandbox never stopped running, so its record goes back to running"
+    );
+}
+
+#[tokio::test]
+async fn a_pause_whose_commit_fails_is_retried_because_the_node_cannot_put_the_vm_back() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to pause");
+    *half.node.pause.lock().expect("lock") = Some(Ok(staged_by_the_node(metadata.id)));
+    // A node that paused a sandbox has already stopped and forgotten it, so a
+    // failed commit has no VM to put back: the staged bytes are the only copy
+    // of this sandbox and the commit is retried rather than abandoned.
+    half.snapshots.refuse_commits(1);
+
+    Arc::clone(&half.orchestrator)
+        .pause_sandbox(metadata.id)
+        .await
+        .expect("a retried commit publishes the capture of a sandbox that cannot come back");
+
+    assert_eq!(
+        half.snapshots.committed().len(),
+        1,
+        "the pause row of a sandbox whose bytes were staged once has to exist exactly once"
+    );
+    assert_eq!(half.record_state(metadata.id).await, None);
+    assert!(
+        half.binding(metadata.id).await.is_none(),
+        "a paused sandbox that still routes somewhere"
+    );
+}
+
+#[tokio::test]
+async fn a_network_policy_replace_grants_the_new_secret_before_the_node_takes_the_rules() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create_naming_a_secret())
+        .await
+        .expect("a sandbox whose policy names a secret");
+
+    Arc::clone(&half.orchestrator)
+        .replace_sandbox_network_policy(metadata.id, policy_naming("anthropic"))
+        .await
+        .expect("the api half replaces the policy on the node and in the record");
+
+    assert_eq!(
+        half.node.seen_update_network.lock().expect("lock").len(),
+        1,
+        "the new rules never reached the node running the sandbox"
+    );
+    assert_eq!(
+        half.granted().last().expect("a grant was issued").2,
+        vec!["anthropic".to_string()],
+        "the broker checks the grant, so it has to name the new policy's secret: {:?}",
+        half.granted()
+    );
+    let record = half
+        .orchestrator
+        .get_sandbox(&metadata.id)
+        .await
+        .expect("the metadata store answers")
+        .expect("the sandbox is still recorded");
+    assert_eq!(
+        record
+            .network_policy
+            .egress
+            .referenced_secret_names()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["anthropic".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_network_policy_replace_the_node_refuses_puts_the_previous_grant_back() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create_naming_a_secret())
+        .await
+        .expect("a sandbox whose policy names a secret");
+    *half.node.update_network.lock().expect("lock") =
+        Some(Err(Status::internal("this node cannot apply those rules")));
+
+    Arc::clone(&half.orchestrator)
+        .replace_sandbox_network_policy(metadata.id, policy_naming("anthropic"))
+        .await
+        .expect_err("a policy the node refused must not look like a success");
+
+    assert_eq!(
+        half.granted().last().expect("a grant was issued").2,
+        vec!["openai".to_string()],
+        "the runtime kept the previous rules, so its grant has to name the previous secret: {:?}",
+        half.granted()
+    );
+    let record = half
+        .orchestrator
+        .get_sandbox(&metadata.id)
+        .await
+        .expect("the metadata store answers")
+        .expect("the sandbox is still recorded");
+    assert_eq!(
+        record
+            .network_policy
+            .egress
+            .referenced_secret_names()
+            .into_iter()
+            .collect::<Vec<_>>(),
+        vec!["openai".to_string()],
+        "a policy the node refused must not be recorded as the sandbox's own"
+    );
+}
+
+#[tokio::test]
+async fn a_params_patch_with_no_extension_configured_never_reaches_the_node() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to patch");
+
+    Arc::clone(&half.orchestrator)
+        .patch_sandbox_custom_extension_params(metadata.id, serde_json::Map::new())
+        .await
+        .expect_err("only the extension that owns these parameters can produce new ones");
+
+    assert!(
+        half.node
+            .seen_update_params
+            .lock()
+            .expect("lock")
+            .is_empty(),
+        "a patch nothing produced must not reach the node"
+    );
+    let record = half
+        .orchestrator
+        .get_sandbox(&metadata.id)
+        .await
+        .expect("the metadata store answers")
+        .expect("the sandbox is still recorded");
+    assert!(
+        record.custom_extension_params.is_none(),
+        "a patch that failed must leave the recorded parameters alone"
+    );
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        Some(SandboxState::Running)
+    );
 }

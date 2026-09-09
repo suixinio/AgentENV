@@ -59,16 +59,16 @@ async fn make_orchestrator_with_publisher_over<F: SandboxBackendFactory>(
     factory: F,
     publisher: Arc<dyn PausePublisher>,
 ) -> Arc<TestOrchestrator<InMemoryMetadataStore, F>> {
-    let orchestrator = Orchestrator::new(
+    Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         store,
         factory,
         test_runtime_image_refs(),
+        publisher,
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
-    .expect("in-memory orchestrator should not fail to construct");
-    orchestrator.set_pause_publisher(publisher);
-    orchestrator
+    .expect("in-memory orchestrator should not fail to construct")
 }
 
 fn make_orchestrator_without_background<S: MetadataStore + 'static>(
@@ -107,17 +107,6 @@ fn make_orchestrator_without_background_parts<
     factory: F,
     default_sandbox_timeout: Duration,
 ) -> Arc<TestOrchestrator<S, F>> {
-    let orchestrator = make_orchestrator_without_publisher(store, factory, default_sandbox_timeout);
-    orchestrator.set_pause_publisher(DiscardingPausePublisher::shared());
-    orchestrator
-}
-
-/// An orchestrator with nowhere to publish a pause.
-fn make_orchestrator_without_publisher<S: MetadataStore + 'static, F: SandboxBackendFactory>(
-    store: S,
-    factory: F,
-    default_sandbox_timeout: Duration,
-) -> Arc<TestOrchestrator<S, F>> {
     Arc::new(Orchestrator::from_test_parts(
         store,
         factory,
@@ -125,6 +114,42 @@ fn make_orchestrator_without_publisher<S: MetadataStore + 'static, F: SandboxBac
         test_runtime_image_refs(),
         "orchestrator-test-seed",
     ))
+}
+
+/// An orchestrator whose pauses land in a publisher the caller can watch.
+fn make_orchestrator_publishing_to<S: MetadataStore + 'static, F: SandboxBackendFactory>(
+    store: S,
+    factory: F,
+    default_sandbox_timeout: Duration,
+    publisher: Arc<dyn PausePublisher>,
+) -> Arc<TestOrchestrator<S, F>> {
+    Arc::new(
+        Orchestrator::from_test_parts(
+            store,
+            factory,
+            default_sandbox_timeout,
+            test_runtime_image_refs(),
+            "orchestrator-test-seed",
+        )
+        .publishing_to(publisher),
+    )
+}
+
+/// An orchestrator whose grants land in an issuer the caller can watch.
+async fn make_orchestrator_granting_to<F: SandboxBackendFactory>(
+    factory: F,
+    grants: Arc<dyn crate::orchestrator::GrantIssuer>,
+) -> Arc<TestOrchestrator<InMemoryMetadataStore, F>> {
+    Orchestrator::new(
+        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+        InMemoryMetadataStore::new(),
+        factory,
+        test_runtime_image_refs(),
+        DiscardingPausePublisher::shared(),
+        grants,
+    )
+    .await
+    .expect("in-memory orchestrator should not fail to construct")
 }
 
 struct FailingPausePublisher;
@@ -1960,12 +1985,12 @@ async fn a_pause_whose_vm_is_gone_retries_the_commit_of_the_bytes_the_node_stage
         },
     );
     let publisher = FlakyPausePublisher::new(2);
-    let orchestrator = make_orchestrator_without_publisher(
+    let orchestrator = make_orchestrator_publishing_to(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         TEST_DEFAULT_SANDBOX_TIMEOUT,
+        Arc::clone(&publisher) as Arc<dyn PausePublisher>,
     );
-    orchestrator.set_pause_publisher(Arc::clone(&publisher) as Arc<dyn PausePublisher>);
     let created = orchestrator
         .create_sandbox(create_request(Some(600), &[("team", "pause-retry")]))
         .await?;
@@ -2114,338 +2139,6 @@ async fn a_launch_racing_one_still_starting_is_refused_before_it_allocates_anyth
     Ok(())
 }
 
-#[tokio::test]
-async fn a_caller_joining_a_launch_in_flight_is_answered_with_what_that_launch_produced(
-) -> Result<()> {
-    setup();
-    let started = Arc::new(AtomicUsize::new(0));
-    let behavior = slow_launch_behavior(&started);
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
-
-    let sandbox_id = SandboxId::new();
-    let winner = tokio::spawn({
-        let orchestrator = Arc::clone(&orchestrator);
-        async move {
-            orchestrator
-                .restore_sandbox(sandbox_id, create_request(Some(60), &[("team", "winner")]))
-                .await
-        }
-    });
-    wait_until("waiting for the first launch to reach its start", || {
-        started.load(Ordering::SeqCst) > 0
-    })
-    .await;
-
-    let joined = Arc::clone(&orchestrator)
-        .restore_or_join_launch(sandbox_id, create_request(Some(60), &[("team", "joiner")]))
-        .await?;
-    let launched = winner.await.expect("the winning launch task")?;
-    assert!(joined.joined, "this caller did not perform the launch");
-    assert_eq!(joined.metadata.execution_id, launched.execution_id);
-    assert_eq!(joined.metadata.state, SandboxState::Running);
-    assert_eq!(
-        behavior.stop_calls(),
-        0,
-        "joining is waiting, so nothing was built and nothing was torn down"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_caller_waiting_out_another_replicas_launch_answers_with_the_record_it_left() -> Result<()>
-{
-    setup();
-    let orchestrator = make_orchestrator().await;
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "elsewhere")]))
-        .await?;
-
-    let waited = orchestrator
-        .await_launch_elsewhere(
-            created.id,
-            OrchestratorError::InternalError("the reservation was refused".to_string()),
-        )
-        .await?;
-    assert_eq!(waited.execution_id, created.execution_id);
-    assert_eq!(waited.state, SandboxState::Running);
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_caller_waiting_out_a_launch_of_a_sandbox_being_deleted_is_told_it_is_gone() -> Result<()>
-{
-    setup();
-    let orchestrator = make_orchestrator().await;
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "elsewhere")]))
-        .await?;
-    orchestrator
-        .store
-        .update_if_state(&created.id, &[SandboxState::Running], |metadata| {
-            metadata.state = SandboxState::Killing
-        })
-        .await?;
-
-    let err = orchestrator
-        .await_launch_elsewhere(
-            created.id,
-            OrchestratorError::InternalError("the reservation was refused".to_string()),
-        )
-        .await
-        .expect_err("a sandbox being torn down is not one to wait for");
-    assert!(
-        matches!(err, OrchestratorError::SandboxNotFound(id) if id == created.id),
-        "{err:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_caller_joining_a_launch_that_fails_fails_with_that_launchs_error() -> Result<()> {
-    setup();
-    let started = Arc::new(AtomicUsize::new(0));
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.set_on_operation(MockOperation::StartNowait, counting_hook(&started));
-    behavior.push_action(
-        MockOperation::StartNowait,
-        MockAction::FailAfter {
-            delay: Duration::from_millis(400),
-            message: "the runtime refused to start".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
-
-    let sandbox_id = SandboxId::new();
-    let loser = tokio::spawn({
-        let orchestrator = Arc::clone(&orchestrator);
-        async move {
-            orchestrator
-                .restore_sandbox(sandbox_id, create_request(Some(60), &[("team", "winner")]))
-                .await
-        }
-    });
-    wait_until("waiting for the first launch to reach its start", || {
-        started.load(Ordering::SeqCst) > 0
-    })
-    .await;
-
-    let joined = Arc::clone(&orchestrator)
-        .restore_or_join_launch(sandbox_id, create_request(Some(60), &[("team", "joiner")]))
-        .await
-        .expect_err("a joiner cannot succeed where the launch it joined failed");
-    assert!(
-        matches!(joined, OrchestratorError::InternalError(ref message) if message.contains("the runtime refused to start")),
-        "{joined:?}"
-    );
-    assert!(loser.await.expect("the failing launch task").is_err());
-    Ok(())
-}
-
-/// A launch that stays inside `start_nowait` until the returned counter has
-/// been observed and then meets the reservation another replica holds, which
-/// is the refusal that decides nothing about the id by itself.
-fn held_elsewhere_launch_behavior(
-    started: &Arc<AtomicUsize>,
-    sandbox_id: SandboxId,
-) -> Arc<MockBehavior> {
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.set_on_operation(MockOperation::StartNowait, counting_hook(started));
-    behavior.push_action(
-        MockOperation::StartNowait,
-        MockAction::FailHeldElsewhere {
-            delay: Duration::from_millis(400),
-            sandbox_id,
-        },
-    );
-    behavior
-}
-
-fn spawn_joiners(
-    orchestrator: &Arc<TestOrchestrator>,
-    sandbox_id: SandboxId,
-    count: usize,
-) -> Vec<tokio::task::JoinHandle<Result<RestoredSandbox>>> {
-    (0..count)
-        .map(|_| {
-            let orchestrator = Arc::clone(orchestrator);
-            tokio::spawn(async move {
-                orchestrator
-                    .restore_or_join_launch(
-                        sandbox_id,
-                        create_request(Some(60), &[("team", "joiner")]),
-                    )
-                    .await
-            })
-        })
-        .collect()
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_launch_another_replica_reserved_answers_its_joiners_with_that_replicas_record(
-) -> Result<()> {
-    setup();
-    let sandbox_id = SandboxId::new();
-    let started = Arc::new(AtomicUsize::new(0));
-    let behavior = held_elsewhere_launch_behavior(&started, sandbox_id);
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
-
-    let claimant = tokio::spawn({
-        let orchestrator = Arc::clone(&orchestrator);
-        async move {
-            orchestrator
-                .restore_or_join_launch(
-                    sandbox_id,
-                    create_request(Some(60), &[("team", "claimant")]),
-                )
-                .await
-        }
-    });
-    wait_until("waiting for the claimant to reach its reservation", || {
-        started.load(Ordering::SeqCst) > 0
-    })
-    .await;
-    let joiners = spawn_joiners(&orchestrator, sandbox_id, 2);
-
-    let elsewhere = ExecutionId::new();
-    orchestrator
-        .store
-        .add(SandboxMetadata {
-            id: sandbox_id,
-            execution_id: elsewhere,
-            state: SandboxState::Running,
-            ..Default::default()
-        })
-        .await?;
-
-    let claimed = claimant
-        .await
-        .expect("the claimant task")
-        .expect("the claimant waits out the replica that took the id");
-    assert!(claimed.joined);
-    assert_eq!(claimed.metadata.execution_id, elsewhere);
-    assert_eq!(claimed.metadata.state, SandboxState::Running);
-    for joiner in joiners {
-        let joined = joiner.await.expect("a joiner task").expect(
-            "a joiner answers what the launch it joined settled on, not the refusal that launch \
-             met on its way there",
-        );
-        assert!(joined.joined);
-        assert_eq!(
-            joined.metadata.execution_id, elsewhere,
-            "a joiner must land on the record the other replica wrote"
-        );
-        assert_eq!(joined.metadata.state, SandboxState::Running);
-    }
-    assert_eq!(
-        started.load(Ordering::SeqCst),
-        1,
-        "only the claimant reached a runtime; the joiners waited"
-    );
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_launch_another_replica_reserved_but_never_recorded_runs_out_the_same_way_for_everyone(
-) -> Result<()> {
-    setup();
-    let sandbox_id = SandboxId::new();
-    let started = Arc::new(AtomicUsize::new(0));
-    let behavior = held_elsewhere_launch_behavior(&started, sandbox_id);
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
-
-    let began = tokio::time::Instant::now();
-    let claimant = tokio::spawn({
-        let orchestrator = Arc::clone(&orchestrator);
-        async move {
-            orchestrator
-                .restore_or_join_launch(
-                    sandbox_id,
-                    create_request(Some(60), &[("team", "claimant")]),
-                )
-                .await
-        }
-    });
-    wait_until("waiting for the claimant to reach its reservation", || {
-        started.load(Ordering::SeqCst) > 0
-    })
-    .await;
-    let joiners = spawn_joiners(&orchestrator, sandbox_id, 2);
-
-    let refused = claimant
-        .await
-        .expect("the claimant task")
-        .expect_err("no replica ever wrote a record for this sandbox");
-    assert_launch_wait_ran_out(&refused, "the claimant");
-    for joiner in joiners {
-        let err = joiner
-            .await
-            .expect("a joiner task")
-            .expect_err("no replica ever wrote a record for this sandbox");
-        assert_launch_wait_ran_out(&err, "a joiner");
-    }
-    let waited = tokio::time::Instant::now() - began;
-    assert!(
-        waited <= WAIT_TRANSITION_TIMEOUT + Duration::from_secs(5),
-        "waiting for another replica's record is one bounded wait, not one per hop: {waited:?}"
-    );
-    Ok(())
-}
-
-fn assert_launch_wait_ran_out(error: &OrchestratorError, who: &str) {
-    assert!(
-        matches!(
-            error,
-            OrchestratorError::SandboxOperationFailed {
-                operation: SandboxOperation::Start,
-                ..
-            }
-        ),
-        "{who} answered a different error class: {error:?}"
-    );
-    assert!(
-        LaunchHeldElsewhere::refused(error),
-        "{who} lost the marker that says the wait was on another replica: {error:?}"
-    );
-}
-
-#[tokio::test]
-async fn a_launch_takes_an_id_whose_runtime_the_cluster_no_longer_routes_to() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "resumed-elsewhere")]))
-        .await?;
-    // A pause performed by another replica leaves this one's handle behind.
-    orchestrator.set_runtime_routing(Arc::new(FixedRouting(false)));
-
-    let restored = Arc::clone(&orchestrator)
-        .restore_sandbox(
-            created.id,
-            create_request(Some(60), &[("team", "resumed-here")]),
-        )
-        .await
-        .expect("a handle nothing routes to must not refuse this sandbox's resume");
-
-    assert_eq!(restored.id, created.id);
-    assert_ne!(
-        restored.execution_id, created.execution_id,
-        "the resume is a new run under the same id"
-    );
-    assert_proxy_ready(&orchestrator, &created.id).await?;
-    Ok(())
-}
-
 #[test]
 fn a_joined_pause_waits_out_the_owners_whole_retry_budget() {
     assert!(
@@ -2469,12 +2162,12 @@ async fn pause_commit_retries_stop_at_their_deadline_however_slow_each_attempt_i
     );
     // Two attempts fit inside the budget; the third backoff would end past it.
     let publisher = SlowFailingPausePublisher::new(Duration::from_secs(20));
-    let orchestrator = make_orchestrator_without_publisher(
+    let orchestrator = make_orchestrator_publishing_to(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         TEST_DEFAULT_SANDBOX_TIMEOUT,
+        Arc::clone(&publisher) as Arc<dyn PausePublisher>,
     );
-    orchestrator.set_pause_publisher(Arc::clone(&publisher) as Arc<dyn PausePublisher>);
     let created = orchestrator
         .create_sandbox(create_request(Some(600), &[("team", "pause-deadline")]))
         .await?;
@@ -2510,14 +2203,14 @@ async fn a_retried_pause_commit_never_deletes_the_bytes_it_is_about_to_commit() 
         },
     );
     let (manager, repository) = crate::snapshot::mock::recording_snapshot_manager();
-    let orchestrator = make_orchestrator_without_publisher(
+    let orchestrator = make_orchestrator_publishing_to(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         TEST_DEFAULT_SANDBOX_TIMEOUT,
+        Arc::new(
+            crate::orchestrator::pause_publisher::CommittingPausePublisher::new(Arc::new(manager)),
+        ),
     );
-    orchestrator.set_pause_publisher(Arc::new(
-        crate::orchestrator::pause_publisher::CommittingPausePublisher::new(Arc::new(manager)),
-    ));
     let created = orchestrator
         .create_sandbox(create_request(Some(600), &[("team", "pause-retain")]))
         .await?;
@@ -2552,12 +2245,12 @@ async fn a_pause_that_never_commits_says_where_its_bytes_were_kept() -> Result<(
         },
     );
     let publisher = FlakyPausePublisher::new(usize::MAX);
-    let orchestrator = make_orchestrator_without_publisher(
+    let orchestrator = make_orchestrator_publishing_to(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         TEST_DEFAULT_SANDBOX_TIMEOUT,
+        Arc::clone(&publisher) as Arc<dyn PausePublisher>,
     );
-    orchestrator.set_pause_publisher(Arc::clone(&publisher) as Arc<dyn PausePublisher>);
     let created = orchestrator
         .create_sandbox(create_request(
             Some(600),
@@ -2587,39 +2280,6 @@ async fn a_pause_that_never_commits_says_where_its_bytes_were_kept() -> Result<(
         causes.contains("capture bytes were retained under snapshot"),
         "the error must name where an operator can find the bytes: {causes}"
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn pause_without_a_wired_publisher_is_an_internal_error() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    let orchestrator = make_orchestrator_without_publisher(
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
-        TEST_DEFAULT_SANDBOX_TIMEOUT,
-    );
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "pause-no-publisher")]))
-        .await?;
-    let sandbox_id = created.id;
-
-    let err = orchestrator
-        .pause_sandbox(sandbox_id)
-        .await
-        .expect_err("a process with nowhere to publish a pause cannot pause");
-    assert!(
-        matches!(err, OrchestratorError::InternalError(_)),
-        "{err:?}"
-    );
-
-    let metadata = orchestrator
-        .get_sandbox(&sandbox_id)
-        .await?
-        .expect("the sandbox is still recorded");
-    assert_eq!(metadata.state, SandboxState::Running);
-    assert_eq!(behavior.stop_calls(), 0);
-    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
     Ok(())
 }
 
@@ -3855,12 +3515,12 @@ impl PausePublisher for AnsweringPausePublisher {
 async fn join_a_vanishing_pause(
     answer: Option<crate::snapshot::SnapshotId>,
 ) -> Result<PauseOutcome> {
-    let orchestrator = make_orchestrator_without_publisher(
+    let orchestrator = make_orchestrator_publishing_to(
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         TEST_DEFAULT_SANDBOX_TIMEOUT,
+        Arc::new(AnsweringPausePublisher { answer }),
     );
-    orchestrator.set_pause_publisher(Arc::new(AnsweringPausePublisher { answer }));
     let sandbox_id = SandboxId::new();
     orchestrator
         .set_metadata_state_for_test(sandbox_id, SandboxState::Pausing)
@@ -5451,6 +5111,8 @@ async fn a_control_plane_orchestrator_stamps_its_own_record_onto_the_create() {
         InMemoryMetadataStore::new(),
         factory,
         test_runtime_image_refs(),
+        DiscardingPausePublisher::shared(),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
     .expect("orchestrator");
@@ -5501,6 +5163,8 @@ async fn a_machine_local_orchestrator_stamps_nothing() {
         InMemoryMetadataStore::new(),
         factory,
         test_runtime_image_refs(),
+        DiscardingPausePublisher::shared(),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
     .expect("orchestrator");
@@ -5537,6 +5201,8 @@ async fn a_marker_the_caller_supplied_survives_the_stamp() {
         InMemoryMetadataStore::new(),
         factory,
         test_runtime_image_refs(),
+        DiscardingPausePublisher::shared(),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
     .expect("orchestrator");
@@ -5872,9 +5538,12 @@ async fn a_create_with_rules_grants_before_start_and_a_delete_revokes() -> Resul
     use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
 
     setup();
-    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::new(),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");
@@ -5907,10 +5576,13 @@ async fn a_name_the_store_does_not_hold_is_reported_and_still_starts() -> Result
     use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
 
     setup();
-    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
     let grants = RecordingGrantIssuer::shared();
     grants.answer_unusable_names(vec!["openai".to_string()]);
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::new(),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");
@@ -5931,9 +5603,12 @@ async fn the_reaper_revokes_aged_grants_no_record_backs_and_keeps_live_ones() ->
     use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
 
     setup();
-    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::new(),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");
@@ -5975,9 +5650,12 @@ async fn a_create_without_rules_asks_for_no_grant() -> Result<()> {
     use crate::orchestrator::grants::recording::RecordingGrantIssuer;
 
     setup();
-    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::new(),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
@@ -5991,8 +5669,11 @@ async fn a_create_without_rules_asks_for_no_grant() -> Result<()> {
 #[tokio::test]
 async fn the_node_half_issuer_starts_a_create_with_rules_without_a_store() -> Result<()> {
     setup();
-    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
-    orchestrator.set_grant_issuer(crate::orchestrator::GrantsIssuedUpstream::shared());
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::new(),
+        crate::orchestrator::GrantsIssuedUpstream::shared(),
+    )
+    .await;
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");
 
@@ -6028,9 +5709,12 @@ async fn an_update_that_adds_a_rule_grants_its_secret_before_the_runtime_takes_i
     use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
 
     setup();
-    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::new(),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
@@ -6059,9 +5743,12 @@ async fn an_update_replaces_the_grant_with_exactly_the_new_names() -> Result<()>
     use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
 
     setup();
-    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::new(),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");
@@ -6090,9 +5777,12 @@ async fn an_update_that_drops_every_rule_revokes_the_grant() -> Result<()> {
     use crate::orchestrator::grants::recording::{GrantEvent, RecordingGrantIssuer};
 
     setup();
-    let orchestrator = make_orchestrator_with_factory(MockBackendFactory::new()).await;
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::new(),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");
@@ -6155,11 +5845,12 @@ async fn an_update_the_runtime_refuses_puts_the_previous_grant_back() -> Result<
 
     setup();
     let behavior = Arc::new(MockBehavior::new());
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");
@@ -6196,11 +5887,12 @@ async fn a_fork_child_that_never_started_does_not_keep_its_grant() -> Result<()>
 
     setup();
     let behavior = Arc::new(MockBehavior::new());
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = make_orchestrator_granting_to(
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>,
+    )
+    .await;
 
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");
@@ -6310,223 +6002,6 @@ async fn an_unclassified_capture_nobody_can_settle_keeps_the_record_running() ->
     Ok(())
 }
 
-/// Answers one fixed verdict about whether a sandbox is still routed to.
-struct FixedRouting(bool);
-
-#[async_trait]
-impl crate::orchestrator::RuntimeRouting for FixedRouting {
-    async fn is_routed(&self, _sandbox_id: SandboxId) -> anyhow::Result<bool> {
-        Ok(self.0)
-    }
-
-    async fn forget(
-        &self,
-        _sandbox_id: SandboxId,
-        _execution_id: ExecutionId,
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-}
-
-/// Records every retirement it is asked for, and whether the sandbox's record
-/// was still in the store at that moment.
-struct RecordingRouting {
-    store: InMemoryMetadataStore,
-    forgotten: StdMutex<Vec<(SandboxId, ExecutionId, bool)>>,
-}
-
-impl RecordingRouting {
-    fn over(store: InMemoryMetadataStore) -> Arc<Self> {
-        Arc::new(Self {
-            store,
-            forgotten: StdMutex::new(Vec::new()),
-        })
-    }
-
-    fn forgotten(&self) -> Vec<(SandboxId, ExecutionId, bool)> {
-        self.forgotten.lock().expect("recorder lock").clone()
-    }
-}
-
-#[async_trait]
-impl crate::orchestrator::RuntimeRouting for RecordingRouting {
-    async fn is_routed(&self, _sandbox_id: SandboxId) -> anyhow::Result<bool> {
-        Ok(true)
-    }
-
-    async fn forget(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> anyhow::Result<()> {
-        let record_present = self
-            .store
-            .get(&sandbox_id)
-            .await
-            .expect("the in-memory store never fails")
-            .is_some();
-        self.forgotten.lock().expect("recorder lock").push((
-            sandbox_id,
-            execution_id,
-            record_present,
-        ));
-        Ok(())
-    }
-}
-
-#[tokio::test]
-async fn a_delete_retires_the_routing_binding_before_it_removes_the_record() -> Result<()> {
-    setup();
-    let store = InMemoryMetadataStore::new();
-    let routing = RecordingRouting::over(store.clone());
-    let orchestrator = make_orchestrator_without_background(store);
-    orchestrator
-        .set_runtime_routing(Arc::clone(&routing) as Arc<dyn crate::orchestrator::RuntimeRouting>);
-
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "routing-delete")]))
-        .await?;
-    orchestrator.delete_sandbox(created.id).await?;
-
-    assert_eq!(
-        routing.forgotten(),
-        vec![(created.id, created.execution_id, true)],
-        "the delete must retire its own incarnation while the record is still there"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_pause_retires_the_routing_binding_before_it_removes_the_record() -> Result<()> {
-    setup();
-    let store = InMemoryMetadataStore::new();
-    let routing = RecordingRouting::over(store.clone());
-    let orchestrator = make_orchestrator_with_publisher_over(
-        store,
-        MockBackendFactory::new(),
-        DiscardingPausePublisher::shared(),
-    )
-    .await;
-    orchestrator
-        .set_runtime_routing(Arc::clone(&routing) as Arc<dyn crate::orchestrator::RuntimeRouting>);
-
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "routing-pause")]))
-        .await?;
-    orchestrator.pause_sandbox(created.id).await?;
-
-    assert_eq!(
-        routing.forgotten(),
-        vec![(created.id, created.execution_id, true)],
-        "the pause must retire its own incarnation while the record is still there"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_superseded_launch_retires_its_own_binding_before_it_takes_its_record_back() {
-    setup();
-    let store = InMemoryMetadataStore::new();
-    let routing = RecordingRouting::over(store.clone());
-    let orchestrator = make_orchestrator_without_background(store);
-    orchestrator
-        .set_runtime_routing(Arc::clone(&routing) as Arc<dyn crate::orchestrator::RuntimeRouting>);
-
-    let sandbox_id = SandboxId::new();
-    let plan = create_launch_plan_with_resources(sandbox_id);
-    orchestrator.store.add(plan.metadata.clone()).await.unwrap();
-    // The handle under this id already belongs to a replacement launch.
-    {
-        let mut sandboxes = orchestrator.sandboxes.write().await;
-        sandboxes.insert(sandbox_id, mock_sandbox_handle());
-    }
-
-    orchestrator
-        .cleanup_failed_launch(
-            &plan,
-            mock_sandbox_handle(),
-            FailedLaunchStage::TransitionalPersisted,
-        )
-        .await;
-
-    assert_eq!(
-        routing.forgotten(),
-        vec![(sandbox_id, plan.execution_id(), true)],
-        "the only other path that removes a record must retire the binding it wrote, \
-         under its own fence and while the record is still there"
-    );
-    assert!(orchestrator.store.get(&sandbox_id).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn an_eviction_forgets_a_sandbox_the_cluster_no_longer_routes_to() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    // The node answers a pause of a sandbox it does not have.
-    behavior.push_action(
-        MockOperation::Pause,
-        MockAction::Fail {
-            message: "the node did not touch the sandbox".to_string(),
-        },
-    );
-    let orchestrator = make_orchestrator_without_background_with_factory(
-        InMemoryMetadataStore::new(),
-        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
-    );
-    orchestrator.set_runtime_routing(Arc::new(FixedRouting(false)));
-
-    let created = orchestrator
-        .create_sandbox(create_request(Some(1), &[("team", "ghost-record")]))
-        .await?;
-    sleep(Duration::from_millis(1100)).await;
-
-    let evicted = orchestrator.evict_expired_sandboxes().await?;
-
-    assert!(evicted.is_empty(), "the pause did not produce a snapshot");
-    assert!(
-        orchestrator.get_sandbox(&created.id).await?.is_none(),
-        "a record whose runtime nothing routes to must not survive the round that found it"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_keepalive_on_a_runtime_nothing_routes_to_drops_the_record() -> Result<()> {
-    setup();
-    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
-    orchestrator.set_runtime_routing(Arc::new(FixedRouting(false)));
-
-    let created = orchestrator
-        .create_sandbox(create_request(Some(600), &[("team", "ghost-keepalive")]))
-        .await?;
-
-    let err = orchestrator
-        .keep_alive_for(created.id, Some(Duration::from_secs(600)), false)
-        .await
-        .expect_err("a dead runtime cannot be kept alive");
-    assert!(
-        matches!(err, OrchestratorError::SandboxNotFound(id) if id == created.id),
-        "{err:?}"
-    );
-    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_keepalive_on_a_routed_runtime_is_unchanged() -> Result<()> {
-    setup();
-    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
-    orchestrator.set_runtime_routing(Arc::new(FixedRouting(true)));
-
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "live-keepalive")]))
-        .await?;
-
-    let updated = orchestrator
-        .keep_alive_for(created.id, Some(Duration::from_secs(600)), false)
-        .await?
-        .expect("the keep-alive returns the record");
-    assert_eq!(updated.state, SandboxState::Running);
-    assert!(orchestrator.get_sandbox(&created.id).await?.is_some());
-    Ok(())
-}
-
 #[tokio::test]
 async fn a_keepalive_that_lands_after_selection_stops_the_eviction() -> Result<()> {
     setup();
@@ -6589,10 +6064,17 @@ async fn a_delete_whose_record_removal_fails_still_revokes() -> Result<()> {
 
     setup();
     let control = Arc::new(ScriptedStoreControl::default());
-    let orchestrator =
-        make_orchestrator_without_background(ScriptedStore::new(Arc::clone(&control)));
     let grants = RecordingGrantIssuer::shared();
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>);
+    let orchestrator = Arc::new(
+        Orchestrator::from_test_parts(
+            ScriptedStore::new(Arc::clone(&control)),
+            MockBackendFactory::new(),
+            TEST_DEFAULT_SANDBOX_TIMEOUT,
+            test_runtime_image_refs(),
+            "orchestrator-test-seed",
+        )
+        .granting_to(Arc::clone(&grants) as Arc<dyn crate::orchestrator::GrantIssuer>),
+    );
 
     let mut request = create_request(Some(60), &[]);
     request.network_policy = policy_with_rules("openai");

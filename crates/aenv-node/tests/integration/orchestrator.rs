@@ -72,11 +72,10 @@ async fn orchestrator_lifecycle() -> Result<()> {
             store,
             factory,
             aenv_node::image::DisabledRuntimeImageRefs::shared(),
+            Arc::new(CommittingPausePublisher::new(Arc::clone(&snapshot_manager))),
+            aenv_node::orchestrator::NoGrants::shared(),
         )
         .await?;
-        orchestrator.set_pause_publisher(Arc::new(CommittingPausePublisher::new(Arc::clone(
-            &snapshot_manager,
-        ))));
         let case_id = Uuid::now_v7().to_string();
 
         let request = CreateSandboxRequest {

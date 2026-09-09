@@ -52,6 +52,8 @@ async fn surface() -> Surface {
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         crate::image::DisabledRuntimeImageRefs::shared(),
+        crate::orchestrator::DiscardingPausePublisher::shared(),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
     .expect("an orchestrator");

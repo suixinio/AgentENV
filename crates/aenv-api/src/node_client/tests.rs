@@ -109,16 +109,17 @@ async fn real_node() -> RunningNode {
 
 async fn real_node_with_factory(factory: MockBackendFactory) -> RunningNode {
     crate::logging::init_for_tests();
+    let snapshots = Arc::new(resolvable_snapshot_manager());
     let orchestrator = Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         factory,
         crate::image::DisabledRuntimeImageRefs::shared(),
+        Arc::new(StagingPausePublisher::new(Arc::clone(&snapshots))),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
-    let snapshots = Arc::new(resolvable_snapshot_manager());
-    orchestrator.set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(&snapshots))));
     let orchestration: Arc<dyn NodeOrchestration> = orchestrator;
     let service = aenv_node::node_server::NodeSandboxService::new(
         Arc::clone(&orchestration),
@@ -165,6 +166,8 @@ async fn real_node_with_image_resolution() -> (RunningNode, std::path::PathBuf) 
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         crate::image::DisabledRuntimeImageRefs::shared(),
+        DiscardingPausePublisher::shared(),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -1871,6 +1874,8 @@ async fn the_gate_refuses_a_node_rpc_that_carries_no_credential() {
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         crate::image::DisabledRuntimeImageRefs::shared(),
+        DiscardingPausePublisher::shared(),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -1966,6 +1971,8 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         crate::image::DisabledRuntimeImageRefs::shared(),
+        DiscardingPausePublisher::shared(),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
     .expect("an in-memory orchestrator");
@@ -2291,16 +2298,16 @@ async fn api_replica_over(placement: Arc<dyn NodePlacement>, ledger: &SharedLedg
 }
 
 async fn local_half() -> Arc<Orchestrator<InMemoryMetadataStore, MockBackendFactory>> {
-    let local = Orchestrator::new(
+    Orchestrator::new(
         crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
         InMemoryMetadataStore::new(),
         MockBackendFactory::new(),
         crate::image::DisabledRuntimeImageRefs::shared(),
+        DiscardingPausePublisher::shared(),
+        crate::orchestrator::NoGrants::shared(),
     )
     .await
-    .expect("a machine-local orchestrator");
-    local.set_pause_publisher(DiscardingPausePublisher::shared());
-    local
+    .expect("a machine-local orchestrator")
 }
 
 fn cluster_create_request() -> crate::orchestrator::CreateSandboxRequest {

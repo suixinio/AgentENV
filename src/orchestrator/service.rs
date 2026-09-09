@@ -20,10 +20,10 @@ use crate::sandbox::{
 };
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
-use super::grants::{GrantIssuer, NoGrants};
-use super::launch_claim::{
-    LaunchClaims, LaunchFailure, LaunchHeldElsewhere, LaunchSettlement, RestoredSandbox,
-};
+use super::grants::GrantIssuer;
+#[cfg(any(test, feature = "test-support"))]
+use super::grants::NoGrants;
+use super::launch_claim::{LaunchClaims, LaunchFailure, LaunchSettlement, RestoredSandbox};
 use super::launch_parts::{
     configured_runtime_versions, default_fresh_sandbox_resources, resources_with_runtime_info,
     snapshot_create_parts, SnapshotCreateInputs, SnapshotCreateParts,
@@ -34,7 +34,6 @@ use super::metrics::{
 };
 use super::pause_publisher::PausePublisher;
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
-use super::runtime_routing::RuntimeRouting;
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
@@ -49,10 +48,6 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 /// Guards against indefinite blocking when a sandbox's in-progress operation
 /// never completes (e.g. the task holding the state panics without rolling back).
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
-/// How often a caller waiting out another replica's launch re-reads the shared
-/// record. The launch it waits on writes that record once, from another
-/// process, so there is nothing local to be woken by.
-const LAUNCH_ELSEWHERE_POLL: Duration = Duration::from_millis(250);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Maximum expired sandboxes processed per eviction round.
@@ -145,16 +140,11 @@ pub struct Orchestrator<S: MetadataStore, F: SandboxBackendFactory> {
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     pub image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
-    /// Where a pause capture becomes durable. Without one a pause cannot
-    /// succeed, because a paused sandbox exists only as what it published.
-    pause_publisher: OnceCell<Arc<dyn PausePublisher>>,
-    /// Who records which secret names an incarnation may read; `NoGrants`
-    /// until the api half installs its store.
-    grants: OnceCell<Arc<dyn GrantIssuer>>,
-    /// Who says whether the cluster still routes to a sandbox's runtime. A
-    /// process whose sandboxes run inside it installs none: its own handles
-    /// are the answer.
-    runtime_routing: OnceCell<Arc<dyn RuntimeRouting>>,
+    /// Where a pause capture becomes durable. A paused sandbox exists only as
+    /// what it published, so this is not optional.
+    pause_publisher: Arc<dyn PausePublisher>,
+    /// Who records which secret names an incarnation may read.
+    grants: Arc<dyn GrantIssuer>,
     /// The sandbox ids this process is launching. A launch takes its id here
     /// before it allocates anything, which is the only point early enough to
     /// keep two launches of one id from ever running together.
@@ -179,17 +169,16 @@ where
     /// published nowhere.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn with_in_memory_store(factory: F) -> Arc<Self> {
-        let orchestrator = Self::new(
+        Self::new(
             AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             factory,
             crate::image::DisabledRuntimeImageRefs::shared(),
+            super::pause_publisher::DiscardingPausePublisher::shared(),
+            NoGrants::shared(),
         )
         .await
-        .expect("in-memory orchestrator should never fail to initialize");
-        orchestrator
-            .set_pause_publisher(super::pause_publisher::DiscardingPausePublisher::shared());
-        orchestrator
+        .expect("in-memory orchestrator should never fail to initialize")
     }
 
     /// Creates the node-local orchestrator: one process's ledger of the VMs it
@@ -197,12 +186,16 @@ where
     pub async fn with_in_memory_store_and_factory(
         factory: F,
         image_refs: Arc<dyn RuntimeImageRefs>,
+        pause_publisher: Arc<dyn PausePublisher>,
+        grants: Arc<dyn GrantIssuer>,
     ) -> Result<Arc<Self>> {
         Self::new(
             AccessTokenSeedPolicy::MayGenerate,
             InMemoryMetadataStore::new(),
             factory,
             image_refs,
+            pause_publisher,
+            grants,
         )
         .await
     }
@@ -222,6 +215,7 @@ where
         image_refs: std::sync::Arc<dyn crate::image::RuntimeImageRefs>,
         access_token_seed: &str,
     ) -> Self {
+        let pause_publisher = super::pause_publisher::DiscardingPausePublisher::shared();
         let (sandbox_event_tx, _sandbox_event_rx) =
             tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
         Self {
@@ -240,11 +234,25 @@ where
             shutdown_outcome: tokio::sync::OnceCell::new(),
             image_refs,
             access_tokens: SandboxAccessTokenGenerator::new(access_token_seed).unwrap(),
-            pause_publisher: tokio::sync::OnceCell::new(),
-            grants: tokio::sync::OnceCell::new(),
-            runtime_routing: tokio::sync::OnceCell::new(),
+            pause_publisher,
+            grants: NoGrants::shared(),
             launch_claims: Arc::new(LaunchClaims::default()),
         }
+    }
+
+    /// Replaces where pause captures become durable, for a test that watches
+    /// the publisher.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn publishing_to(mut self, publisher: Arc<dyn PausePublisher>) -> Self {
+        self.pause_publisher = publisher;
+        self
+    }
+
+    /// Replaces who records secret grants, for a test that watches the issuer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn granting_to(mut self, grants: Arc<dyn GrantIssuer>) -> Self {
+        self.grants = grants;
+        self
     }
 
     /// Builds the orchestrator with explicit role-owned dependencies.
@@ -253,6 +261,8 @@ where
         store: S,
         factory: F,
         image_refs: Arc<dyn RuntimeImageRefs>,
+        pause_publisher: Arc<dyn PausePublisher>,
+        grants: Arc<dyn GrantIssuer>,
     ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
         let config = &app_config.orchestrator;
@@ -289,9 +299,8 @@ where
             shutdown_outcome: OnceCell::new(),
             image_refs,
             access_tokens,
-            pause_publisher: OnceCell::new(),
-            grants: OnceCell::new(),
-            runtime_routing: OnceCell::new(),
+            pause_publisher,
+            grants,
             launch_claims: Arc::new(LaunchClaims::default()),
         });
 
@@ -468,9 +477,6 @@ where
     ) -> Result<RestoredSandbox> {
         let joined = match self.restore_sandbox(sandbox_id, request).await {
             Err(OrchestratorError::LaunchInFlight { .. }) => self.join_launch(sandbox_id).await,
-            Err(error) if LaunchHeldElsewhere::refused(&error) => {
-                self.await_launch_elsewhere(sandbox_id, error).await
-            }
             other => {
                 return other.map(|metadata| RestoredSandbox {
                     metadata,
@@ -497,9 +503,6 @@ where
 
     /// Waits out the launch this process is running under `sandbox_id`.
     async fn join_launch(&self, sandbox_id: SandboxId) -> Result<SandboxMetadata> {
-        // One deadline covers the whole join, including the wait on another
-        // replica's record that a claim refused elsewhere ends in, so a joiner
-        // never waits longer than the launch it joined.
         let deadline = tokio::time::Instant::now() + WAIT_TRANSITION_TIMEOUT;
         let Some(in_flight) = self.launch_claims.in_flight(sandbox_id) else {
             // The launch settled between the refusal and this lookup, so its
@@ -514,18 +517,6 @@ where
         let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
         match in_flight.join(wait).await {
             Some(LaunchSettlement::Launched(metadata)) => Ok(*metadata),
-            Some(LaunchSettlement::Failed(failure @ LaunchFailure::HeldElsewhere(_))) => {
-                // The launch this caller joined stopped at another replica's
-                // reservation, which decides the id instead of it. Following
-                // the refusal here would answer a failure about a sandbox that
-                // is starting, so this caller waits where the claimant waits.
-                self.await_launch_elsewhere_until(
-                    sandbox_id,
-                    failure.into_error(sandbox_id),
-                    deadline,
-                )
-                .await
-            }
             Some(LaunchSettlement::Failed(failure)) => Err(failure.into_error(sandbox_id)),
             None => {
                 warn!(%sandbox_id, "timed out joining a launch of this sandbox");
@@ -534,46 +525,6 @@ where
                     state: SandboxState::Creating,
                 })
             }
-        }
-    }
-
-    /// Waits for the launch another replica holds to leave a running record.
-    async fn await_launch_elsewhere(
-        &self,
-        sandbox_id: SandboxId,
-        refusal: OrchestratorError,
-    ) -> Result<SandboxMetadata> {
-        let deadline = tokio::time::Instant::now() + WAIT_TRANSITION_TIMEOUT;
-        self.await_launch_elsewhere_until(sandbox_id, refusal, deadline)
-            .await
-    }
-
-    async fn await_launch_elsewhere_until(
-        &self,
-        sandbox_id: SandboxId,
-        refusal: OrchestratorError,
-        deadline: tokio::time::Instant,
-    ) -> Result<SandboxMetadata> {
-        info!(
-            %sandbox_id,
-            "another replica is launching this sandbox; waiting for the record it will write"
-        );
-        loop {
-            match self.store.get(&sandbox_id).await? {
-                Some(metadata) if metadata.state == SandboxState::Running => return Ok(metadata),
-                Some(metadata) if metadata.state == SandboxState::Killing => {
-                    return Err(OrchestratorError::SandboxNotFound(sandbox_id))
-                }
-                _ => {}
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                warn!(%sandbox_id, "timed out waiting for another replica to finish this launch");
-                // The refusal is what this caller actually met; a launch that
-                // never produced a record has nothing better to report.
-                return Err(refusal);
-            }
-            tokio::time::sleep(LAUNCH_ELSEWHERE_POLL.min(deadline - now)).await;
         }
     }
 
@@ -1375,15 +1326,6 @@ where
             });
         }
 
-        // A record that says running is this replica's memory; the binding is
-        // the cluster's. Extending the life of a runtime nobody can reach
-        // would keep the record out of the evictor's way forever.
-        if self.runtime_confirmed_gone(sandbox_id).await {
-            self.forget_unrouted_runtime(sandbox_id, metadata.execution_id)
-                .await;
-            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
-        }
-
         // Only an already-exhausted lifetime ceiling refuses renewal.
         let now = SystemTime::now();
         if let Some(deadline) = metadata.lifetime_deadline(now) {
@@ -1555,12 +1497,6 @@ where
             }
         };
 
-        if self.runtime_confirmed_gone(sandbox_id).await {
-            self.forget_unrouted_runtime(sandbox_id, expected_execution_id)
-                .await;
-            return Ok(());
-        }
-
         let (handle, removed_route) = self
             .detach_sandbox_handle_and_route_checked(&sandbox_id, expected_execution_id)
             .await;
@@ -1628,72 +1564,6 @@ where
         Ok(())
     }
 
-    /// Wires where pause captures become durable; the first publisher wins.
-    pub fn set_pause_publisher(&self, publisher: Arc<dyn PausePublisher>) {
-        if self.pause_publisher.set(publisher).is_err() {
-            warn!("pause publisher was already wired; ignoring");
-        }
-    }
-
-    /// Installs the grant issuer once; later calls are ignored.
-    pub fn set_grant_issuer(&self, issuer: Arc<dyn GrantIssuer>) {
-        if self.grants.set(issuer).is_err() {
-            warn!("grant issuer was already wired; ignoring");
-        }
-    }
-
-    /// Installs who answers whether a sandbox's runtime is still routed to.
-    pub fn set_runtime_routing(&self, routing: Arc<dyn RuntimeRouting>) {
-        if self.runtime_routing.set(routing).is_err() {
-            warn!("runtime routing was already wired; ignoring");
-        }
-    }
-
-    /// Whether the cluster has stopped routing to this sandbox's runtime.
-    ///
-    /// Only a complete answer counts: a lookup that fails, and a process that
-    /// installed no routing source, both leave the record alone.
-    async fn runtime_confirmed_gone(&self, sandbox_id: SandboxId) -> bool {
-        let Some(routing) = self.runtime_routing.get() else {
-            return false;
-        };
-        match routing.is_routed(sandbox_id).await {
-            Ok(routed) => !routed,
-            Err(error) => {
-                warn!(
-                    %sandbox_id,
-                    error = %format_args!("{error:#}"),
-                    "could not tell whether anything still routes to this sandbox"
-                );
-                false
-            }
-        }
-    }
-
-    /// Drops the record and handle of a runtime nothing routes to any more.
-    async fn forget_unrouted_runtime(&self, sandbox_id: SandboxId, execution_id: ExecutionId) {
-        warn!(
-            %sandbox_id,
-            %execution_id,
-            "nothing routes to this sandbox's runtime any more; dropping its record"
-        );
-        self.detach_sandbox_handle_and_route(&sandbox_id).await;
-        if let Err(error) = self.forget_sandbox(sandbox_id, execution_id).await {
-            warn!(
-                %sandbox_id,
-                error = ?error,
-                "failed to remove the record of a sandbox nothing routes to"
-            );
-        }
-    }
-
-    fn grants(&self) -> Arc<dyn GrantIssuer> {
-        self.grants
-            .get()
-            .cloned()
-            .unwrap_or_else(|| NoGrants::shared())
-    }
-
     /// Grants the names the policy references before the sandbox can open a
     /// brokered connection. An empty set is a no-op for every issuer.
     ///
@@ -1718,7 +1588,7 @@ where
         // refused now, so a name deleted or reshaped meanwhile is reported
         // here and the sandbox still starts. Without this the guest gets a
         // synthetic 403 and the operator gets nothing.
-        if let Some(unusable) = self.grants().unusable_names(&wanted).await {
+        if let Some(unusable) = self.grants.unusable_names(&wanted).await {
             if !unusable.is_empty() {
                 warn!(
                     %sandbox_id,
@@ -1730,7 +1600,7 @@ where
             }
         }
         let names: BTreeSet<String> = wanted.into_keys().collect();
-        self.grants()
+        self.grants
             .grant(sandbox_id, execution_id, &names)
             .await
             .with_context(|| {
@@ -1745,7 +1615,7 @@ where
     /// the execution id it names is gone; the warning is for the operator,
     /// and the reaper picks the row up on a later round.
     async fn revoke_secrets(&self, sandbox_id: SandboxId, execution_id: ExecutionId) {
-        if let Err(err) = self.grants().revoke(sandbox_id, execution_id).await {
+        if let Err(err) = self.grants.revoke(sandbox_id, execution_id).await {
             warn!(%sandbox_id, %execution_id, error = %format_args!("{err:#}"), "failed to revoke secret grants");
         }
     }
@@ -1758,7 +1628,7 @@ where
     /// nothing can then be compared against.
     pub async fn reap_orphaned_grants(&self) -> Result<Vec<(SandboxId, ExecutionId)>> {
         let candidates = self
-            .grants()
+            .grants
             .stale_grant_candidates(GRANT_REAP_MIN_AGE, GRANT_REAP_BATCH_LIMIT)
             .await
             .map_err(|err| OrchestratorError::InternalError(format!("{err:#}")))?;
@@ -1794,12 +1664,12 @@ where
     ) -> anyhow::Result<()> {
         if names.is_empty() {
             return self
-                .grants()
+                .grants
                 .revoke(sandbox_id, execution_id)
                 .await
                 .with_context(|| format!("revoke the secret grants of sandbox {sandbox_id}"));
         }
-        self.grants()
+        self.grants
             .grant(sandbox_id, execution_id, names)
             .await
             .with_context(|| {
@@ -1810,37 +1680,13 @@ where
             })
     }
 
-    /// Retires the cluster's routing answer for one incarnation.
-    ///
-    /// A process that installed no routing source runs no cluster routing and
-    /// has nothing to retire. A failure is not fatal to the teardown: the
-    /// node's own event and the next heartbeat's reconcile still remove the
-    /// binding, one interval later.
-    async fn forget_runtime_routing(&self, sandbox_id: SandboxId, execution_id: ExecutionId) {
-        let Some(routing) = self.runtime_routing.get() else {
-            return;
-        };
-        if let Err(error) = routing.forget(sandbox_id, execution_id).await {
-            warn!(
-                %sandbox_id,
-                %execution_id,
-                error = %format_args!("{error:#}"),
-                "could not retire this sandbox's routing binding; traffic may reach the node \
-                 that no longer runs it until a heartbeat reconciles it"
-            );
-        }
-    }
-
-    /// Drops a sandbox's record, its routing binding and its incarnation's
-    /// grant together. The routing binding goes first, so no request is routed
-    /// at a runtime this teardown has already stopped; the grant goes even
-    /// when the record removal fails, so no terminal teardown can leave one
-    /// behind.
+    /// Drops a sandbox's record and its incarnation's grant together. The grant
+    /// goes even when the record removal fails, so no terminal teardown can
+    /// leave one behind.
     ///
     /// The removal is fenced on `execution_id`: a record another incarnation
     /// wrote under this id belongs to that incarnation, and a caller cleaning
-    /// up after its own launch must not take it. The routing retirement
-    /// carries the same fence into the binding store.
+    /// up after its own launch must not take it.
     async fn forget_sandbox(
         &self,
         sandbox_id: SandboxId,
@@ -1848,7 +1694,6 @@ where
     ) -> Result<Option<SandboxMetadata>> {
         // Read first so the caller still learns what the removal took.
         let current = self.store.get(&sandbox_id).await;
-        self.forget_runtime_routing(sandbox_id, execution_id).await;
         let removal = self
             .store
             .remove_if_execution(&sandbox_id, execution_id, &ALL_SANDBOX_STATES)
@@ -1968,13 +1813,7 @@ where
         self: &Arc<Self>,
         sandbox_id: SandboxId,
     ) -> Result<PauseOutcome> {
-        let Some(publisher) = self.pause_publisher.get().cloned() else {
-            self.rollback_pause_to_running(sandbox_id).await;
-            return Err(OrchestratorError::InternalError(format!(
-                "sandbox {sandbox_id} cannot be paused: this process has nowhere to publish a pause"
-            )));
-        };
-
+        let publisher = Arc::clone(&self.pause_publisher);
         // Read the authoritative record after exclusively entering `Pausing`.
         let metadata = match self.store.get(&sandbox_id).await {
             Ok(Some(metadata)) => metadata,
@@ -1989,12 +1828,6 @@ where
             }
         };
         let expected_execution_id = metadata.execution_id;
-
-        if self.runtime_confirmed_gone(sandbox_id).await {
-            self.forget_unrouted_runtime(sandbox_id, expected_execution_id)
-                .await;
-            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
-        }
 
         let (handle, removed_proxy_route) = self
             .detach_sandbox_handle_and_route_checked(&sandbox_id, expected_execution_id)
@@ -2048,12 +1881,6 @@ where
                         .await;
                     self.forget_sandbox(sandbox_id, expected_execution_id)
                         .await?;
-                } else if self.runtime_confirmed_gone(sandbox_id).await {
-                    // A node that says it never had this sandbox, and a cluster
-                    // that routes nowhere for it, agree: there is nothing to
-                    // put back and nothing to retry next tick.
-                    self.forget_unrouted_runtime(sandbox_id, expected_execution_id)
-                        .await;
                 } else {
                     if handle_was_held_here {
                         self.sandboxes.write().await.insert(sandbox_id, handle);
@@ -2947,12 +2774,7 @@ where
         before: SandboxMetadata,
         joined_at: SystemTime,
     ) -> Result<PauseOutcome> {
-        let Some(publisher) = self.pause_publisher.get().cloned() else {
-            return Err(OrchestratorError::InternalError(format!(
-                "sandbox {sandbox_id} was paused elsewhere and this process has nowhere to look \
-                 for what that pause published"
-            )));
-        };
+        let publisher = Arc::clone(&self.pause_publisher);
         let not_before_unix_ms = joined_at
             .checked_sub(CONCURRENT_PAUSE_WAIT)
             .and_then(|start| start.duration_since(std::time::UNIX_EPOCH).ok())
@@ -3240,29 +3062,14 @@ where
         // reached through and then tear that entry down when the store refuses
         // the duplicate record.
         if let Some(held) = self.held_sandbox(sandbox_id).await? {
-            // A routing source with a complete view is the only thing that can
-            // say the id is free here: a replica that watched a pause happen
-            // elsewhere still holds a handle, and that handle must not refuse
-            // this sandbox's resume.
-            let residue = match held.execution_id {
-                Some(execution_id) if self.runtime_confirmed_gone(sandbox_id).await => {
-                    Some(execution_id)
-                }
-                _ => None,
-            };
-            match residue {
-                Some(execution_id) => self.forget_unrouted_runtime(sandbox_id, execution_id).await,
-                None => {
-                    warn!(
-                        held_execution_id = ?held.execution_id,
-                        execution_id = %plan.execution_id(),
-                        "refusing a launch under a sandbox id this process already holds"
-                    );
-                    return Err(OrchestratorError::StoreOperationFailed(
-                        StoreError::SandboxAlreadyExists { sandbox_id },
-                    ));
-                }
-            }
+            warn!(
+                held_execution_id = ?held.execution_id,
+                execution_id = %plan.execution_id(),
+                "refusing a launch under a sandbox id this process already holds"
+            );
+            return Err(OrchestratorError::StoreOperationFailed(
+                StoreError::SandboxAlreadyExists { sandbox_id },
+            ));
         }
 
         // Build and start the sandbox first, before making any state changes, so that we don't
@@ -3531,8 +3338,6 @@ where
             .await;
     }
 
-    // The binding goes first under the same fence as the record, as in
-    // `forget_sandbox`: a successor rebinds this id itself.
     async fn reclaim_superseded_launch_record(
         &self,
         plan: &LaunchPlan,
@@ -3540,7 +3345,6 @@ where
     ) {
         let sandbox_id = plan.sandbox_id;
         let execution_id = plan.execution_id();
-        self.forget_runtime_routing(sandbox_id, execution_id).await;
         match self
             .store
             .remove_if_execution(

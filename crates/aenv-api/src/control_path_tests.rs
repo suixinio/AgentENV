@@ -126,6 +126,11 @@ impl ApiHalf {
     fn revoked(&self) -> Vec<(SandboxId, ExecutionId)> {
         self.grants.revoked.lock().expect("lock").clone()
     }
+
+    /// Fixes what the cluster answers about every sandbox's runtime.
+    fn routing_answers(&self, routed: bool) {
+        *self.routing.routed.lock().expect("lock") = Some(routed);
+    }
 }
 
 /// Retires bindings for real, and records whether the sandbox's record was
@@ -134,6 +139,9 @@ struct RecordingRouting {
     inner: Arc<dyn crate::orchestrator::RuntimeRouting>,
     store: InMemoryMetadataStore,
     forgotten: Mutex<Vec<(SandboxId, ExecutionId, bool)>>,
+    /// A fixed verdict, for a test about what an unrouted runtime does to a
+    /// record rather than about the binding store's own answer.
+    routed: Mutex<Option<bool>>,
 }
 
 impl RecordingRouting {
@@ -145,6 +153,9 @@ impl RecordingRouting {
 #[async_trait::async_trait]
 impl crate::orchestrator::RuntimeRouting for RecordingRouting {
     async fn is_routed(&self, sandbox_id: SandboxId) -> anyhow::Result<bool> {
+        if let Some(routed) = *self.routed.lock().expect("lock") {
+            return Ok(routed);
+        }
         self.inner.is_routed(sandbox_id).await
     }
 
@@ -548,6 +559,7 @@ async fn api_half() -> ApiHalf {
         inner: PlacementRuntimeRouting::shared(Arc::clone(&placement)),
         store: store.clone(),
         forgotten: Mutex::new(Vec::new()),
+        routed: Mutex::new(None),
     });
     let orchestrator = SandboxControl::new(SandboxControlParts {
         // The one thing this assembly cannot reproduce: `MustBeConfigured`
@@ -1194,4 +1206,148 @@ async fn a_launch_rolled_back_after_it_was_recorded_retires_its_binding_first() 
     );
     assert_eq!(half.record_state(sandbox_id).await, None);
     assert!(half.binding(sandbox_id).await.is_none());
+}
+
+#[tokio::test]
+async fn an_eviction_forgets_a_sandbox_the_cluster_no_longer_routes_to() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(CreateSandboxRequest {
+            expiry: SandboxExpiry::After(Duration::from_millis(1)),
+            ..cold_create()
+        })
+        .await
+        .expect("a sandbox to evict");
+    // The node has no pause scripted, so the pause fails; what decides the
+    // record's fate is that nothing routes to the sandbox any more.
+    half.routing_answers(false);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let evicted = Arc::clone(&half.orchestrator)
+        .evict_expired_sandboxes()
+        .await
+        .expect("the eviction round runs");
+
+    assert!(evicted.is_empty(), "the pause did not produce a snapshot");
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        None,
+        "a record whose runtime nothing routes to must not survive the round that found it"
+    );
+}
+
+#[tokio::test]
+async fn a_keepalive_on_a_runtime_nothing_routes_to_drops_the_record() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to keep alive");
+    half.routing_answers(false);
+
+    let err = half
+        .orchestrator
+        .keep_alive_for(metadata.id, Some(Duration::from_secs(600)), false)
+        .await
+        .expect_err("a runtime nobody can reach is not one to keep alive");
+
+    assert!(
+        matches!(err, crate::orchestrator::OrchestratorError::SandboxNotFound(id) if id == metadata.id),
+        "{err:?}"
+    );
+    assert_eq!(half.record_state(metadata.id).await, None);
+}
+
+#[tokio::test]
+async fn a_keepalive_on_a_routed_runtime_extends_it() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to keep alive");
+    half.routing_answers(true);
+
+    let extended = half
+        .orchestrator
+        .keep_alive_for(metadata.id, Some(Duration::from_secs(1200)), false)
+        .await
+        .expect("a sandbox the cluster still routes to keeps its record")
+        .expect("the keep-alive answers with the record it wrote");
+
+    assert_eq!(extended.state, SandboxState::Running);
+    assert!(extended.expires_at > metadata.expires_at);
+}
+
+#[tokio::test]
+async fn a_launch_takes_an_id_whose_runtime_the_cluster_no_longer_routes_to() {
+    let half = api_half().await;
+    let created = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox whose record outlives its runtime");
+    // A pause performed by another replica leaves this one's record behind.
+    half.routing_answers(false);
+
+    let restored = Arc::clone(&half.orchestrator)
+        .restore_sandbox(created.id, cold_create())
+        .await
+        .expect("a record nothing routes to must not refuse this sandbox's resume");
+
+    assert_eq!(restored.id, created.id);
+    assert_ne!(
+        restored.execution_id, created.execution_id,
+        "the resume is a new run under the same id"
+    );
+}
+
+#[tokio::test]
+async fn a_caller_waiting_out_another_replicas_launch_answers_with_the_record_it_left() {
+    let half = api_half().await;
+    let created = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("the record the other replica leaves behind");
+
+    let waited = half
+        .orchestrator
+        .await_launch_elsewhere(
+            created.id,
+            crate::orchestrator::OrchestratorError::InternalError(
+                "the reservation was refused".to_string(),
+            ),
+        )
+        .await
+        .expect("a launch that produced a running record is one to answer with");
+
+    assert_eq!(waited.execution_id, created.execution_id);
+    assert_eq!(waited.state, SandboxState::Running);
+}
+
+#[tokio::test]
+async fn a_caller_waiting_out_a_launch_of_a_sandbox_being_deleted_is_told_it_is_gone() {
+    let half = api_half().await;
+    let created = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to tear down");
+    half.orchestrator
+        .set_metadata_state_for_test(created.id, SandboxState::Killing)
+        .await
+        .expect("a killing record should be writable");
+
+    let err = half
+        .orchestrator
+        .await_launch_elsewhere(
+            created.id,
+            crate::orchestrator::OrchestratorError::InternalError(
+                "the reservation was refused".to_string(),
+            ),
+        )
+        .await
+        .expect_err("a sandbox being torn down is not one to wait for");
+
+    assert!(
+        matches!(err, crate::orchestrator::OrchestratorError::SandboxNotFound(id) if id == created.id),
+        "{err:?}"
+    );
 }

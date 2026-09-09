@@ -27,40 +27,208 @@ struct Surface {
     orchestrator: Arc<Orchestrator<crate::orchestrator::InMemoryMetadataStore, MockBackendFactory>>,
 }
 
-/// Answers one fixed verdict about whether a sandbox is still routed to.
-struct FixedRouting(bool);
+/// The orchestration under the handlers, with keep-alive answering that the
+/// sandbox is gone. That is what a control path reports for a record whose
+/// runtime the cluster no longer routes to, and the handlers' reaction to it
+/// is what these tests are about.
+struct KeepAliveSaysGone(Arc<dyn crate::orchestrator::SandboxOrchestration>);
 
 #[async_trait::async_trait]
-impl crate::orchestrator::RuntimeRouting for FixedRouting {
-    async fn is_routed(&self, _sandbox_id: SandboxId) -> anyhow::Result<bool> {
-        Ok(self.0)
+impl crate::orchestrator::SandboxOrchestration for KeepAliveSaysGone {
+    async fn create_sandbox(
+        self: Arc<Self>,
+        request: crate::orchestrator::CreateSandboxRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::SandboxMetadata> {
+        Arc::clone(&self.0).create_sandbox(request).await
     }
 
-    async fn forget(
+    async fn restore_or_join_launch(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+        request: crate::orchestrator::CreateSandboxRequest,
+    ) -> crate::orchestrator::Result<crate::orchestrator::RestoredSandbox> {
+        Arc::clone(&self.0)
+            .restore_or_join_launch(sandbox_id, request)
+            .await
+    }
+
+    async fn fork_sandbox(
+        self: Arc<Self>,
+        source_sandbox_id: SandboxId,
+        children: crate::orchestrator::ForkChildren,
+        new_timeout: crate::orchestrator::NewTimeout,
+    ) -> crate::orchestrator::Result<Vec<crate::orchestrator::SandboxForkOutcome>> {
+        Arc::clone(&self.0)
+            .fork_sandbox(source_sandbox_id, children, new_timeout)
+            .await
+    }
+
+    async fn delete_sandbox(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> crate::orchestrator::Result<()> {
+        Arc::clone(&self.0).delete_sandbox(sandbox_id).await
+    }
+
+    async fn shutdown(self: Arc<Self>) -> crate::orchestrator::Result<()> {
+        Arc::clone(&self.0).shutdown().await
+    }
+
+    async fn pause_sandbox(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> crate::orchestrator::Result<crate::orchestrator::PauseOutcome> {
+        Arc::clone(&self.0).pause_sandbox(sandbox_id).await
+    }
+
+    async fn capture_snapshot(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> crate::orchestrator::Result<crate::orchestrator::SnapshotCaptureResult> {
+        Arc::clone(&self.0).capture_snapshot(sandbox_id).await
+    }
+
+    async fn replace_sandbox_network_policy(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+        network_policy: crate::sandbox::SandboxNetworkPolicy,
+    ) -> crate::orchestrator::Result<()> {
+        Arc::clone(&self.0)
+            .replace_sandbox_network_policy(sandbox_id, network_policy)
+            .await
+    }
+
+    async fn patch_sandbox_custom_extension_params(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+        patch: serde_json::Map<String, serde_json::Value>,
+    ) -> crate::orchestrator::Result<Option<crate::sandbox::CustomExtensionParams>> {
+        Arc::clone(&self.0)
+            .patch_sandbox_custom_extension_params(sandbox_id, patch)
+            .await
+    }
+
+    async fn get_sandbox(
         &self,
-        _sandbox_id: SandboxId,
-        _execution_id: crate::types::ExecutionId,
-    ) -> anyhow::Result<()> {
-        Ok(())
+        sandbox_id: &SandboxId,
+    ) -> crate::orchestrator::Result<Option<crate::orchestrator::SandboxMetadata>> {
+        self.0.get_sandbox(sandbox_id).await
+    }
+
+    async fn wait_for_pause_to_settle(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> crate::orchestrator::Result<Option<crate::orchestrator::SandboxMetadata>> {
+        self.0.wait_for_pause_to_settle(sandbox_id).await
+    }
+
+    async fn list_sandboxes_filtered(
+        &self,
+        filter: crate::orchestrator::SandboxListFilter,
+    ) -> crate::orchestrator::Result<Vec<crate::orchestrator::SandboxMetadata>> {
+        self.0.list_sandboxes_filtered(filter).await
+    }
+
+    async fn list_sandbox_roster(
+        &self,
+    ) -> crate::orchestrator::Result<Vec<crate::orchestrator::SandboxRosterEntry>> {
+        self.0.list_sandbox_roster().await
+    }
+
+    async fn keep_alive_for(
+        &self,
+        sandbox_id: SandboxId,
+        _timeout: Option<std::time::Duration>,
+        _allow_shorter: bool,
+    ) -> crate::orchestrator::Result<Option<crate::orchestrator::SandboxMetadata>> {
+        Err(crate::orchestrator::OrchestratorError::SandboxNotFound(
+            sandbox_id,
+        ))
+    }
+
+    async fn sandbox_holding_node_id(&self, sandbox_id: &SandboxId) -> Option<String> {
+        self.0.sandbox_holding_node_id(sandbox_id).await
+    }
+
+    async fn metrics_snapshot(
+        &self,
+    ) -> crate::orchestrator::Result<crate::orchestrator::OrchestratorMetrics> {
+        self.0.metrics_snapshot().await
+    }
+
+    async fn set_metadata_state_for_test(
+        &self,
+        sandbox_id: SandboxId,
+        state: SandboxState,
+    ) -> crate::orchestrator::Result<()> {
+        self.0.set_metadata_state_for_test(sandbox_id, state).await
+    }
+
+    async fn remove_sandbox_for_test(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> crate::orchestrator::Result<()> {
+        self.0.remove_sandbox_for_test(sandbox_id).await
+    }
+
+    async fn set_auto_resume_for_test(
+        &self,
+        sandbox_id: &SandboxId,
+        auto_resume_enabled: bool,
+    ) -> crate::orchestrator::Result<()> {
+        self.0
+            .set_auto_resume_for_test(sandbox_id, auto_resume_enabled)
+            .await
+    }
+
+    fn get_envd_access_token(
+        &self,
+        metadata: &crate::orchestrator::SandboxMetadata,
+    ) -> Option<crate::sandbox::EnvdAccessToken> {
+        self.0.get_envd_access_token(metadata)
+    }
+
+    fn validate_envd_access_token(&self, sandbox_id: SandboxId, candidate: &str) -> bool {
+        self.0.validate_envd_access_token(sandbox_id, candidate)
+    }
+
+    fn subscribe_sandbox_events(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::orchestrator::SandboxLifecycleEvent> {
+        self.0.subscribe_sandbox_events()
+    }
+
+    fn scheduling_disabled(&self) -> bool {
+        self.0.scheduling_disabled()
+    }
+
+    fn set_scheduling_disabled(&self, disabled: bool) -> bool {
+        self.0.set_scheduling_disabled(disabled)
+    }
+
+    fn scheduling_disabled_changed_at_ms(&self) -> Option<i64> {
+        self.0.scheduling_disabled_changed_at_ms()
     }
 }
 
 impl Surface {
     async fn as_half(wiring: ResumeWiring) -> Self {
-        Self::as_half_routed(wiring, None).await
+        Self::as_half_keeping_alive(wiring, true).await
     }
 
-    async fn as_half_routed(
-        wiring: ResumeWiring,
-        routing: Option<Arc<dyn crate::orchestrator::RuntimeRouting>>,
-    ) -> Self {
+    async fn as_half_keeping_alive(wiring: ResumeWiring, keep_alive_works: bool) -> Self {
         let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
-        if let Some(routing) = routing {
-            orchestrator.set_runtime_routing(routing);
-        }
+        let orchestration: Arc<dyn crate::orchestrator::SandboxOrchestration> = if keep_alive_works
+        {
+            Arc::clone(&orchestrator) as Arc<dyn crate::orchestrator::SandboxOrchestration>
+        } else {
+            Arc::new(KeepAliveSaysGone(
+                Arc::clone(&orchestrator) as Arc<dyn crate::orchestrator::SandboxOrchestration>
+            ))
+        };
         let (snapshot_manager, catalog) = in_memory_snapshot_manager();
         let api = Arc::new(ApiImpl::new(
-            Arc::clone(&orchestrator) as Arc<dyn crate::orchestrator::SandboxOrchestration>,
+            orchestration,
             Arc::new(snapshot_manager),
             None,
             Vec::new(),
@@ -611,12 +779,11 @@ async fn a_connect_during_a_pause_waits_for_it_and_rebuilds_from_the_row() {
     );
 }
 
-async fn connect_over_a_running_record(routed: bool) -> SandboxesSandboxIdConnectPostResponse {
-    let surface = Surface::as_half_routed(
-        ResumeWiring::api_half_for_test(),
-        Some(Arc::new(FixedRouting(routed))),
-    )
-    .await;
+async fn connect_over_a_running_record(
+    keep_alive_works: bool,
+) -> SandboxesSandboxIdConnectPostResponse {
+    let surface =
+        Surface::as_half_keeping_alive(ResumeWiring::api_half_for_test(), keep_alive_works).await;
     let sandbox_id = surface.paused(mock_paused_sandbox_config());
     surface
         .orchestrator
@@ -628,7 +795,7 @@ async fn connect_over_a_running_record(routed: bool) -> SandboxesSandboxIdConnec
 }
 
 #[tokio::test]
-async fn a_connect_to_a_runtime_nothing_routes_to_resumes_instead_of_answering_running() {
+async fn a_connect_whose_keep_alive_says_gone_resumes_instead_of_answering_running() {
     let response = connect_over_a_running_record(false).await;
 
     assert!(
@@ -642,7 +809,7 @@ async fn a_connect_to_a_runtime_nothing_routes_to_resumes_instead_of_answering_r
 }
 
 #[tokio::test]
-async fn a_connect_to_a_routed_runtime_still_answers_running() {
+async fn a_connect_whose_keep_alive_succeeds_still_answers_running() {
     let response = connect_over_a_running_record(true).await;
 
     assert!(

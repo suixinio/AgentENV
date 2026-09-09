@@ -33,11 +33,16 @@ async fn service() -> (Arc<dyn NodeOrchestration>, NodeSandboxService) {
 async fn service_with(
     factory: MockBackendFactory,
 ) -> (Arc<dyn NodeOrchestration>, NodeSandboxService) {
-    let orchestrator = orchestrator_with(InMemoryMetadataStore::new(), factory).await;
-    serve_node(orchestrator, mock_snapshot_manager())
+    let manager = Arc::new(mock_snapshot_manager());
+    let orchestrator = orchestrator_with(InMemoryMetadataStore::new(), factory, &manager).await;
+    serve_node(orchestrator, manager)
 }
 
-async fn orchestrator_with<S, F>(store: S, factory: F) -> Arc<Orchestrator<S, F>>
+async fn orchestrator_with<S, F>(
+    store: S,
+    factory: F,
+    manager: &Arc<SnapshotManager>,
+) -> Arc<Orchestrator<S, F>>
 where
     S: MetadataStore + 'static,
     F: SandboxBackendFactory,
@@ -48,22 +53,23 @@ where
         store,
         factory,
         crate::image::DisabledRuntimeImageRefs::shared(),
+        // The node's wiring: pauses stage on the same repository the service
+        // answers from.
+        Arc::new(StagingPausePublisher::new(Arc::clone(manager))),
+        crate::orchestrator::GrantsIssuedUpstream::shared(),
     )
     .await
     .expect("an in-memory orchestrator")
 }
 
-// The node's wiring: pauses stage on the same repository the service answers from.
 fn serve_node<S, F>(
     orchestrator: Arc<Orchestrator<S, F>>,
-    manager: SnapshotManager,
+    manager: Arc<SnapshotManager>,
 ) -> (Arc<dyn NodeOrchestration>, NodeSandboxService)
 where
     S: MetadataStore + 'static,
     F: SandboxBackendFactory,
 {
-    let manager = Arc::new(manager);
-    orchestrator.set_pause_publisher(Arc::new(StagingPausePublisher::new(Arc::clone(&manager))));
     let orchestration: Arc<dyn NodeOrchestration> = orchestrator;
     let service = NodeSandboxService::new(Arc::clone(&orchestration), manager, NODE.to_string());
     (orchestration, service)
@@ -74,9 +80,14 @@ async fn service_with_catalog() -> (
     NodeSandboxService,
     Arc<crate::snapshot::mock::MockSnapshotCatalog>,
 ) {
-    let orchestrator =
-        orchestrator_with(InMemoryMetadataStore::new(), MockBackendFactory::new()).await;
     let (manager, catalog) = crate::snapshot::mock::mock_snapshot_manager_with_catalog();
+    let manager = Arc::new(manager);
+    let orchestrator = orchestrator_with(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        &manager,
+    )
+    .await;
     let (orchestration, service) = serve_node(orchestrator, manager);
     (orchestration, service, catalog)
 }
@@ -311,12 +322,14 @@ async fn a_partial_record_read_fails_the_listing_instead_of_shortening_it() {
         }
     }
 
+    let manager = Arc::new(mock_snapshot_manager());
     let orchestrator = orchestrator_with(
         HalfAnswering(InMemoryMetadataStore::new()),
         MockBackendFactory::new(),
+        &manager,
     )
     .await;
-    let (orchestration, service) = serve_node(orchestrator, mock_snapshot_manager());
+    let (orchestration, service) = serve_node(orchestrator, manager);
 
     start(&orchestration, Some(b"owned-a")).await;
     start(&orchestration, Some(b"owned-b")).await;
@@ -408,15 +421,17 @@ async fn the_listing_reports_the_incarnation_the_handle_is_running() {
     }
 
     let drifted = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let manager = Arc::new(mock_snapshot_manager());
     let orchestrator = orchestrator_with(
         InMemoryMetadataStore::new(),
         Drifting {
             inner: MockBackendFactory::new(),
             drifted: Arc::clone(&drifted),
         },
+        &manager,
     )
     .await;
-    let (orchestration, service) = serve_node(orchestrator, mock_snapshot_manager());
+    let (orchestration, service) = serve_node(orchestrator, manager);
 
     let record = start(&orchestration, Some(b"owned")).await;
     let running = *drifted.lock().expect("lock").first().expect("one backend");
@@ -439,12 +454,14 @@ async fn a_sandbox_whose_handle_is_busy_is_still_reported() {
     use crate::sandbox::mock::{MockAction, MockBehavior, MockOperation};
 
     let behavior = Arc::new(MockBehavior::new());
+    let manager = Arc::new(mock_snapshot_manager());
     let orchestrator = orchestrator_with(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        &manager,
     )
     .await;
-    let (orchestration, service) = serve_node(orchestrator, mock_snapshot_manager());
+    let (orchestration, service) = serve_node(orchestrator, manager);
 
     let busy = start(&orchestration, Some(b"busy")).await;
     let idle = start(&orchestration, Some(b"idle")).await;
@@ -1388,9 +1405,14 @@ async fn describe_answers_for_a_sandbox_the_listing_leaves_out() {
 
 #[tokio::test]
 async fn a_record_kept_without_a_handle_is_described_and_refuses_a_create() {
-    let orchestrator =
-        orchestrator_with(InMemoryMetadataStore::new(), MockBackendFactory::new()).await;
-    let (orchestration, service) = serve_node(Arc::clone(&orchestrator), mock_snapshot_manager());
+    let manager = Arc::new(mock_snapshot_manager());
+    let orchestrator = orchestrator_with(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        &manager,
+    )
+    .await;
+    let (orchestration, service) = serve_node(Arc::clone(&orchestrator), manager);
     let started = start(&orchestration, Some(b"owned")).await;
     assert!(
         orchestrator
@@ -1448,12 +1470,14 @@ async fn a_create_for_a_sandbox_this_node_is_still_starting_is_already_exists() 
         MockOperation::StartNowait,
         MockAction::SucceedAfter(std::time::Duration::from_millis(400)),
     );
+    let manager = Arc::new(mock_snapshot_manager());
     let orchestrator = orchestrator_with(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        &manager,
     )
     .await;
-    let (orchestration, service) = serve_node(Arc::clone(&orchestrator), mock_snapshot_manager());
+    let (orchestration, service) = serve_node(Arc::clone(&orchestrator), manager);
 
     let sandbox_id = SandboxId::new();
     let starting = tokio::spawn({
@@ -1604,12 +1628,14 @@ struct StagingHarness {
 async fn staging_service() -> StagingHarness {
     let behavior = Arc::new(MockBehavior::new());
     behavior.make_captures_stageable();
+    let (manager, repository) = recording_snapshot_manager();
+    let manager = Arc::new(manager);
     let orchestrator = orchestrator_with(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        &manager,
     )
     .await;
-    let (manager, repository) = recording_snapshot_manager();
     let (orchestration, service) = serve_node(orchestrator, manager);
     StagingHarness {
         orchestration,
@@ -1940,12 +1966,14 @@ async fn a_failed_pause_says_whether_the_sandbox_survived_it() {
         ),
     ] {
         let behavior = Arc::new(MockBehavior::new());
+        let manager = Arc::new(mock_snapshot_manager());
         let orchestrator = orchestrator_with(
             InMemoryMetadataStore::new(),
             MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+            &manager,
         )
         .await;
-        let (orchestration, service) = serve_node(orchestrator, mock_snapshot_manager());
+        let (orchestration, service) = serve_node(orchestrator, manager);
 
         let sandbox = start(&orchestration, Some(b"owned")).await;
         behavior.push_action(MockOperation::Pause, action);

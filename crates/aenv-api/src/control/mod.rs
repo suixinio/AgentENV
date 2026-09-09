@@ -563,7 +563,7 @@ impl<S: MetadataStore + 'static> SandboxControl<S> {
     /// The reservation says who is launching; the record it writes is what this
     /// caller is waiting for, and is the same record a resume and a connect
     /// already read.
-    async fn await_launch_elsewhere(
+    pub(crate) async fn await_launch_elsewhere(
         &self,
         sandbox_id: SandboxId,
         refusal: OrchestratorError,
@@ -2433,7 +2433,7 @@ impl<S: MetadataStore + 'static> SandboxControl<S> {
     }
 
     /// Pauses or deletes sandboxes whose timeout has expired.
-    async fn evict_expired_sandboxes(self: &Arc<Self>) -> Result<Vec<SandboxId>> {
+    pub(crate) async fn evict_expired_sandboxes(self: &Arc<Self>) -> Result<Vec<SandboxId>> {
         if self.is_shutting_down() {
             debug!("skipping auto-evict because this process is shutting down");
             return Ok(Vec::new());

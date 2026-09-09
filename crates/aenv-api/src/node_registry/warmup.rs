@@ -94,19 +94,20 @@ impl WarmupGate {
         self.reported_in(now);
     }
 
-    /// Records that `node_id`'s roster did not reach the binding store.
+    /// Records that `node_id`'s roster did not reach the binding store, stamped with
+    /// when the absorption failed rather than when its heartbeat arrived.
     ///
     /// Its sandboxes have no binding to find, so the gate shuts until a later roster
     /// for that node lands, the node stops being discovered or reporting, or this
     /// stamp falls outside the veto window.
-    pub fn roster_not_absorbed(&self, node_id: &str, now: SystemTime) {
+    pub fn roster_not_absorbed(&self, node_id: &str, failed_at: SystemTime) {
         let (deadline, window) = self.veto_bounds();
         let mut unabsorbed = self
             .unabsorbed
             .write()
             .expect("warmup absorption lock poisoned");
-        unabsorbed.retain(|_, at| Self::veto_in_force(*at, deadline, window, now));
-        unabsorbed.insert(node_id.to_string(), now);
+        unabsorbed.retain(|_, at| Self::veto_in_force(*at, deadline, window, failed_at));
+        unabsorbed.insert(node_id.to_string(), failed_at);
     }
 
     fn veto_bounds(&self) -> (SystemTime, Duration) {

@@ -722,7 +722,13 @@ impl Scheduler for NodeRegistryGrpcService {
                     // is one tick stale, and its liveness is already recorded.
                     // The unabsorbed roster shuts the gate instead, so a lookup
                     // answers "unavailable" rather than absence until one lands.
-                    self.warmup.roster_not_absorbed(&node_key, now);
+                    // The stamp is when the reconcile failed, not when the
+                    // heartbeat arrived: the reporter waits for this call before
+                    // sending the next one, so a failure that takes longer than
+                    // the veto window would otherwise be recorded already
+                    // outside it and hold nothing shut.
+                    self.warmup
+                        .roster_not_absorbed(&node_key, SystemTime::now());
                     Self::record_heartbeat_reconcile_failure();
                     tracing::warn!(
                         node_id = %node_id,
@@ -2067,15 +2073,21 @@ mod tests {
     struct ReconcileRefusingBindingStore {
         inner: crate::binding_store::InMemoryBindingStore,
         reconcile_fails: std::sync::atomic::AtomicBool,
+        fails_after: Duration,
     }
 
     impl ReconcileRefusingBindingStore {
         fn new() -> Self {
+            Self::failing_after(Duration::ZERO)
+        }
+
+        fn failing_after(fails_after: Duration) -> Self {
             Self {
                 inner: crate::binding_store::InMemoryBindingStore::new(
                     crate::binding_store::BindingStoreSettings::default(),
                 ),
                 reconcile_fails: std::sync::atomic::AtomicBool::new(true),
+                fails_after,
             }
         }
     }
@@ -2108,6 +2120,7 @@ mod tests {
                 .reconcile_fails
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
+                tokio::time::sleep(self.fails_after).await;
                 return Err(crate::binding_store::BindingStoreError::new(
                     "reconcile refused",
                 ));
@@ -2206,6 +2219,42 @@ mod tests {
             .await
             .expect_err("nothing is bound");
         assert_eq!(absent.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_reconcile_that_fails_slower_than_the_veto_window_still_shuts_the_gate() {
+        // The failure has to outlast two windows: a stamp taken when the heartbeat
+        // arrived cannot expire before the warm-up deadline, which is one window out.
+        let window = Duration::from_millis(200);
+        let store = Arc::new(ReconcileRefusingBindingStore::failing_after(
+            Duration::from_millis(1000),
+        ));
+        let registry = Arc::new(AtomicNodeRegistry::new(
+            vec![node("node-a", "http://node-a")],
+            Duration::from_secs(30),
+        ));
+        let warmup = Arc::new(WarmupGate::new(
+            Arc::clone(&registry) as Arc<dyn NodeRegistry>,
+            window,
+            SystemTime::now(),
+        ));
+        let service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup))
+            .with_binding_store(
+                Arc::clone(&store) as Arc<dyn BindingStore>,
+                true,
+                Duration::ZERO,
+            );
+
+        service
+            .heartbeat(Request::new(heartbeat_reporting_ready("node-a")))
+            .await
+            .expect("a slow reconcile failure must not take the node's liveness down with it");
+
+        assert!(
+            !warmup.warmed_up(SystemTime::now()),
+            "the node is live and its roster never landed, so the gate is shut whatever the \
+             reconcile cost"
+        );
     }
 
     #[tokio::test]

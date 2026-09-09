@@ -41,6 +41,10 @@ use crate::types::{ExecutionId, SandboxId};
 const NODE_ID: &str = "node-under-test";
 const CLUSTER_ID: &str = "cluster-under-test";
 
+// The value the shipped kustomization sets, kept honest by
+// `the_fixture_runs_the_projection_authoritative_value_the_cluster_deploys`.
+const DEPLOYED_PROJECTION_AUTHORITATIVE: bool = true;
+
 /// The api half as `bin/aenv-api.rs` wires it, plus the two doubles the test
 /// reads its decisions out of.
 struct ApiHalf {
@@ -423,14 +427,14 @@ async fn api_half() -> ApiHalf {
     ));
     warmup.reported_in(SystemTime::now());
     let bindings = Arc::new(InMemoryBindingStore::new(BindingStoreSettings::default()));
-    // The deployed values, read from the shipped defaults rather than picked:
-    // `projection_authoritative` decides what a heartbeat does to a binding's
-    // deadline, and no deployment turns it on.
+    // The deployed values rather than picked ones: the TTL ceiling is the shipped
+    // compiled default, while `projection_authoritative` -- what a heartbeat does to a
+    // binding's deadline -- is a kustomization literal `AppConfig::default()` cannot see.
     let binding_config = crate::cfg::AppConfig::default().binding_store;
     let grpc_service = NodeRegistryGrpcService::new(Arc::clone(&registry), Arc::clone(&warmup))
         .with_binding_store(
             Arc::clone(&bindings) as Arc<dyn BindingStore>,
-            binding_config.projection_authoritative,
+            DEPLOYED_PROJECTION_AUTHORITATIVE,
             Duration::from_secs(binding_config.max_projection_ttl_secs),
         );
     *node.binding_store.lock().expect("lock") = Some(Arc::clone(&bindings));
@@ -586,6 +590,37 @@ fn staged_by_the_node(sandbox_id: SandboxId) -> pb::SandboxPauseResponse {
             ),
         }),
     }
+}
+
+#[test]
+fn the_fixture_runs_the_projection_authoritative_value_the_cluster_deploys() {
+    // A kustomize literal, anchored at the start of the list item so a line that
+    // merely mentions the key does not answer for the one that sets it.
+    const LITERAL: &str = "- AENV_BINDING_STORE_PROJECTION_AUTHORITATIVE=";
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../deploy/k8s/base/kustomization.yaml");
+    let manifest = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+
+    let set: Vec<&str> = manifest
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix(LITERAL))
+        .collect();
+    assert_eq!(
+        set.len(),
+        1,
+        "expected exactly one kustomize literal setting the switch, found {set:?} -- the \
+         fixture below claims to run what the cluster runs and can no longer tell"
+    );
+    let deployed: bool = set[0]
+        .trim()
+        .parse()
+        .unwrap_or_else(|err| panic!("{LITERAL}{} is not a bool: {err}", set[0]));
+    assert_eq!(
+        deployed, DEPLOYED_PROJECTION_AUTHORITATIVE,
+        "the deployment changed this switch and the fixture kept the old value, so every \
+         binding-deadline assertion below is being made against a value nothing runs"
+    );
 }
 
 #[tokio::test]

@@ -27,10 +27,10 @@ struct Surface {
     orchestrator: Arc<Orchestrator<crate::orchestrator::InMemoryMetadataStore, MockBackendFactory>>,
 }
 
-/// The orchestration under the handlers, with keep-alive answering that the
-/// sandbox is gone. That is what a control path reports for a record whose
-/// runtime the cluster no longer routes to, and the handlers' reaction to it
-/// is what these tests are about.
+/// The orchestration under the handlers, with keep-alive dropping the record
+/// and answering that the sandbox is gone. That is what the control path does
+/// for a record whose runtime the cluster no longer routes to, and the
+/// handlers' reaction to it is what these tests are about.
 struct KeepAliveSaysGone(Arc<dyn crate::orchestrator::SandboxOrchestration>);
 
 #[async_trait::async_trait]
@@ -141,6 +141,9 @@ impl crate::orchestrator::SandboxOrchestration for KeepAliveSaysGone {
         _timeout: Option<std::time::Duration>,
         _allow_shorter: bool,
     ) -> crate::orchestrator::Result<Option<crate::orchestrator::SandboxMetadata>> {
+        // The record goes with the answer, as it does in the control path: a
+        // keep-alive that finds no runtime is what drops it.
+        self.0.remove_sandbox_for_test(&sandbox_id).await?;
         Err(crate::orchestrator::OrchestratorError::SandboxNotFound(
             sandbox_id,
         ))

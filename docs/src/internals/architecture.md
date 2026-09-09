@@ -112,9 +112,9 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
 | API layer | `crates/aenv-node/src/api/` | Axum HTTP server for this node's own report, its metrics and the reverse proxy to sandbox services; the user-facing REST surface is `aenv-api`'s and is absent here |
-| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Forking, Snapshotting, Pausing, Killing), auto-eviction, incremental runtime metrics; a pause ends in a snapshot-catalog row and no record. Its collaborators -- the store, the backend factory, the pause publisher, the grant issuer -- all arrive at construction. Callers reach it through `SandboxOrchestration`, which both halves answer, or `NodeOrchestration`, the subtrait only a process holding VM handles can |
+| Orchestrator | `crates/aenv-node/src/orchestrator/`, over the model in `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Forking, Snapshotting, Pausing, Killing), auto-eviction, incremental runtime metrics; a pause ends in a snapshot-catalog row and no record. Its collaborators -- the store, the backend factory, the pause publisher, the grant issuer -- all arrive at construction. Callers reach it through `SandboxOrchestration`, which both halves answer, or `NodeOrchestration`, the subtrait only a process holding VM handles can |
 | Observability | `src/observability/`, `crates/aenv-node/src/observability/reporter.rs` | Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting |
-| Sandbox | `src/sandbox/` for the backend contract, access tokens and network policy; `crates/aenv-node/src/sandbox/` for the rest | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
+| Sandbox | `src/sandbox/` for the backend contract, access tokens and the network policy model; `crates/aenv-node/src/sandbox/` for the rest, including the iptables that model turns into | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
 | Snapshot + Template Builder | `src/snapshot/`, `src/template/`, `crates/aenv-node/src/template/builder.rs` | `src/snapshot/` owns the committed snapshot model, its repository backends and runtime resolution; `src/template/` is the build spec, and the builder that runs it lives on the node |
 | P2P artifact transport | `crates/aenv-node/src/p2p/` | Optional project-wide artifact lookup, publish, and fetch layer with disabled and iroh-backed transports |
 | Config | `src/cfg.rs`, `crates/aenv-node/src/cfg.rs` | TOML config for firecracker paths, machine specs, timeouts, shared pool tuning, observability metadata, P2P, and scheduler-report settings |
@@ -139,7 +139,7 @@ Snapshot resume can also use `[pool.firecracker]` to pre-spawn `(network slot, F
 The node observability path combines request-time host collection with request-time projection:
 
 - `src/orchestrator/metrics.rs` maintains incremental runtime counters during lifecycle operations, including running sandbox count, starting sandbox count, allocated CPU/memory, and create success/failure totals.
-- `src/orchestrator/service.rs` publishes those counters through a `tokio::sync::watch` channel whenever lifecycle state changes affect the node's runtime accounting.
+- `crates/aenv-node/src/orchestrator/service.rs` publishes those counters through a `tokio::sync::watch` channel whenever lifecycle state changes affect the node's runtime accounting.
 - `src/identity.rs` resolves stable node identity fields such as node ID, cluster ID, service instance ID, package version, and build-time commit.
 - `src/observability/machine.rs` captures static machine descriptors from `/proc/cpuinfo`.
 - `src/observability/host.rs` collects host CPU, memory, and disk usage each time a node snapshot is requested. CPU percent is derived from two `/proc/stat` samples; on the first request it takes both samples with a 100ms window to avoid returning a synthetic zero.
@@ -286,9 +286,9 @@ storage/
 
 src/                            # aenv-core: what both halves link
 ├── api/                        # generated HTTP surface, credential gate, wire conversions
-├── orchestrator/               # sandbox lifecycle
+├── orchestrator/               # states, the metadata record, the store contract, SandboxOrchestration
 ├── observability/              # node identity + host/runtime metrics projection
-├── sandbox/                    # the backend contract, access tokens, network policy
+├── sandbox/                    # the backend contract, access tokens, the network policy model
 ├── secret_kind.rs              # the one secret shape both halves read
 ├── snapshot/                   # committed snapshot model, repository backends, runtime resolution
 ├── template/                   # the template build spec
@@ -298,6 +298,7 @@ crates/aenv-api/src/             # the deciding half
 ├── api/impls/                  # the user-facing REST implementations
 ├── api/server.rs               # their composition
 ├── node_registry/              # the Scheduler contract, discovery, placement
+├── orchestrator/store/redis/   # the metadata store every replica reads
 ├── binding_store/              # the sandbox-to-node routing binding
 ├── control/                    # SandboxControl: place, call the node, settle the record
 ├── node_client/                # driving a sandbox on another machine
@@ -306,6 +307,7 @@ crates/aenv-api/src/             # the deciding half
 
 crates/aenv-node/src/            # the running half
 ├── bin/aenv-node.rs            # node binary entrypoint
+├── orchestrator/               # the lifecycle state machine and its in-memory store
 ├── api/                        # this node's own router and the sandbox data plane
 ├── node_server/                # the node gRPC service the api half drives
 ├── p2p/, record_dir.rs         # artifact transport, node-local JSON records

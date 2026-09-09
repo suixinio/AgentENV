@@ -14,7 +14,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use tonic::Code;
 
-use crate::binding_store::BindingDecision;
+use crate::binding_store::{BindingDecision, LaunchReservationOutcome};
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use crate::node_registry::warmup::WarmupGate;
@@ -305,6 +305,40 @@ impl NodePlacement for NativeNodePlacement {
             );
         }
         Ok(())
+    }
+
+    async fn reserve_launch(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> Result<()> {
+        let outcome = self
+            .local
+            .reserve_launch(&sandbox_id.to_string(), &execution_id.to_string())
+            .await
+            .map_err(|status| {
+                anyhow!(
+                    "the local scheduler refused to reserve the launch of {sandbox_id}: {status}"
+                )
+            })?;
+        if let LaunchReservationOutcome::HeldElsewhere { execution_id: held } = outcome {
+            // Someone is already launching this id. The caller waits for what
+            // that launch produces instead of starting a second runtime.
+            return Err(
+                anyhow::Error::new(LaunchHeldElsewhere { sandbox_id }).context(format!(
+                    "the launch of {sandbox_id} is held by execution {held}"
+                )),
+            );
+        }
+        Ok(())
+    }
+
+    async fn release_launch(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> Result<()> {
+        self.local
+            .release_launch(&sandbox_id.to_string(), &execution_id.to_string())
+            .await
+            .map(|_| ())
+            .map_err(|status| {
+                anyhow!(
+                    "the local scheduler could not release the launch of {sandbox_id}: {status}"
+                )
+            })
     }
 
     async fn release_placement_reservation(

@@ -383,6 +383,79 @@ impl NodeRegistryGrpcService {
             })
     }
 
+    /// Takes a sandbox id for a launch before a node is chosen for it.
+    ///
+    /// In-process only, for the same reason as [`Self::reserve_assignment`]: it
+    /// is one half of single activation and no `Scheduler` caller may take an
+    /// id on another's behalf.
+    pub async fn reserve_launch(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+    ) -> Result<crate::binding_store::LaunchReservationOutcome, Status> {
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "reserving a launch needs a binding store, and this deployment has none \
+                 wired: {NOT_WIRED}"
+            )));
+        };
+        let sandbox_id = sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        let (execution, _reason) =
+            crate::binding_store::record::normalize_execution_id_reason(execution_id);
+        if execution.is_empty() {
+            // A reservation with no incarnation could never be released or
+            // arbitrated against, so it would hold the id until its window ran out.
+            return Err(Status::invalid_argument("execution_id is required"));
+        }
+        binding_store
+            .reserve_launch(sandbox_id, &execution, SystemTime::now())
+            .await
+            .inspect(|outcome| Self::record_sandbox_event("launch_reservation", outcome.as_str()))
+            .map_err(|err| {
+                Self::record_sandbox_event("launch_reservation", "store_error");
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "scheduler reserve_launch failed"
+                );
+                Status::unavailable("binding store unavailable")
+            })
+    }
+
+    /// Gives a launch's sandbox id back once it has settled, either way.
+    pub async fn release_launch(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+    ) -> Result<BindingDeleteOutcome, Status> {
+        let Some(binding_store) = self.binding_store.clone() else {
+            return Err(Status::unimplemented(format!(
+                "releasing a launch needs a binding store, and this deployment has none \
+                 wired: {NOT_WIRED}"
+            )));
+        };
+        let sandbox_id = sandbox_id.trim();
+        if sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        let (execution, _reason) =
+            crate::binding_store::record::normalize_execution_id_reason(execution_id);
+        binding_store
+            .release_launch(sandbox_id, &execution, SystemTime::now())
+            .await
+            .map_err(|err| {
+                tracing::warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "scheduler release_launch failed"
+                );
+                Status::unavailable("binding store unavailable")
+            })
+    }
+
     /// Withdraws a reservation this process wrote, leaving a confirmation alone.
     pub async fn release_assignment_reservation(
         &self,

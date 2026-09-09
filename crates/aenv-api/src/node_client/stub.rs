@@ -434,6 +434,23 @@ impl RemoteSandboxStub {
         }
     }
 
+    /// Gives the sandbox id back. Best-effort: a reservation nothing releases
+    /// is retired by its own window.
+    async fn release_launch(&self) {
+        if let Err(error) = self
+            .placement
+            .release_launch(self.sandbox_id, self.execution_id)
+            .await
+        {
+            warn!(
+                sandbox_id = %self.sandbox_id,
+                execution_id = %self.execution_id,
+                error = %error,
+                "could not give back the launch reservation of this sandbox; it expires on its own"
+            );
+        }
+    }
+
     async fn withdraw_reservation(&self) {
         if let Err(error) = self
             .placement
@@ -646,27 +663,17 @@ fn decode_resolved_image_facts(
     })
 }
 
-#[async_trait]
-impl SandboxBackend for RemoteSandboxStub {
-    fn execution_id(&self) -> ExecutionId {
-        self.execution_id
-    }
-
-    async fn start(&mut self) -> Result<()> {
-        if self.placed.is_some() {
-            return Ok(());
-        }
-        let (request, preferred_node_id, needs) = match &self.pending {
-            PendingLaunch::AlreadyStarted => return Ok(()),
-            // Attach resolves an existing sandbox rather than starting one.
-            PendingLaunch::Attach => return self.attach().await,
-            PendingLaunch::Launch {
-                request,
-                preferred_node_id,
-                needs,
-            } => ((**request).clone(), preferred_node_id.clone(), *needs),
-        };
-
+/// The half of a launch that happens once the sandbox id is held.
+impl RemoteSandboxStub {
+    /// Chooses a node, reserves its routing record and asks it for the runtime,
+    /// trying another node for as long as the refusals are ones another node
+    /// could answer differently.
+    async fn start_on_a_node(
+        &mut self,
+        request: pb::SandboxCreateRequest,
+        preferred_node_id: Option<String>,
+        needs: PlacementNeeds,
+    ) -> Result<()> {
         // A node that refuses the launch is excluded and placement is asked
         // again, so a preference the placement source is stale about (a node
         // just put into draining) costs one round trip, not the launch.
@@ -783,8 +790,46 @@ impl SandboxBackend for RemoteSandboxStub {
         });
         Ok(())
     }
+}
 
-    /// Starts and waits in the same remote round trip.
+#[async_trait]
+impl SandboxBackend for RemoteSandboxStub {
+    fn execution_id(&self) -> ExecutionId {
+        self.execution_id
+    }
+
+    async fn start(&mut self) -> Result<()> {
+        if self.placed.is_some() {
+            return Ok(());
+        }
+        let (request, preferred_node_id, needs) = match &self.pending {
+            PendingLaunch::AlreadyStarted => return Ok(()),
+            // Attach resolves an existing sandbox rather than starting one.
+            PendingLaunch::Attach => return self.attach().await,
+            PendingLaunch::Launch {
+                request,
+                preferred_node_id,
+                needs,
+            } => ((**request).clone(), preferred_node_id.clone(), *needs),
+        };
+
+        // Take the id before any node is chosen: a concurrent launch of the
+        // same id must learn it is the later one before it spends a placement
+        // decision and an optimistic resource deduction on it.
+        self.placement
+            .reserve_launch(self.sandbox_id, self.execution_id)
+            .await
+            .with_context(|| format!("reserve the launch of sandbox {}", self.sandbox_id))?;
+        let started = self
+            .start_on_a_node(request, preferred_node_id, needs)
+            .await;
+        // Either way the reservation has done its work: a launch that got as
+        // far as a routing record is fenced by that record, and one that failed
+        // must not keep the id until the window runs out.
+        self.release_launch().await;
+        started
+    }
+
     async fn start_nowait(&mut self) -> Result<()> {
         self.start().await
     }
@@ -792,7 +837,6 @@ impl SandboxBackend for RemoteSandboxStub {
     async fn wait_for_ready(&self) -> Result<()> {
         self.placed().map(|_| ())
     }
-
     /// Pauses on the node, which stages the capture and forgets the sandbox.
     ///
     /// The node's answer is the staged snapshot; the api half commits it. A

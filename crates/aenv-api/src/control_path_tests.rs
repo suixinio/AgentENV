@@ -53,6 +53,7 @@ struct ApiHalf {
     snapshots: Arc<RecordingSnapshotRepository>,
     grants: Arc<RecordingGrants>,
     calls: Arc<Mutex<Vec<String>>>,
+    launch_calls: Arc<Mutex<Vec<String>>>,
     node: Arc<ScriptedNode>,
     _node_shutdown: oneshot::Sender<()>,
 }
@@ -109,6 +110,10 @@ impl ApiHalf {
         self.calls.lock().expect("lock").clone()
     }
 
+    fn launch_reservation_calls(&self) -> Vec<String> {
+        self.launch_calls.lock().expect("lock").clone()
+    }
+
     fn creates_seen(&self) -> Vec<pb::SandboxCreateRequest> {
         self.node.seen_create.lock().expect("lock").clone()
     }
@@ -126,11 +131,21 @@ impl ApiHalf {
 struct RecordingPlacement {
     inner: Arc<dyn NodePlacement>,
     calls: Arc<Mutex<Vec<String>>>,
+    /// Launch reservations are recorded apart from the node-bound decisions:
+    /// they precede placement and belong to no node.
+    launch_calls: Arc<Mutex<Vec<String>>>,
 }
 
 impl RecordingPlacement {
     fn note(&self, what: &str) {
         self.calls.lock().expect("lock").push(what.to_string());
+    }
+
+    fn note_launch(&self, what: &str) {
+        self.launch_calls
+            .lock()
+            .expect("lock")
+            .push(what.to_string());
     }
 }
 
@@ -221,6 +236,24 @@ impl NodePlacement for RecordingPlacement {
         self.inner
             .release_placement_reservation(sandbox_id, execution_id)
             .await
+    }
+
+    async fn reserve_launch(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        self.note_launch("reserve_launch");
+        self.inner.reserve_launch(sandbox_id, execution_id).await
+    }
+
+    async fn release_launch(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        self.note_launch("release_launch");
+        self.inner.release_launch(sandbox_id, execution_id).await
     }
 
     async fn forget_placement(
@@ -459,6 +492,7 @@ async fn api_half() -> ApiHalf {
     .expect("the node under test reports in");
 
     let calls: Arc<Mutex<Vec<String>>> = Arc::default();
+    let launch_calls: Arc<Mutex<Vec<String>>> = Arc::default();
     let placement: Arc<dyn NodePlacement> = Arc::new(RecordingPlacement {
         inner: Arc::new(NativeNodePlacement::new(
             registry,
@@ -467,6 +501,7 @@ async fn api_half() -> ApiHalf {
             grpc_service,
         )),
         calls: Arc::clone(&calls),
+        launch_calls: Arc::clone(&launch_calls),
     });
 
     let store = InMemoryMetadataStore::new();
@@ -495,6 +530,7 @@ async fn api_half() -> ApiHalf {
         snapshots,
         grants,
         calls,
+        launch_calls,
         node,
         _node_shutdown: shutdown_tx,
     }
@@ -948,5 +984,98 @@ async fn a_delete_the_node_refuses_keeps_the_record_rather_than_forgetting_a_liv
     assert!(
         half.record_state(metadata.id).await.is_some(),
         "a delete the node refused forgot a sandbox that may still be running"
+    );
+}
+
+#[tokio::test]
+async fn a_launch_another_replica_holds_never_reaches_placement() {
+    let half = api_half().await;
+    let sandbox_id = SandboxId::new();
+    let holder = ExecutionId::new();
+    half.bindings
+        .reserve_launch(
+            &sandbox_id.to_string(),
+            &holder.to_string(),
+            SystemTime::now(),
+        )
+        .await
+        .expect("the binding store takes the id for the other replica");
+
+    let err = Arc::clone(&half.orchestrator)
+        .restore_sandbox(sandbox_id, cold_create())
+        .await
+        .expect_err("a sandbox id another replica is launching is not this launch's to take");
+
+    assert!(
+        crate::orchestrator::LaunchHeldElsewhere::refused(&err),
+        "the caller has to read this as a launch to wait for, not a failure: {err:#}"
+    );
+    assert!(
+        !half.placement_calls().contains(&"place_new".to_string()),
+        "the id is taken before a node is chosen, so no placement decision may be spent: {:?}",
+        half.placement_calls()
+    );
+    assert!(
+        half.creates_seen().is_empty(),
+        "no node may be asked for a runtime under an id someone else is launching"
+    );
+}
+
+#[tokio::test]
+async fn a_cold_create_gives_the_sandbox_id_back_once_a_routing_record_fences_it() {
+    let half = api_half().await;
+
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("the api half creates a sandbox on the node");
+
+    assert_eq!(
+        half.launch_reservation_calls(),
+        vec!["reserve_launch".to_string(), "release_launch".to_string()],
+        "the id is taken for the launch and given back when the launch settles"
+    );
+    assert_eq!(
+        half.bindings
+            .reserve_launch(
+                &metadata.id.to_string(),
+                &ExecutionId::new().to_string(),
+                SystemTime::now()
+            )
+            .await
+            .expect("the binding store answers"),
+        crate::binding_store::LaunchReservationOutcome::Claimed,
+        "past the launch it is the routing record that fences the id, not the reservation"
+    );
+}
+
+#[tokio::test]
+async fn a_cold_create_the_node_refuses_gives_the_sandbox_id_back_too() {
+    let half = api_half().await;
+    *half.node.create.lock().expect("lock") =
+        Some(Err(Status::internal("this node cannot pull that image")));
+
+    Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect_err("a node that refuses the create must not look like a success");
+
+    assert_eq!(
+        half.launch_reservation_calls(),
+        vec!["reserve_launch".to_string(), "release_launch".to_string()],
+        "a launch that failed must not hold the id until its window runs out"
+    );
+    let sandbox_id =
+        SandboxId::parse_str(&half.creates_seen()[0].sandbox_id).expect("a sandbox id");
+    assert_eq!(
+        half.bindings
+            .reserve_launch(
+                &sandbox_id.to_string(),
+                &ExecutionId::new().to_string(),
+                SystemTime::now()
+            )
+            .await
+            .expect("the binding store answers"),
+        crate::binding_store::LaunchReservationOutcome::Claimed
     );
 }

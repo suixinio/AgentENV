@@ -136,6 +136,35 @@ pub trait NodePlacement: Send + Sync + 'static {
         execution_id: ExecutionId,
     ) -> anyhow::Result<()>;
 
+    /// Takes the sandbox id for this launch before any node is chosen.
+    ///
+    /// A launch that meets one already holding the id fails with a
+    /// [`crate::orchestrator::LaunchHeldElsewhere`] in its error chain, which
+    /// the caller reads as "wait for that launch" rather than "this failed".
+    /// The default claims without writing: a source with no shared reservation
+    /// space arbitrates one process's launches, which the caller already does.
+    async fn reserve_launch(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        let _ = (sandbox_id, execution_id);
+        Ok(())
+    }
+
+    /// Gives the sandbox id back once the launch has settled, either way.
+    ///
+    /// The routing record the launch wrote is what fences the id from here on,
+    /// so holding the reservation past that only delays the next launch.
+    async fn release_launch(
+        &self,
+        sandbox_id: SandboxId,
+        execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        let _ = (sandbox_id, execution_id);
+        Ok(())
+    }
+
     /// Retires the placement record of an incarnation being torn down, so no
     /// lookup routes at a runtime that is going away.
     ///

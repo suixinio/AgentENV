@@ -615,6 +615,20 @@ mod pg {
         sandbox_id: &str,
         payload: &[u8],
     ) -> SnapshotId {
+        let id =
+            insert_a_building_row_the_way_the_previous_build_does(pool, cluster_id, sandbox_id)
+                .await;
+        commit_a_pause_the_way_the_previous_build_does(pool, id.clone(), payload)
+            .await
+            .expect("the previous build's commit should succeed");
+        id
+    }
+
+    async fn insert_a_building_row_the_way_the_previous_build_does(
+        pool: &PgPool,
+        cluster_id: Uuid,
+        sandbox_id: &str,
+    ) -> SnapshotId {
         let id = SnapshotId::generate();
         sqlx::query(
             "INSERT INTO snapshots (
@@ -638,7 +652,14 @@ mod pg {
         .execute(pool)
         .await
         .expect("the previous build's insert should succeed");
+        id
+    }
 
+    async fn commit_a_pause_the_way_the_previous_build_does(
+        pool: &PgPool,
+        id: SnapshotId,
+        payload: &[u8],
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE snapshots
                 SET status            = 'ready',
@@ -653,8 +674,56 @@ mod pg {
         .bind(2_000_i64)
         .execute(pool)
         .await
-        .expect("the previous build's commit should succeed");
-        id
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn a_second_pause_from_the_previous_build_collides_with_the_unique_index() {
+        let pool = isolated_schema_pool_or_skip!(
+            "a_second_pause_from_the_previous_build_collides_with_the_unique_index"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+        let cluster_id = Uuid::new_v4();
+
+        let commit = sandbox_pause_owned_by("sbx-rolled-twice", Some("keep"));
+        let payload = convert::encode_committed(&commit.committed).expect("the payload encodes");
+        write_a_pause_the_way_the_previous_build_does(
+            &pool,
+            cluster_id,
+            "sbx-rolled-twice",
+            &payload,
+        )
+        .await;
+
+        // The previous build has no upsert, so nothing retires the live row first.
+        let second = insert_a_building_row_the_way_the_previous_build_does(
+            &pool,
+            cluster_id,
+            "sbx-rolled-twice",
+        )
+        .await;
+        let err = commit_a_pause_the_way_the_previous_build_does(&pool, second, &payload)
+            .await
+            .expect_err(
+                "a second live pause row for one sandbox is what the unique index exists to \
+                 refuse, whichever build writes it",
+            );
+
+        let db = err
+            .as_database_error()
+            .expect("a constraint violation is a database error");
+        assert_eq!(
+            db.code().as_deref(),
+            Some("23505"),
+            "the operator-visible shape of this window is a unique violation, not some other \
+             failure: {err}"
+        );
+        assert_eq!(
+            db.constraint(),
+            Some("snapshots_one_pause_per_sandbox"),
+            "and it names the index, so the 500 an old replica returns can be read back to \
+             this window: {err}"
+        );
     }
 
     #[tokio::test]

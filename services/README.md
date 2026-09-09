@@ -267,6 +267,17 @@ Consequences for an operator:
   classifies such a write from `committed_payload`: a pause committed in that
   window is a pause to the unique index, the pause listing, a resume and
   `delete_sandbox_pauses`. A writer that states the column keeps its own answer.
+- Being a pause to the unique index has a cost during the roll. The older build
+  has no upsert — retiring the sandbox's previous pause row in the transaction
+  that commits the new one arrived with this image — so its **second** pause of
+  a sandbox that already holds a live pause row hits
+  `snapshots_one_pause_per_sandbox` and fails with SQLSTATE `23505`. The api
+  half answers that pause `500`, and the sandbox resumes in place or is torn
+  down (`OrchestratorError::PausePublicationFailed`); nothing is lost, and the
+  same request retried against a replica of this image succeeds, because that
+  build retires the previous row first. The alternative was the older behaviour
+  — a second live pause row nobody would ever resume — so this is a loud
+  failure replacing a silent one, for as long as the roll takes.
 - **Retiring the trigger.** It exists for that window and for nothing else. Once
   no replica older than this image can run again, and only then, it can go:
 

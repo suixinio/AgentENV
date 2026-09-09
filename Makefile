@@ -206,6 +206,10 @@ DEP_EGRESS_TLS_FEATURE := ^aenv-egress feature "tls"
 # package with the features enabled on it, so this names the feature on the
 # package rather than anywhere in a tree.
 DEP_CORE_TEST_SUPPORT := ^aenv-core v[0-9].*[ ,]test-support([ ,]|$$)
+# The same feature on either half, for the workspace-wide reading of the rule:
+# cargo unifies features per invocation, so a sibling member's normal edge is
+# what the halves' own subtrees cannot see.
+DEP_TEST_SEEDS := ^aenv-(core|node) v[0-9].*[ ,]test-support([ ,]|$$)
 # The control for the rule above: a feature tree that names no aenv-egress
 # feature at all cannot be read for the one feature that is forbidden.
 DEP_EGRESS_FEATURE_SHAPE := ^aenv-egress feature "(core|local|resolver|tls)"
@@ -284,6 +288,16 @@ check-crate-boundaries:
 	  fi; \
 	  control '$(DEP_CORE_TEST_SUPPORT)' "aenv-core's test-support feature" "$$tested" "$$half's tree with its dev edges, where the feature is turned on"; \
 	done; \
+	workspace_shipped=$$($(CARGO) tree --workspace -e normal --prefix none -f '{p} {f}' | sort -u) || { echo "cargo tree --workspace -e normal -f '{p} {f}' failed"; exit 1; }; \
+	workspace_tested=$$($(CARGO) tree --workspace -e normal,dev --prefix none -f '{p} {f}' | sort -u) || { echo "cargo tree --workspace -e normal,dev -f '{p} {f}' failed"; exit 1; }; \
+	if matches '$(DEP_TEST_SEEDS)' "$$workspace_shipped"; then \
+	  echo "a workspace member turns on aenv-core's or aenv-node's test-support feature over a"; \
+	  echo "normal dependency edge. Feature unification is per invocation, not per package: a"; \
+	  echo "sibling's normal edge hands the seeded build to every binary resolved beside it,"; \
+	  echo "which is why this reads the whole workspace and not each half's own subtree."; \
+	  fail=1; \
+	fi; \
+	control '$(DEP_TEST_SEEDS)' "aenv-core's and aenv-node's test-support feature" "$$workspace_tested" "the workspace tree with its dev edges, where the feature is turned on"; \
 	for pair in $(CORE_EXILED_PATHS); do \
 	  path=$${pair%%:*}; home=$${pair#*:}; stem=$${path%.rs}; \
 	  back=""; \

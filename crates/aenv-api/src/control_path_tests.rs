@@ -878,6 +878,15 @@ async fn a_pause_revokes_the_grant_the_create_issued() {
         .create_sandbox(cold_create_naming_a_secret())
         .await
         .expect("a sandbox to pause");
+    assert_eq!(
+        half.granted(),
+        vec![(
+            metadata.id,
+            metadata.execution_id,
+            vec!["openai".to_string()]
+        )],
+        "there is no grant for the pause to revoke unless the create issued one"
+    );
     *half.node.pause.lock().expect("lock") = Some(Ok(staged_by_the_node(metadata.id)));
 
     Arc::clone(&half.orchestrator)

@@ -373,8 +373,14 @@ node gRPC 面、Redis 与 PG 的键与列）都不变——§3 的预留是**新
 `control_path_tests.rs` 现在 38 个，即新增 27 个。（`InMemoryMetadataStore` 经
 `crates/aenv-api/src/orchestrator/` 的一条 `#[cfg(test)] pub use` 到位。）
 2：测试计数守恒逐 crate 核过——搬走的用例在收方一个不少地出现；测试属性总数
-`src` 576 → 309、`crates/aenv-node` 660 → 823、`crates/aenv-api` 622 → 754，
-合计 1,858 → 1,886。消失的十个用例每一个都在提交正文里点名了替代品。
+`src` 576 → 308、`crates/aenv-node` 660 → 823、`crates/aenv-api` 622 → 755，
+合计 1,858 → 1,886。计法：`#[test]` 与 `#[tokio::test(...)]` 按出现次数计，
+并跳过首个非空白字符是 `//` 的行——`src/orchestrator/store/contract.rs:604`
+的 doc 注释正文里写着 `#[tokio::test]`，把它当成一个用例会让 `src` 多出一个。
+消失的十个用例每一个都在提交正文里点名了替代品。`aenv-api` 这一侧的最后一个
+是 pause 提交耗尽重试预算后的拆除臂（`control/mod.rs` 的 `node.stop` +
+`forget_sandbox` + terminal 错误）：它在 `#[tokio::test(start_paused = true)]`
+的虚拟时间里跑，2+4+8+16 秒的退避不花墙钟。
 4：`cargo tree -p aenv-node -e normal` 不含 `kube`/`k8s-openapi`/`sqlx`/`redis`，
 677 → 667 行、去掉 `(*)` 重复后 504 → 495，即真实少了 9 个 crate（`redis` 与它的
 八个传递依赖）。`aenv-api` 528 → 527 **行**，但依赖集合 393 → 393 完全不变：

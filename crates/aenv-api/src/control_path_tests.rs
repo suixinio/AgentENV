@@ -1872,7 +1872,7 @@ async fn a_fork_the_node_refuses_revokes_every_child_grant_it_issued() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_pause_whose_commit_fails_is_retried_because_the_node_cannot_put_the_vm_back() {
     let half = api_half().await;
     let metadata = Arc::clone(&half.orchestrator)
@@ -1899,6 +1899,69 @@ async fn a_pause_whose_commit_fails_is_retried_because_the_node_cannot_put_the_v
     assert!(
         half.binding(metadata.id).await.is_none(),
         "a paused sandbox that still routes somewhere"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pause_whose_commits_are_all_refused_drops_the_sandbox_it_cannot_bring_back() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create_naming_a_secret())
+        .await
+        .expect("a sandbox to pause");
+    *half.node.pause.lock().expect("lock") = Some(Ok(staged_by_the_node(metadata.id)));
+    // More refusals than the commit has attempts, so what ends the retries is
+    // the budget running out rather than a later attempt landing.
+    half.snapshots.refuse_commits(64);
+
+    let err = Arc::clone(&half.orchestrator)
+        .pause_sandbox(metadata.id)
+        .await
+        .expect_err("a capture that was never committed is not a paused sandbox");
+
+    assert!(
+        matches!(
+            &err,
+            crate::orchestrator::OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation,
+                ..
+            } if *sandbox_id == metadata.id
+                && *operation == crate::orchestrator::SandboxOperation::Pause
+        ),
+        "a pause nothing could commit reported {err:?}"
+    );
+    assert!(
+        half.snapshots.committed().is_empty(),
+        "a pause row exists for a capture every attempt refused"
+    );
+    assert_eq!(
+        half.record_state(metadata.id).await,
+        None,
+        "the record of a sandbox whose VM is gone and whose bytes were never committed"
+    );
+    assert!(
+        half.binding(metadata.id).await.is_none(),
+        "a sandbox nothing runs any more still routes somewhere"
+    );
+    assert!(
+        half.routing
+            .forgotten()
+            .iter()
+            .any(|(id, execution, _)| *id == metadata.id && *execution == metadata.execution_id),
+        "the routing binding of this incarnation was never retired"
+    );
+    assert!(
+        half.revoked()
+            .contains(&(metadata.id, metadata.execution_id)),
+        "a sandbox that no longer exists keeps the secrets it was granted"
+    );
+    // The node stopped the VM as part of the pause, so the stop this arm asks
+    // for reaches no node: a delete here would name a sandbox the node has
+    // already forgotten.
+    assert!(
+        half.node.seen_delete.lock().expect("lock").is_empty(),
+        "the node was asked to delete a sandbox it had already stopped"
     );
 }
 

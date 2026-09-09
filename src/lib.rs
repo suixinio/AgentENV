@@ -93,8 +93,8 @@ mod mock_module_gating {
         false
     }
 
-    /// One-based line numbers of the `mod mock` declarations this text leaves in
-    /// an unconditional build, whatever their visibility.
+    // One-based line numbers of the `mod mock` declarations this text leaves in
+    // an unconditional build, whatever their visibility.
     fn ungated_mock_declarations(source: &str) -> Vec<usize> {
         let lines: Vec<&str> = source.lines().collect();
         lines

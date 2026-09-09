@@ -116,8 +116,8 @@ impl WarmupGate {
         (deadline, window)
     }
 
-    /// A stamp holds for one window, renewed by every failing heartbeat, and never
-    /// expires before warm-up itself could have opened the gate.
+    // A stamp holds for one window, renewed by every failing heartbeat, and never
+    // expires before warm-up itself could have opened the gate.
     fn veto_in_force(
         recorded_at: SystemTime,
         deadline: SystemTime,
@@ -127,8 +127,8 @@ impl WarmupGate {
         now < recorded_at.max(deadline) + window
     }
 
-    /// A node past its own report TTL holds nothing: this replica can no longer tell
-    /// its sandboxes from those of any other node it cannot reach.
+    // A node past its own report TTL holds nothing: this replica can no longer tell
+    // its sandboxes from those of any other node it cannot reach.
     fn node_still_reporting(&self, node_id: &str, now: SystemTime) -> bool {
         match self.nodes.peek_observed_with_freshness(node_id, now) {
             // A receive time ahead of `now` is a newer report, not a missing one.

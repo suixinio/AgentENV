@@ -1323,74 +1323,69 @@ impl<S: MetadataStore + 'static> SandboxControl<S> {
                     error = %format_args!("{source:#}"),
                     "the pause capture could not be published; putting the sandbox back"
                 );
-                match node.resume().await {
-                    Ok(()) => {
-                        self.rollback_pause_to_running(sandbox_id).await;
-                        return Err(OrchestratorError::PausePublicationFailed {
-                            sandbox_id,
-                            source,
-                        });
+                // A pause on this half stops the VM on the node, so the ask
+                // yields the reason it cannot come back and never the sandbox:
+                // `RemoteSandboxStub::resume` refuses by construction.
+                let resume_err = node.resume().await.expect_err(
+                    "a node that paused a sandbox has already stopped it, so resuming it in \
+                     place cannot succeed",
+                );
+                // The VM cannot come back, so the staged capture is the only
+                // copy of this sandbox. Commit it again before giving up on it.
+                warn!(error = ?resume_err, "failed to resume sandbox after a failed publication");
+                let recovered = match restageable.as_ref() {
+                    Some(staged) => self.retry_pause_publication(&metadata, staged).await,
+                    None => Err(source),
+                };
+                match recovered {
+                    Ok(published) => {
+                        info!(
+                            published = ?published,
+                            "a retried commit published the pause capture of a sandbox \
+                             that could not be resumed"
+                        );
+                        published
                     }
-                    Err(resume_err) => {
-                        // The VM cannot come back, so the staged capture is the
-                        // only copy of this sandbox. Commit it again before
-                        // giving up on it.
-                        warn!(error = ?resume_err, "failed to resume sandbox after a failed publication");
-                        let recovered = match restageable.as_ref() {
-                            Some(staged) => self.retry_pause_publication(&metadata, staged).await,
-                            None => Err(source),
-                        };
-                        match recovered {
-                            Ok(published) => {
-                                info!(
-                                    published = ?published,
-                                    "a retried commit published the pause capture of a sandbox \
-                                     that could not be resumed"
-                                );
-                                published
-                            }
-                            Err(retry_error) => {
-                                let snapshot_id = restageable
-                                    .as_ref()
-                                    .map(|staged| staged.commit.id.to_string())
-                                    .unwrap_or_default();
-                                let staged_commit = restageable
-                                    .as_ref()
-                                    .and_then(|staged| serde_json::to_string(staged).ok())
-                                    .unwrap_or_default();
-                                // The bytes stay where the node put them; this
-                                // line is what an operator re-commits from.
-                                error!(
-                                    %sandbox_id,
-                                    %snapshot_id,
-                                    %staged_commit,
-                                    error = %format_args!("{retry_error:#}"),
-                                    "the pause capture of this sandbox could not be committed \
-                                     and its sandbox cannot be resumed; the capture bytes were \
-                                     kept and only a commit of the staged snapshot recovers it"
-                                );
-                                if let Err(stop_err) = node.stop().await {
-                                    warn!(error = ?stop_err, "failed to stop sandbox after a failed publication");
-                                }
-                                if let Err(error) =
-                                    self.forget_sandbox(sandbox_id, metadata.execution_id).await
-                                {
-                                    warn!(error = ?error, "failed to remove sandbox after pause failure");
-                                }
-                                return Err(OrchestratorError::SandboxOperationFailed {
-                                    sandbox_id,
-                                    operation: SandboxOperation::Pause,
-                                    source: aenv_core::sandbox::SandboxCaptureError::terminal(
-                                        retry_error.context(format!(
-                                            "the capture could not be committed and the sandbox \
-                                             could not be resumed ({resume_err:#}); its capture \
-                                             bytes were retained under snapshot {snapshot_id}"
-                                        )),
-                                    )
-                                    .into(),
-                                });
-                            }
+                    Err(retry_error) => {
+                        let snapshot_id = restageable
+                            .as_ref()
+                            .map(|staged| staged.commit.id.to_string())
+                            .unwrap_or_default();
+                        let staged_commit = restageable
+                            .as_ref()
+                            .and_then(|staged| serde_json::to_string(staged).ok())
+                            .unwrap_or_default();
+                        // The bytes stay where the node put them; this line is
+                        // what an operator re-commits from.
+                        error!(
+                            %sandbox_id,
+                            %snapshot_id,
+                            %staged_commit,
+                            error = %format_args!("{retry_error:#}"),
+                            "the pause capture of this sandbox could not be committed \
+                             and its sandbox cannot be resumed; the capture bytes were \
+                             kept and only a commit of the staged snapshot recovers it"
+                        );
+                        if let Err(stop_err) = node.stop().await {
+                            warn!(error = ?stop_err, "failed to stop sandbox after a failed publication");
                         }
+                        if let Err(error) =
+                            self.forget_sandbox(sandbox_id, metadata.execution_id).await
+                        {
+                            warn!(error = ?error, "failed to remove sandbox after pause failure");
+                        }
+                        return Err(OrchestratorError::SandboxOperationFailed {
+                            sandbox_id,
+                            operation: SandboxOperation::Pause,
+                            source: aenv_core::sandbox::SandboxCaptureError::terminal(
+                                retry_error.context(format!(
+                                    "the capture could not be committed and the sandbox \
+                                     could not be resumed ({resume_err:#}); its capture \
+                                     bytes were retained under snapshot {snapshot_id}"
+                                )),
+                            )
+                            .into(),
+                        });
                     }
                 }
             }

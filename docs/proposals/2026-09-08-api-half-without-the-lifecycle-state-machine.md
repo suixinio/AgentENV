@@ -132,7 +132,10 @@ crates/aenv-api      SandboxControl（放置 → binding 预留 → node gRPC �
 ```
 
 `SandboxControl` 的每个方法是 e2b 那条直线**加上它的回滚臂**（见 §2 的 `finish`
-闭包）：`PausePublicationFailed` 必须活下来。构造参数直接接收今天靠三个
+闭包）：`PausePublicationFailed` 必须活下来。它在 api 半边由 join 路径产生——
+pause 自身没有就地 resume 臂，节点在 pause 里已经把 VM 停掉并遗忘，
+`RemoteSandboxStub::resume` 恒拒；发布失败在这一半的出口是重试，再不成是拆除。
+就地 resume 那条臂属于节点半边（`crates/aenv-node/src/orchestrator/service.rs`）。构造参数直接接收今天靠三个
 `set_*` 后置注入的协作者（`set_pause_publisher` / `set_grant_issuer` /
 `set_runtime_routing`，`service.rs:1629,1636,1643`）—— 一个装配完就不可变的类型
 不需要 `OnceCell`，而那三个 `OnceCell`（`service.rs:147,150,154`）今天正是

@@ -170,6 +170,13 @@ e2b 的分法一样：预留在 `getReservationPrefix(teamID)` 下，沙箱记�
 `.../sandboxes/{id}`（`packages/api/internal/sandbox/reservations/redis/utils.go:20-36`
 与 `.../storage/redis/utils.go:66-68`），共享的只有那个用于配额的团队索引。
 
+预留已按此落地（`crates/aenv-api/src/binding_store/reservation.rs`），三个结果
+claimed / held-elsewhere / expired，窗口取 `LAUNCH_RESERVATION_EXCLUSIVE_TTL`。
+与 e2b 的一处偏离：e2b 的预留键还存放启动结果（`resultKey`），join 者从那里读；
+我们的 join 者读的仍是共享元数据记录（`await_launch_elsewhere_until` 的
+`LAUNCH_ELSEWHERE_POLL`），预留只回答"谁在启动"。理由是这条记录本来就是 resume
+与 connect 的判据，再存一份结果会多出一个可以互相矛盾的真相源。
+
 **与 e2b 的偏离**：e2b 的 keep-alive **有**一段向持有节点的转发
 （`keep_alive.go:60` → `update_instance.go:34,40`：`getOrConnectNode` 后
 `client.Sandbox.Update`），因为它的节点自己持 deadline。我们没有这段代码可删——
@@ -223,6 +230,19 @@ api 侧的 `sandboxes` 桩表、`proxy_routes`；**`launch_claims`**（连同它
 `ApiImpl::runs_sandbox_runtime` / `owns_sandboxes` / `WakeSite` 与 `role_gate`
 已在步骤 2 删除（commit 270d858），不再是本步的工作。
 
+**本步已落地的部分**：§3 的预留（新键、两后端契约、清扫器回收）与它在创建路径上的
+位置（`RemoteSandboxStub::start` 先取 id 再选节点，落定后归还）；以及 `facade.rs`
+的拆分——`SandboxOrchestration` 是 REST 层与 observability 两个消费者要的那一份，
+`NodeOrchestration` 是只有跑沙箱的进程能回答的十一个方法。
+
+**本步未落地的部分**：`SandboxControl` 本身，以及随它才能删掉的
+`DisabledRuntimeImageRefs`、`UnknownRecordOwner`、`RoleStorage` 的造了再丢、
+api 侧 `sandboxes` 桩表与 `proxy_routes`、`launch_claims` 在 api 半边的用法、
+三个 `set_*` 变构造参数。api 半边今天仍构造 `Orchestrator`。
+`launch_claims` 在**节点侧**必须保留：它守的是同一节点上两个不同 execution id
+的并发 create（dev 的 406bc6f），预留只保证一个 api 副本在一个时刻持有一个
+sandbox id，覆盖不到这一条。
+
 ### 步骤 4：文档
 
 CLAUDE.md 的 aenv-api 条、Orchestrator 条、Workspace Crates，以及讲"哪一半是二进制
@@ -258,9 +278,9 @@ node gRPC 面、Redis 与 PG 的键与列）都不变——§3 的预留是**新
 |---|---|---|---|
 | 1 | `src/orchestrator/store/redis/`（4,671 行，含自带测试） | 唯一生产调用方 `crates/aenv-api/src/bin/aenv-api.rs:193` | `crates/aenv-node` 对 `RedisMetadataStore` 的引用数为 **0**，却链进 node 二进制。步骤 3 若只搬 `service.rs`，它还留在那儿 |
 | 2 | 三个 `OnceCell` 就是运行期角色分支 | `src/orchestrator/service.rs:147,150,154`；判定点 `:1654`、`:1817` | 与四个 no-op 同一诊断：编译期可判定的差异降级成运行期的 `None` 分支 |
-| 3 | `SandboxOrchestration` facade（38 个方法） | `src/orchestrator/facade.rs`；消费者 `ApiImpl::new`、`ObservabilityService::new` | `SandboxControl` 要么实现同一 trait，要么同时改这两个构造点与其下的 handler 调用 |
-| 4 | `src/sandbox/network/iptables_util.rs`（290 行） | 引用方 `crates/aenv-node/src/sandbox/network/{manager.rs:18,slot.rs:26}` 与 core 自己的 `policy.rs:8` | node 独用，链进 api 二进制且永不执行。C4 的尾巴 |
-| 5 | `src/secrets/mod.rs`（1,728 行）中只有 `SecretKind` 真共享 | node 侧对 `secrets::` 的引用数为 **0**；core 内部消费者 `orchestrator/grants.rs`、`sandbox/network/policy.rs` | 其余整块是 api 独用，只因一个枚举留在 core |
+| 3 | ~~`SandboxOrchestration` facade（38 个方法）~~ 已拆：27 个方法的 `SandboxOrchestration` + 11 个方法的 `NodeOrchestration` | `src/orchestrator/facade.rs` | `SandboxControl` 只需实现前者；`check-crate-boundaries` 盯住 `ApiImpl` 持有的是哪一个 |
+| 4 | `src/sandbox/network/iptables_util.rs`（290 行） | 引用方 `crates/aenv-node/src/sandbox/network/{manager.rs:18,slot.rs:26}` 与 core 自己的 `policy.rs:8` | node 独用，链进 api 二进制且永不执行。**它搬不动是因为 `policy.rs` 用它**：那 2,140 行里 366-714 行是只有节点跑的 iptables 施加面，而模型与施加面的测试在同一个 `mod tests` 里交错，拆开不是一个提交的量 |
+| 5 | ~~`src/secrets/mod.rs`（1,728 行）~~ 已搬进 `crates/aenv-api/src/secrets/service.rs`；`SecretKind` 留在 core 的 `src/secret_kind.rs` | core 消费者 `orchestrator/grants.rs`、`sandbox/network/policy.rs` | `API_EXILED_PATHS` 新增 `src/secrets`，双向变异证据在提交里 |
 | 6 | `RemoteSandboxBackendFactory::build` 的拒绝式实现 | `crates/aenv-api/src/node_client/factory.rs:52-64` | 第五份 no-op：冷创建在 api 半边"没有东西可发"，只能 `bail!` |
 
 ## 7. 验收判据
@@ -281,3 +301,6 @@ node gRPC 面、Redis 与 PG 的键与列）都不变——§3 的预留是**新
    之下（见 §1）。
 6. 新增的模块级守卫有双向变异证据（破坏 → 出现 FAILED 行；复原 → ok；
    `git status` 干净）。
+
+判据现状：1 成立（步骤 1 的十个用例逐字未改，新增三个）；2、3、6 成立；
+4 与 5 要等 `SandboxControl` 落地，因为它们说的是 api 半边装配里的东西。

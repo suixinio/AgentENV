@@ -103,6 +103,7 @@ async fn apply(conn: &mut sqlx::PgConnection) -> Result<()> {
 
     preflight(conn, &applied).await?;
     verify_applied(conn, &applied).await?;
+    verify_applied_routines(conn, &applied).await?;
 
     for migration in MIGRATIONS {
         if applied.contains(&migration.version) {
@@ -131,6 +132,12 @@ const RELATIONS_BY_VERSION: &[(i32, &[&str])] = &[
     // `to_regclass` resolves it the same way.
     (4, &["snapshots_one_pause_per_sandbox"]),
 ];
+
+// Routines a recorded version must still provide, by signature. Only what has to
+// outlive its migration belongs here: `snapshots_pause_axis_trg` and the function
+// behind it are documented in `services/README.md` as droppable once no older
+// replica can run, and requiring them would make that step unstartable.
+const ROUTINES_BY_VERSION: &[(i32, &[&str])] = &[(4, &["catalog_try_jsonb(bytea)"])];
 
 // `to_regclass` resolves against this connection's search path.
 async fn relation_exists(conn: &mut sqlx::PgConnection, relation: &str) -> Result<bool> {
@@ -209,6 +216,58 @@ async fn verify_applied(conn: &mut sqlx::PgConnection, applied: &HashSet<i32>) -
          \x20   DROP TABLE IF EXISTS catalog_schema_migrations;",
         claimed.join(", "),
         missing.join(", ")
+    )
+}
+
+// Same signature resolution the read path gets, and NULL rather than an error
+// for a name that is not there.
+async fn routine_exists(conn: &mut sqlx::PgConnection, signature: &str) -> Result<bool> {
+    let found: Option<String> = sqlx::query_scalar("SELECT to_regprocedure($1)::text")
+        .bind(signature)
+        .fetch_one(&mut *conn)
+        .await
+        .context("inspect the catalog schema")?;
+    Ok(found.is_some())
+}
+
+fn migration_name(version: i32) -> &'static str {
+    MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == version)
+        .map(|migration| migration.name)
+        .unwrap_or("a migration this build does not carry")
+}
+
+// Refuses a recorded version whose routines are missing. The ledger records a
+// file name and not its contents, so a migration edited after it was applied is
+// invisible to every check keyed on the version alone.
+async fn verify_applied_routines(
+    conn: &mut sqlx::PgConnection,
+    applied: &HashSet<i32>,
+) -> Result<()> {
+    let mut missing = Vec::new();
+    for (version, routines) in ROUTINES_BY_VERSION {
+        if !applied.contains(version) {
+            continue;
+        }
+        for routine in *routines {
+            if !routine_exists(conn, routine).await? {
+                missing.push(format!("{routine}, from {}", migration_name(*version)));
+            }
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "catalog_schema_migrations records the migration(s) that create {} as applied, but they \
+         are not in this database. A version is applied once and never revisited, so a migration \
+         file edited after it ran leaves exactly this: a ledger that looks complete and a read \
+         path that fails on every call to the missing routine. Apply the named migration by \
+         hand, or drop catalog_schema_migrations along with the catalog tables and migrate from \
+         empty.",
+        missing.join("; ")
     )
 }
 
@@ -458,6 +517,53 @@ mod pg {
             message.contains("cannot be true") || message.contains("not in the database"),
             "got: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn verify_applied_refuses_a_ledger_whose_routines_are_gone() {
+        let pool = isolated_schema_pool_or_skip!(
+            "verify_applied_refuses_a_ledger_whose_routines_are_gone"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+
+        // What a database that ran an earlier edit of 0004 looks like: version 4
+        // recorded, its index in place, and the function the read path calls absent.
+        sqlx::raw_sql("DROP FUNCTION IF EXISTS catalog_try_jsonb(bytea);")
+            .execute(&pool)
+            .await
+            .expect("dropping the helper should succeed");
+
+        let error = migrate(&pool)
+            .await
+            .expect_err("migrate must refuse a ledger whose recorded routines are gone");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("catalog_try_jsonb(bytea)"),
+            "the refusal must name the routine: {message}"
+        );
+        assert!(
+            message.contains("0004_one_pause_per_sandbox.sql"),
+            "and the migration that creates it, which is the file to apply by hand: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_the_mixed_window_trigger_still_starts() {
+        let pool = isolated_schema_pool_or_skip!("retiring_the_mixed_window_trigger_still_starts");
+        migrate(&pool).await.expect("migration should succeed");
+
+        // The retirement `services/README.md` documents, verbatim.
+        sqlx::raw_sql(
+            "DROP TRIGGER IF EXISTS snapshots_pause_axis_trg ON snapshots;\n\
+             DROP FUNCTION IF EXISTS catalog_snapshots_pause_axis_trg();",
+        )
+        .execute(&pool)
+        .await
+        .expect("the documented retirement should succeed");
+
+        migrate(&pool)
+            .await
+            .expect("a documented operator step must not make the next start refuse");
     }
 
     #[tokio::test]

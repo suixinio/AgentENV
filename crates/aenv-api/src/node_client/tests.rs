@@ -935,6 +935,23 @@ struct ReplacementNodePlacement {
 
 #[async_trait]
 impl NodePlacement for ReplacementNodePlacement {
+    /// Claims without writing: this double answers for one launch at a time.
+    async fn reserve_launch(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn release_launch(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn place_new(
         &self,
         _sandbox_id: crate::types::SandboxId,
@@ -1299,6 +1316,23 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
 
     #[async_trait]
     impl NodePlacement for SlowReresolve {
+        /// Claims without writing: this double answers for one launch at a time.
+        async fn reserve_launch(
+            &self,
+            _sandbox_id: crate::types::SandboxId,
+            _execution_id: ExecutionId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn release_launch(
+            &self,
+            _sandbox_id: crate::types::SandboxId,
+            _execution_id: ExecutionId,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         async fn place_new(
             &self,
             _sandbox_id: crate::types::SandboxId,
@@ -3163,6 +3197,23 @@ impl ClusterPlacement {
 
 #[async_trait]
 impl NodePlacement for ClusterPlacement {
+    /// Claims without writing: this double answers for one launch at a time.
+    async fn reserve_launch(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn release_launch(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _execution_id: ExecutionId,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn place_new(
         &self,
         _sandbox_id: crate::types::SandboxId,

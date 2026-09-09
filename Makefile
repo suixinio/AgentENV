@@ -142,6 +142,11 @@ clippy:
 CORE_EXILED_PATHS := \
 	src/api/proxy.rs:crates/aenv-node/src/api/proxy.rs \
 	src/observability/reporter.rs:crates/aenv-node/src/observability/reporter.rs \
+	src/orchestrator/launch_claim.rs:crates/aenv-node/src/orchestrator/launch_claim.rs \
+	src/orchestrator/launch_plan.rs:crates/aenv-node/src/orchestrator/launch_plan.rs \
+	src/orchestrator/proxy.rs:crates/aenv-node/src/orchestrator/proxy.rs \
+	src/orchestrator/service.rs:crates/aenv-node/src/orchestrator/service.rs \
+	src/orchestrator/store/in_memory.rs:crates/aenv-node/src/orchestrator/store/in_memory.rs \
 	src/p2p:crates/aenv-node/src/p2p \
 	src/record_dir.rs:crates/aenv-node/src/record_dir.rs \
 	src/sandbox/envd.rs:crates/aenv-node/src/sandbox/envd.rs \
@@ -158,7 +163,18 @@ API_EXILED_PATHS := \
 	src/binding_store:crates/aenv-api/src/binding_store \
 	src/node_client:crates/aenv-api/src/node_client \
 	src/node_registry:crates/aenv-api/src/node_registry \
+	src/orchestrator/runtime_routing.rs:crates/aenv-api/src/orchestrator/runtime_routing.rs \
+	src/orchestrator/store/redis:crates/aenv-api/src/orchestrator/store/redis \
 	src/secrets:crates/aenv-api/src/secrets
+
+# The fourth arm, and the one the two path lists cannot state: `orchestrator`
+# is a module name all three crates have. `aenv-core` keeps the model both
+# halves read; each half declares its own module over it, with the state
+# machine on one side and the Redis store on the other. A half that drops its
+# own declaration and re-exports core's instead puts the union crate back
+# without moving a file, because every path a caller writes still resolves.
+# Each entry is `<half>:<module it owns>`.
+HALF_OWNED_MODULES := aenv-node:orchestrator aenv-api:orchestrator
 
 # The third half of the same rule: what each half re-exports from `aenv-core`.
 # Read from `crates/<half>/src/lib.rs` with line comments stripped: every
@@ -178,6 +194,11 @@ check-crate-boundaries:
 	fi; \
 	if printf '%s\n' "$$node_tree" | grep -E 'sqlx|deadpool-postgres'; then \
 	  echo "aenv-node links a PostgreSQL driver; a node must never hold database credentials."; \
+	  fail=1; \
+	fi; \
+	if printf '%s\n' "$$node_tree" | grep -E '^[^a-z]*redis v[0-9]'; then \
+	  echo "aenv-node links a Redis client. The metadata store every replica reads is the api"; \
+	  echo "half's, and a node's own records live in its process; a node opens no Redis."; \
 	  fail=1; \
 	fi; \
 	egress_tree=$$($(CARGO) tree -p aenv-egress -e normal --all-features --prefix none) || { echo "cargo tree -p aenv-egress failed"; exit 1; }; \
@@ -292,7 +313,20 @@ check-crate-boundaries:
 	    fi; \
 	  done; \
 	done; \
-	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, no p2p transport and no guest agent, aenv-node has no database and no broker TLS, aenv-core holds neither half's runtime, aenv-egress is a leaf whose features each stand alone, the workspace has no embedded database"; fi; \
+	for pair in $(HALF_OWNED_MODULES); do \
+	  half=$${pair%%:*}; module=$${pair#*:}; \
+	  if ! grep -qE "^pub mod $$module;$$" crates/$$half/src/lib.rs; then \
+	    echo "crates/$$half/src/lib.rs declares no 'pub mod $$module' of its own, so whatever it"; \
+	    echo "publishes under that path is aenv-core's and this half owns none of it."; \
+	    fail=1; \
+	  fi; \
+	  if [ ! -d "crates/$$half/src/$$module" ] && [ ! -e "crates/$$half/src/$$module.rs" ]; then \
+	    echo "crates/$$half/src/$$module does not exist, so the rule above is watching a path"; \
+	    echo "nothing owns. Name where the half's own $$module lives, or drop the pair."; \
+	    fail=1; \
+	  fi; \
+	done; \
+	if [ $$fail -eq 0 ]; then echo "crate boundaries hold: aenv-api has no byte half, no p2p transport and no guest agent, aenv-node has no database, no Redis client and no broker TLS, aenv-core holds neither half's runtime, aenv-egress is a leaf whose features each stand alone, the workspace has no embedded database"; fi; \
 	exit $$fail
 
 mutants:

@@ -801,6 +801,80 @@ mod pg {
     }
 
     #[tokio::test]
+    async fn a_commit_whose_payload_does_not_decode_is_refused_and_reaches_no_axis() {
+        let pool = isolated_schema_pool_or_skip!(
+            "a_commit_whose_payload_does_not_decode_is_refused_and_reaches_no_axis"
+        );
+        migrate(&pool).await.expect("migration should succeed");
+        let cluster_id = Uuid::new_v4();
+        let catalog = PostgresSnapshotCatalog::new(pool.clone(), cluster_id, "node-a".to_string());
+
+        let building = insert_a_building_row_the_way_the_previous_build_does(
+            &pool,
+            cluster_id,
+            "sbx-corrupt-commit",
+        )
+        .await;
+        // Neither UTF-8 nor JSON: the two things the classification raises on.
+        let error = commit_a_pause_the_way_the_previous_build_does(
+            &pool,
+            building.clone(),
+            &[0xff_u8, 0xfe, 0x00, 0x01],
+        )
+        .await
+        .expect_err("a payload the catalog cannot decode must not become a row");
+        let db = error
+            .as_database_error()
+            .expect("the trigger raises, so this surfaces as a database error");
+        assert_eq!(
+            db.code().as_deref(),
+            Some("22000"),
+            "the refusal is about the data, not about a constraint: {error}"
+        );
+        assert!(
+            db.message().contains("not decodable JSON"),
+            "and it says which column of which row is wrong: {error}"
+        );
+
+        let status: String = sqlx::query_scalar("SELECT status FROM snapshots WHERE id = $1")
+            .bind(building.to_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("the refused row should still be where the insert left it");
+        assert_eq!(status, "building", "a refused commit writes nothing");
+
+        let listed = catalog
+            .list_page_scoped(
+                SnapshotListFilter::pauses(None),
+                CatalogReadScope::Resolvable,
+            )
+            .await
+            .expect("the pause listing should succeed");
+        assert!(
+            listed.items.is_empty(),
+            "the row that was refused is on no axis, so the listing has nothing to show"
+        );
+
+        let pause = catalog
+            .publish_commit(sandbox_pause_owned_by("sbx-corrupt-commit", Some("keep")))
+            .await
+            .expect("the sandbox's next pause must not collide with the refused row");
+
+        let removed = catalog
+            .delete_sandbox_pauses("sbx-corrupt-commit")
+            .await
+            .expect("deleting the sandbox's pauses should succeed");
+        assert_eq!(
+            removed
+                .iter()
+                .map(|row| row.id.to_string())
+                .collect::<Vec<_>>(),
+            vec![pause.id.to_string()],
+            "the pause axis holds exactly the row that was let onto it"
+        );
+    }
+
+    #[tokio::test]
     async fn one_undecodable_payload_does_not_take_the_metadata_filtered_listing_with_it() {
         let pool = isolated_schema_pool_or_skip!(
             "one_undecodable_payload_does_not_take_the_metadata_filtered_listing_with_it"

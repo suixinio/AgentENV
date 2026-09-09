@@ -89,14 +89,32 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    BEGIN
-        NEW.is_pause := NEW.source_kind = 'sandbox'
-            AND COALESCE(
-                    convert_from(NEW.committed_payload, 'UTF8')::jsonb ? 'paused_sandbox',
-                    false
-                );
-    EXCEPTION WHEN others THEN
+    -- A template row is never a pause and its payload is not this axis's
+    -- business. AND is not obliged to short-circuit, so the kind decides before
+    -- the payload is touched.
+    IF NEW.source_kind <> 'sandbox' THEN
         NEW.is_pause := false;
+        RETURN NEW;
+    END IF;
+
+    BEGIN
+        NEW.is_pause := COALESCE(
+            convert_from(NEW.committed_payload, 'UTF8')::jsonb ? 'paused_sandbox',
+            false
+        );
+    EXCEPTION WHEN others THEN
+        -- Refusing the write is the only outcome that leaves nothing behind.
+        -- `false` would hide the row from the unique index, the pause listing,
+        -- the resume read and `delete_sandbox_pauses` at once, and no column
+        -- value tells it apart from a checkpoint afterwards; NULL is not
+        -- available at all, because the column is total and the reclaim would
+        -- have to return rows `decode_row` cannot decode. The backfill above
+        -- cannot do this -- a migration that raises is a deployment that cannot
+        -- start -- but a trigger that raises costs one write, and the payload is
+        -- written by the commit path of the build that sends it.
+        RAISE EXCEPTION
+            'snapshots.committed_payload of sandbox row % is not decodable JSON', NEW.id
+            USING ERRCODE = 'data_exception', DETAIL = SQLERRM;
     END;
     RETURN NEW;
 END;

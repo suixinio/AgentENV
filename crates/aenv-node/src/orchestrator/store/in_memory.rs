@@ -6,11 +6,12 @@ use async_trait::async_trait;
 use tokio::sync::{watch, RwLock};
 
 use crate::orchestrator::SandboxState;
+use crate::types::{ExecutionId, SandboxId};
 
 use super::{
-    is_allowed_transition, ExecutionId, FencedRemoval, MetadataStore, MetadataUpdateResult, Result,
-    SandboxId, SandboxListFilter, SandboxMetadata, StoreError, TransitionCompleter,
-    TransitionEffect, TransitionGuard, TransitionOutcome, TransitionRequest,
+    is_allowed_transition, FencedRemoval, MetadataStore, MetadataUpdateResult, Result,
+    SandboxListFilter, SandboxMetadata, StoreError, TransitionCompleter, TransitionEffect,
+    TransitionGuard, TransitionOutcome, TransitionRequest,
 };
 
 /// In-memory metadata store backed by a `RwLock<HashMap>`.
@@ -554,7 +555,7 @@ mod tests {
             Some(InMemoryMetadataStore::new())
         }
 
-        crate::orchestrator::store::contract::metadata_store_contract!();
+        aenv_core::metadata_store_contract!();
     }
 
     #[tokio::test]

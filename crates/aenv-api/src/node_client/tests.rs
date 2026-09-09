@@ -7,10 +7,9 @@ use async_trait::async_trait;
 use tokio::sync::oneshot;
 use tonic::{Request, Response, Status};
 
-use crate::orchestrator::{
-    DiscardingPausePublisher, InMemoryMetadataStore, MetadataStore, NodeOrchestration,
-    Orchestrator, StagingPausePublisher,
-};
+use aenv_node::orchestrator::{InMemoryMetadataStore, NodeOrchestration, Orchestrator};
+
+use crate::orchestrator::{DiscardingPausePublisher, MetadataStore, StagingPausePublisher};
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
     NodeSandboxService, NodeSandboxServiceServer,

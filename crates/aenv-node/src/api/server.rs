@@ -166,8 +166,8 @@ mod tests {
     use axum::http::{Method, Request as HttpRequest};
     use tower::ServiceExt;
 
+    use crate::orchestrator::Orchestrator;
     use aenv_core::api::CONTROL_PLANE_HEADER;
-    use aenv_core::orchestrator::Orchestrator;
 
     const TOKEN: &str = "control-plane-token";
     /// A route this node both serves and gates.
@@ -192,7 +192,7 @@ mod tests {
                     aenv_core::observability::ObservabilityService::new(
                         identity,
                         Arc::clone(&orchestrator)
-                            as Arc<dyn aenv_core::orchestrator::SandboxOrchestration>,
+                            as Arc<dyn crate::orchestrator::SandboxOrchestration>,
                         None,
                         Arc::new(std::sync::RwLock::new(None)),
                     )

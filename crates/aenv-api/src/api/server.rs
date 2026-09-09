@@ -55,7 +55,7 @@ mod tests {
     }
 
     async fn api_half_with(extra_control_plane_routes: Router) -> Router {
-        let orchestrator = crate::orchestrator::Orchestrator::with_in_memory_store(
+        let orchestrator = aenv_node::orchestrator::Orchestrator::with_in_memory_store(
             crate::sandbox::mock::MockBackendFactory::new(),
         )
         .await;

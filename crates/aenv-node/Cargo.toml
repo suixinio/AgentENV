@@ -14,6 +14,10 @@ path = "src/bin/aenv-node.rs"
 
 [features]
 vendored-openssl = ["aenv-core/vendored-openssl"]
+# 🔴 The same contract `aenv-core`'s feature of this name carries, for the
+# orchestrator that moved here: the test seeds and the in-memory constructor
+# `aenv-api`'s tests drive this half through, and that nothing ships.
+test-support = ["aenv-core/test-support"]
 
 [dependencies]
 aenv-core = { path = "../.." }
@@ -75,6 +79,11 @@ which = "8.0.0"
 
 [dev-dependencies]
 aenv-core = { path = "../..", features = ["test-support"] }
+# 🔴 A dev-dependency on this crate itself, for the reason the root manifest
+# gives for its own: `aenv-api`'s dev-dependency asks for `test-support`, so
+# without this `cargo test -p aenv-node` resolves a different feature set than
+# a run that also builds `aenv-api` does, and cargo rebuilds the graph twice.
+aenv-node = { path = ".", features = ["test-support"] }
 agentenv-test-support = { path = "../test-support" }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
 headers = "0.4"

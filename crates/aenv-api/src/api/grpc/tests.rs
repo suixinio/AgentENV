@@ -15,7 +15,9 @@ use crate::cfg::ConfigManager;
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
 use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use crate::node_registry::warmup::WarmupGate;
-use crate::orchestrator::{Orchestrator, SandboxMetadata, SandboxState};
+use aenv_node::orchestrator::Orchestrator;
+
+use crate::orchestrator::{SandboxMetadata, SandboxState};
 use crate::proto::apiproxy::{
     self as pb, sandbox_resume_service_client::SandboxResumeServiceClient,
 };

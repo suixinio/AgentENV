@@ -601,6 +601,10 @@ pub async fn the_lifetime_clock_is_reconciled_after_every_write<S: MetadataStore
     );
 }
 
+/// Runs each named contract function as a `#[tokio::test]` around whatever
+/// `new_contract_store` the invoking module defines. Exported because the two
+/// backends live in the two halves' crates.
+#[macro_export]
 macro_rules! metadata_store_contract_suite {
     ($($name:ident),* $(,)?) => {
         $(
@@ -609,15 +613,17 @@ macro_rules! metadata_store_contract_suite {
                 let Some(store) = new_contract_store(stringify!($name)).await else {
                     return;
                 };
-                crate::orchestrator::store::contract::$name(&store).await;
+                $crate::orchestrator::store::contract::$name(&store).await;
             }
         )*
     };
 }
 
+/// The whole suite, in the order the assertions build on each other.
+#[macro_export]
 macro_rules! metadata_store_contract {
     () => {
-        crate::orchestrator::store::contract::metadata_store_contract_suite!(
+        $crate::metadata_store_contract_suite!(
             add_get_remove_round_trip,
             network_rules_and_brokers_round_trip,
             a_fenced_removal_takes_back_only_its_own_record,
@@ -641,5 +647,3 @@ macro_rules! metadata_store_contract {
         );
     };
 }
-
-pub(crate) use {metadata_store_contract, metadata_store_contract_suite};

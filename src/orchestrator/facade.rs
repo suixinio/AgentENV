@@ -1,43 +1,21 @@
-//! Object-safe orchestration facades over the generic orchestrator.
+//! The object-safe orchestration surface both halves answer.
 //!
-//! Two surfaces, because two kinds of caller exist: the REST layer and the
-//! observability reporter, which both halves run, and the sandbox runtime,
-//! which only a node has. One macro defines each trait and its forwarding
-//! implementation.
+//! The trait is declared here and implemented in the crate that owns each
+//! half's orchestrator, so its signature list is a macro rather than a written
+//! trait body: [`sandbox_orchestration_surface`] hands the list to an emitter,
+//! [`orchestration_trait`] is the emitter that writes the trait, and a half
+//! with a concrete orchestrator passes an emitter that writes the forwarding
+//! implementation from the same list. One list, so a signature cannot drift
+//! between the two.
 
-use std::sync::Arc;
-use std::time::Duration;
-
-use async_trait::async_trait;
-use tokio::sync::broadcast;
-
-use crate::sandbox::{
-    CustomExtensionParams, EnvdAccessToken, SandboxBackendFactory, SandboxNetworkPolicy,
-};
-use crate::types::{ExecutionId, SandboxId};
-
-use super::launch_claim::RestoredSandbox;
-use super::metrics::OrchestratorMetrics;
-use super::proxy::ProxyLookupResult;
-#[cfg(any(test, feature = "test-support"))]
-use super::proxy::ProxyTarget;
-use super::service::Orchestrator;
-use super::store::{MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata};
-#[cfg(any(test, feature = "test-support"))]
-use super::types::SandboxState;
-use super::types::{
-    CreateSandboxRequest, ForkChildren, LiveSandbox, PauseOutcome, SandboxLifecycleEvent,
-    SandboxRosterEntry, SnapshotCaptureResult,
-};
-use super::{Result, SandboxForkOutcome};
-
-/// Declares the facade and forwarding implementation from one signature list.
-/// Owned methods translate `&Arc<Self>` receivers to object-safe `Arc<Self>`.
-macro_rules! orchestration_surface {
+/// Writes a trait from an orchestration surface's signature list.
+///
+/// Owned methods take `Arc<Self>` so the surface stays object-safe.
+#[macro_export]
+macro_rules! orchestration_trait {
     (
         $(#[$trait_meta:meta])*
         trait $trait_name:ident $(: $supertrait:ident)? ;
-        // Methods taking `self: &Arc<Self>`.
         owned {
             $(
                 $(#[$owned_meta:meta])*
@@ -45,7 +23,6 @@ macro_rules! orchestration_surface {
                     $( -> $owned_ret:ty )? ;
             )*
         }
-        // Methods taking `&self`.
         borrowed {
             $(
                 $(#[$borrowed_meta:meta])*
@@ -53,7 +30,6 @@ macro_rules! orchestration_surface {
                     $( -> $borrowed_ret:ty )? ;
             )*
         }
-        // Synchronous methods taking `&self`.
         sync {
             $(
                 $(#[$sync_meta:meta])*
@@ -72,11 +48,11 @@ macro_rules! orchestration_surface {
         }
     ) => {
         $(#[$trait_meta])*
-        #[async_trait]
+        #[::async_trait::async_trait]
         pub trait $trait_name: $( $supertrait + )? Send + Sync + 'static {
             $(
                 $(#[$owned_meta])*
-                async fn $owned_name(self: Arc<Self> $(, $owned_arg: $owned_ty )* )
+                async fn $owned_name(self: std::sync::Arc<Self> $(, $owned_arg: $owned_ty )* )
                     $( -> $owned_ret )? ;
             )*
             $(
@@ -90,302 +66,129 @@ macro_rules! orchestration_surface {
             )*
             $(
                 $(#[$seeded_meta])*
-                async fn $seeded_name(&self $(, $seeded_arg: $seeded_ty )* ) -> Result<()> {
+                async fn $seeded_name(&self $(, $seeded_arg: $seeded_ty )* )
+                    -> $crate::orchestrator::Result<()>
+                {
                     $( let _ = $seeded_arg; )*
-                    Err(crate::orchestrator::OrchestratorError::InternalError(format!(
+                    Err($crate::orchestrator::OrchestratorError::InternalError(format!(
                         "{} keeps no test seed",
                         stringify!($seeded_name)
                     )))
                 }
             )*
         }
+    };
+}
 
-        #[async_trait]
-        impl<S, F> $trait_name for Orchestrator<S, F>
-        where
-            S: MetadataStore + 'static,
-            F: SandboxBackendFactory,
-        {
-            $(
-                $(#[$owned_meta])*
-                async fn $owned_name(self: Arc<Self> $(, $owned_arg: $owned_ty )* )
-                    $( -> $owned_ret )?
-                {
-                    // Fully qualify the inherent method to avoid trait recursion.
-                    Orchestrator::<S, F>::$owned_name(&self $(, $owned_arg )* ).await
-                }
-            )*
-            $(
-                $(#[$borrowed_meta])*
-                async fn $borrowed_name(&self $(, $borrowed_arg: $borrowed_ty )* )
-                    $( -> $borrowed_ret )?
-                {
-                    Orchestrator::<S, F>::$borrowed_name(self $(, $borrowed_arg )* ).await
-                }
-            )*
-            $(
-                $(#[$sync_meta])*
-                fn $sync_name(&self $(, $sync_arg: $sync_ty )* ) $( -> $sync_ret )? {
-                    Orchestrator::<S, F>::$sync_name(self $(, $sync_arg )* )
-                }
-            )*
-            $(
-                $(#[$seeded_meta])*
-                async fn $seeded_name(&self $(, $seeded_arg: $seeded_ty )* ) -> Result<()> {
-                    Orchestrator::<S, F>::$seeded_name(self $(, $seeded_arg )* ).await
-                }
-            )*
+/// The signature list of [`SandboxOrchestration`], handed to `$emit`.
+///
+/// The half that owns a concrete orchestrator invokes this with an emitter of
+/// its own to write the implementation that forwards to it.
+#[macro_export]
+macro_rules! sandbox_orchestration_surface {
+    ($emit:ident) => {
+        $emit! {
+            /// What the REST layer and the observability reporter ask of
+            /// whichever half they run in. Both halves answer all of it.
+            trait SandboxOrchestration;
+            owned {
+                /// Creates and starts a sandbox.
+                fn create_sandbox(request: CreateSandboxRequest) -> Result<SandboxMetadata>;
+                /// Rebuilds a sandbox that already has an identity elsewhere in the
+                /// cluster under that identity, waiting out a launch of the same id
+                /// already in flight rather than starting a second one.
+                fn restore_or_join_launch(
+                    sandbox_id: SandboxId,
+                    request: CreateSandboxRequest,
+                ) -> Result<RestoredSandbox>;
+                /// Forks into one result per requested child, preserving request order.
+                fn fork_sandbox(
+                    source_sandbox_id: SandboxId,
+                    children: ForkChildren,
+                    new_timeout: NewTimeout,
+                ) -> Result<Vec<SandboxForkOutcome>>;
+                /// Tears a sandbox down and forgets it.
+                fn delete_sandbox(sandbox_id: SandboxId) -> Result<()>;
+                /// Stops every sandbox and stops accepting work.
+                fn shutdown() -> Result<()>;
+                /// Pauses one sandbox: publishes its capture and forgets the record.
+                fn pause_sandbox(sandbox_id: SandboxId) -> Result<PauseOutcome>;
+                /// Captures a snapshot of a running sandbox and leaves it running.
+                fn capture_snapshot(sandbox_id: SandboxId) -> Result<SnapshotCaptureResult>;
+                /// Replaces a running sandbox's egress policy.
+                fn replace_sandbox_network_policy(
+                    sandbox_id: SandboxId,
+                    network_policy: SandboxNetworkPolicy,
+                ) -> Result<()>;
+                /// Applies an extension-defined custom-parameter patch.
+                fn patch_sandbox_custom_extension_params(
+                    sandbox_id: SandboxId,
+                    patch: serde_json::Map<String, serde_json::Value>,
+                ) -> Result<Option<CustomExtensionParams>>;
+            }
+            borrowed {
+                /// One sandbox's metadata, or `None` when this orchestrator has no
+                /// record of it.
+                fn get_sandbox(sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
+                /// Waits for a pause in flight to settle: `None` once the record is
+                /// gone, the record itself if the pause did not finish.
+                fn wait_for_pause_to_settle(sandbox_id: SandboxId) -> Result<Option<SandboxMetadata>>;
+                /// Sandbox metadata narrowed by a filter.
+                fn list_sandboxes_filtered(filter: SandboxListFilter) -> Result<Vec<SandboxMetadata>>;
+                /// The heartbeat roster: what this node claims to be holding.
+                fn list_sandbox_roster() -> Result<Vec<SandboxRosterEntry>>;
+                /// Extends a sandbox's lifetime.
+                fn keep_alive_for(
+                    sandbox_id: SandboxId,
+                    timeout: Option<std::time::Duration>,
+                    allow_shorter: bool,
+                ) -> Result<Option<SandboxMetadata>>;
+                /// The real machine currently running a sandbox, straight from its
+                /// live backend.
+                fn sandbox_holding_node_id(sandbox_id: &SandboxId) -> Option<String>;
+                /// Runtime counters and derived resource totals, sampled now.
+                fn metrics_snapshot() -> Result<OrchestratorMetrics>;
+            }
+            sync {
+                /// The envd access token for a sandbox, when it has one.
+                fn get_envd_access_token(metadata: &SandboxMetadata) -> Option<EnvdAccessToken>;
+                /// Whether `candidate` is the envd access token for this sandbox.
+                fn validate_envd_access_token(sandbox_id: SandboxId, candidate: &str) -> bool;
+                /// Subscribes to sandbox lifecycle events. Best-effort and lossy.
+                fn subscribe_sandbox_events()
+                    -> tokio::sync::broadcast::Receiver<SandboxLifecycleEvent>;
+                /// Whether this node is refusing new work.
+                fn scheduling_disabled() -> bool;
+                /// Sets whether this node refuses new work. Returns whether that
+                /// changed anything.
+                fn set_scheduling_disabled(disabled: bool) -> bool;
+                /// When isolation last changed, in unix milliseconds.
+                fn scheduling_disabled_changed_at_ms() -> Option<i64>;
+            }
+            seeded {
+                #[cfg(any(test, feature = "test-support"))]
+                fn set_metadata_state_for_test(sandbox_id: SandboxId, state: SandboxState);
+                #[cfg(any(test, feature = "test-support"))]
+                fn remove_sandbox_for_test(sandbox_id: &SandboxId);
+                #[cfg(any(test, feature = "test-support"))]
+                fn set_auto_resume_for_test(sandbox_id: &SandboxId, auto_resume_enabled: bool);
+            }
         }
     };
 }
 
-orchestration_surface! {
-    /// What the REST layer and the observability reporter ask of whichever
-    /// half they run in. Both halves answer all of it.
-    trait SandboxOrchestration;
-    owned {
-        /// Creates and starts a sandbox.
-        fn create_sandbox(request: CreateSandboxRequest) -> Result<SandboxMetadata>;
-        /// Rebuilds a sandbox that already has an identity elsewhere in the
-        /// cluster under that identity, waiting out a launch of the same id
-        /// already in flight rather than starting a second one.
-        fn restore_or_join_launch(
-            sandbox_id: SandboxId,
-            request: CreateSandboxRequest,
-        ) -> Result<RestoredSandbox>;
-        /// Forks into one result per requested child, preserving request order.
-        fn fork_sandbox(
-            source_sandbox_id: SandboxId,
-            children: ForkChildren,
-            new_timeout: NewTimeout,
-        ) -> Result<Vec<SandboxForkOutcome>>;
-        /// Tears a sandbox down and forgets it.
-        fn delete_sandbox(sandbox_id: SandboxId) -> Result<()>;
-        /// Stops every sandbox and stops accepting work.
-        fn shutdown() -> Result<()>;
-        /// Pauses one sandbox: publishes its capture and forgets the record.
-        fn pause_sandbox(sandbox_id: SandboxId) -> Result<PauseOutcome>;
-        /// Captures a snapshot of a running sandbox and leaves it running.
-        fn capture_snapshot(sandbox_id: SandboxId) -> Result<SnapshotCaptureResult>;
-        /// Replaces a running sandbox's egress policy.
-        fn replace_sandbox_network_policy(
-            sandbox_id: SandboxId,
-            network_policy: SandboxNetworkPolicy,
-        ) -> Result<()>;
-        /// Applies an extension-defined custom-parameter patch.
-        fn patch_sandbox_custom_extension_params(
-            sandbox_id: SandboxId,
-            patch: serde_json::Map<String, serde_json::Value>,
-        ) -> Result<Option<CustomExtensionParams>>;
-    }
-    borrowed {
-        /// One sandbox's metadata, or `None` when this orchestrator has no
-        /// record of it.
-        fn get_sandbox(sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>>;
-        /// Waits for a pause in flight to settle: `None` once the record is
-        /// gone, the record itself if the pause did not finish.
-        fn wait_for_pause_to_settle(sandbox_id: SandboxId) -> Result<Option<SandboxMetadata>>;
-        /// Sandbox metadata narrowed by a filter.
-        fn list_sandboxes_filtered(filter: SandboxListFilter) -> Result<Vec<SandboxMetadata>>;
-        /// The heartbeat roster: what this node claims to be holding.
-        fn list_sandbox_roster() -> Result<Vec<SandboxRosterEntry>>;
-        /// Extends a sandbox's lifetime.
-        fn keep_alive_for(
-            sandbox_id: SandboxId,
-            timeout: Option<Duration>,
-            allow_shorter: bool,
-        ) -> Result<Option<SandboxMetadata>>;
-        /// The real machine currently running a sandbox, straight from its
-        /// live backend.
-        fn sandbox_holding_node_id(sandbox_id: &SandboxId) -> Option<String>;
-        /// Runtime counters and derived resource totals, sampled now.
-        fn metrics_snapshot() -> Result<OrchestratorMetrics>;
-    }
-    sync {
-        /// The envd access token for a sandbox, when it has one.
-        fn get_envd_access_token(metadata: &SandboxMetadata) -> Option<EnvdAccessToken>;
-        /// Whether `candidate` is the envd access token for this sandbox.
-        fn validate_envd_access_token(sandbox_id: SandboxId, candidate: &str) -> bool;
-        /// Subscribes to sandbox lifecycle events. Best-effort and lossy.
-        fn subscribe_sandbox_events() -> broadcast::Receiver<SandboxLifecycleEvent>;
-        /// Whether this node is refusing new work.
-        fn scheduling_disabled() -> bool;
-        /// Sets whether this node refuses new work. Returns whether that
-        /// changed anything.
-        fn set_scheduling_disabled(disabled: bool) -> bool;
-        /// When isolation last changed, in unix milliseconds.
-        fn scheduling_disabled_changed_at_ms() -> Option<i64>;
-    }
-    seeded {
-        #[cfg(any(test, feature = "test-support"))]
-        fn set_metadata_state_for_test(sandbox_id: SandboxId, state: SandboxState);
-        #[cfg(any(test, feature = "test-support"))]
-        fn remove_sandbox_for_test(sandbox_id: &SandboxId);
-        #[cfg(any(test, feature = "test-support"))]
-        fn set_auto_resume_for_test(sandbox_id: &SandboxId, auto_resume_enabled: bool);
-    }
-}
+use crate::sandbox::{CustomExtensionParams, EnvdAccessToken, SandboxNetworkPolicy};
+use crate::types::SandboxId;
 
-orchestration_surface! {
-    /// What only a process that runs sandboxes can answer: the handle table,
-    /// the proxy route table, and the launches in flight inside this process.
-    trait NodeOrchestration: SandboxOrchestration;
-    owned {
-        /// Rebuilds a sandbox that already has an identity elsewhere in the
-        /// cluster, under that identity.
-        fn restore_sandbox(
-            sandbox_id: SandboxId,
-            request: CreateSandboxRequest,
-        ) -> Result<SandboxMetadata>;
-        /// Applies already-approved custom extension parameters without invoking hooks.
-        fn replace_sandbox_custom_extension_params(
-            sandbox_id: SandboxId,
-            params: Option<CustomExtensionParams>,
-        ) -> Result<()>;
-    }
-    borrowed {
-        /// Every sandbox this orchestrator has a record of.
-        fn list_sandboxes() -> Result<Vec<SandboxMetadata>>;
-        /// The ids of every sandbox this orchestrator has a record of.
-        fn list_sandbox_ids() -> Result<Vec<SandboxId>>;
-        /// Lists locally live handles without applying ownership filtering.
-        fn list_live_sandboxes() -> Result<Vec<LiveSandbox>>;
-        /// What this process holds under one id: its live handle, or the
-        /// record it kept. `None` is the id being free here.
-        fn held_sandbox(sandbox_id: SandboxId) -> Result<Option<LiveSandbox>>;
-        /// The execution currently live for a sandbox, if one is.
-        fn live_execution_id(sandbox_id: &SandboxId) -> Option<ExecutionId>;
-        /// Where the local proxy should send traffic for a sandbox, or why it
-        /// cannot.
-        fn proxy_lookup_for(sandbox_id: &SandboxId) -> Result<ProxyLookupResult>;
+use super::launch::RestoredSandbox;
+use super::metrics::OrchestratorMetrics;
+use super::store::{NewTimeout, SandboxListFilter, SandboxMetadata};
+#[cfg(any(test, feature = "test-support"))]
+use super::types::SandboxState;
+use super::types::{
+    CreateSandboxRequest, ForkChildren, PauseOutcome, SandboxLifecycleEvent, SandboxRosterEntry,
+    SnapshotCaptureResult,
+};
+use super::{Result, SandboxForkOutcome};
 
-        // Test-only facade seed helpers.
-        #[cfg(any(test, feature = "test-support"))]
-        fn set_proxy_target_for_test(
-            sandbox_id: SandboxId,
-            target: ProxyTarget,
-            state: SandboxState,
-        );
-        #[cfg(any(test, feature = "test-support"))]
-        fn remove_proxy_route_for_test(sandbox_id: &SandboxId);
-        #[cfg(any(test, feature = "test-support"))]
-        fn set_live_execution_for_test(
-            sandbox_id: SandboxId,
-            target: ProxyTarget,
-            execution_id: ExecutionId,
-        );
-    }
-    sync {
-        /// The incarnation of a launch this process is running under this id,
-        /// before any handle or record names it.
-        fn launch_in_flight(sandbox_id: SandboxId) -> Option<ExecutionId>;
-    }
-    seeded {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::orchestrator::OrchestratorError;
-
-    #[tokio::test]
-    async fn the_facade_answers_from_the_orchestrator_behind_it() {
-        let concrete =
-            Orchestrator::with_in_memory_store(crate::sandbox::mock::MockBackendFactory::new())
-                .await;
-        let orchestration: Arc<dyn NodeOrchestration> = Arc::clone(&concrete) as _;
-
-        assert!(!orchestration.scheduling_disabled());
-        assert!(orchestration.set_scheduling_disabled(true));
-        assert!(orchestration.scheduling_disabled());
-        assert!(concrete.scheduling_disabled());
-        assert!(orchestration.scheduling_disabled_changed_at_ms().is_some());
-
-        assert!(!orchestration.set_scheduling_disabled(true));
-
-        let seeded = SandboxId::new();
-        orchestration
-            .set_metadata_state_for_test(seeded, SandboxState::Running)
-            .await
-            .unwrap();
-
-        let listed = orchestration.list_sandboxes().await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, seeded, "the list is about the seeded sandbox");
-        assert_eq!(
-            orchestration.list_sandbox_ids().await.unwrap(),
-            vec![seeded]
-        );
-        assert_eq!(orchestration.list_sandbox_roster().await.unwrap().len(), 1);
-        let metrics = orchestration.metrics_snapshot().await.unwrap();
-        assert_eq!(metrics.running_sandbox_count, 1);
-        assert_eq!(metrics.create_successes, 0);
-
-        let unknown = SandboxId::new();
-        assert!(orchestration.get_sandbox(&seeded).await.unwrap().is_some());
-        assert!(orchestration.get_sandbox(&unknown).await.unwrap().is_none());
-        assert!(orchestration.live_execution_id(&unknown).await.is_none());
-        assert!(!orchestration.validate_envd_access_token(unknown, "nonsense"));
-    }
-
-    #[tokio::test]
-    async fn every_by_arc_method_reaches_the_orchestrator_through_dyn() {
-        let orchestration: Arc<dyn NodeOrchestration> =
-            Orchestrator::with_in_memory_store(crate::sandbox::mock::MockBackendFactory::new())
-                .await;
-        let unknown = SandboxId::new();
-
-        fn refuses<T: std::fmt::Debug>(what: &str, unknown: SandboxId, result: Result<T>) {
-            match result {
-                Err(OrchestratorError::SandboxNotFound(id)) => {
-                    assert_eq!(id, unknown, "{what} named the wrong sandbox")
-                }
-                other => panic!("{what} should not have found {unknown}; got {other:?}"),
-            }
-        }
-
-        refuses(
-            "delete_sandbox",
-            unknown,
-            Arc::clone(&orchestration).delete_sandbox(unknown).await,
-        );
-        refuses(
-            "pause_sandbox",
-            unknown,
-            Arc::clone(&orchestration).pause_sandbox(unknown).await,
-        );
-        refuses(
-            "capture_snapshot",
-            unknown,
-            Arc::clone(&orchestration).capture_snapshot(unknown).await,
-        );
-        refuses(
-            "replace_sandbox_network_policy",
-            unknown,
-            Arc::clone(&orchestration)
-                .replace_sandbox_network_policy(unknown, SandboxNetworkPolicy::default())
-                .await,
-        );
-        refuses(
-            "patch_sandbox_custom_extension_params",
-            unknown,
-            Arc::clone(&orchestration)
-                .patch_sandbox_custom_extension_params(unknown, serde_json::Map::new())
-                .await,
-        );
-        refuses(
-            "replace_sandbox_custom_extension_params",
-            unknown,
-            Arc::clone(&orchestration)
-                .replace_sandbox_custom_extension_params(unknown, None)
-                .await,
-        );
-        refuses(
-            "fork_sandbox",
-            unknown,
-            Arc::clone(&orchestration)
-                .fork_sandbox(unknown, ForkChildren::Fresh(1), NewTimeout::UseExisting)
-                .await,
-        );
-    }
-}
+sandbox_orchestration_surface!(orchestration_trait);

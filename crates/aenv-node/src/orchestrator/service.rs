@@ -23,7 +23,7 @@ use crate::types::{ExecutionId, SandboxId, SandboxResources};
 use super::grants::GrantIssuer;
 #[cfg(any(test, feature = "test-support"))]
 use super::grants::NoGrants;
-use super::launch_claim::{LaunchClaims, LaunchFailure, LaunchSettlement, RestoredSandbox};
+use super::launch_claim::{LaunchClaims, LaunchFailure, LaunchSettlement};
 use super::launch_parts::{
     configured_runtime_versions, default_fresh_sandbox_resources, resources_with_runtime_info,
     snapshot_create_parts, SnapshotCreateInputs, SnapshotCreateParts,
@@ -32,15 +32,15 @@ use super::launch_plan::{LaunchPlan, LaunchSource};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
-use super::pause_publisher::PausePublisher;
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
-use super::types::{
-    CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, PauseOutcome,
-    PublishedPause, SandboxExpiry, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
+use super::PausePublisher;
+use super::{
+    CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox, OrchestratorError,
+    PauseOutcome, PublishedPause, RestoredSandbox, Result, SandboxExpiry, SandboxForkOutcome,
+    SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxOperation,
+    SandboxRosterEntry, SandboxState, SnapshotCaptureResult,
 };
-use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
 type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 
@@ -174,7 +174,7 @@ where
             InMemoryMetadataStore::new(),
             factory,
             crate::image::DisabledRuntimeImageRefs::shared(),
-            super::pause_publisher::DiscardingPausePublisher::shared(),
+            super::DiscardingPausePublisher::shared(),
             NoGrants::shared(),
         )
         .await
@@ -215,7 +215,7 @@ where
         image_refs: std::sync::Arc<dyn crate::image::RuntimeImageRefs>,
         access_token_seed: &str,
     ) -> Self {
-        let pause_publisher = super::pause_publisher::DiscardingPausePublisher::shared();
+        let pause_publisher = super::DiscardingPausePublisher::shared();
         let (sandbox_event_tx, _sandbox_event_rx) =
             tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
         Self {

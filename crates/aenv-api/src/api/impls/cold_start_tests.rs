@@ -12,8 +12,8 @@ use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 
 use super::ApiImpl;
-use crate::orchestrator::{InMemoryMetadataStore, Orchestrator};
 use crate::sandbox::mock::MockBackendFactory;
+use aenv_node::orchestrator::{InMemoryMetadataStore, Orchestrator};
 
 // Fully qualified reserved-domain reference keeps the fake resolver probe deterministic.
 const IMAGE: &str = "registry.invalid/agentenv/cold-start:pinned";

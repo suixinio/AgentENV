@@ -888,7 +888,6 @@ mod template_read_scope_tests {
 
     use super::{run_the_build_on_a_node, ApiImpl, TemplateBuildStartBaseSource};
     use crate::node_client::{FixedNodePlacement, NodeEndpoint, NodePlacement};
-    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
         SnapshotCatalog, SnapshotCommit, SnapshotListPage, StartedBuild,
@@ -901,6 +900,7 @@ mod template_read_scope_tests {
         SnapshotSource, TemplateBuildErrorReason, TemplateBuildInfo,
     };
     use crate::template::TemplateBuildSpec;
+    use aenv_node::orchestrator::Orchestrator;
 
     /// A catalog that hides a `waiting` row from a resolvable read, and shows
     /// it to a scoped one. The central catalog, in the one respect these tests

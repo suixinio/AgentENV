@@ -217,6 +217,7 @@ version = "0.1.2"
 dependencies = [
  "aenv-core",
  "aenv-egress",
+ "aenv-node",
  "agentenv-observability",
  "agentenv-test-support",
  "agentenv_http_server",

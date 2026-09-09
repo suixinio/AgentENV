@@ -9,7 +9,9 @@ use agentenv_http_server::models;
 
 use super::ApiImpl;
 use crate::api::ResumeWiring;
-use crate::orchestrator::{Orchestrator, SandboxState};
+use aenv_node::orchestrator::Orchestrator;
+
+use crate::orchestrator::SandboxState;
 use crate::sandbox::mock::MockBackendFactory;
 use crate::snapshot::mock::{
     in_memory_snapshot_manager, mock_paused_sandbox_config, paused_sandbox_record,
@@ -24,7 +26,8 @@ const ORIGIN: &str = "node-origin";
 struct Surface {
     api: Arc<ApiImpl>,
     catalog: Arc<InMemorySnapshotCatalog>,
-    orchestrator: Arc<Orchestrator<crate::orchestrator::InMemoryMetadataStore, MockBackendFactory>>,
+    orchestrator:
+        Arc<Orchestrator<aenv_node::orchestrator::InMemoryMetadataStore, MockBackendFactory>>,
 }
 
 /// The orchestration under the handlers, with keep-alive dropping the record

@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 
 use super::store::{NewTimeout, SandboxMetadata};
-use super::types::SandboxState;
+use super::SandboxState;
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::{FreshSandboxBuildSpec, SandboxLaunchConfig, UnresolvedImageBuildSpec};
 use crate::snapshot::SnapshotRecord;

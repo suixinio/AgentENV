@@ -1,9 +1,10 @@
-mod in_memory;
 mod metadata;
 pub mod redis;
 mod transitions;
 
-#[cfg(test)]
+// The suite both backends run, and neither of them is in this crate: the gate
+// has to let a sibling crate's tests compile it, not just this one's.
+#[cfg(any(test, feature = "test-support"))]
 pub mod contract;
 
 use std::collections::HashMap;
@@ -15,7 +16,6 @@ use async_trait::async_trait;
 use crate::orchestrator::SandboxState;
 use crate::types::{ExecutionId, SandboxId};
 
-pub use in_memory::InMemoryMetadataStore;
 pub(crate) use metadata::deserialize_optional_control_plane_config;
 pub use metadata::{
     configured_max_sandbox_lifetime, ControlPlaneConfig, NewTimeout, SandboxMetadata,

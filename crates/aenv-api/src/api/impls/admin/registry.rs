@@ -130,7 +130,6 @@ mod registry_listing_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::{
         in_memory_snapshot_manager, mock_paused_sandbox_config, mock_snapshot_manager,
@@ -138,6 +137,7 @@ mod registry_listing_tests {
     };
     use crate::snapshot::{SnapshotManager, SnapshotRecord};
     use crate::types::SandboxId;
+    use aenv_node::orchestrator::Orchestrator;
 
     fn sandbox_id(nth: u8) -> SandboxId {
         SandboxId::from_uuid(

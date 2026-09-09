@@ -81,7 +81,7 @@ mod contract {
         harness::store_for(test, |_| {}).await
     }
 
-    crate::orchestrator::store::contract::metadata_store_contract!();
+    crate::metadata_store_contract!();
 }
 
 #[tokio::test]

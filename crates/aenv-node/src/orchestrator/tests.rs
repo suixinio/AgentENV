@@ -13,8 +13,7 @@ use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 use super::super::launch_plan::LaunchPlan;
-use super::super::pause_publisher::{DiscardingPausePublisher, PausePublisher};
-use super::super::types::{PublishedPause, SandboxLaunchSource};
+use super::super::{DiscardingPausePublisher, PausePublisher, PublishedPause, SandboxLaunchSource};
 use super::*;
 use crate::image::{RecordingRuntimeImageRefs, RuntimeImageRefs};
 use crate::runtime_snapshot::RunnableSnapshot;
@@ -2207,9 +2206,9 @@ async fn a_retried_pause_commit_never_deletes_the_bytes_it_is_about_to_commit() 
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
         TEST_DEFAULT_SANDBOX_TIMEOUT,
-        Arc::new(
-            crate::orchestrator::pause_publisher::CommittingPausePublisher::new(Arc::new(manager)),
-        ),
+        Arc::new(crate::orchestrator::CommittingPausePublisher::new(
+            Arc::new(manager),
+        )),
     );
     let created = orchestrator
         .create_sandbox(create_request(Some(600), &[("team", "pause-retain")]))

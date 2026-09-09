@@ -6,8 +6,8 @@
 
 use std::sync::Arc;
 
+use crate::orchestrator::NodeOrchestration;
 use aenv_core::observability::{node_detail, ObservabilityService};
-use aenv_core::orchestrator::NodeOrchestration;
 use agentenv_http_server::models;
 
 /// The node's HTTP state: what it runs, what it reports, and the domains its

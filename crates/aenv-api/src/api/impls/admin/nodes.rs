@@ -341,10 +341,10 @@ mod fleet_node_tests {
     use super::{observed_node_detail, observed_node_model, observed_status, ApiImpl};
     use crate::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
     use crate::node_registry::types::Node as DiscoveredNode;
-    use crate::orchestrator::Orchestrator;
     use crate::proto::scheduler as scheduler_proto;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::mock_snapshot_manager;
+    use aenv_node::orchestrator::Orchestrator;
 
     /// An observed node whose every field carries a value distinct from the rest.
     fn sentinel_observed() -> scheduler_proto::ObservedNode {

@@ -94,7 +94,7 @@ zeroize = "1"
 # service over a real socket, and that service is `aenv-node`'s.
 # `make check-crate-boundaries` reads `cargo tree -e normal`, so the byte half
 # stays out of the shipped api binary.
-aenv-node = { path = "../aenv-node" }
+aenv-node = { path = "../aenv-node", features = ["test-support"] }
 # Driving the internal router with `oneshot`, so the endpoint tests need no
 # port and no server task.
 tower = { version = "0.5.2", features = ["util"] }

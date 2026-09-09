@@ -11,8 +11,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use super::store::SandboxMetadata;
-use super::types::SandboxState;
-use super::{OrchestratorError, SandboxOperation};
+use super::{LaunchHeldElsewhere, OrchestratorError, SandboxOperation, SandboxState};
 use crate::types::{ExecutionId, SandboxId};
 
 /// How a launch ended, for the callers that waited on it.
@@ -81,34 +80,6 @@ fn refusal_detail(error: &OrchestratorError) -> String {
     match error {
         OrchestratorError::SandboxOperationFailed { source, .. } => format!("{source:#}"),
         other => other.to_string(),
-    }
-}
-
-/// A restore's result, and whether this caller performed the launch or waited
-/// out one that was already running.
-#[derive(Debug, Clone)]
-pub struct RestoredSandbox {
-    pub metadata: SandboxMetadata,
-    pub joined: bool,
-}
-
-/// Marker a placement source attaches when it refuses to reserve a sandbox
-/// another replica is still launching.
-#[derive(Debug, thiserror::Error)]
-#[error("sandbox {sandbox_id} is being launched by another replica")]
-pub struct LaunchHeldElsewhere {
-    pub sandbox_id: SandboxId,
-}
-
-impl LaunchHeldElsewhere {
-    /// Whether the launch `error` ended is one another replica already holds.
-    pub fn refused(error: &OrchestratorError) -> bool {
-        let OrchestratorError::SandboxOperationFailed { source, .. } = error else {
-            return false;
-        };
-        source
-            .chain()
-            .any(|cause| cause.is::<LaunchHeldElsewhere>())
     }
 }
 
@@ -285,29 +256,6 @@ mod tests {
         assert!(
             claims.in_flight(sandbox_id).is_none(),
             "the id has to be free again once its launch is gone"
-        );
-    }
-
-    #[test]
-    fn a_launch_held_elsewhere_is_recognised_through_the_layers_that_wrap_it() {
-        let sandbox_id = SandboxId::new();
-        let refused = OrchestratorError::SandboxOperationFailed {
-            sandbox_id,
-            operation: crate::orchestrator::SandboxOperation::Start,
-            source: anyhow::Error::new(LaunchHeldElsewhere { sandbox_id })
-                .context("reserve a routing record before starting it")
-                .context("start sandbox on node node-a"),
-        };
-        assert!(LaunchHeldElsewhere::refused(&refused));
-
-        let other = OrchestratorError::SandboxOperationFailed {
-            sandbox_id,
-            operation: crate::orchestrator::SandboxOperation::Start,
-            source: anyhow::anyhow!("the node refused the launch"),
-        };
-        assert!(
-            !LaunchHeldElsewhere::refused(&other),
-            "waiting for a launch nobody is running would hang every ordinary failure"
         );
     }
 

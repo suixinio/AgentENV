@@ -1,14 +1,11 @@
 mod facade;
 pub mod grants;
-mod launch_claim;
+mod launch;
 pub mod launch_parts;
-mod launch_plan;
 
 pub mod metrics;
 mod pause_publisher;
-mod proxy;
 mod runtime_routing;
-mod service;
 pub mod store;
 mod types;
 
@@ -17,9 +14,9 @@ use std::time::SystemTime;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
-pub use facade::{NodeOrchestration, SandboxOrchestration};
+pub use facade::SandboxOrchestration;
 pub use grants::{GrantIssuer, GrantsIssuedUpstream, NoGrants};
-pub use launch_claim::{LaunchFailure, LaunchHeldElsewhere, LaunchSettlement, RestoredSandbox};
+pub use launch::{LaunchHeldElsewhere, RestoredSandbox};
 pub use launch_parts::{
     configured_runtime_versions, default_fresh_sandbox_resources, resources_with_runtime_info,
     snapshot_create_parts, SnapshotCreateInputs, SnapshotCreateParts,
@@ -28,13 +25,11 @@ pub use metrics::OrchestratorMetrics;
 #[cfg(any(test, feature = "test-support"))]
 pub use pause_publisher::DiscardingPausePublisher;
 pub use pause_publisher::{CommittingPausePublisher, PausePublisher, StagingPausePublisher};
-pub use proxy::{ProxyLookupResult, ProxyTarget};
 pub use runtime_routing::RuntimeRouting;
-pub use service::Orchestrator;
 pub use store::{
     configured_max_sandbox_lifetime, is_allowed_transition, ActiveStateRecord, ControlPlaneConfig,
-    FencedRemoval, InMemoryMetadataStore, MetadataRows, MetadataStore, MetadataUpdateResult,
-    NewTimeout, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError, SandboxListFilter,
+    FencedRemoval, MetadataRows, MetadataStore, MetadataUpdateResult, NewTimeout,
+    RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError, SandboxListFilter,
     SandboxMetadata, SandboxTimeoutAction, StoreError, StoredSandboxRecord, TransitionEffect,
     TransitionGuard, TransitionOutcome, TransitionRequest, TransitionSettlement,
     DEFAULT_STORE_KEY_PREFIX, STORE_RECORD_VERSION,

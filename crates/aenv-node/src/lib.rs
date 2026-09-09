@@ -2,7 +2,7 @@
 //! resolution, snapshots, and templates.
 
 pub use aenv_core::{
-    digest, identity, leader_task, logging, orchestrator, privileges, proto, runtime_snapshot,
+    digest, identity, leader_task, logging, privileges, proto, runtime_snapshot,
     scheduler_endpoint, server_main, types, virtualization,
 };
 
@@ -15,6 +15,7 @@ pub mod image;
 pub mod node_reclaim;
 pub mod node_server;
 pub mod observability;
+pub mod orchestrator;
 pub mod overlaybd;
 pub mod p2p;
 pub mod record_dir;

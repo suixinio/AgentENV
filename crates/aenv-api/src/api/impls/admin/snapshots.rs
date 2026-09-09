@@ -66,7 +66,6 @@ mod operator_snapshot_delete_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::repository::interfaces::{
         ImportedSnapshotArtifacts, SnapshotArtifactStore, SnapshotCatalog, SnapshotCommit,
@@ -80,6 +79,7 @@ mod operator_snapshot_delete_tests {
         SnapshotManager, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource,
         TemplateBuildErrorReason, TemplateBuildInfo,
     };
+    use aenv_node::orchestrator::Orchestrator;
 
     /// Catalog fixture holding one row and recording complete records passed to delete.
     struct OneRowCatalog {

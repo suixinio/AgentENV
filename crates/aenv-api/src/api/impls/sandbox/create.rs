@@ -517,10 +517,10 @@ mod warm_start_source_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
+    use aenv_node::orchestrator::Orchestrator;
 
     async fn surface(row: SnapshotRecord) -> Arc<ApiImpl> {
         let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;
@@ -578,12 +578,12 @@ mod rule_secret_check_tests {
     use agentenv_http_server::models;
 
     use super::ApiImpl;
-    use crate::orchestrator::Orchestrator;
     use crate::sandbox::mock::MockBackendFactory;
     use crate::secrets::memory::{InMemorySecretRefStore, InMemorySecretsBackend};
     use crate::secrets::{SecretMetadata, SecretString, SecretValue, SecretsService};
     use crate::snapshot::mock::unresolvable_snapshot_manager;
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
+    use aenv_node::orchestrator::Orchestrator;
 
     async fn surface(secrets: Option<Arc<SecretsService>>) -> Arc<ApiImpl> {
         let orchestrator = Orchestrator::with_in_memory_store(MockBackendFactory::new()).await;

@@ -853,19 +853,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn node_membership_reports_gone_once_a_silent_nodes_unabsorbed_roster_expires() {
+    async fn node_membership_reports_gone_once_a_silent_node_stops_holding_its_veto() {
+        // Report TTL under the veto window, so node-a is past reporting while its
+        // veto is still inside its window: liveness is the only leg that can open
+        // the gate here, and the node stays in discovery throughout.
         let registry = Arc::new(AtomicNodeRegistry::new(
             vec![Node {
                 id: "node-a".to_string(),
                 endpoint: "http://10.0.0.7:8000".to_string(),
                 pod_name: String::new(),
             }],
-            Duration::from_secs(30),
+            Duration::from_secs(5),
         ));
-        let start = SystemTime::now() - Duration::from_secs(300);
+        let start = SystemTime::now() - Duration::from_secs(60);
         let warmup = Arc::new(WarmupGate::new(
             Arc::clone(&registry) as Arc<dyn crate::node_registry::registry::NodeRegistry>,
-            Duration::from_secs(15),
+            Duration::from_secs(300),
             start,
         ));
         let placement = placement_with_warmup(Arc::clone(&registry), Arc::clone(&warmup));
@@ -882,8 +885,9 @@ mod tests {
         assert_eq!(
             placement.node_membership("node-c").await.unwrap(),
             NodeMembership::Gone,
-            "node-a stopped heartbeating long ago, so its unabsorbed roster no longer withholds \
-             Gone -- withholding it forever is how records on a dead node become unreclaimable"
+            "node-a stopped reporting, so its unabsorbed roster withholds Gone no longer even \
+             though the window it was stamped in has not run out -- withholding it forever is \
+             how records on a dead node become unreclaimable"
         );
     }
 

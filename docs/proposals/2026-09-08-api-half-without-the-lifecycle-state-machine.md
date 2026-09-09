@@ -158,6 +158,18 @@ e2b 相反：`Reserve` 在选节点之前，键是 `(teamID, sandboxID)`、与�
    （`service.rs:52,468,573`）的轮询是我们替代 e2b `waitForStart` join 的方式，
    保留，但它等待的对象改成预留而不是进程内 map。
 
+**预留住在自己的键空间里，不是路由键里。** 本仓库的 `Binding` 必带节点：
+`crates/aenv-api/src/binding_store/record.rs:99-107` 的 `parse_record` 在
+node_id 或 endpoint 为空时返回 `None`，而这套值住在 gateway 路由投影读的同一个
+键空间（`binding_key`，`record.rs:111` 的 `{prefix}:sandbox:{id}`）。所以
+"键里不含节点"**不能**实现成往路由键里写一条无节点的 `Starting` 记录——那条记录
+对 gateway 和 `get` 都等于不存在，单激活反而没了。预留改走并列的新键
+（`{prefix}:reservation:{id}`），只有 api 半边读写；放置成功后仍按今天的形状写
+路由键，`Starting` 因此只描述路由记录的一个阶段，不再兼任单激活的真相源。
+e2b 的分法一样：预留在 `getReservationPrefix(teamID)` 下，沙箱记录在
+`.../sandboxes/{id}`（`packages/api/internal/sandbox/reservations/redis/utils.go:20-36`
+与 `.../storage/redis/utils.go:66-68`），共享的只有那个用于配额的团队索引。
+
 **与 e2b 的偏离**：e2b 的 keep-alive **有**一段向持有节点的转发
 （`keep_alive.go:60` → `update_instance.go:34,40`：`getOrConnectNode` 后
 `client.Sandbox.Update`），因为它的节点自己持 deadline。我们没有这段代码可删——
@@ -221,7 +233,10 @@ CLAUDE.md 的 aenv-api 条、Orchestrator 条、Workspace Crates，以及讲"哪
 
 **这一节的作用域是 C6 本身，不是承载它的分支。** C6：零迁移、零 schema 变更、
 零 feature flag、零双写腿。两个二进制的线上契约（REST 面、`scheduler.v1`、
-node gRPC 面、Redis 与 PG 的键与列）都不变，所以回滚手段是**镜像 digest**：
+node gRPC 面、Redis 与 PG 的键与列）都不变——§3 的预留是**新增**的一个键，
+路由键的键名与值形状一个字节都不动，所以 gateway 与旧副本读到的东西不变；
+回滚后最多留下每个在途 create 一个孤儿预留键，按它自己的 TTL 过期。
+所以回滚手段是**镜像 digest**：
 把 Deployment/DaemonSet 的镜像换回上一版即可，不需要开关。这与 CLAUDE.md
 "Rolling this half back is an image digest change on its Deployment, no flags"
 是同一条。

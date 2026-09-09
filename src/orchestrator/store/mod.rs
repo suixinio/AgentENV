@@ -1,5 +1,4 @@
 mod metadata;
-pub mod redis;
 mod transitions;
 
 // The suite both backends run, and neither of them is in this crate: the gate
@@ -20,11 +19,6 @@ pub(crate) use metadata::deserialize_optional_control_plane_config;
 pub use metadata::{
     configured_max_sandbox_lifetime, ControlPlaneConfig, NewTimeout, SandboxMetadata,
     SandboxTimeoutAction,
-};
-pub use redis::{
-    ActiveStateRecord, RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError,
-    StoredSandboxRecord, DEFAULT_KEY_PREFIX as DEFAULT_STORE_KEY_PREFIX,
-    RECORD_VERSION as STORE_RECORD_VERSION,
 };
 pub use transitions::{
     is_allowed_transition, state_from_token, state_token, TransitionEffect, ALL_SANDBOX_STATES,

@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::redis_test_server::{self, RedisTestServer};
+use aenv_core::redis_test_server::{self, RedisTestServer};
 
 use super::{RedisMetadataStore, RedisStoreConfig};
 

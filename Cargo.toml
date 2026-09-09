@@ -51,7 +51,12 @@ vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 # `[dev-dependencies]` only. Cargo's v2 resolver does not unify a
 # dev-dependency's features into a normal build, so `cargo build` is
 # unaffected.
-test-support = []
+#
+# `redis` rides along because the only thing left in this crate that speaks it
+# is `redis_test_server`, which starts one for a sibling's tests. The metadata
+# store that used to need it is `aenv-api`'s, and a node linking a Redis client
+# it never opens is what `make check-crate-boundaries` now refuses.
+test-support = ["dep:redis"]
 
 [dev-dependencies]
 # 🔴 A dev-dependency on this crate itself, and the only way to say "turn
@@ -126,7 +131,7 @@ hex = "0.4"
 rand = "0.10"
 zeroize = "1"
 openssl-sys = { version = "0.9", optional = true }
-redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"] }
+redis = { version = "1.6.0", features = ["tokio-comp", "script", "connection-manager"], optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

@@ -43,8 +43,8 @@ mod redis_harness_tests {
         [
             (
                 "orchestrator::store::redis",
-                aenv_core::orchestrator::store::redis::harness::db_counter(),
-                aenv_core::orchestrator::store::redis::harness::server(),
+                crate::orchestrator::store::redis::harness::db_counter(),
+                crate::orchestrator::store::redis::harness::server(),
             ),
             (
                 "binding_store::redis",

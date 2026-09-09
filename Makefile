@@ -354,13 +354,18 @@ test-unit:
 #     silently skipped 152 tests and reported ok, and two of them were the only
 #     tests that would have caught a `KEEPTTL` being dropped.
 #
-# Covers every Redis-backed suite in this crate: orchestrator::store (api's
-# own sandbox-metadata store), binding_store::redis (the routing/binding
-# store, task's own "D3" -- see that module's own KEEPTTL fix, the same
-# defect class this target exists to keep catching), and node_registry::redis
-# (the shared-roster fix's cross-replica observed-state store). A filter
-# naming only some of these would let a newer suite silently skip the same
-# way the incident above did for the first one.
+# Covers every Redis-backed suite: orchestrator::store::redis (the api half's
+# sandbox-metadata store), binding_store::redis (the routing/binding store,
+# task's own "D3" -- see that module's own KEEPTTL fix, the same defect class
+# this target exists to keep catching), and node_registry::redis (the
+# shared-roster fix's cross-replica observed-state store). A filter naming
+# only some of these would let a newer suite silently skip the same way the
+# incident above did for the first one.
+#
+# `-p aenv-node` for the other half of one suite: the metadata-store contract
+# runs against both backends, and the in-memory one lives with the node whose
+# records it holds. A run of this target after a contract change has to
+# exercise the pair.
 REDIS_TEST_LOG ?= target/redis-store-tests.log
 
 test-with-redis:
@@ -369,7 +374,7 @@ test-with-redis:
 	  echo "Install redis-server, or point REDIS_SERVER_BIN at one."; \
 	  exit 1; }
 	@mkdir -p $(dir $(REDIS_TEST_LOG))
-	@AENV_REDIS_TEST_REQUIRED=1 $(CARGO) test -p aenv-core -p aenv-api --lib -- --nocapture \
+	@AENV_REDIS_TEST_REQUIRED=1 $(CARGO) test -p aenv-core -p aenv-api -p aenv-node --lib -- --nocapture \
 	  orchestrator::store:: binding_store::redis:: node_registry::redis:: \
 	  redis_test_server:: node_client::redis_harness_tests:: \
 	  > $(REDIS_TEST_LOG) 2>&1; status=$$?; \

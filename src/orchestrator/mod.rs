@@ -5,7 +5,6 @@ pub mod launch_parts;
 
 pub mod metrics;
 mod pause_publisher;
-mod runtime_routing;
 pub mod store;
 mod types;
 
@@ -25,14 +24,11 @@ pub use metrics::OrchestratorMetrics;
 #[cfg(any(test, feature = "test-support"))]
 pub use pause_publisher::DiscardingPausePublisher;
 pub use pause_publisher::{CommittingPausePublisher, PausePublisher, StagingPausePublisher};
-pub use runtime_routing::RuntimeRouting;
 pub use store::{
-    configured_max_sandbox_lifetime, is_allowed_transition, ActiveStateRecord, ControlPlaneConfig,
-    FencedRemoval, MetadataRows, MetadataStore, MetadataUpdateResult, NewTimeout,
-    RedisMetadataStore, RedisStoreConfig, RedisStoreConfigError, SandboxListFilter,
-    SandboxMetadata, SandboxTimeoutAction, StoreError, StoredSandboxRecord, TransitionEffect,
-    TransitionGuard, TransitionOutcome, TransitionRequest, TransitionSettlement,
-    DEFAULT_STORE_KEY_PREFIX, STORE_RECORD_VERSION,
+    configured_max_sandbox_lifetime, is_allowed_transition, ControlPlaneConfig, FencedRemoval,
+    MetadataRows, MetadataStore, MetadataUpdateResult, NewTimeout, SandboxListFilter,
+    SandboxMetadata, SandboxTimeoutAction, StoreError, TransitionEffect, TransitionGuard,
+    TransitionOutcome, TransitionRequest, TransitionSettlement,
 };
 pub use types::{
     capture_publish_metadata, CreateSandboxRequest, ForkChildAssignment, ForkChildren, LiveSandbox,

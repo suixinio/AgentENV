@@ -112,7 +112,7 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
 | API layer | `crates/aenv-node/src/api/` | Axum HTTP server for this node's own report, its metrics and the reverse proxy to sandbox services; the user-facing REST surface is `aenv-api`'s and is absent here |
-| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Forking, Snapshotting, Pausing, Killing), auto-eviction, incremental runtime metrics; a pause ends in a snapshot-catalog row and no record. Callers reach it through `SandboxOrchestration`, which both halves answer, or `NodeOrchestration`, the subtrait only a process holding VM handles can |
+| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Forking, Snapshotting, Pausing, Killing), auto-eviction, incremental runtime metrics; a pause ends in a snapshot-catalog row and no record. Its collaborators -- the store, the backend factory, the pause publisher, the grant issuer -- all arrive at construction. Callers reach it through `SandboxOrchestration`, which both halves answer, or `NodeOrchestration`, the subtrait only a process holding VM handles can |
 | Observability | `src/observability/`, `crates/aenv-node/src/observability/reporter.rs` | Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting |
 | Sandbox | `src/sandbox/` for the backend contract, access tokens and network policy; `crates/aenv-node/src/sandbox/` for the rest | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
 | Snapshot + Template Builder | `src/snapshot/`, `src/template/`, `crates/aenv-node/src/template/builder.rs` | `src/snapshot/` owns the committed snapshot model, its repository backends and runtime resolution; `src/template/` is the build spec, and the builder that runs it lives on the node |
@@ -299,6 +299,7 @@ crates/aenv-api/src/             # the deciding half
 ├── api/server.rs               # their composition
 ├── node_registry/              # the Scheduler contract, discovery, placement
 ├── binding_store/              # the sandbox-to-node routing binding
+├── control/                    # SandboxControl: place, call the node, settle the record
 ├── node_client/                # driving a sandbox on another machine
 ├── secrets/                    # the secret store, service and grant issuer
 └── pg/, snapshot/              # PostgreSQL: catalog, secret values

@@ -230,18 +230,34 @@ api 侧的 `sandboxes` 桩表、`proxy_routes`；**`launch_claims`**（连同它
 `ApiImpl::runs_sandbox_runtime` / `owns_sandboxes` / `WakeSite` 与 `role_gate`
 已在步骤 2 删除（commit 270d858），不再是本步的工作。
 
-**本步已落地的部分**：§3 的预留（新键、两后端契约、清扫器回收）与它在创建路径上的
-位置（`RemoteSandboxStub::start` 先取 id 再选节点，落定后归还）；以及 `facade.rs`
+**本步已落地**：§3 的预留（新键、两后端契约、清扫器回收）与它在创建路径上的
+位置（`RemoteSandboxStub::start` 先取 id 再选节点，落定后归还）；`facade.rs`
 的拆分——`SandboxOrchestration` 是 REST 层与 observability 两个消费者要的那一份，
-`NodeOrchestration` 是只有跑沙箱的进程能回答的十一个方法。
+`NodeOrchestration` 是只有跑沙箱的进程能回答的十一个方法；以及
+`SandboxControl`（`crates/aenv-api/src/control/`）本身。随它删掉的有：api 半边
+装配里的 `DisabledRuntimeImageRefs`、`UnknownRecordOwner` 与 `RoleStorage` 的
+造了再丢（api 半边改为 `build_catalog_backed_backend` 直接在
+`build_artifact_store` 上组合 PostgreSQL），api 侧的 `sandboxes` 桩表与
+`proxy_routes`，`launch_claims` 在 api 半边的用法，以及
+`RemoteSandboxBackendFactory` 整个类型——`RemoteSandboxStub` 现在只是"一个沙箱的
+节点会话"，经 `NodeLaunchBuilder` 取得，不再实现 `SandboxBackend`。
+三个 `set_*` 也没了：`pause_publisher` 与 `grants` 成为 `Orchestrator::new` 的参数，
+`RuntimeRouting` 这一路整个从 `Orchestrator` 移除（api 半边不再构造它，节点半边
+自己的句柄表就是答案）。
 
-**本步未落地的部分**：`SandboxControl` 本身，以及随它才能删掉的
-`DisabledRuntimeImageRefs`、`UnknownRecordOwner`、`RoleStorage` 的造了再丢、
-api 侧 `sandboxes` 桩表与 `proxy_routes`、`launch_claims` 在 api 半边的用法、
-三个 `set_*` 变构造参数。api 半边今天仍构造 `Orchestrator`。
 `launch_claims` 在**节点侧**必须保留：它守的是同一节点上两个不同 execution id
 的并发 create（dev 的 406bc6f），预留只保证一个 api 副本在一个时刻持有一个
 sandbox id，覆盖不到这一条。
+
+**与本稿的两处偏离，各有理由**：
+
+1. `SandboxControl` 的每个操作都从路由绑定解析节点（`place_existing`），而不是
+   从本副本的记忆里取句柄。今天的 api 半边在创建它的那个副本上会命中句柄表，
+   在别的副本上早已走这条路；删掉句柄表等于让所有副本走同一条，代价是 delete
+   与 pause 多一次 `describe`。
+2. `SandboxOrchestration` 的三个 `*_for_test` 种子改为带"拒绝"默认体：另一个 crate
+   里的实现者读不到 `aenv-core` 的 `test-support` feature 来给覆盖加门，而
+   `--all-targets` 会编出一个看得见门控 trait、自己却没有 `cfg(test)` 的 lib。
 
 ### 步骤 4：文档
 
@@ -276,12 +292,13 @@ node gRPC 面、Redis 与 PG 的键与列）都不变——§3 的预留是**新
 
 | # | 耦合 | 位置 | 为什么它属于这份清单 |
 |---|---|---|---|
-| 1 | `src/orchestrator/store/redis/`（4,671 行，含自带测试） | 唯一生产调用方 `crates/aenv-api/src/bin/aenv-api.rs:193` | `crates/aenv-node` 对 `RedisMetadataStore` 的引用数为 **0**，却链进 node 二进制。步骤 3 若只搬 `service.rs`，它还留在那儿 |
-| 2 | 三个 `OnceCell` 就是运行期角色分支 | `src/orchestrator/service.rs:147,150,154`；判定点 `:1654`、`:1817` | 与四个 no-op 同一诊断：编译期可判定的差异降级成运行期的 `None` 分支 |
+| 1 | `src/orchestrator/store/redis/`（4,671 行，含自带测试） | 唯一生产调用方 `crates/aenv-api/src/bin/aenv-api.rs` | `crates/aenv-node` 对 `RedisMetadataStore` 的引用数为 **0**，却链进 node 二进制。步骤 3 只搬了 `service.rs` 的一半（api 半边不再用它），它还留在那儿 |
+| 2 | ~~三个 `OnceCell`~~ 已删：`pause_publisher` 与 `grants` 是构造参数，`RuntimeRouting` 整条路径不在 `Orchestrator` 里了 | `src/orchestrator/service.rs` | — |
 | 3 | ~~`SandboxOrchestration` facade（38 个方法）~~ 已拆：27 个方法的 `SandboxOrchestration` + 11 个方法的 `NodeOrchestration` | `src/orchestrator/facade.rs` | `SandboxControl` 只需实现前者；`check-crate-boundaries` 盯住 `ApiImpl` 持有的是哪一个 |
 | 4 | `src/sandbox/network/iptables_util.rs`（290 行） | 引用方 `crates/aenv-node/src/sandbox/network/{manager.rs:18,slot.rs:26}` 与 core 自己的 `policy.rs:8` | node 独用，链进 api 二进制且永不执行。**它搬不动是因为 `policy.rs` 用它**：那 2,140 行里 366-714 行是只有节点跑的 iptables 施加面，而模型与施加面的测试在同一个 `mod tests` 里交错，拆开不是一个提交的量 |
 | 5 | ~~`src/secrets/mod.rs`（1,728 行）~~ 已搬进 `crates/aenv-api/src/secrets/service.rs`；`SecretKind` 留在 core 的 `src/secret_kind.rs` | core 消费者 `orchestrator/grants.rs`、`sandbox/network/policy.rs` | `API_EXILED_PATHS` 新增 `src/secrets`，双向变异证据在提交里 |
-| 6 | `RemoteSandboxBackendFactory::build` 的拒绝式实现 | `crates/aenv-api/src/node_client/factory.rs:52-64` | 第五份 no-op：冷创建在 api 半边"没有东西可发"，只能 `bail!` |
+| 6 | ~~`RemoteSandboxBackendFactory::build` 的拒绝式实现~~ 已删：冷创建的拒绝现在是 `SandboxControl::plan_launch` 里 `SandboxLaunchSource::Image` 那一臂，返回 `InvalidRequest` | `crates/aenv-api/src/control/mod.rs` | — |
+| 7 | `crates/aenv-api` 的测试仍以 `Orchestrator` + `MockBackendFactory` 作编排替身 | `crates/aenv-api/src/api/impls/sandbox/paused_surface_tests.rs`、`api/impls/cold_start_tests.rs`、`api/grpc/tests.rs`、`node_client/tests.rs` 的 `real_node()` | 这是步骤 4 的真正阻塞：把 `Orchestrator` 搬进 `crates/aenv-node` 之后，`crates/aenv-api`（不得依赖 aenv-node）里这四处就没有编排替身可用了。`node_client/tests.rs::real_node()` 尤其麻烦——它在 api 的测试里起了一个**节点半边**来服务 node gRPC 面 |
 
 ## 7. 验收判据
 
@@ -302,5 +319,10 @@ node gRPC 面、Redis 与 PG 的键与列）都不变——§3 的预留是**新
 6. 新增的模块级守卫有双向变异证据（破坏 → 出现 FAILED 行；复原 → ok；
    `git status` 干净）。
 
-判据现状：1 成立（步骤 1 的十个用例逐字未改，新增三个）；2、3、6 成立；
-4 与 5 要等 `SandboxControl` 落地，因为它们说的是 api 半边装配里的东西。
+判据现状：1 成立（步骤 1 的十四个用例逐字未改，装配换成 `SandboxControl`，
+另新增九个）；2、3、5、6 成立。4 只成立一半：`cargo tree -p aenv-node` 不含
+`kube`/`k8s-openapi`，但 `cargo tree -p aenv-api -e normal` 的依赖数不变（528），
+因为两个 crate 的 manifest 一个字节都没动——那个数字要等步骤 4 把模块搬出 core、
+让 core 掉依赖才会动。
+
+步骤 4 未落地，阻塞写在 §6 第 7 条。

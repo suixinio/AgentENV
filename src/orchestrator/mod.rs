@@ -4,7 +4,7 @@ mod launch_claim;
 pub mod launch_parts;
 mod launch_plan;
 
-mod metrics;
+pub mod metrics;
 mod pause_publisher;
 mod proxy;
 mod runtime_routing;

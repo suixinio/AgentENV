@@ -17,10 +17,7 @@ use crate::proto::node::node_sandbox_service_server::{
 };
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::mock::{MockBackendFactory, MockBehavior};
-use crate::sandbox::{
-    CustomExtensionParams, SandboxBackend, SandboxBackendFactory, SandboxForkSpec,
-    SandboxLaunchConfig,
-};
+use crate::sandbox::{CustomExtensionParams, SandboxForkSpec, SandboxLaunchConfig};
 use crate::snapshot::mock::RecordingSnapshotRepository;
 use crate::snapshot::repository::{
     RepositoryResult, SnapshotCatalog, SnapshotCommit, SnapshotListFilter, SnapshotListPage,
@@ -30,7 +27,25 @@ use crate::snapshot::CapturedSandboxSnapshot;
 use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotManager, SnapshotRecord};
 use crate::types::ExecutionId;
 
-use crate::node_client::factory::RemoteSandboxBackendFactory;
+use crate::node_client::factory::NodeLaunchBuilder;
+use crate::node_client::RemoteSandboxStub;
+
+/// The record owner of a test that is not about who owns a sandbox id.
+struct UnrecordedOwner;
+
+#[async_trait]
+impl crate::node_client::SandboxRecordOwner for UnrecordedOwner {
+    async fn recorded_execution(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+    ) -> anyhow::Result<Option<ExecutionId>> {
+        anyhow::bail!("this test keeps no record of sandbox {sandbox_id} to read")
+    }
+}
+
+fn launch_builder(placement: Arc<dyn NodePlacement>) -> NodeLaunchBuilder {
+    NodeLaunchBuilder::new(placement, Arc::new(UnrecordedOwner))
+}
 use crate::node_client::placement::{
     FixedNodePlacement, NodeEndpoint, NodeMembership, NodePlacement,
 };
@@ -412,7 +427,7 @@ fn launch_config() -> SandboxLaunchConfig {
 #[tokio::test]
 async fn a_sandbox_built_here_starts_on_the_node() {
     let node = real_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let snapshot = RunnableSnapshot::mock();
     let execution_id = ExecutionId::new();
     let config = launch_config();
@@ -489,7 +504,7 @@ async fn custom_extension_params_update_lands_in_the_real_node() {
     let behavior = Arc::new(MockBehavior::new());
     let node =
         real_node_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior))).await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let execution_id = ExecutionId::new();
     let config = launch_config();
     let sandbox_id = config.sandbox_id;
@@ -567,7 +582,7 @@ async fn a_node_that_started_another_run_fails_the_start_and_is_told_to_stop() {
         ..Default::default()
     }));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), asked_for) {
             Ok(backend) => backend,
@@ -610,8 +625,7 @@ async fn start_against_a_node_that_already_holds_the_sandbox(
         "sandbox is already on this node",
     )));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement())
-        .with_record_owner(Arc::new(FixedRecordOwner(recorded)));
+    let factory = NodeLaunchBuilder::new(node.placement(), Arc::new(FixedRecordOwner(recorded)));
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), launching)
         .expect("building a stub should not fail");
@@ -688,9 +702,7 @@ async fn a_create_from_an_unresolved_record_is_the_same_bytes_as_one_from_a_reso
     let execution_id = ExecutionId::new();
 
     async fn one_create(
-        build: impl FnOnce(
-            &RemoteSandboxBackendFactory,
-        ) -> anyhow::Result<Box<dyn crate::sandbox::SandboxBackend>>,
+        build: impl FnOnce(&NodeLaunchBuilder) -> anyhow::Result<RemoteSandboxStub>,
         config: &SandboxLaunchConfig,
         execution_id: ExecutionId,
     ) -> pb::SandboxCreateRequest {
@@ -700,7 +712,7 @@ async fn a_create_from_an_unresolved_record_is_the_same_bytes_as_one_from_a_reso
             execution_id: execution_id.to_string(),
             ..Default::default()
         }));
-        let factory = RemoteSandboxBackendFactory::new(node.placement());
+        let factory = launch_builder(node.placement());
         let mut backend = build(&factory).expect("building a stub should not fail");
         backend.start().await.expect("start");
         let creates = script.seen_create.lock().expect("lock").clone();
@@ -749,7 +761,7 @@ async fn the_create_names_the_run_the_caller_minted() {
         ..Default::default()
     }));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id) {
             Ok(backend) => backend,
@@ -767,9 +779,7 @@ async fn the_create_names_the_run_the_caller_minted() {
         backend.host_interaction_ip(),
         Some(std::net::Ipv4Addr::new(10, 1, 2, 3))
     );
-    assert_eq!(backend.runtime_info().rootfs_virtual_size, Some(8192));
-    assert!(backend.runtime_info().runtime_artifacts.is_empty());
-    assert!(backend.startup_artifacts().is_empty());
+    assert_eq!(backend.rootfs_virtual_size(), Some(8192));
 }
 
 #[tokio::test]
@@ -786,7 +796,7 @@ async fn the_create_tells_the_node_that_this_half_keeps_the_deadline() {
         ..Default::default()
     }));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
         .expect("building a stub should not fail");
@@ -824,7 +834,7 @@ async fn custom_extension_params_update_is_a_real_round_trip() {
         execution_id: execution_id.to_string(),
         ..Default::default()
     }));
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         {
@@ -890,7 +900,7 @@ async fn an_unreachable_node_does_not_mean_the_sandbox_stopped() {
         execution_id: execution_id.to_string(),
         ..Default::default()
     }));
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         {
@@ -1018,8 +1028,7 @@ async fn a_stale_node_address_is_retried_once_against_a_freshly_resolved_one() {
         resolve_calls: std::sync::atomic::AtomicUsize::new(0),
         resolve_budget: usize::MAX,
     });
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         .expect("build a stub");
@@ -1076,14 +1085,14 @@ fn scripted_fork_of(
 async fn started_parent_on(
     script: &ScriptedNode,
     placement: Arc<ClusterPlacement>,
-) -> Box<dyn crate::sandbox::SandboxBackend> {
+) -> RemoteSandboxStub {
     let execution_id = ExecutionId::new();
     *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
         sandbox_id: launch_config().sandbox_id.to_string(),
         execution_id: execution_id.to_string(),
         ..Default::default()
     }));
-    let factory = RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>);
+    let factory = launch_builder(placement as Arc<dyn NodePlacement>);
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         .expect("build a stub");
@@ -1194,8 +1203,7 @@ async fn a_forks_children_carry_the_connection_the_retry_actually_used() {
         // See the field doc: this is the test that needs the cap to bite.
         resolve_budget: 1,
     });
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         .expect("build a stub");
@@ -1247,8 +1255,7 @@ async fn a_status_the_node_sent_is_not_retried_against_a_different_address() {
         resolve_calls: std::sync::atomic::AtomicUsize::new(0),
         resolve_budget: usize::MAX,
     });
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         .expect("build a stub");
@@ -1368,8 +1375,7 @@ async fn a_slow_reresolve_is_bounded_by_the_retry_budget() {
         initial: NodeEndpoint::same_address("the-slow-node", node_a.endpoint.endpoint.clone()),
         resolve_calls: std::sync::atomic::AtomicUsize::new(0),
     });
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         .expect("build a stub");
@@ -1477,7 +1483,7 @@ async fn a_pause_the_node_staged_nothing_for_is_terminal() {
     }));
     *script.pause.lock().expect("lock") = Some(Ok(pb::SandboxPauseResponse { staged: None }));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         .expect("build a stub");
@@ -1508,7 +1514,7 @@ async fn a_capture_failure_keeps_its_classification_across_the_wire() {
                 "the memory snapshot did not land",
             )));
 
-        let factory = RemoteSandboxBackendFactory::new(node.placement());
+        let factory = launch_builder(node.placement());
         let mut backend = factory
             .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
             .expect("a stub");
@@ -1526,7 +1532,7 @@ async fn a_capture_failure_keeps_its_classification_across_the_wire() {
         ..Default::default()
     }));
     *script.checkpoint.lock().expect("lock") = Some(Err(Status::internal("something went wrong")));
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         {
@@ -1572,7 +1578,7 @@ async fn a_checkpoint_comes_back_as_a_row_that_has_not_been_announced() {
         }),
     }));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         {
@@ -1603,7 +1609,7 @@ async fn a_fork_answered_with_the_wrong_shape_is_refused() {
         children: Vec::new(),
     }));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         {
@@ -1664,7 +1670,7 @@ async fn a_fork_keeps_each_childs_outcome_with_that_child() {
         ],
     }));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         {
@@ -1675,7 +1681,7 @@ async fn a_fork_keeps_each_childs_outcome_with_that_child() {
 
     let results = backend.fork(&specs).await.expect("fork");
     assert_eq!(results.len(), 2);
-    let child: Box<dyn SandboxBackend> = results
+    let child: RemoteSandboxStub = results
         .into_iter()
         .next()
         .expect("the first child")
@@ -1685,24 +1691,26 @@ async fn a_fork_keeps_each_childs_outcome_with_that_child() {
 
 #[tokio::test]
 async fn a_cold_create_is_refused_with_the_reason() {
-    let (_script, node) = scripted_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let node = real_node().await;
+    let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
+    let replica = api_replica(&node, &ledger).await;
 
-    let err = match factory.build(
-        crate::sandbox::FreshSandboxBuildSpec {
-            image_config_path: std::path::PathBuf::from("/var/lib/agentenv/image.json"),
-            context: Default::default(),
-            resources: Default::default(),
-            extra_drives: Vec::new(),
-            extra_boot_args: None,
-        },
-        launch_config(),
-        ExecutionId::new(),
-    ) {
-        Err(err) => err,
-        Ok(_) => panic!("a cold create was accepted, and there is nothing to send"),
-    };
-    assert!(err.to_string().contains("image reference"), "{err:#}");
+    let err = Arc::clone(&replica)
+        .create_sandbox(crate::orchestrator::CreateSandboxRequest {
+            source: crate::orchestrator::SandboxLaunchSource::Image {
+                image_ref: "registry.invalid/agentenv/base:pinned".to_string(),
+                overlaybd_config_path: std::path::PathBuf::from("/var/lib/agentenv/image.json"),
+                context: Default::default(),
+                resources: None,
+                extra_drives: Vec::new(),
+                extra_boot_args: None,
+                image_configs: Default::default(),
+            },
+            ..cluster_create_request()
+        })
+        .await
+        .expect_err("a cold create was accepted, and there is nothing to send");
+    assert!(format!("{err:#}").contains("image reference"), "{err:#}");
 }
 
 #[tokio::test]
@@ -1710,7 +1718,7 @@ async fn an_unresolved_image_reference_ships_to_the_node_which_resolves_it_itsel
     const IMAGE: &str = "registry.invalid/agentenv/cold-start:pinned";
 
     let (node, regctl_dir) = real_node_with_image_resolution().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
 
     let mut backend = factory
         .build_from_image_ref(
@@ -1779,12 +1787,7 @@ fn the_remote_factory_sends_no_blank_ownership_marker() {
 #[tokio::test]
 async fn the_marker_the_orchestrator_stamped_is_the_marker_on_the_wire() {
     let node = real_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-
-    assert!(
-        factory.stamps_control_plane_ownership(),
-        "a factory whose sandboxes run elsewhere has to ask for the marker"
-    );
+    let factory = launch_builder(node.placement());
 
     let marker = b"the control plane's record of this sandbox".to_vec();
     let config = SandboxLaunchConfig {
@@ -1826,7 +1829,7 @@ async fn the_marker_the_orchestrator_stamped_is_the_marker_on_the_wire() {
 #[tokio::test]
 async fn a_sandbox_that_arrived_without_a_marker_is_not_the_control_planes() {
     let node = real_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
 
     let config = launch_config();
     let sandbox_id = config.sandbox_id;
@@ -1996,7 +1999,7 @@ async fn the_node_service_answers_through_the_entry_point_a_binary_uses() {
         "node-under-test",
         format!("http://{addr}"),
     )));
-    let factory = RemoteSandboxBackendFactory::new(placement);
+    let factory = launch_builder(placement);
     let config = SandboxLaunchConfig {
         control_plane_config: Some(b"a marker".to_vec()),
         ..launch_config()
@@ -2037,7 +2040,7 @@ async fn paused_stub(
     script: &Arc<ScriptedNode>,
     node: &RunningNode,
     staged: &StagedSnapshot,
-) -> (Box<dyn SandboxBackend>, ExecutionId) {
+) -> (RemoteSandboxStub, ExecutionId) {
     let execution_id = ExecutionId::new();
     *script.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
         sandbox_id: launch_config().sandbox_id.to_string(),
@@ -2049,7 +2052,7 @@ async fn paused_stub(
             value: Some(wire::serialize(staged, "staged snapshot").expect("encode")),
         }),
     }));
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         .expect("build a stub");
@@ -2085,7 +2088,7 @@ async fn stopping_a_sandbox_that_was_just_paused_does_not_reach_the_node() {
 async fn a_pause_crosses_both_halves() {
     let real = real_node().await;
     let orchestration = real.orchestration.as_ref().expect("a real node").clone();
-    let factory = RemoteSandboxBackendFactory::new(real.placement());
+    let factory = launch_builder(real.placement());
     let execution_id = ExecutionId::new();
     let config = launch_config();
     let sandbox_id = config.sandbox_id;
@@ -2266,20 +2269,25 @@ impl crate::orchestrator::MetadataStore for SharedLedger {
     }
 }
 
-type ApiReplica = Arc<Orchestrator<SharedLedger, RemoteSandboxBackendFactory>>;
+type ApiReplica = Arc<crate::control::SandboxControl<SharedLedger>>;
 
 async fn api_replica(node: &RunningNode, ledger: &SharedLedger) -> ApiReplica {
-    let replica = Orchestrator::new(
+    api_replica_over(node.placement(), ledger).await
+}
+
+async fn api_replica_over(placement: Arc<dyn NodePlacement>, ledger: &SharedLedger) -> ApiReplica {
+    crate::control::SandboxControl::new(crate::control::SandboxControlParts {
         // Test replicas may generate an otherwise irrelevant access-token seed.
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-        ledger.clone(),
-        RemoteSandboxBackendFactory::new(node.placement()),
-        crate::image::DisabledRuntimeImageRefs::shared(),
-    )
+        access_token_seed_policy: crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
+        store: ledger.clone(),
+        placement: Arc::clone(&placement),
+        record_owner: Arc::new(UnrecordedOwner),
+        routing: crate::node_client::PlacementRuntimeRouting::shared(placement),
+        pause_publisher: DiscardingPausePublisher::shared(),
+        grants: crate::orchestrator::NoGrants::shared(),
+    })
     .await
-    .expect("a replica of the deciding half");
-    replica.set_pause_publisher(DiscardingPausePublisher::shared());
-    replica
+    .expect("a replica of the deciding half")
 }
 
 async fn local_half() -> Arc<Orchestrator<InMemoryMetadataStore, MockBackendFactory>> {
@@ -2688,18 +2696,16 @@ async fn an_egress_policy_set_on_a_replica_that_did_not_start_the_sandbox_reache
     );
 }
 
+/// Where the cluster routes a sandbox: the machine the binding names, asked
+/// for the address it is serving that sandbox on.
 async fn routed_to(
-    replica: &ApiReplica,
-    sandbox_id: crate::types::SandboxId,
+    node: &RunningNode,
+    sandbox: &crate::orchestrator::SandboxMetadata,
 ) -> std::net::Ipv4Addr {
-    match replica
-        .proxy_lookup_for(&sandbox_id)
+    adopted(node, sandbox)
         .await
-        .expect("the replica can look a route up")
-    {
-        crate::orchestrator::ProxyLookupResult::Ready(target) => target.ip,
-        other => panic!("sandbox {sandbox_id} is not routable: {other:?}"),
-    }
+        .host_interaction_ip()
+        .unwrap_or_else(|| panic!("sandbox {} is routed nowhere", sandbox.id))
 }
 
 #[tokio::test]
@@ -2727,9 +2733,9 @@ async fn a_fork_driven_by_the_deciding_half_routes_each_child_to_its_own_vm() {
         .map(|outcome| outcome.expect("a fork child whose VM started on the node"))
         .collect::<Vec<_>>();
 
-    let source_address = routed_to(&replica, source.id).await;
-    let first = routed_to(&replica, children[0].id).await;
-    let second = routed_to(&replica, children[1].id).await;
+    let source_address = routed_to(&node, &source).await;
+    let first = routed_to(&node, &children[0]).await;
+    let second = routed_to(&node, &children[1]).await;
 
     assert_ne!(
         first, second,
@@ -2804,7 +2810,7 @@ async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
         ],
     }));
 
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let mut backend =
         match factory.build_from_snapshot(&RunnableSnapshot::mock(), launch_config(), execution_id)
         {
@@ -2814,11 +2820,11 @@ async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
     backend.start().await.expect("start");
 
     let mut children = backend.fork(&specs).await.expect("fork").into_iter();
-    let reported: Box<dyn SandboxBackend> = children
+    let reported: RemoteSandboxStub = children
         .next()
         .expect("the first child")
         .expect("which started");
-    let blank: Box<dyn SandboxBackend> = children
+    let blank: RemoteSandboxStub = children
         .next()
         .expect("the second child")
         .expect("which started");
@@ -2829,7 +2835,7 @@ async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
         "the address the node reported for a fork child did not reach this half"
     );
     assert_eq!(
-        reported.runtime_info().rootfs_virtual_size,
+        reported.rootfs_virtual_size(),
         Some(8192),
         "the rootfs size the node reported for a fork child did not reach this half"
     );
@@ -2840,7 +2846,7 @@ async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
         "a fork child the node gave no address for was made to look routable"
     );
     assert_eq!(
-        blank.runtime_info().rootfs_virtual_size,
+        blank.rootfs_virtual_size(),
         None,
         "a fork child the node gave no rootfs size for was given one anyway"
     );
@@ -2849,12 +2855,10 @@ async fn a_child_the_node_reported_no_address_for_arrives_here_with_none() {
 async fn adopted(
     node: &RunningNode,
     sandbox: &crate::orchestrator::SandboxMetadata,
-) -> Box<dyn SandboxBackend> {
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
-    let mut backend = factory
-        .adopt_running(sandbox.id, sandbox.execution_id, sandbox.resources)
-        .expect("a remote factory can say where its sandboxes live")
-        .expect("a remote factory's sandboxes outlive the process that started them");
+) -> RemoteSandboxStub {
+    let factory = launch_builder(node.placement());
+    let mut backend =
+        factory.attach_to_running(sandbox.id, sandbox.execution_id, sandbox.resources);
     backend
         .start()
         .await
@@ -2863,7 +2867,7 @@ async fn adopted(
 }
 
 #[tokio::test]
-async fn a_replica_that_did_not_start_a_sandbox_says_the_same_address_as_the_one_that_did() {
+async fn a_replica_that_did_not_start_a_sandbox_finds_it_at_its_own_address() {
     let node = real_node().await;
     let ledger = SharedLedger(Arc::new(InMemoryMetadataStore::new()));
     let owner = api_replica(&node, &ledger).await;
@@ -2886,10 +2890,8 @@ async fn a_replica_that_did_not_start_a_sandbox_says_the_same_address_as_the_one
 
     let sandboxes = [source, children[0].clone(), children[1].clone()];
 
-    let mut published = Vec::new();
     let mut adopted_addresses = Vec::new();
     for sandbox in &sandboxes {
-        published.push(routed_to(&owner, sandbox.id).await);
         adopted_addresses.push(
             adopted(&node, sandbox)
                 .await
@@ -2897,12 +2899,6 @@ async fn a_replica_that_did_not_start_a_sandbox_says_the_same_address_as_the_one
                 .expect("🔴 a replica that did not start this sandbox could not say where it is"),
         );
     }
-
-    assert_eq!(
-        adopted_addresses, published,
-        "the replica that adopted these sandboxes and the one that started them do not agree on \
-         where they are"
-    );
 
     assert_ne!(
         adopted_addresses[0], adopted_addresses[1],
@@ -2934,7 +2930,7 @@ async fn a_replica_that_did_not_start_a_sandbox_says_the_same_address_as_the_one
 #[tokio::test]
 async fn a_machine_that_could_not_be_asked_is_not_one_that_is_not_running_it() {
     let (script, node) = scripted_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
 
     let stranger = crate::types::SandboxId::new();
     let resources = crate::types::SandboxResources {
@@ -2944,10 +2940,7 @@ async fn a_machine_that_could_not_be_asked_is_not_one_that_is_not_running_it() {
     };
 
     // The scripted node answers `NOT_FOUND` when it was told to run nothing.
-    let mut answered = factory
-        .adopt_running(stranger, ExecutionId::new(), resources)
-        .expect("a remote factory can say where its sandboxes live")
-        .expect("a remote factory's sandboxes are on other machines");
+    let mut answered = factory.attach_to_running(stranger, ExecutionId::new(), resources);
     answered
         .start()
         .await
@@ -2958,7 +2951,7 @@ async fn a_machine_that_could_not_be_asked_is_not_one_that_is_not_running_it() {
         "the machine said it is running nothing under this id, and an address appeared anyway"
     );
     assert_eq!(
-        answered.runtime_info().rootfs_virtual_size,
+        answered.rootfs_virtual_size(),
         None,
         "the machine said it is running nothing under this id, and a rootfs size appeared anyway"
     );
@@ -2967,10 +2960,7 @@ async fn a_machine_that_could_not_be_asked_is_not_one_that_is_not_running_it() {
     *script.describe.lock().expect("lock") = Some(Err(Status::unavailable(
         "the node could not look right now",
     )));
-    let mut unanswered = factory
-        .adopt_running(stranger, ExecutionId::new(), resources)
-        .expect("a remote factory can say where its sandboxes live")
-        .expect("a remote factory's sandboxes are on other machines");
+    let mut unanswered = factory.attach_to_running(stranger, ExecutionId::new(), resources);
     let err = unanswered
         .start()
         .await
@@ -2984,7 +2974,7 @@ async fn a_machine_that_could_not_be_asked_is_not_one_that_is_not_running_it() {
 #[tokio::test]
 async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded() {
     let (script, node) = scripted_node().await;
-    let factory = RemoteSandboxBackendFactory::new(node.placement());
+    let factory = launch_builder(node.placement());
     let sandbox_id = crate::types::SandboxId::new();
     let execution_id = ExecutionId::new();
     let resources = crate::types::SandboxResources {
@@ -3000,10 +2990,7 @@ async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded(
     };
 
     *script.describe.lock().expect("lock") = Some(Ok(reply(false)));
-    let mut from_a_record = factory
-        .adopt_running(sandbox_id, execution_id, resources)
-        .expect("a remote factory can say where its sandboxes live")
-        .expect("a remote factory's sandboxes are on other machines");
+    let mut from_a_record = factory.attach_to_running(sandbox_id, execution_id, resources);
     let err = from_a_record
         .start()
         .await
@@ -3015,10 +3002,7 @@ async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded(
 
     // The same reply, one bit different.
     *script.describe.lock().expect("lock") = Some(Ok(reply(true)));
-    let mut from_a_handle = factory
-        .adopt_running(sandbox_id, execution_id, resources)
-        .expect("a remote factory can say where its sandboxes live")
-        .expect("a remote factory's sandboxes are on other machines");
+    let mut from_a_handle = factory.attach_to_running(sandbox_id, execution_id, resources);
     from_a_handle
         .start()
         .await
@@ -3029,7 +3013,7 @@ async fn an_address_the_node_read_off_no_handle_is_refused_rather_than_recorded(
         "the address the node read off the live handle did not reach this half"
     );
     assert_eq!(
-        from_a_handle.runtime_info().rootfs_virtual_size,
+        from_a_handle.rootfs_virtual_size(),
         Some(4096),
         "the rootfs size the node read off the live handle did not reach this half"
     );
@@ -3301,8 +3285,7 @@ async fn a_create_reserves_the_routing_record_before_it_asks_for_a_runtime() {
     }));
 
     let placement = ClusterPlacement::refusing_reservations(node.endpoint.clone());
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
         .expect("building a stub does no I/O");
@@ -3335,8 +3318,7 @@ async fn a_reservation_becomes_a_binding_when_the_node_acknowledges_the_create()
     }));
 
     let placement = ClusterPlacement::recording(node.endpoint.clone());
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
         .expect("building a stub does no I/O");
@@ -3363,8 +3345,7 @@ async fn a_create_the_node_refused_withdraws_its_reservation() {
         Some(Err(Status::resource_exhausted("no room on this node")));
 
     let placement = ClusterPlacement::recording(node.endpoint.clone());
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let mut backend = factory
         .build_from_snapshot(&RunnableSnapshot::mock(), config, execution_id)
         .expect("building a stub does no I/O");
@@ -3390,8 +3371,7 @@ async fn a_create_a_draining_node_refused_is_placed_on_another_node() {
 
     let placement =
         ClusterPlacement::recording_with_spare(refusing_endpoint, accepting.endpoint.clone());
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let config = launch_config();
     let sandbox_id = config.sandbox_id;
     let mut backend = factory
@@ -3436,8 +3416,7 @@ async fn a_create_refused_for_its_request_is_not_retried_elsewhere() {
 
     let placement =
         ClusterPlacement::recording_with_spare(refusing_endpoint, accepting.endpoint.clone());
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let config = launch_config();
     let sandbox_id = config.sandbox_id;
     let mut backend = factory
@@ -3472,8 +3451,7 @@ async fn a_refusal_with_nowhere_else_to_go_is_the_answer() {
         "node-draining",
         refusing.endpoint.endpoint.clone(),
     ));
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
     let config = launch_config();
     let sandbox_id = config.sandbox_id;
     let mut backend = factory
@@ -3495,16 +3473,7 @@ async fn a_refusal_with_nowhere_else_to_go_is_the_answer() {
 }
 
 async fn api_replica_on(placement: Arc<ClusterPlacement>, ledger: &SharedLedger) -> ApiReplica {
-    let replica = Orchestrator::new(
-        crate::sandbox::AccessTokenSeedPolicy::MayGenerate,
-        ledger.clone(),
-        RemoteSandboxBackendFactory::new(placement as Arc<dyn NodePlacement>),
-        crate::image::DisabledRuntimeImageRefs::shared(),
-    )
-    .await
-    .expect("a replica of the deciding half");
-    replica.set_pause_publisher(DiscardingPausePublisher::shared());
-    replica
+    api_replica_over(placement as Arc<dyn NodePlacement>, ledger).await
 }
 
 #[tokio::test]
@@ -3521,8 +3490,7 @@ async fn a_create_tells_the_cluster_which_machine_the_sandbox_is_on() {
         endpoint: dialled.clone(),
         advertised_endpoint: advertised.clone(),
     });
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
 
     let mut started = Vec::new();
     for _ in 0..2 {
@@ -3608,8 +3576,7 @@ async fn a_create_survives_a_cluster_that_refuses_the_assignment() {
     // Face 1: the cluster says no.
     let refusing = ClusterPlacement::refusing_records(node.endpoint.clone());
     let refused = {
-        let factory =
-            RemoteSandboxBackendFactory::new(Arc::clone(&refusing) as Arc<dyn NodePlacement>);
+        let factory = launch_builder(Arc::clone(&refusing) as Arc<dyn NodePlacement>);
         let config = launch_config();
         let sandbox_id = config.sandbox_id;
         let mut backend = factory
@@ -3635,8 +3602,7 @@ async fn a_create_survives_a_cluster_that_refuses_the_assignment() {
     // different, and the observable difference is the binding.
     let accepting = ClusterPlacement::recording(node.endpoint.clone());
     let accepted = {
-        let factory =
-            RemoteSandboxBackendFactory::new(Arc::clone(&accepting) as Arc<dyn NodePlacement>);
+        let factory = launch_builder(Arc::clone(&accepting) as Arc<dyn NodePlacement>);
         let config = launch_config();
         let sandbox_id = config.sandbox_id;
         let mut backend = factory
@@ -3658,8 +3624,7 @@ async fn a_create_survives_a_cluster_that_refuses_the_assignment() {
 async fn a_launch_tells_the_cluster_which_machine_last_held_the_bytes() {
     let node = real_node().await;
     let placement = ClusterPlacement::recording(node.endpoint.clone());
-    let factory =
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement) as Arc<dyn NodePlacement>);
+    let factory = launch_builder(Arc::clone(&placement) as Arc<dyn NodePlacement>);
 
     let mut fresh = factory
         .build_from_snapshot(
@@ -3717,10 +3682,6 @@ async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
         .delete_sandbox(sandbox.id)
         .await
         .expect("the node tears its own sandbox down");
-    assert!(
-        replica.forget_sandbox_handle_for_test(&sandbox.id).await,
-        "the replica held no handle to forget, so this face proves nothing"
-    );
     Arc::clone(&replica)
         .delete_sandbox(sandbox.id)
         .await
@@ -3779,10 +3740,6 @@ async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
         .delete_sandbox(orphan.id)
         .await
         .expect("the node tears its own sandbox down");
-    assert!(
-        replica.forget_sandbox_handle_for_test(&orphan.id).await,
-        "the replica held no handle to forget, so this face proves nothing"
-    );
     // What a machine that lost the sandbox, plus an expired reservation, leaves
     // behind.
     told2.forget(orphan.id);
@@ -3809,10 +3766,6 @@ async fn a_delete_reaps_an_orphan_but_never_a_sandbox_a_create_has_reserved() {
         .create_sandbox(cluster_create_request())
         .await
         .expect("create on the node");
-    assert!(
-        replica.forget_sandbox_handle_for_test(&contested.id).await,
-        "the replica held no handle to forget, so this face proves nothing"
-    );
     racing.forget(contested.id);
     racing.reserve_elsewhere(contested.id);
     Arc::clone(&replica)
@@ -3863,10 +3816,6 @@ async fn without_the_create_time_reservation_the_delete_verdict_reaps_a_live_san
         .create_sandbox(cluster_create_request())
         .await
         .expect("a build without reservations still creates");
-    assert!(
-        replica.forget_sandbox_handle_for_test(&sandbox.id).await,
-        "the replica held no handle to forget, so this face proves nothing"
-    );
     // The window a reservation exists to cover: the cluster's record of this
     // sandbox is gone while the machine still holds it.
     no_reservations.forget(sandbox.id);

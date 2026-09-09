@@ -10,20 +10,19 @@ use super::artifacts::OssSnapshotArtifactStore;
 use super::client::OssClient;
 use super::config::NormalizedOssConfig;
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
-use crate::snapshot::repository::no_catalog::NoSnapshotCatalog;
-use crate::snapshot::repository::SnapshotRepository;
+use crate::snapshot::repository::interfaces::SnapshotArtifactStore;
 
-/// The durable repository and values required by its optional runtime resolver.
+/// The durable byte store and the values required by its optional runtime resolver.
 pub struct OssDurableParts {
-    pub repository: Arc<SnapshotRepository>,
+    pub artifacts: Arc<dyn SnapshotArtifactStore>,
     pub client: Arc<OssClient>,
     pub managed_layers_repo_blob_url: String,
 }
 
 impl OssDurableParts {
-    /// The repository on its own, dropping what only the resolver would use.
-    pub fn into_repository(self) -> Arc<SnapshotRepository> {
-        self.repository
+    /// The byte store on its own, dropping what only the resolver would use.
+    pub fn into_artifacts(self) -> Arc<dyn SnapshotArtifactStore> {
+        self.artifacts
     }
 }
 
@@ -42,13 +41,11 @@ pub fn oss_durable_parts(
         config.credential_source(),
     )?);
 
-    let repository = Arc::new(SnapshotRepository::new(
-        Arc::new(NoSnapshotCatalog),
-        Arc::new(OssSnapshotArtifactStore::new(Arc::clone(&client))),
-    ));
+    let artifacts: Arc<dyn SnapshotArtifactStore> =
+        Arc::new(OssSnapshotArtifactStore::new(Arc::clone(&client)));
 
     Ok(OssDurableParts {
-        repository,
+        artifacts,
         client,
         managed_layers_repo_blob_url,
     })

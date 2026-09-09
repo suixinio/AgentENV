@@ -229,14 +229,12 @@ async fn assemble_node_core(config: &AppConfig) -> anyhow::Result<NodeCore> {
             as Arc<dyn aenv_node::snapshot::SnapshotArtifactAdvertiser>
     });
     // Nodes stage snapshot bytes; only the API half writes catalog rows.
-    let snapshot_backend = aenv_node::snapshot::repository::backends::build_snapshot_backend(
+    let snapshot_backend = aenv_node::snapshot::repository::backends::build_node_snapshot_backend(
         aenv_node::snapshot::repository::backends::storage::build_node_storage(
             config,
             snapshot_p2p_transport,
         )?,
-        None,
-        aenv_node::snapshot::repository::backends::CentralCatalogUse::Never,
-    )?;
+    );
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(
         snapshot_backend,
         snapshot_advertiser,

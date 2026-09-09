@@ -8,20 +8,12 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 
 use crate::cfg::{AppConfig, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
+use crate::snapshot::repository::interfaces::SnapshotArtifactStore;
 use crate::snapshot::repository::interfaces::SnapshotCatalog;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::repository::SnapshotRepository;
 pub use catalog_write::{CatalogRefusal, CatalogWrite};
-use posixfs::posixfs_artifacts_only_repository;
-
-/// Whether this process assembles the shared PostgreSQL catalog.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CentralCatalogUse {
-    /// API process with required PostgreSQL catalog.
-    AsConfigured,
-    /// Node process with no catalog; catalog operations refuse.
-    Never,
-}
+use posixfs::posixfs_artifacts_only_store;
 
 /// Assembled repository and optional runtime resolver.
 pub struct AssembledSnapshotBackend {
@@ -30,24 +22,24 @@ pub struct AssembledSnapshotBackend {
     pub runtime_resolver: Option<Arc<dyn SnapshotRuntimeResolver>>,
 }
 
-/// Combines caller-built byte storage with the selected catalog policy.
-pub fn build_snapshot_backend(
-    // Byte storage is assembled by the owning binary.
-    storage: RoleStorage,
+/// The running half's backend: the byte storage it assembled, carrying the
+/// catalog that refuses. Rows are the deciding half's.
+pub fn build_node_snapshot_backend(storage: RoleStorage) -> AssembledSnapshotBackend {
+    let (repository, runtime_resolver) = storage;
+    AssembledSnapshotBackend {
+        repository,
+        runtime_resolver,
+    }
+}
+
+/// The deciding half's backend: the shared catalog over the byte store this
+/// deployment is configured for, and no runtime resolver, because this half
+/// materializes nothing.
+pub fn build_catalog_backed_backend(
+    config: &AppConfig,
     // PostgreSQL catalog is supplied only by the API process.
     pg: Option<Arc<dyn SnapshotCatalog>>,
-    central: CentralCatalogUse,
 ) -> Result<AssembledSnapshotBackend> {
-    let (repository, runtime_resolver) = storage;
-
-    if central == CentralCatalogUse::Never {
-        // Node storage already carries the refusing no-catalog implementation.
-        return Ok(AssembledSnapshotBackend {
-            repository,
-            runtime_resolver,
-        });
-    }
-
     let catalog = pg.context(
         "no snapshot catalog is configured: [pg].dsn is unset and PostgreSQL is the only \
          snapshot catalog there is. Object storage holds byte artifacts alone, so starting \
@@ -68,29 +60,27 @@ pub fn build_snapshot_backend(
     Ok(AssembledSnapshotBackend {
         repository: Arc::new(SnapshotRepository::on_node(
             catalog,
-            repository.artifacts(),
+            build_artifact_store(config)?,
             node_id,
         )),
-        runtime_resolver,
+        // This half materializes nothing, so it resolves nothing.
+        runtime_resolver: None,
     })
 }
 
 /// Repository plus optional runtime resolver assembled by the owning binary.
 ///
-/// Both arrive with a refusing catalog until API assembly adds PostgreSQL.
+/// The repository arrives with the refusing catalog; only the deciding half
+/// composes PostgreSQL over the byte store.
 pub type RoleStorage = (
     Arc<SnapshotRepository>,
     Option<Arc<dyn SnapshotRuntimeResolver>>,
 );
 
-/// Durable artifact lifecycle without runtime materialization or a catalog.
+/// The byte store this deployment is configured for, on its own.
 ///
 /// Delete remains available because the origin node may be gone.
-pub fn build_catalog_only_storage(config: &AppConfig) -> Result<RoleStorage> {
-    Ok((build_artifacts_only_repository(config)?, None))
-}
-
-fn build_artifacts_only_repository(config: &AppConfig) -> Result<Arc<SnapshotRepository>> {
+pub fn build_artifact_store(config: &AppConfig) -> Result<Arc<dyn SnapshotArtifactStore>> {
     match config.snapshot.repository_backend {
         SnapshotRepositoryBackendKind::PosixFs => {
             let root = config
@@ -100,7 +90,7 @@ fn build_artifacts_only_repository(config: &AppConfig) -> Result<Arc<SnapshotRep
                 .context("backend.posix_fs config is required when repository_backend = posix_fs")?
                 .snapshot_store
                 .join("repository");
-            Ok(Arc::new(posixfs_artifacts_only_repository(&root)))
+            Ok(posixfs_artifacts_only_store(&root))
         }
         SnapshotRepositoryBackendKind::Oss => {
             let oss_config = config
@@ -110,7 +100,7 @@ fn build_artifacts_only_repository(config: &AppConfig) -> Result<Arc<SnapshotRep
                 .context("backend.oss config is required when repository_backend = oss")?;
             Ok(
                 oss::oss_durable_parts(oss_config, snapshot_image_storage_policy(config))?
-                    .into_repository(),
+                    .into_artifacts(),
             )
         }
     }
@@ -133,19 +123,32 @@ mod tests {
     use crate::snapshot::repository::interfaces::SnapshotArtifactStore;
     use crate::snapshot::types::SnapshotId;
 
-    fn storage() -> RoleStorage {
+    fn config_with_a_byte_store() -> (tempfile::TempDir, AppConfig) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let mut config = AppConfig::default();
+        config.snapshot.repository_backend = SnapshotRepositoryBackendKind::PosixFs;
+        config.backend.posix_fs = Some(crate::cfg::PosixFsBackendConfig {
+            snapshot_store: dir.path().join("store"),
+        });
+        (dir, config)
+    }
+
+    fn node_storage() -> RoleStorage {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let root = dir.keep();
         (
-            Arc::new(posixfs_artifacts_only_repository(&root)),
+            Arc::new(SnapshotRepository::new(
+                Arc::new(crate::snapshot::repository::no_catalog::NoSnapshotCatalog),
+                posixfs_artifacts_only_store(&root),
+            )),
             None::<Arc<dyn SnapshotRuntimeResolver>>,
         )
     }
 
     #[test]
     fn the_deciding_half_refuses_to_assemble_without_postgresql() {
-        let Err(error) = build_snapshot_backend(storage(), None, CentralCatalogUse::AsConfigured)
-        else {
+        let (_dir, config) = config_with_a_byte_store();
+        let Err(error) = build_catalog_backed_backend(&config, None) else {
             panic!("an api half with no [pg] holds no catalog and must not start");
         };
         let rendered = format!("{error:#}");
@@ -157,8 +160,8 @@ mod tests {
 
     #[test]
     fn the_refusal_names_no_environment_variable_that_does_not_exist() {
-        let Err(error) = build_snapshot_backend(storage(), None, CentralCatalogUse::AsConfigured)
-        else {
+        let (_dir, config) = config_with_a_byte_store();
+        let Err(error) = build_catalog_backed_backend(&config, None) else {
             panic!("an api half with no [pg] holds no catalog and must not start");
         };
         let rendered = format!("{error:#}");
@@ -174,13 +177,13 @@ mod tests {
 
     #[tokio::test]
     async fn the_deciding_half_reads_the_catalog_it_was_handed() {
+        let (_dir, config) = config_with_a_byte_store();
         let catalog = Arc::new(MockSnapshotCatalog::default());
         assert_eq!(catalog.get_calls(), 0);
 
-        let assembled = build_snapshot_backend(
-            storage(),
+        let assembled = build_catalog_backed_backend(
+            &config,
             Some(Arc::clone(&catalog) as Arc<dyn SnapshotCatalog>),
-            CentralCatalogUse::AsConfigured,
         )
         .expect("an api half with a catalog assembles");
 
@@ -198,8 +201,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_running_half_assembles_with_a_catalog_that_refuses() {
-        let assembled = build_snapshot_backend(storage(), None, CentralCatalogUse::Never)
-            .expect("a node half assembles without a catalog");
+        let assembled = build_node_snapshot_backend(node_storage());
 
         let error = assembled
             .repository

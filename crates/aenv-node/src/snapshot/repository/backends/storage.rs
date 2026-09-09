@@ -1,7 +1,7 @@
 //! Node-only snapshot byte storage and runtime materialization.
 //!
 //! This module links overlaybd layers, artifact caches, and importing backends.
-//! Catalog-only processes must use `build_catalog_only_storage` instead; the
+//! Catalog-only processes must use `build_artifact_store` instead; the
 //! crate boundary and `make check-crate-boundaries` enforce that split.
 
 use std::path::PathBuf;
@@ -89,7 +89,6 @@ mod tests {
     use super::*;
     use crate::cfg::SnapshotRepositoryBackendKind;
     use crate::snapshot::mock::InMemorySnapshotCatalog;
-    use crate::snapshot::repository::backends::build_catalog_only_storage;
     use crate::snapshot::repository::interfaces::CatalogReadScope;
     use crate::snapshot::types::SnapshotId;
     use crate::snapshot::RepositoryError;
@@ -103,17 +102,16 @@ mod tests {
             snapshot_store: dir.path().join("store"),
         });
 
-        let (api_bytes, runtime_resolver) = build_catalog_only_storage(&config)
-            .expect("the api half should assemble a storage backend");
-
         let catalog = Arc::new(InMemorySnapshotCatalog::default());
-        let repository = Arc::new(SnapshotRepository::new(
-            Arc::clone(&catalog) as Arc<dyn crate::snapshot::repository::SnapshotCatalog>,
-            api_bytes.artifacts(),
-        ));
+        let assembled = crate::snapshot::repository::backends::build_catalog_backed_backend(
+            &config,
+            Some(Arc::clone(&catalog) as Arc<dyn crate::snapshot::repository::SnapshotCatalog>),
+        )
+        .expect("the api half should assemble a catalog-backed repository");
+        let repository = Arc::clone(&assembled.repository);
 
         assert!(
-            runtime_resolver.is_none(),
+            assembled.runtime_resolver.is_none(),
             "the catalog-only half built a snapshot runtime resolver; it resolves nothing and \
              must hold none of what a resolver drags in"
         );

@@ -1,84 +1,61 @@
-//! Building sandboxes that run somewhere else.
+//! Building the node calls one sandbox that runs somewhere else needs.
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::proto::node as pb;
 use crate::runtime_snapshot::RunnableSnapshot;
+use crate::sandbox::SandboxLaunchConfig;
 use crate::sandbox::SandboxNetworkPolicy;
-use crate::sandbox::{
-    FreshSandboxBuildSpec, SandboxBackend, SandboxBackendFactory, SandboxLaunchConfig,
-    UnresolvedImageBuildSpec,
-};
+use crate::sandbox::UnresolvedImageBuildSpec;
 use crate::snapshot::SnapshotRecord;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
 
 use super::placement::{NodePlacement, PlacementNeeds};
-use super::record_owner::{SandboxRecordOwner, UnknownRecordOwner};
+use super::record_owner::SandboxRecordOwner;
 use super::stub::{PendingLaunch, RemoteSandboxStub};
 use super::wire;
 
-/// Builds remote sandbox stubs without network I/O.
+/// Builds the node session a launch or an already-running sandbox needs,
+/// without network I/O.
 ///
 /// Unresolved image and snapshot inputs are forwarded for node-side resolution.
-pub struct RemoteSandboxBackendFactory {
+pub struct NodeLaunchBuilder {
     placement: Arc<dyn NodePlacement>,
     record_owner: Arc<dyn SandboxRecordOwner>,
 }
 
-impl RemoteSandboxBackendFactory {
-    pub fn new(placement: Arc<dyn NodePlacement>) -> Self {
+impl NodeLaunchBuilder {
+    /// `record_owner` answers for a sandbox id when a node says it already
+    /// holds one.
+    pub fn new(
+        placement: Arc<dyn NodePlacement>,
+        record_owner: Arc<dyn SandboxRecordOwner>,
+    ) -> Self {
         Self {
             placement,
-            record_owner: UnknownRecordOwner::shared(),
+            record_owner,
         }
     }
 
-    /// Names who answers for a sandbox id when a node says it already holds one.
-    pub fn with_record_owner(mut self, record_owner: Arc<dyn SandboxRecordOwner>) -> Self {
-        self.record_owner = record_owner;
-        self
-    }
-}
-
-impl SandboxBackendFactory for RemoteSandboxBackendFactory {
-    /// Marks remote sandboxes so node reconciliation can attribute ownership.
-    fn stamps_control_plane_ownership(&self) -> bool {
-        true
-    }
-
-    /// Refuses already-resolved local image inputs.
-    fn build(
-        &self,
-        _build_spec: FreshSandboxBuildSpec,
-        _launch_config: SandboxLaunchConfig,
-        _execution_id: ExecutionId,
-    ) -> Result<Box<dyn SandboxBackend>> {
-        bail!(
-            "a cold sandbox cannot be started on another node from here: the build spec this \
-             factory is handed has already been resolved into local paths, and the image \
-             reference a node would need is no longer in it"
-        )
-    }
-
-    fn build_from_snapshot(
+    pub fn build_from_snapshot(
         &self,
         snapshot: &RunnableSnapshot,
         launch_config: SandboxLaunchConfig,
         execution_id: ExecutionId,
-    ) -> Result<Box<dyn SandboxBackend>> {
+    ) -> Result<RemoteSandboxStub> {
         // Delegate so resolved and unresolved snapshot paths build the same request.
         self.build_from_snapshot_record(snapshot.record(), launch_config, execution_id)
     }
 
     /// Builds a create request from a snapshot record without materializing its bytes locally.
-    fn build_from_snapshot_record(
+    pub fn build_from_snapshot_record(
         &self,
         record: &SnapshotRecord,
         launch_config: SandboxLaunchConfig,
         execution_id: ExecutionId,
-    ) -> Result<Box<dyn SandboxBackend>> {
+    ) -> Result<RemoteSandboxStub> {
         let resources = record.resources;
 
         let request = pb::SandboxCreateRequest {
@@ -119,29 +96,27 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             control_plane_config: launch_config.control_plane_config.unwrap_or_default(),
         };
 
-        Ok(Box::new(
-            RemoteSandboxStub::pending(
-                launch_config.sandbox_id,
-                execution_id,
-                resources,
-                Arc::clone(&self.placement),
-                PendingLaunch::Launch {
-                    request: Box::new(request),
-                    preferred_node_id: launch_config.preferred_node_id,
-                    needs: placement_needs(&launch_config.network),
-                },
-            )
-            .with_record_owner(Arc::clone(&self.record_owner)),
+        Ok(RemoteSandboxStub::pending(
+            launch_config.sandbox_id,
+            execution_id,
+            resources,
+            Arc::clone(&self.placement),
+            Arc::clone(&self.record_owner),
+            PendingLaunch::Launch {
+                request: Box::new(request),
+                preferred_node_id: launch_config.preferred_node_id,
+                needs: placement_needs(&launch_config.network),
+            },
         ))
     }
 
     /// Builds a create request from an unresolved image specification.
-    fn build_from_image_ref(
+    pub fn build_from_image_ref(
         &self,
         spec: UnresolvedImageBuildSpec,
         launch_config: SandboxLaunchConfig,
         execution_id: ExecutionId,
-    ) -> Result<Box<dyn SandboxBackend>> {
+    ) -> Result<RemoteSandboxStub> {
         let resources = spec.resources;
         let attached_drives = spec
             .attached_drives
@@ -200,42 +175,36 @@ impl SandboxBackendFactory for RemoteSandboxBackendFactory {
             control_plane_config: launch_config.control_plane_config.unwrap_or_default(),
         };
 
-        Ok(Box::new(
-            RemoteSandboxStub::pending(
-                launch_config.sandbox_id,
-                execution_id,
-                resources,
-                Arc::clone(&self.placement),
-                PendingLaunch::Launch {
-                    request: Box::new(request),
-                    preferred_node_id: launch_config.preferred_node_id,
-                    needs: placement_needs(&launch_config.network),
-                },
-            )
-            .with_record_owner(Arc::clone(&self.record_owner)),
+        Ok(RemoteSandboxStub::pending(
+            launch_config.sandbox_id,
+            execution_id,
+            resources,
+            Arc::clone(&self.placement),
+            Arc::clone(&self.record_owner),
+            PendingLaunch::Launch {
+                request: Box::new(request),
+                preferred_node_id: launch_config.preferred_node_id,
+                needs: placement_needs(&launch_config.network),
+            },
         ))
     }
 
-    /// Remote sandboxes continue running when this deciding process exits.
-    fn sandboxes_outlive_this_process(&self) -> bool {
-        true
-    }
-
-    /// Adopts a running sandbox through deferred placement resolution.
+    /// A session over a sandbox that is already running somewhere.
     ///
     /// Construction stays synchronous; `start` locates the existing runtime.
-    fn adopt_running(
+    pub fn attach_to_running(
         &self,
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         resources: SandboxResources,
-    ) -> Result<Option<Box<dyn SandboxBackend>>> {
-        Ok(Some(Box::new(RemoteSandboxStub::attaching(
+    ) -> RemoteSandboxStub {
+        RemoteSandboxStub::attaching(
             sandbox_id,
             execution_id,
             resources,
             Arc::clone(&self.placement),
-        ))))
+            Arc::clone(&self.record_owner),
+        )
     }
 }
 

@@ -5,5 +5,5 @@ pub mod durable;
 pub mod layout;
 
 /// The durable byte half without local materialization.
-pub use durable::posixfs_artifacts_only_repository;
+pub use durable::posixfs_artifacts_only_store;
 pub use layout::PosixFsSnapshotArtifactLayout;

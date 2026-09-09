@@ -11,15 +11,13 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use async_trait::async_trait;
 use tonic::transport::Endpoint;
 use tracing::{info, warn};
 
 use crate::proto::node as pb;
 use crate::sandbox::{
-    CapturedSandboxSnapshot, CustomExtensionParams, ResolvedImageFacts, RuntimeArtifactSet,
-    RuntimeConfirmedGone, SandboxBackend, SandboxCaptureError, SandboxCaptureResult,
-    SandboxForkResult, SandboxForkSpec, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, CustomExtensionParams, ResolvedImageFacts, RuntimeConfirmedGone,
+    SandboxCaptureError, SandboxCaptureResult, SandboxForkSpec, SandboxNetworkPolicy,
 };
 use crate::snapshot::repository::interfaces::StagedSnapshot;
 use crate::types::{ExecutionId, SandboxId, SandboxResources};
@@ -76,6 +74,13 @@ struct Placed {
     resolved_image_facts: Option<ResolvedImageFacts>,
 }
 
+/// A sandbox a node has already started, named by what it runs under.
+pub struct StartedSandbox {
+    pub sandbox_id: SandboxId,
+    pub execution_id: ExecutionId,
+    pub resources: SandboxResources,
+}
+
 /// Facts reported by a live sandbox handle; two `None`s are still a valid answer.
 #[derive(Default)]
 struct LiveFacts {
@@ -89,6 +94,7 @@ impl RemoteSandboxStub {
         execution_id: ExecutionId,
         resources: SandboxResources,
         placement: Arc<dyn NodePlacement>,
+        record_owner: Arc<dyn super::record_owner::SandboxRecordOwner>,
         pending: PendingLaunch,
     ) -> Self {
         Self {
@@ -97,7 +103,7 @@ impl RemoteSandboxStub {
             resources,
             placement,
             pending,
-            record_owner: super::record_owner::UnknownRecordOwner::shared(),
+            record_owner,
             placed: None,
             paused: false,
             projection_ttl_secs: 0,
@@ -105,21 +111,25 @@ impl RemoteSandboxStub {
     }
 
     pub fn already_running(
-        sandbox_id: SandboxId,
-        execution_id: ExecutionId,
-        resources: SandboxResources,
+        identity: StartedSandbox,
         placement: Arc<dyn NodePlacement>,
+        record_owner: Arc<dyn super::record_owner::SandboxRecordOwner>,
         node: NodeEndpoint,
         client: super::NodeClient,
         ack: &pb::SandboxCreateResponse,
     ) -> Self {
+        let StartedSandbox {
+            sandbox_id,
+            execution_id,
+            resources,
+        } = identity;
         Self {
             sandbox_id,
             execution_id,
             resources,
             placement,
             pending: PendingLaunch::AlreadyStarted,
-            record_owner: super::record_owner::UnknownRecordOwner::shared(),
+            record_owner,
             paused: false,
             projection_ttl_secs: 0,
             placed: Some(Placed {
@@ -133,27 +143,21 @@ impl RemoteSandboxStub {
         }
     }
 
-    /// Names who to ask when a node answers a create with a copy of its own.
-    pub fn with_record_owner(
-        mut self,
-        record_owner: Arc<dyn super::record_owner::SandboxRecordOwner>,
-    ) -> Self {
-        self.record_owner = record_owner;
-        self
-    }
-
-    /// Builds a stub that resolves and attaches during `start`, without creating a VM.
+    /// Builds a session that resolves the node running this sandbox during
+    /// `start`, without creating a VM.
     pub fn attaching(
         sandbox_id: SandboxId,
         execution_id: ExecutionId,
         resources: SandboxResources,
         placement: Arc<dyn NodePlacement>,
+        record_owner: Arc<dyn super::record_owner::SandboxRecordOwner>,
     ) -> Self {
         Self::pending(
             sandbox_id,
             execution_id,
             resources,
             placement,
+            record_owner,
             PendingLaunch::Attach,
         )
     }
@@ -351,6 +355,7 @@ impl RemoteSandboxStub {
         requested: &SandboxForkSpec,
         resources: SandboxResources,
         placement: &Arc<dyn NodePlacement>,
+        record_owner: &Arc<dyn super::record_owner::SandboxRecordOwner>,
         node: &NodeEndpoint,
         client: &super::NodeClient,
     ) -> Result<RemoteSandboxStub> {
@@ -369,10 +374,13 @@ impl RemoteSandboxStub {
                         format!("fork child {} returned no incarnation", result.sandbox_id)
                     })?;
                 Ok(RemoteSandboxStub::already_running(
-                    requested.sandbox_id,
-                    execution_id,
-                    resources,
+                    StartedSandbox {
+                        sandbox_id: requested.sandbox_id,
+                        execution_id,
+                        resources,
+                    },
                     Arc::clone(placement),
+                    Arc::clone(record_owner),
                     node.clone(),
                     client.clone(),
                     &ack,
@@ -792,13 +800,14 @@ impl RemoteSandboxStub {
     }
 }
 
-#[async_trait]
-impl SandboxBackend for RemoteSandboxStub {
-    fn execution_id(&self) -> ExecutionId {
+/// Every node RPC one sandbox needs, fenced on the incarnation this session
+/// was built for.
+impl RemoteSandboxStub {
+    pub fn execution_id(&self) -> ExecutionId {
         self.execution_id
     }
 
-    async fn start(&mut self) -> Result<()> {
+    pub async fn start(&mut self) -> Result<()> {
         if self.placed.is_some() {
             return Ok(());
         }
@@ -830,19 +839,12 @@ impl SandboxBackend for RemoteSandboxStub {
         started
     }
 
-    async fn start_nowait(&mut self) -> Result<()> {
-        self.start().await
-    }
-
-    async fn wait_for_ready(&self) -> Result<()> {
-        self.placed().map(|_| ())
-    }
     /// Pauses on the node, which stages the capture and forgets the sandbox.
     ///
     /// The node's answer is the staged snapshot; the api half commits it. A
     /// pause that stopped the VM without staging anything left nothing to
     /// resume, so it is reported as terminal.
-    async fn pause(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+    pub async fn pause(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
         let node_id = self
@@ -880,7 +882,7 @@ impl SandboxBackend for RemoteSandboxStub {
     }
 
     /// A remote pause cannot be undone: the node stops the VM as part of it.
-    async fn resume(&mut self) -> Result<()> {
+    pub async fn resume(&mut self) -> Result<()> {
         bail!(
             "sandbox {} cannot be resumed in place from here: the node that paused it has \
              already stopped it, and only a resume from its snapshot brings it back",
@@ -888,7 +890,7 @@ impl SandboxBackend for RemoteSandboxStub {
         )
     }
 
-    async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+    pub async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
         let node_id = self
@@ -931,15 +933,16 @@ impl SandboxBackend for RemoteSandboxStub {
         Ok(CapturedSandboxSnapshot::staged(staged))
     }
 
-    async fn fork(
+    pub async fn fork(
         &mut self,
         spec: &[SandboxForkSpec],
-    ) -> SandboxCaptureResult<Vec<SandboxForkResult>> {
+    ) -> SandboxCaptureResult<Vec<Result<RemoteSandboxStub>>> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
         let resources = self.resources;
         let projection_ttl_secs = self.projection_ttl_secs;
         let placement = Arc::clone(&self.placement);
+        let record_owner = Arc::clone(&self.record_owner);
         let node_before = self
             .placed()
             .map_err(SandboxCaptureError::recoverable)?
@@ -1013,7 +1016,15 @@ impl SandboxBackend for RemoteSandboxStub {
 
         let mut children = Vec::with_capacity(spec.len());
         for (result, requested) in response.children.into_iter().zip(spec) {
-            let child = Self::fork_child(result, requested, resources, &placement, &node, &client);
+            let child = Self::fork_child(
+                result,
+                requested,
+                resources,
+                &placement,
+                &record_owner,
+                &node,
+                &client,
+            );
             match &child {
                 Ok(child) => {
                     Self::announce_child_placement(
@@ -1033,13 +1044,13 @@ impl SandboxBackend for RemoteSandboxStub {
                     .await
                 }
             }
-            children.push(child.map(|child| Box::new(child) as Box<dyn SandboxBackend>));
+            children.push(child);
         }
         Ok(children)
     }
 
     /// Deletes the remote sandbox unless pause already stopped it and left a capture.
-    async fn stop(&mut self) -> Result<()> {
+    pub async fn stop(&mut self) -> Result<()> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
         if self.paused {
@@ -1073,7 +1084,7 @@ impl SandboxBackend for RemoteSandboxStub {
     /// Asks the node whether it is still running this incarnation.
     ///
     /// A node that answers for another incarnation is not running this one.
-    async fn is_still_running(&mut self) -> Result<bool> {
+    pub async fn is_still_running(&mut self) -> Result<bool> {
         let placed = self.placed()?;
         let sandbox_id = self.sandbox_id;
         let node_id = placed.node.node_id.clone();
@@ -1092,42 +1103,42 @@ impl SandboxBackend for RemoteSandboxStub {
         }
     }
 
-    fn host_interaction_ip(&self) -> Option<Ipv4Addr> {
+    pub fn host_interaction_ip(&self) -> Option<Ipv4Addr> {
         self.placed
             .as_ref()
             .and_then(|placed| placed.host_interaction_ip)
     }
 
-    fn runtime_info(&self) -> SandboxRuntimeInfo {
-        SandboxRuntimeInfo {
-            rootfs_virtual_size: self
-                .placed
-                .as_ref()
-                .and_then(|placed| placed.rootfs_virtual_size),
-            runtime_artifacts: RuntimeArtifactSet::empty(),
-            resolved_image_facts: self
-                .placed
-                .as_ref()
-                .and_then(|placed| placed.resolved_image_facts.clone()),
-        }
+    /// The rootfs size the node reported, once it has answered for one.
+    pub fn rootfs_virtual_size(&self) -> Option<u64> {
+        self.placed
+            .as_ref()
+            .and_then(|placed| placed.rootfs_virtual_size)
     }
 
-    fn startup_artifacts(&self) -> RuntimeArtifactSet {
-        RuntimeArtifactSet::empty()
+    /// What the node resolved an image reference into, when it answered a
+    /// create for one.
+    pub fn resolved_image_facts(&self) -> Option<ResolvedImageFacts> {
+        self.placed
+            .as_ref()
+            .and_then(|placed| placed.resolved_image_facts.clone())
     }
 
     /// Returns the node from the established placement, or `None` before placement.
-    fn holding_node_id(&self) -> Option<&str> {
+    pub fn holding_node_id(&self) -> Option<&str> {
         self.placed
             .as_ref()
             .map(|placed| placed.node.node_id.as_str())
     }
 
-    fn set_projection_budget(&mut self, projection_ttl_secs: u32) {
+    pub fn set_projection_budget(&mut self, projection_ttl_secs: u32) {
         self.projection_ttl_secs = projection_ttl_secs;
     }
 
-    async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {
+    pub async fn update_network_policy(
+        &mut self,
+        policy: Option<SandboxNetworkPolicy>,
+    ) -> Result<()> {
         let sandbox_id = self.sandbox_id;
         let execution_id = self.execution_id;
         let encoded = policy
@@ -1149,7 +1160,7 @@ impl SandboxBackend for RemoteSandboxStub {
     }
 
     /// Awaits the remote update so failure reaches the caller.
-    async fn update_custom_extension_params(
+    pub async fn update_custom_extension_params(
         &mut self,
         params: Option<CustomExtensionParams>,
     ) -> Result<()> {

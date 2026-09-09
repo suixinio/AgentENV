@@ -71,12 +71,8 @@ mod pg {
             .await
             .expect("create should succeed");
 
-        let assembled = build_snapshot_backend(
-            build_catalog_only_storage(&config).expect("the byte half should assemble"),
-            Some(catalog),
-            CentralCatalogUse::AsConfigured,
-        )
-        .expect("the assembly should succeed with a catalog");
+        let assembled = build_catalog_backed_backend(&config, Some(catalog))
+            .expect("the assembly should succeed with a catalog");
 
         let found = assembled
             .repository

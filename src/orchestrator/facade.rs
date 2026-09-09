@@ -18,7 +18,6 @@ use crate::types::{ExecutionId, SandboxId};
 
 use super::launch_claim::RestoredSandbox;
 use super::metrics::OrchestratorMetrics;
-use super::pause_publisher::PausePublisher;
 use super::proxy::ProxyLookupResult;
 #[cfg(any(test, feature = "test-support"))]
 use super::proxy::ProxyTarget;
@@ -62,6 +61,15 @@ macro_rules! orchestration_surface {
                     $( -> $sync_ret:ty )? ;
             )*
         }
+        // Test seeds. The trait body refuses, so an implementor in another
+        // crate -- which cannot read this crate's `test-support` feature to
+        // gate an override on -- still satisfies the trait when it keeps none.
+        seeded {
+            $(
+                $(#[$seeded_meta:meta])*
+                fn $seeded_name:ident ( $( $seeded_arg:ident : $seeded_ty:ty ),* $(,)? );
+            )*
+        }
     ) => {
         $(#[$trait_meta])*
         #[async_trait]
@@ -79,6 +87,16 @@ macro_rules! orchestration_surface {
             $(
                 $(#[$sync_meta])*
                 fn $sync_name(&self $(, $sync_arg: $sync_ty )* ) $( -> $sync_ret )? ;
+            )*
+            $(
+                $(#[$seeded_meta])*
+                async fn $seeded_name(&self $(, $seeded_arg: $seeded_ty )* ) -> Result<()> {
+                    $( let _ = $seeded_arg; )*
+                    Err(crate::orchestrator::OrchestratorError::InternalError(format!(
+                        "{} keeps no test seed",
+                        stringify!($seeded_name)
+                    )))
+                }
             )*
         }
 
@@ -109,6 +127,12 @@ macro_rules! orchestration_surface {
                 $(#[$sync_meta])*
                 fn $sync_name(&self $(, $sync_arg: $sync_ty )* ) $( -> $sync_ret )? {
                     Orchestrator::<S, F>::$sync_name(self $(, $sync_arg )* )
+                }
+            )*
+            $(
+                $(#[$seeded_meta])*
+                async fn $seeded_name(&self $(, $seeded_arg: $seeded_ty )* ) -> Result<()> {
+                    Orchestrator::<S, F>::$seeded_name(self $(, $seeded_arg )* ).await
                 }
             )*
         }
@@ -176,25 +200,12 @@ orchestration_surface! {
         fn sandbox_holding_node_id(sandbox_id: &SandboxId) -> Option<String>;
         /// Runtime counters and derived resource totals, sampled now.
         fn metrics_snapshot() -> Result<OrchestratorMetrics>;
-
-        // Test-only facade seed helpers.
-        #[cfg(any(test, feature = "test-support"))]
-        fn set_metadata_state_for_test(sandbox_id: SandboxId, state: SandboxState) -> Result<()>;
-        #[cfg(any(test, feature = "test-support"))]
-        fn remove_sandbox_for_test(sandbox_id: &SandboxId) -> Result<()>;
-        #[cfg(any(test, feature = "test-support"))]
-        fn set_auto_resume_for_test(
-            sandbox_id: &SandboxId,
-            auto_resume_enabled: bool,
-        ) -> Result<()>;
     }
     sync {
         /// The envd access token for a sandbox, when it has one.
         fn get_envd_access_token(metadata: &SandboxMetadata) -> Option<EnvdAccessToken>;
         /// Whether `candidate` is the envd access token for this sandbox.
         fn validate_envd_access_token(sandbox_id: SandboxId, candidate: &str) -> bool;
-        /// Wires where pause captures become durable. The first wiring wins.
-        fn set_pause_publisher(publisher: Arc<dyn PausePublisher>);
         /// Subscribes to sandbox lifecycle events. Best-effort and lossy.
         fn subscribe_sandbox_events() -> broadcast::Receiver<SandboxLifecycleEvent>;
         /// Whether this node is refusing new work.
@@ -204,6 +215,14 @@ orchestration_surface! {
         fn set_scheduling_disabled(disabled: bool) -> bool;
         /// When isolation last changed, in unix milliseconds.
         fn scheduling_disabled_changed_at_ms() -> Option<i64>;
+    }
+    seeded {
+        #[cfg(any(test, feature = "test-support"))]
+        fn set_metadata_state_for_test(sandbox_id: SandboxId, state: SandboxState);
+        #[cfg(any(test, feature = "test-support"))]
+        fn remove_sandbox_for_test(sandbox_id: &SandboxId);
+        #[cfg(any(test, feature = "test-support"))]
+        fn set_auto_resume_for_test(sandbox_id: &SandboxId, auto_resume_enabled: bool);
     }
 }
 
@@ -261,6 +280,7 @@ orchestration_surface! {
         /// before any handle or record names it.
         fn launch_in_flight(sandbox_id: SandboxId) -> Option<ExecutionId>;
     }
+    seeded {}
 }
 
 #[cfg(test)]

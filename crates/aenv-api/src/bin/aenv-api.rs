@@ -18,8 +18,9 @@ use aenv_api::cfg::{
     validate_api_half, AppConfig, BindingStoreConfig, ClusterNodeRegistryStoreConfig,
     MetadataStoreBackendKind, NodeRegistryObservedBackendKind,
 };
+use aenv_api::control::{SandboxControl, SandboxControlParts};
 use aenv_api::identity::NodeIdentity;
-use aenv_api::node_client::{NativeNodePlacement, RemoteSandboxBackendFactory};
+use aenv_api::node_client::NativeNodePlacement;
 use aenv_api::node_registry::grpc_service::NodeRegistryGrpcService;
 use aenv_api::node_registry::kubernetes_discovery::{
     validate_optional_pod_selector, KubernetesDiscovery, KubernetesDiscoveryConfig,
@@ -31,7 +32,7 @@ use aenv_api::node_registry::registry::{AtomicNodeRegistry, NodeRegistry};
 use aenv_api::node_registry::warmup::WarmupGate;
 use aenv_api::observability::ObservabilityService;
 use aenv_api::orchestrator::{
-    CommittingPausePublisher, Orchestrator, RedisMetadataStore, SandboxOrchestration,
+    CommittingPausePublisher, GrantIssuer, NoGrants, RedisMetadataStore, SandboxOrchestration,
 };
 use aenv_api::pg::{self, PgPoolSettings};
 use aenv_api::server_main::{self, spawn_grpc_surface, Assembly};
@@ -206,29 +207,37 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
             )),
         ),
     ));
-    let orchestrator = Orchestrator::new(
-        aenv_api::sandbox::AccessTokenSeedPolicy::MustBeConfigured,
-        store,
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement)).with_record_owner(record_owner),
-        aenv_api::image::DisabledRuntimeImageRefs::shared(),
-    )
-    .await?;
-    // The routing binding, not this replica's memory, says whether a sandbox's
-    // runtime is still there.
-    orchestrator.set_runtime_routing(aenv_api::node_client::PlacementRuntimeRouting::shared(
-        Arc::clone(&placement),
-    ));
-    let orchestration: Arc<dyn SandboxOrchestration> =
-        Arc::clone(&orchestrator) as Arc<dyn SandboxOrchestration>;
-
     let pg_catalog =
         Some(aenv_api::snapshot::repository::backends::pg_snapshot_catalog(config, &pg_pool));
-    let snapshot_backend = aenv_api::snapshot::repository::backends::build_snapshot_backend(
-        aenv_api::snapshot::repository::backends::build_catalog_only_storage(config)?,
-        pg_catalog,
-        aenv_api::snapshot::repository::backends::CentralCatalogUse::AsConfigured,
-    )?;
+    let snapshot_backend =
+        aenv_api::snapshot::repository::backends::build_catalog_backed_backend(config, pg_catalog)?;
     let snapshot_manager = Arc::new(SnapshotManager::from_assembled(snapshot_backend, None));
+
+    // Names, values and grants for network rules; this process holds the key
+    // that opens them and serves the broker's lookups from the same database.
+    let secrets = aenv_api::secrets::build_secrets_service(config, &pg_pool)?;
+    let grants: Arc<dyn GrantIssuer> = match &secrets {
+        Some(secrets) => Arc::clone(&secrets.service) as Arc<dyn GrantIssuer>,
+        None => NoGrants::shared(),
+    };
+
+    let control = SandboxControl::new(SandboxControlParts {
+        access_token_seed_policy: aenv_api::sandbox::AccessTokenSeedPolicy::MustBeConfigured,
+        store,
+        // The routing binding, not this replica's memory, says which machine a
+        // sandbox is on and whether its runtime is still there.
+        placement: Arc::clone(&placement),
+        record_owner,
+        routing: aenv_api::node_client::PlacementRuntimeRouting::shared(Arc::clone(&placement)),
+        // A pause's staged snapshot is committed here, making the sandbox
+        // resumable anywhere.
+        pause_publisher: Arc::new(CommittingPausePublisher::new(Arc::clone(&snapshot_manager))),
+        grants,
+    })
+    .await?;
+    let orchestration: Arc<dyn SandboxOrchestration> =
+        Arc::clone(&control) as Arc<dyn SandboxOrchestration>;
+
     // API replicas receive metrics but must not report themselves as schedulable nodes.
     let observability = if config.observability.enabled {
         Some(Arc::new(
@@ -243,21 +252,6 @@ async fn assemble_api(config: &AppConfig) -> anyhow::Result<Assembly> {
     } else {
         None
     };
-
-    // A pause's staged snapshot is committed here, making the sandbox
-    // resumable anywhere.
-    orchestrator.set_pause_publisher(Arc::new(CommittingPausePublisher::new(Arc::clone(
-        &snapshot_manager,
-    ))));
-
-    // Names, values and grants for network rules; this process holds the key
-    // that opens them and serves the broker's lookups from the same database.
-    let secrets = aenv_api::secrets::build_secrets_service(config, &pg_pool)?;
-    if let Some(secrets) = &secrets {
-        orchestrator.set_grant_issuer(
-            Arc::clone(&secrets.service) as Arc<dyn aenv_api::orchestrator::GrantIssuer>
-        );
-    }
 
     let mut api_impl = ApiImpl::new(
         Arc::clone(&orchestration),

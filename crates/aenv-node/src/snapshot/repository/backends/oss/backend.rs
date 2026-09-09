@@ -56,7 +56,7 @@ impl OssBackend {
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Result<Self> {
         let OssDurableParts {
-            repository: _,
+            artifacts: _,
             client,
             managed_layers_repo_blob_url,
         } = oss_durable_parts(config, snapshot_image_storage)?;

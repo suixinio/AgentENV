@@ -1,10 +1,10 @@
 //! The api half's own assembly, driven against a node on a real socket.
 //!
-//! What is assembled here is what `bin/aenv-api.rs` assembles: a
-//! `RemoteSandboxBackendFactory` over `NativeNodePlacement`, the binding store
-//! behind it, `PlacementRuntimeRouting` and `CommittingPausePublisher`. The
-//! metadata store is the in-memory one because the store is not the subject;
-//! the Redis contract suite covers that.
+//! What is assembled here is what `bin/aenv-api.rs` assembles: `SandboxControl`
+//! over `NativeNodePlacement`, the binding store behind it,
+//! `PlacementRuntimeRouting` and `CommittingPausePublisher`. The metadata store
+//! is the in-memory one because the store is not the subject; the Redis
+//! contract suite covers that.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -16,7 +16,7 @@ use tonic::{Request, Response, Status};
 use crate::binding_store::{
     BindingState, BindingStore, BindingStoreSettings, InMemoryBindingStore,
 };
-use crate::node_client::factory::RemoteSandboxBackendFactory;
+use crate::control::{SandboxControl, SandboxControlParts};
 use crate::node_client::placement::{NodeEndpoint, NodePlacement};
 use crate::node_client::{NativeNodePlacement, PlacementRuntimeRouting, StoreRecordOwner};
 use crate::node_registry::grpc_service::NodeRegistryGrpcService;
@@ -25,7 +25,7 @@ use crate::node_registry::types::Node;
 use crate::node_registry::warmup::WarmupGate;
 use crate::orchestrator::{
     CommittingPausePublisher, CreateSandboxRequest, GrantIssuer, InMemoryMetadataStore,
-    Orchestrator, SandboxExpiry, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
+    MetadataStore, SandboxExpiry, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
 use crate::proto::node as pb;
 use crate::proto::node::node_sandbox_service_server::{
@@ -48,7 +48,8 @@ const DEPLOYED_PROJECTION_AUTHORITATIVE: bool = true;
 /// The api half as `bin/aenv-api.rs` wires it, plus the two doubles the test
 /// reads its decisions out of.
 struct ApiHalf {
-    orchestrator: Arc<Orchestrator<InMemoryMetadataStore, RemoteSandboxBackendFactory>>,
+    orchestrator: Arc<SandboxControl<InMemoryMetadataStore>>,
+    routing: Arc<RecordingRouting>,
     bindings: Arc<InMemoryBindingStore>,
     snapshots: Arc<RecordingSnapshotRepository>,
     grants: Arc<RecordingGrants>,
@@ -124,6 +125,41 @@ impl ApiHalf {
 
     fn revoked(&self) -> Vec<(SandboxId, ExecutionId)> {
         self.grants.revoked.lock().expect("lock").clone()
+    }
+}
+
+/// Retires bindings for real, and records whether the sandbox's record was
+/// still in the store at the moment each retirement was asked for.
+struct RecordingRouting {
+    inner: Arc<dyn crate::orchestrator::RuntimeRouting>,
+    store: InMemoryMetadataStore,
+    forgotten: Mutex<Vec<(SandboxId, ExecutionId, bool)>>,
+}
+
+impl RecordingRouting {
+    fn forgotten(&self) -> Vec<(SandboxId, ExecutionId, bool)> {
+        self.forgotten.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::orchestrator::RuntimeRouting for RecordingRouting {
+    async fn is_routed(&self, sandbox_id: SandboxId) -> anyhow::Result<bool> {
+        self.inner.is_routed(sandbox_id).await
+    }
+
+    async fn forget(&self, sandbox_id: SandboxId, execution_id: ExecutionId) -> anyhow::Result<()> {
+        let record_present = self
+            .store
+            .get(&sandbox_id)
+            .await
+            .expect("the in-memory store never fails")
+            .is_some();
+        self.forgotten
+            .lock()
+            .expect("lock")
+            .push((sandbox_id, execution_id, record_present));
+        self.inner.forget(sandbox_id, execution_id).await
     }
 }
 
@@ -506,26 +542,30 @@ async fn api_half() -> ApiHalf {
 
     let store = InMemoryMetadataStore::new();
     let record_owner = StoreRecordOwner::shared(store.clone());
-    let orchestrator = Orchestrator::new(
+    let grants = Arc::new(RecordingGrants::default());
+    let (snapshot_manager, snapshots) = recording_snapshot_manager();
+    let routing = Arc::new(RecordingRouting {
+        inner: PlacementRuntimeRouting::shared(Arc::clone(&placement)),
+        store: store.clone(),
+        forgotten: Mutex::new(Vec::new()),
+    });
+    let orchestrator = SandboxControl::new(SandboxControlParts {
         // The one thing this assembly cannot reproduce: `MustBeConfigured`
         // needs the shared seed, which no test process has.
-        AccessTokenSeedPolicy::MayGenerate,
+        access_token_seed_policy: AccessTokenSeedPolicy::MayGenerate,
         store,
-        RemoteSandboxBackendFactory::new(Arc::clone(&placement)).with_record_owner(record_owner),
-        crate::image::DisabledRuntimeImageRefs::shared(),
-    )
+        placement: Arc::clone(&placement),
+        record_owner,
+        routing: Arc::clone(&routing) as Arc<dyn crate::orchestrator::RuntimeRouting>,
+        pause_publisher: Arc::new(CommittingPausePublisher::new(Arc::new(snapshot_manager))),
+        grants: Arc::clone(&grants) as Arc<dyn GrantIssuer>,
+    })
     .await
     .expect("the api half assembles");
-    orchestrator.set_runtime_routing(PlacementRuntimeRouting::shared(Arc::clone(&placement)));
-    let grants = Arc::new(RecordingGrants::default());
-    orchestrator.set_grant_issuer(Arc::clone(&grants) as Arc<dyn GrantIssuer>);
-    let (snapshot_manager, snapshots) = recording_snapshot_manager();
-    orchestrator.set_pause_publisher(Arc::new(CommittingPausePublisher::new(Arc::new(
-        snapshot_manager,
-    ))));
 
     ApiHalf {
         orchestrator,
+        routing,
         bindings,
         snapshots,
         grants,
@@ -1078,4 +1118,80 @@ async fn a_cold_create_the_node_refuses_gives_the_sandbox_id_back_too() {
             .expect("the binding store answers"),
         crate::binding_store::LaunchReservationOutcome::Claimed
     );
+}
+
+#[tokio::test]
+async fn a_delete_retires_the_routing_binding_before_it_removes_the_record() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to delete");
+
+    Arc::clone(&half.orchestrator)
+        .delete_sandbox(metadata.id)
+        .await
+        .expect("the api half deletes the sandbox");
+
+    assert_eq!(
+        half.routing.forgotten(),
+        vec![(metadata.id, metadata.execution_id, true)],
+        "the delete must retire its own incarnation while the record is still there"
+    );
+}
+
+#[tokio::test]
+async fn a_pause_retires_the_routing_binding_before_it_removes_the_record() {
+    let half = api_half().await;
+    let metadata = Arc::clone(&half.orchestrator)
+        .create_sandbox(cold_create())
+        .await
+        .expect("a sandbox to pause");
+    *half.node.pause.lock().expect("lock") = Some(Ok(staged_by_the_node(metadata.id)));
+
+    Arc::clone(&half.orchestrator)
+        .pause_sandbox(metadata.id)
+        .await
+        .expect("the api half pauses the sandbox");
+
+    assert_eq!(
+        half.routing.forgotten(),
+        vec![(metadata.id, metadata.execution_id, true)],
+        "the pause must retire its own incarnation while the record is still there"
+    );
+}
+
+#[tokio::test]
+async fn a_launch_rolled_back_after_it_was_recorded_retires_its_binding_first() {
+    let half = api_half().await;
+    let sandbox_id = SandboxId::new();
+    let execution_id = ExecutionId::new();
+    // A node that answers a create without an address leaves the launch with
+    // nowhere to send traffic, so the record it just wrote is taken back.
+    *half.node.create.lock().expect("lock") = Some(Ok(pb::SandboxCreateResponse {
+        sandbox_id: sandbox_id.to_string(),
+        execution_id: execution_id.to_string(),
+        host_interaction_ip: String::new(),
+        ..Default::default()
+    }));
+
+    Arc::clone(&half.orchestrator)
+        .restore_sandbox(
+            sandbox_id,
+            CreateSandboxRequest {
+                execution_id: Some(execution_id),
+                ..cold_create()
+            },
+        )
+        .await
+        .expect_err("a sandbox with no address is not a sandbox");
+
+    assert_eq!(
+        half.routing.forgotten(),
+        vec![(sandbox_id, execution_id, true)],
+        "the only other path that removes a record must retire the binding it wrote, under its \
+         own fence and while the record is still there"
+    );
+    assert_eq!(half.record_state(sandbox_id).await, None);
+    assert!(half.binding(sandbox_id).await.is_none());
 }

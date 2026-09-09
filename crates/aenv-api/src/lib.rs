@@ -10,6 +10,7 @@ pub use aenv_core::{
 
 pub mod api;
 pub mod binding_store;
+pub mod control;
 pub mod node_client;
 pub mod node_registry;
 

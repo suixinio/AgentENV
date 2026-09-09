@@ -164,6 +164,11 @@ impl OverlaybdTarget {
         io_desc: ublk_sys::ublksrv_io_desc,
     ) -> std::result::Result<(UblkDescOperation, u64, usize), i32> {
         let op = UblkDescOperation::try_from(io_desc.op_flags & 0xff).map_err(|_| -libc::EINVAL)?;
+        // The kernel issues a flush with no sector range: start_sector is -1
+        // and nr_sectors is 0. It names the whole device, not an offset.
+        if matches!(op, UblkDescOperation::Flush) {
+            return Ok((op, 0, 0));
+        }
         let offset = io_desc.start_sector << state.logical_bs_shift;
         let len_u64 = (io_desc.nr_sectors as u64) << state.logical_bs_shift;
         let end = offset.checked_add(len_u64).ok_or(-libc::EINVAL)?;
@@ -640,10 +645,12 @@ mod tests {
             assert_eq!(ret, 4096);
         }
 
+        // The kernel describes a flush with start_sector -1 and no sectors; a
+        // target that reads those as a range refuses every guest fsync.
         let flush = ublksrv_io_desc {
             op_flags: ublk_sys::UBLK_IO_OP_FLUSH,
             nr_sectors: 0,
-            start_sector: 0,
+            start_sector: u64::MAX,
             addr: buf.uring_buf_idx() as u64,
         };
         let ret = target

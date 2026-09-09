@@ -25,10 +25,43 @@ pub mod virtualization;
 mod mock_module_gating {
     use std::path::PathBuf;
 
+    // Splits any attributes written on the declaration's own line from the
+    // declaration, so `#[cfg(test)] pub mod mock;` is one line the scan reads as
+    // both a gate and a declaration.
+    fn split_inline_attributes(line: &str) -> (Vec<&str>, &str) {
+        let mut rest = line.trim_start();
+        let mut attributes = Vec::new();
+        while rest.starts_with("#[") {
+            let Some(end) = rest.find(']') else {
+                break;
+            };
+            attributes.push(&rest[..=end]);
+            rest = rest[end + 1..].trim_start();
+        }
+        (attributes, rest)
+    }
+
+    // Any visibility at all: a private `mod mock` is compiled into the same
+    // binary, which is the harm; being a public path is only the loudest form.
+    fn strip_visibility(declaration: &str) -> &str {
+        let Some(rest) = declaration.strip_prefix("pub") else {
+            return declaration;
+        };
+        let rest = match rest.strip_prefix('(') {
+            Some(restricted) => match restricted.find(')') {
+                Some(end) => &restricted[end + 1..],
+                None => rest,
+            },
+            None => rest,
+        };
+        rest.trim_start()
+    }
+
     // The anchor is a line start followed by the declaration itself, so a
     // comment or a doc line describing the pattern never matches.
     fn declares_a_mock_module(line: &str) -> bool {
-        let Some(rest) = line.trim_start().strip_prefix("pub mod mock") else {
+        let (_, declaration) = split_inline_attributes(line);
+        let Some(rest) = strip_visibility(declaration).strip_prefix("mod mock") else {
             return false;
         };
         matches!(rest.chars().next(), Some(';') | Some('{') | Some(' '))
@@ -43,7 +76,10 @@ mod mock_module_gating {
         "#[cfg(any(test, feature = \"test-support\"))]",
     ];
 
-    fn gated(preceding: &[&str]) -> bool {
+    fn gated(inline: &[&str], preceding: &[&str]) -> bool {
+        if let Some(cfg) = inline.iter().find(|attr| attr.starts_with("#[cfg(")) {
+            return TEST_ONLY_CFGS.contains(cfg);
+        }
         for line in preceding.iter().rev() {
             let trimmed = line.trim_start();
             if trimmed.starts_with("#[cfg(") {
@@ -57,20 +93,27 @@ mod mock_module_gating {
         false
     }
 
-    /// One-based line numbers of the `pub mod mock` declarations this text
-    /// leaves in an unconditional build.
+    /// One-based line numbers of the `mod mock` declarations this text leaves in
+    /// an unconditional build, whatever their visibility.
     fn ungated_mock_declarations(source: &str) -> Vec<usize> {
         let lines: Vec<&str> = source.lines().collect();
         lines
             .iter()
             .enumerate()
-            .filter(|(index, line)| declares_a_mock_module(line) && !gated(&lines[..*index]))
+            .filter(|(index, line)| {
+                let (inline, _) = split_inline_attributes(line);
+                declares_a_mock_module(line) && !gated(&inline, &lines[..*index])
+            })
             .map(|(index, _)| index + 1)
             .collect()
     }
 
     // aenv-core's own `src/`, plus the `src/` of every sibling crate: a mock
-    // declared in either is a public path of a shipped binary.
+    // declared in either is compiled into a shipped binary. Out of scope, and
+    // deliberately so rather than because a double there would be harmless:
+    // `storage/*` and `thirdparty/*`, which `aenv-node` does link, and `adev/`,
+    // which it does not. The scan is by module name, so a double called `fakes`
+    // or `stubs` is not something it can see either.
     fn scanned_roots() -> Vec<PathBuf> {
         let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut roots = vec![workspace.join("src")];
@@ -121,11 +164,11 @@ mod mock_module_gating {
 
         assert!(
             offenders.is_empty(),
-            "{offenders:?} declare `pub mod mock` under no cfg that excludes a release \
-             build. Nothing here strips a non-generic `pub fn`, so such a test double is \
-             linked into a shipped binary and is a public path of the crate that declares \
-             it. Gate it with one of {TEST_ONLY_CFGS:?}, the way `src/image/mod.rs` and \
-             `crates/aenv-node/src/p2p/mod.rs` do."
+            "{offenders:?} declare a `mod mock` under no cfg that excludes a release build. \
+             Nothing here strips a non-generic `pub fn`, so such a test double is linked \
+             into a shipped binary whatever its visibility, and a `pub` one is a public \
+             path of its crate as well. Gate it with one of {TEST_ONLY_CFGS:?}, the way \
+             `src/image/mod.rs` and `crates/aenv-node/src/p2p/mod.rs` do."
         );
         assert!(
             declarations > 0,
@@ -164,6 +207,27 @@ mod mock_module_gating {
             ungated_mock_declarations("#[cfg(target_os = \"linux\")]\npub mod mock;\n"),
             vec![2],
             "any cfg at all satisfies the gate, so it proves nothing about release builds"
+        );
+        assert_eq!(
+            ungated_mock_declarations("mod mock;\n"),
+            vec![1],
+            "a private module is compiled into the same binary, and `pub use mock::*;` \
+             publishes it anyway"
+        );
+        assert_eq!(
+            ungated_mock_declarations("pub(crate) mod mock;\n"),
+            vec![1],
+            "a restricted visibility is still a module in the shipped binary"
+        );
+        assert!(
+            ungated_mock_declarations("#[cfg(test)] pub mod mock;\n").is_empty(),
+            "a cfg written on the declaration's own line is that declaration's gate"
+        );
+        assert_eq!(
+            ungated_mock_declarations("#[cfg(feature = \"other\")] pub mod mock;\n"),
+            vec![1],
+            "and a same-line cfg that is not one of the test-only ones must not hide the \
+             declaration from the scan either"
         );
     }
 }

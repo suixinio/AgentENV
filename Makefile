@@ -129,7 +129,10 @@ clippy:
 # copy of any of them under `src/` is the union crate re-forming.
 #
 # Each entry is `<path that must stay out of aenv-core>:<the half that owns it
-# now>`. The second half is the positive control this check would otherwise
+# now>`. Both file shapes of the left-hand module are one rule -- `src/p2p` and
+# `src/p2p.rs`, `src/api/proxy.rs` and `src/api/proxy/` -- so bringing it back
+# as the other shape is not a way through. The second half is the positive
+# control this check would otherwise
 # have none of: an absence test passes forever on a path nobody ever writes, so
 # a typo in an entry, or a module renamed out from under one, is caught here
 # rather than by nothing.
@@ -193,9 +196,13 @@ check-crate-boundaries:
 	  fail=1; \
 	fi; \
 	for pair in $(CORE_EXILED_PATHS); do \
-	  path=$${pair%%:*}; home=$${pair#*:}; \
-	  if [ -e "$$path" ]; then \
-	    echo "$$path is under aenv-core again. It runs only where sandboxes run, so aenv-node"; \
+	  path=$${pair%%:*}; home=$${pair#*:}; stem=$${path%.rs}; \
+	  back=""; \
+	  for shape in "$$stem" "$$stem.rs"; do \
+	    if [ -e "$$shape" ]; then back="$$shape"; fi; \
+	  done; \
+	  if [ -n "$$back" ]; then \
+	    echo "$$back is under aenv-core again. It runs only where sandboxes run, so aenv-node"; \
 	    echo "owns it; back here it is compiled into the api binary as well."; \
 	    fail=1; \
 	  fi; \
@@ -211,9 +218,13 @@ check-crate-boundaries:
 	  esac; \
 	done; \
 	for pair in $(API_EXILED_PATHS); do \
-	  path=$${pair%%:*}; home=$${pair#*:}; \
-	  if [ -e "$$path" ]; then \
-	    echo "$$path is under aenv-core again. Only the deciding half serves it, so aenv-api"; \
+	  path=$${pair%%:*}; home=$${pair#*:}; stem=$${path%.rs}; \
+	  back=""; \
+	  for shape in "$$stem" "$$stem.rs"; do \
+	    if [ -e "$$shape" ]; then back="$$shape"; fi; \
+	  done; \
+	  if [ -n "$$back" ]; then \
+	    echo "$$back is under aenv-core again. Only the deciding half serves it, so aenv-api"; \
 	    echo "owns it; back here it is compiled into every node binary as well."; \
 	    fail=1; \
 	  fi; \
@@ -229,13 +240,17 @@ check-crate-boundaries:
 	  esac; \
 	done; \
 	for half in aenv-api aenv-node; do \
-	  reexports=$$(sed -n '/^pub use aenv_core::{$$/,/^};$$/p' crates/$$half/src/lib.rs | sed '1d;$$d' | tr -d ' \t' | tr ',' '\n' | grep -v '^$$' || true); \
+	  flat=$$(sed 's|//.*||' crates/$$half/src/lib.rs | tr '\n' ' '); \
+	  braced=$$(printf '%s' "$$flat" | grep -oE 'pub use aenv_core::\{[^}]*\}' | sed -e 's/.*{//' -e 's/}//' | tr -d ' \t' | tr ',' '\n' || true); \
+	  named=$$(printf '%s' "$$flat" | grep -oE 'pub use aenv_core::[A-Za-z0-9_]+' | sed 's/.*:://' || true); \
+	  reexports=$$(printf '%s\n%s\n' "$$braced" "$$named" | grep -v '^$$' | sort -u || true); \
 	  if [ -z "$$reexports" ]; then \
-	    echo "crates/$$half/src/lib.rs has no 'pub use aenv_core::{' block to read; this check"; \
-	    echo "anchors on that declaration and a reshaped one turns it silently green."; \
+	    echo "crates/$$half/src/lib.rs re-exports nothing from aenv_core; this check reads every"; \
+	    echo "'pub use aenv_core::' in the file, braced list or single name, and a file with none"; \
+	    echo "leaves it green whatever the halves publish."; \
 	    fail=1; \
 	  fi; \
-	  own=$$(grep -E '^pub mod [a-z_]+;$$' crates/$$half/src/lib.rs | sed 's/^pub mod //; s/;$$//' || true); \
+	  own=$$(grep -E '^pub mod [a-z0-9_]+;$$' crates/$$half/src/lib.rs | sed 's/^pub mod //; s/;$$//' || true); \
 	  if [ -z "$$own" ]; then \
 	    echo "crates/$$half/src/lib.rs declares no 'pub mod' of its own; this check reads that"; \
 	    echo "list to tell a re-exported path from one the half owns, and an empty list tells it nothing."; \

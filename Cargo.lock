@@ -330,6 +330,7 @@ dependencies = [
 name = "agentenv-e2e-tests"
 version = "0.1.0"
 dependencies = [
+ "aenv-core",
  "aenv-node",
  "agentenv-test-support",
  "anyhow",

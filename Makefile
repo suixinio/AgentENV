@@ -110,6 +110,9 @@ fmt:
 
 clippy:
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+	# --all-features turns test-support on everywhere and hides a test target
+	# that forgot to ask for it; the default-feature check does not.
+	$(CARGO) check --workspace --all-targets
 
 # The crate split, as a fact about the dependency graph rather than a comment.
 #

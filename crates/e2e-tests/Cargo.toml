@@ -5,6 +5,10 @@ edition = "2021"
 publish = false
 
 [dev-dependencies]
+# The snapshot mock this suite writes artifacts with is compiled into
+# aenv-core only under test-support; a dev-dependency's features do not
+# propagate through aenv-node, so the feature is named here.
+aenv-core = { path = "../..", features = ["test-support"] }
 aenv-node = { path = "../aenv-node" }
 agentenv-test-support = { path = "../test-support" }
 anyhow = "1.0"

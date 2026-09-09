@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 
 use super::arbitration::BindingDecision;
 use super::record::{
-    binding_key, marshal_record, node_index_key, parse_record, DEFAULT_KEY_PREFIX,
+    binding_key, marshal_record, node_index_key, normalize_execution_id, parse_record,
+    DEFAULT_KEY_PREFIX,
+};
+use super::reservation::{
+    marshal_reservation, parse_reservation, reservation_key, still_exclusive,
+    LaunchReservationOutcome,
 };
 use super::{
     Binding, BindingDeleteOutcome, BindingState, BindingStore, BindingStoreError,
@@ -55,6 +60,9 @@ impl Default for RedisBindingStoreConfig {
 fn backend(err: impl std::fmt::Display) -> BindingStoreError {
     BindingStoreError::new(err.to_string())
 }
+
+/// Keys per SCAN round when reaping reservations.
+const SCAN_BATCH: usize = 256;
 
 fn ms(d: Duration) -> i64 {
     i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
@@ -99,6 +107,10 @@ impl RedisBindingStore {
 
     fn node_index_key(&self, node_id: &str) -> String {
         node_index_key(&self.redis_config.key_prefix, node_id)
+    }
+
+    fn reservation_key(&self, sandbox_id: &str) -> String {
+        reservation_key(&self.redis_config.key_prefix, sandbox_id)
     }
 
     fn decision_from_label(label: &str) -> BindingDecision {
@@ -327,5 +339,94 @@ impl BindingStore for RedisBindingStore {
             .await
             .map_err(backend)?;
         Ok(Self::delete_outcome_from_label(&outcome))
+    }
+
+    async fn reserve_launch(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        now: SystemTime,
+    ) -> Result<LaunchReservationOutcome, BindingStoreError> {
+        let sandbox_id = sandbox_id.trim();
+        let execution_id = normalize_execution_id(execution_id);
+        if sandbox_id.is_empty() || execution_id.is_empty() {
+            return Err(BindingStoreError::new(
+                "a launch reservation needs both a sandbox id and an execution id".to_string(),
+            ));
+        }
+        let now_ms = unix_ms(now);
+        let window_ms = ms(super::LAUNCH_RESERVATION_EXCLUSIVE_TTL);
+        let mut connection = self.connection.clone();
+        // The key's own expiry is the window, so a replica that dies mid-launch
+        // stops holding the id even if nothing ever sweeps.
+        let (label, holder): (String, String) = scripts::reserve_launch_script()
+            .key(self.reservation_key(sandbox_id))
+            .arg(&execution_id)
+            .arg(now_ms)
+            .arg(window_ms)
+            .arg(marshal_reservation(&execution_id, now_ms))
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend)?;
+        Ok(LaunchReservationOutcome::from_label(&label, &holder))
+    }
+
+    async fn release_launch(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        _now: SystemTime,
+    ) -> Result<BindingDeleteOutcome, BindingStoreError> {
+        let sandbox_id = sandbox_id.trim();
+        let execution_id = normalize_execution_id(execution_id);
+        if sandbox_id.is_empty() || execution_id.is_empty() {
+            return Ok(BindingDeleteOutcome::Absent);
+        }
+        let mut connection = self.connection.clone();
+        let outcome: String = scripts::release_launch_script()
+            .key(self.reservation_key(sandbox_id))
+            .arg(&execution_id)
+            .invoke_async(&mut connection)
+            .await
+            .map_err(backend)?;
+        Ok(Self::delete_outcome_from_label(&outcome))
+    }
+
+    async fn reap_expired_launches(&self, now: SystemTime) -> Result<u64, BindingStoreError> {
+        let now_ms = unix_ms(now);
+        let window_ms = ms(super::LAUNCH_RESERVATION_EXCLUSIVE_TTL);
+        let pattern = self.reservation_key("*");
+        let mut connection = self.connection.clone();
+        let mut cursor: u64 = 0;
+        let mut reaped = 0u64;
+        loop {
+            let (next, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(SCAN_BATCH)
+                .query_async(&mut connection)
+                .await
+                .map_err(backend)?;
+            for key in keys {
+                let raw: Option<Vec<u8>> = connection.get(&key).await.map_err(backend)?;
+                let Some(raw) = raw else {
+                    continue;
+                };
+                let expired = parse_reservation(&raw).is_none_or(|record| {
+                    !still_exclusive(record.reserved_at_ms, now_ms, window_ms)
+                });
+                if expired {
+                    let removed: i64 = connection.del(&key).await.map_err(backend)?;
+                    reaped += u64::try_from(removed).unwrap_or(0);
+                }
+            }
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        Ok(reaped)
     }
 }

@@ -12,6 +12,7 @@ pub mod in_memory;
 pub mod lookup;
 pub mod record;
 pub mod redis;
+pub mod reservation;
 pub mod sweep;
 
 #[cfg(test)]
@@ -29,6 +30,7 @@ pub use arbitration::BindingDecision;
 pub use in_memory::InMemoryBindingStore;
 pub use record::BindingState;
 pub use redis::{RedisBindingStore, RedisBindingStoreConfig};
+pub use reservation::{LaunchReservationOutcome, ReservationRecord};
 
 /// A sandbox's serving node and, when known, execution incarnation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -137,6 +139,35 @@ pub trait BindingStore: Send + Sync {
         execution_id: &str,
         now: SystemTime,
     ) -> Result<BindingDeleteOutcome, BindingStoreError>;
+
+    /// Takes a sandbox id for a launch before any node is chosen, or names the
+    /// launch already holding it.
+    ///
+    /// This is the cluster's single-activation truth source: the routing record
+    /// cannot be, because it must name a node and a launch has none yet.
+    async fn reserve_launch(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        now: SystemTime,
+    ) -> Result<LaunchReservationOutcome, BindingStoreError>;
+
+    /// Gives a sandbox id back once the launch has settled, either way.
+    ///
+    /// Fenced on `execution_id`: a reservation another launch took over after
+    /// this one's window ran out is left where it is.
+    async fn release_launch(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        now: SystemTime,
+    ) -> Result<BindingDeleteOutcome, BindingStoreError>;
+
+    /// Removes reservations past their exclusivity window, returning how many.
+    ///
+    /// A replica that dies mid-launch leaves one behind, and nothing else ever
+    /// releases it.
+    async fn reap_expired_launches(&self, now: SystemTime) -> Result<u64, BindingStoreError>;
 }
 
 /// Tuning shared by all binding-store backends.

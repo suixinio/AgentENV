@@ -266,6 +266,64 @@ pub fn release_script() -> &'static Script {
     SCRIPT.get_or_init(|| Script::new(&format!("{PARSE_BINDING}{RELEASE_BODY}")))
 }
 
+// KEYS: reservation. ARGV: execution id, now_ms, window_ms, value.
+// First writer wins for the window: a launch has not chosen a node yet, so
+// there is nothing to order two of them by, only who asked first.
+const RESERVE_LAUNCH_BODY: &str = r#"
+local raw = redis.call("GET", KEYS[1])
+if raw then
+  local ok, decoded = pcall(cjson.decode, raw)
+  local holder = ""
+  if ok and decoded and type(decoded["execution_id"]) == "string" then
+    holder = decoded["execution_id"]
+  end
+  if holder ~= "" and holder ~= ARGV[1] then
+    local reserved = tonumber(decoded["reserved_at_ms"])
+    local now = tonumber(ARGV[2]) or 0
+    local window = tonumber(ARGV[3]) or 0
+    if reserved and (now - reserved) < window then
+      return { "held_elsewhere", holder }
+    end
+    redis.call("SET", KEYS[1], ARGV[4], "PX", ARGV[3])
+    return { "claimed_from_expired", holder }
+  end
+end
+redis.call("SET", KEYS[1], ARGV[4], "PX", ARGV[3])
+return { "claimed", "" }
+"#;
+
+pub fn reserve_launch_script() -> &'static Script {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    SCRIPT.get_or_init(|| Script::new(RESERVE_LAUNCH_BODY))
+}
+
+// KEYS: reservation. ARGV: execution id.
+const RELEASE_LAUNCH_BODY: &str = r#"
+local raw = redis.call("GET", KEYS[1])
+if not raw then
+  return "noop_absent"
+end
+local ok, decoded = pcall(cjson.decode, raw)
+local holder = ""
+if ok and decoded and type(decoded["execution_id"]) == "string" then
+  holder = decoded["execution_id"]
+end
+if holder == "" then
+  redis.call("DEL", KEYS[1])
+  return "deleted_unknown_incumbent"
+end
+if holder ~= ARGV[1] then
+  return "rejected_stale"
+end
+redis.call("DEL", KEYS[1])
+return "deleted"
+"#;
+
+pub fn release_launch_script() -> &'static Script {
+    static SCRIPT: OnceLock<Script> = OnceLock::new();
+    SCRIPT.get_or_init(|| Script::new(RELEASE_LAUNCH_BODY))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +362,23 @@ mod tests {
             reconcile_script(false).get_hash(),
             "a reservation refused on the assignment path and superseded on the heartbeat path \
              would be two different arbitrations under one name"
+        );
+    }
+
+    #[test]
+    fn the_launch_reservation_scripts_are_their_own_bodies_and_are_memoized() {
+        assert_eq!(
+            reserve_launch_script().get_hash(),
+            Script::new(RESERVE_LAUNCH_BODY).get_hash(),
+            "the reservation arbitrates on its own key and borrows no routing prelude"
+        );
+        assert_eq!(
+            release_launch_script().get_hash(),
+            Script::new(RELEASE_LAUNCH_BODY).get_hash()
+        );
+        assert_ne!(
+            reserve_launch_script().get_hash(),
+            release_launch_script().get_hash()
         );
     }
 

@@ -3,6 +3,7 @@
 
 use std::time::{Duration, SystemTime};
 
+use super::reservation::LaunchReservationOutcome;
 use super::{Binding, BindingDecision, BindingDeleteOutcome, BindingState, BindingStore};
 use crate::node_registry::types::{Node, RosterEntry};
 
@@ -691,6 +692,191 @@ pub async fn releasing_an_absent_reservation_is_a_noop<S: BindingStore>(store: &
     );
 }
 
+pub async fn a_launch_reservation_is_claimed_by_the_first_asker<S: BindingStore>(store: &S) {
+    assert_eq!(
+        store
+            .reserve_launch("sbx-1", "exec-1", unix(0))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::Claimed
+    );
+    assert_eq!(
+        store
+            .reserve_launch("sbx-1", "exec-1", unix(1))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::Claimed,
+        "the launch holding the id may say so again"
+    );
+}
+
+pub async fn a_second_launch_is_told_which_one_holds_the_id<S: BindingStore>(store: &S) {
+    store
+        .reserve_launch("sbx-1", "exec-1", unix(0))
+        .await
+        .unwrap();
+    let outcome = store
+        .reserve_launch("sbx-1", "exec-2", unix(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        LaunchReservationOutcome::HeldElsewhere {
+            execution_id: "exec-1".to_string()
+        },
+        "the later launch has to be able to wait for the one that holds the id"
+    );
+    assert!(!outcome.claimed());
+}
+
+pub async fn a_reservation_past_its_window_is_taken_over<S: BindingStore>(store: &S) {
+    store
+        .reserve_launch("sbx-1", "exec-1", unix(0))
+        .await
+        .unwrap();
+    let outcome = store
+        .reserve_launch("sbx-1", "exec-2", unix(600))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        LaunchReservationOutcome::ClaimedFromExpired {
+            execution_id: "exec-1".to_string()
+        },
+        "a replica that died mid-launch must not hold a sandbox id forever"
+    );
+    assert!(outcome.claimed());
+    assert_eq!(
+        store
+            .reserve_launch("sbx-1", "exec-3", unix(601))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::HeldElsewhere {
+            execution_id: "exec-2".to_string()
+        },
+        "the launch that took the id over now holds it"
+    );
+}
+
+pub async fn releasing_a_launch_reservation_frees_the_id<S: BindingStore>(store: &S) {
+    store
+        .reserve_launch("sbx-1", "exec-1", unix(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .release_launch("sbx-1", "exec-1", unix(1))
+            .await
+            .unwrap(),
+        BindingDeleteOutcome::Deleted
+    );
+    assert_eq!(
+        store
+            .reserve_launch("sbx-1", "exec-2", unix(2))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::Claimed,
+        "a launch that failed and gave the id back must not keep excluding the next one"
+    );
+    assert_eq!(
+        store
+            .release_launch("sbx-2", "exec-1", unix(3))
+            .await
+            .unwrap(),
+        BindingDeleteOutcome::Absent
+    );
+}
+
+pub async fn releasing_another_launchs_reservation_is_refused<S: BindingStore>(store: &S) {
+    store
+        .reserve_launch("sbx-1", "exec-1", unix(0))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .release_launch("sbx-1", "exec-2", unix(1))
+            .await
+            .unwrap(),
+        BindingDeleteOutcome::RejectedStale
+    );
+    assert_eq!(
+        store
+            .reserve_launch("sbx-1", "exec-3", unix(2))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::HeldElsewhere {
+            execution_id: "exec-1".to_string()
+        },
+        "the refused release must have left the reservation where it was"
+    );
+}
+
+pub async fn reaping_removes_reservations_past_their_window_only<S: BindingStore>(store: &S) {
+    store
+        .reserve_launch("sbx-old", "exec-1", unix(0))
+        .await
+        .unwrap();
+    store
+        .reserve_launch("sbx-fresh", "exec-2", unix(550))
+        .await
+        .unwrap();
+
+    assert_eq!(store.reap_expired_launches(unix(600)).await.unwrap(), 1);
+
+    assert_eq!(
+        store
+            .reserve_launch("sbx-old", "exec-3", unix(601))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::Claimed,
+        "the reaped reservation must be gone, not merely unreadable"
+    );
+    assert_eq!(
+        store
+            .reserve_launch("sbx-fresh", "exec-4", unix(602))
+            .await
+            .unwrap(),
+        LaunchReservationOutcome::HeldElsewhere {
+            execution_id: "exec-2".to_string()
+        },
+        "a reservation inside its window is not residue"
+    );
+}
+
+pub async fn a_launch_reservation_leaves_the_routing_record_alone<S: BindingStore>(store: &S) {
+    store
+        .reserve_launch("sbx-1", "exec-1", unix(0))
+        .await
+        .unwrap();
+    assert!(
+        store.get("sbx-1", unix(0)).await.unwrap().is_none(),
+        "a reservation names no node, so it must not be readable as a routing record"
+    );
+
+    store
+        .record(
+            "sbx-1",
+            Binding {
+                node: node("node-a"),
+                execution_id: "exec-1".to_string(),
+                projection_ttl: Duration::ZERO,
+                state: BindingState::Confirmed,
+            },
+            unix(1),
+        )
+        .await
+        .unwrap();
+    store
+        .release_launch("sbx-1", "exec-1", unix(2))
+        .await
+        .unwrap();
+    let binding = store.get("sbx-1", unix(3)).await.unwrap().expect("bound");
+    assert_eq!(
+        binding.node.id, "node-a",
+        "giving the launch reservation back must not retire the routing record it produced"
+    );
+}
+
 macro_rules! binding_store_contract_suite {
     ($($name:ident),* $(,)?) => {
         $(
@@ -736,6 +922,13 @@ macro_rules! binding_store_contract {
             releasing_refuses_to_withdraw_a_confirmation,
             releasing_refuses_another_incarnations_reservation,
             releasing_an_absent_reservation_is_a_noop,
+            a_launch_reservation_is_claimed_by_the_first_asker,
+            a_second_launch_is_told_which_one_holds_the_id,
+            a_reservation_past_its_window_is_taken_over,
+            releasing_a_launch_reservation_frees_the_id,
+            releasing_another_launchs_reservation_is_refused,
+            reaping_removes_reservations_past_their_window_only,
+            a_launch_reservation_leaves_the_routing_record_alone,
         );
     };
 }

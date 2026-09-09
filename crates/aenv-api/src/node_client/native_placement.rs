@@ -658,6 +658,29 @@ mod tests {
             ) -> Result<BindingDeleteOutcome, BindingStoreError> {
                 unreachable!("this test never releases")
             }
+            async fn reserve_launch(
+                &self,
+                _sandbox_id: &str,
+                _execution_id: &str,
+                _now: SystemTime,
+            ) -> Result<crate::binding_store::LaunchReservationOutcome, BindingStoreError>
+            {
+                unreachable!("this test never reserves a launch")
+            }
+            async fn release_launch(
+                &self,
+                _sandbox_id: &str,
+                _execution_id: &str,
+                _now: SystemTime,
+            ) -> Result<BindingDeleteOutcome, BindingStoreError> {
+                unreachable!("this test never releases a launch")
+            }
+            async fn reap_expired_launches(
+                &self,
+                _now: SystemTime,
+            ) -> Result<u64, BindingStoreError> {
+                unreachable!("this test never reaps")
+            }
         }
 
         let registry = Arc::new(AtomicNodeRegistry::new(Vec::new(), Duration::from_secs(30)));

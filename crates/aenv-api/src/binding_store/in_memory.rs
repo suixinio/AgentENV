@@ -7,6 +7,9 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 
 use super::arbitration::{arbitrate_fenced, BindingDecision};
+use super::reservation::{
+    arbitrate_reservation, still_exclusive, LaunchReservationOutcome, ReservationRecord,
+};
 use super::{
     Binding, BindingDeleteOutcome, BindingState, BindingStore, BindingStoreError,
     BindingStoreSettings, LAUNCH_RESERVATION_EXCLUSIVE_TTL,
@@ -45,6 +48,8 @@ enum WriteSource {
 struct Inner {
     bindings: HashMap<String, BindingRecord>,
     node_binding: HashMap<String, HashSet<String>>,
+    /// Launch reservations, keyed by sandbox id and naming no node.
+    reservations: HashMap<String, ReservationRecord>,
 }
 
 pub struct InMemoryBindingStore {
@@ -58,6 +63,7 @@ impl InMemoryBindingStore {
             inner: RwLock::new(Inner {
                 bindings: HashMap::new(),
                 node_binding: HashMap::new(),
+                reservations: HashMap::new(),
             }),
             settings,
         }
@@ -175,6 +181,18 @@ impl InMemoryBindingStore {
             .bindings
             .get(sandbox_id)
             .is_some_and(|record| record.state == BindingState::Starting)
+    }
+
+    /// The caller's clock in Unix milliseconds, the unit both backends
+    /// arbitrate reservations in.
+    fn unix_ms(now: SystemTime) -> i64 {
+        now.duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+    }
+
+    fn window_ms() -> i64 {
+        i64::try_from(LAUNCH_RESERVATION_EXCLUSIVE_TTL.as_millis()).unwrap_or(i64::MAX)
     }
 
     fn delete_locked(inner: &mut Inner, sandbox_id: &str) {
@@ -368,6 +386,72 @@ impl BindingStore for InMemoryBindingStore {
         }
         Self::delete_locked(&mut inner, sandbox_id);
         Ok(BindingDeleteOutcome::Deleted)
+    }
+
+    async fn reserve_launch(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        now: SystemTime,
+    ) -> Result<LaunchReservationOutcome, BindingStoreError> {
+        let sandbox_id = sandbox_id.trim();
+        let execution_id = super::record::normalize_execution_id(execution_id);
+        if sandbox_id.is_empty() || execution_id.is_empty() {
+            return Err(BindingStoreError::new(
+                "a launch reservation needs both a sandbox id and an execution id".to_string(),
+            ));
+        }
+        let now_ms = Self::unix_ms(now);
+        let mut inner = self.inner.write().expect("binding store lock poisoned");
+        let outcome = arbitrate_reservation(
+            inner.reservations.get(sandbox_id),
+            &execution_id,
+            now_ms,
+            Self::window_ms(),
+        );
+        if outcome.claimed() {
+            inner.reservations.insert(
+                sandbox_id.to_string(),
+                ReservationRecord {
+                    execution_id,
+                    reserved_at_ms: Some(now_ms),
+                },
+            );
+        }
+        Ok(outcome)
+    }
+
+    async fn release_launch(
+        &self,
+        sandbox_id: &str,
+        execution_id: &str,
+        _now: SystemTime,
+    ) -> Result<BindingDeleteOutcome, BindingStoreError> {
+        let sandbox_id = sandbox_id.trim();
+        let execution_id = super::record::normalize_execution_id(execution_id);
+        if sandbox_id.is_empty() || execution_id.is_empty() {
+            return Ok(BindingDeleteOutcome::Absent);
+        }
+        let mut inner = self.inner.write().expect("binding store lock poisoned");
+        let Some(record) = inner.reservations.get(sandbox_id) else {
+            return Ok(BindingDeleteOutcome::Absent);
+        };
+        if record.execution_id != execution_id {
+            return Ok(BindingDeleteOutcome::RejectedStale);
+        }
+        inner.reservations.remove(sandbox_id);
+        Ok(BindingDeleteOutcome::Deleted)
+    }
+
+    async fn reap_expired_launches(&self, now: SystemTime) -> Result<u64, BindingStoreError> {
+        let now_ms = Self::unix_ms(now);
+        let window_ms = Self::window_ms();
+        let mut inner = self.inner.write().expect("binding store lock poisoned");
+        let before = inner.reservations.len();
+        inner
+            .reservations
+            .retain(|_, record| still_exclusive(record.reserved_at_ms, now_ms, window_ms));
+        Ok((before - inner.reservations.len()) as u64)
     }
 }
 

@@ -23,6 +23,8 @@ pub struct SweepOutcome {
     pub ignored_unknown_execution: u64,
     pub nodes_swept: u64,
     pub nodes_suppressed_all_silent: u64,
+    /// Launch reservations removed because their exclusivity window had run out.
+    pub reservations_reaped: u64,
 }
 
 struct Inner {
@@ -63,6 +65,10 @@ impl BindingSweeper {
         store: &dyn BindingStore,
         now: SystemTime,
     ) -> SweepOutcome {
+        // A reservation belongs to a launch, not to a node, so no roster ever
+        // mentions one and only its own age retires it.
+        let reservations_reaped = store.reap_expired_launches(now).await.unwrap_or(0);
+
         let live: HashMap<String, Roster> = registry
             .rosters_in_cluster(&self.cluster_id)
             .into_iter()
@@ -108,7 +114,10 @@ impl BindingSweeper {
         }
 
         if candidates.is_empty() {
-            return SweepOutcome::default();
+            return SweepOutcome {
+                reservations_reaped,
+                ..Default::default()
+            };
         }
 
         let silent: Vec<&(String, Roster)> = candidates
@@ -123,11 +132,15 @@ impl BindingSweeper {
         if candidates.len() > 1 && silent.len() == candidates.len() {
             return SweepOutcome {
                 nodes_suppressed_all_silent: candidates.len() as u64,
+                reservations_reaped,
                 ..Default::default()
             };
         }
 
-        let mut outcome = SweepOutcome::default();
+        let mut outcome = SweepOutcome {
+            reservations_reaped,
+            ..Default::default()
+        };
         for (node_id, roster) in silent {
             let last_seen = roster.last_seen.expect("candidates always have one");
             if now.duration_since(last_seen).unwrap_or(Duration::ZERO) <= self.silence {
@@ -603,5 +616,52 @@ mod tests {
         assert_eq!(outcome.retired, 0);
         assert!(store.get("sbx-1", unix(1_000)).await.unwrap().is_some());
         assert!(store.get("sbx-2", unix(1_000)).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_sweep_round_reaps_launch_reservations_no_roster_will_ever_mention() {
+        use crate::binding_store::LaunchReservationOutcome;
+
+        let registry = registry_with_roster(
+            "node-a",
+            "sbx-1",
+            "00000000-0000-7000-8000-000000000001",
+            unix(0),
+        )
+        .await;
+        let store = InMemoryBindingStore::new(BindingStoreSettings::default());
+        store
+            .reserve_launch("sbx-abandoned", "exec-1", unix(0))
+            .await
+            .unwrap();
+        store
+            .reserve_launch("sbx-in-flight", "exec-2", unix(900))
+            .await
+            .unwrap();
+        let sweeper = BindingSweeper::new("cluster-a".to_string(), Duration::from_secs(60));
+
+        let outcome = sweeper.sweep_once(&registry, &store, unix(1_000)).await;
+
+        assert_eq!(
+            outcome.reservations_reaped, 1,
+            "a launch that died leaves a reservation nothing else ever releases"
+        );
+        assert_eq!(
+            store
+                .reserve_launch("sbx-abandoned", "exec-3", unix(1_001))
+                .await
+                .unwrap(),
+            LaunchReservationOutcome::Claimed
+        );
+        assert_eq!(
+            store
+                .reserve_launch("sbx-in-flight", "exec-4", unix(1_002))
+                .await
+                .unwrap(),
+            LaunchReservationOutcome::HeldElsewhere {
+                execution_id: "exec-2".to_string()
+            },
+            "a launch still inside its window is not residue"
+        );
     }
 }

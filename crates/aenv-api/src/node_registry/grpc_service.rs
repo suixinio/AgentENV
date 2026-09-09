@@ -1691,6 +1691,31 @@ mod tests {
         ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
             Err(crate::binding_store::BindingStoreError::new("always fails"))
         }
+        async fn reserve_launch(
+            &self,
+            _sandbox_id: &str,
+            _execution_id: &str,
+            _now: SystemTime,
+        ) -> Result<
+            crate::binding_store::LaunchReservationOutcome,
+            crate::binding_store::BindingStoreError,
+        > {
+            Err(crate::binding_store::BindingStoreError::new("always fails"))
+        }
+        async fn release_launch(
+            &self,
+            _sandbox_id: &str,
+            _execution_id: &str,
+            _now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            Err(crate::binding_store::BindingStoreError::new("always fails"))
+        }
+        async fn reap_expired_launches(
+            &self,
+            _now: SystemTime,
+        ) -> Result<u64, crate::binding_store::BindingStoreError> {
+            Err(crate::binding_store::BindingStoreError::new("always fails"))
+        }
     }
 
     #[tokio::test]
@@ -1910,6 +1935,31 @@ mod tests {
             }
             written.remove(position);
             Ok(BindingDeleteOutcome::Deleted)
+        }
+        async fn reserve_launch(
+            &self,
+            _sandbox_id: &str,
+            _execution_id: &str,
+            _now: SystemTime,
+        ) -> Result<
+            crate::binding_store::LaunchReservationOutcome,
+            crate::binding_store::BindingStoreError,
+        > {
+            Ok(crate::binding_store::LaunchReservationOutcome::Claimed)
+        }
+        async fn release_launch(
+            &self,
+            _sandbox_id: &str,
+            _execution_id: &str,
+            _now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            Ok(BindingDeleteOutcome::Absent)
+        }
+        async fn reap_expired_launches(
+            &self,
+            _now: SystemTime,
+        ) -> Result<u64, crate::binding_store::BindingStoreError> {
+            Ok(0)
         }
     }
 
@@ -2144,6 +2194,35 @@ mod tests {
             self.inner
                 .release_reservation(sandbox_id, execution_id, now)
                 .await
+        }
+        async fn reserve_launch(
+            &self,
+            sandbox_id: &str,
+            execution_id: &str,
+            now: SystemTime,
+        ) -> Result<
+            crate::binding_store::LaunchReservationOutcome,
+            crate::binding_store::BindingStoreError,
+        > {
+            self.inner
+                .reserve_launch(sandbox_id, execution_id, now)
+                .await
+        }
+        async fn release_launch(
+            &self,
+            sandbox_id: &str,
+            execution_id: &str,
+            now: SystemTime,
+        ) -> Result<BindingDeleteOutcome, crate::binding_store::BindingStoreError> {
+            self.inner
+                .release_launch(sandbox_id, execution_id, now)
+                .await
+        }
+        async fn reap_expired_launches(
+            &self,
+            now: SystemTime,
+        ) -> Result<u64, crate::binding_store::BindingStoreError> {
+            self.inner.reap_expired_launches(now).await
         }
     }
 

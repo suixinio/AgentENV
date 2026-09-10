@@ -58,14 +58,15 @@ pub fn a_device_node_is_writable() -> bool {
     nodes == 0
 }
 
+/// Everything but the connection count and a shorter io timeout is left at the
+/// production default, `dead_conn_timeout` above all: without a reconnect
+/// window nothing the supervisor installs can be waited for.
 pub fn options(connections: u16) -> NbdOptions {
     NbdOptions {
         connections,
         io_timeout: Duration::from_secs(30),
-        dead_conn_timeout: None,
         queue_depth: 32,
-        backend_identifier: None,
-        destroy_on_disconnect: false,
+        ..Default::default()
     }
 }
 

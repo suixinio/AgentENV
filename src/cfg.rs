@@ -566,10 +566,15 @@ pub struct UblkNbdTomlConfig {
     /// Sockets per device; each is a kernel hardware queue. Default: `4`.
     #[config(default = 4u16)]
     pub connections: u16,
-    /// Kernel request timeout in seconds, after which an unanswered request fails with EIO.
-    /// Must exceed the overlaybd download budget. Default: `90`.
+    /// Kernel request timeout in seconds. After it the kernel replaces the connection through
+    /// the daemon and retries the request; it must sit above the overlaybd registry request
+    /// timeout with room for its retries. Default: `90`.
     #[config(default = 90u64)]
     pub io_timeout_secs: u64,
+    /// How long a request with no live connection waits for the daemon's replacement before it
+    /// fails with EIO. `0` fails it at once and leaves the device answering EIO. Default: `30`.
+    #[config(default = 30u64)]
+    pub dead_conn_timeout_secs: u64,
 }
 
 /// Writable OverlayBD upper format, converted to the storage type at the boundary.

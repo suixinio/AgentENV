@@ -13,7 +13,7 @@ use std::time::Duration;
 use storage_util::io_ring::{AsyncIoRing, AsyncIoRingBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::OwnedWriteHalf;
-use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::netlink::{ConnectSpec, NbdNetlink, ReconfigureSpec};
@@ -32,6 +32,17 @@ use crate::{device_size_bytes, wait_for_nbd_dev};
 // slots dead, and the device answers EIO from then on.
 const REATTACH_SETTLE: Duration = Duration::from_millis(500);
 
+// What a replacement connection waits before each attempt. Five attempts over
+// roughly ten seconds, settle included, so a replacement lands well inside the
+// default dead-connection window.
+const REPLACEMENT_BACKOFF: [Duration; 5] = [
+    Duration::from_millis(0),
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(3),
+    Duration::from_secs(3),
+];
+
 // The kernel's max_hw_sectors for nbd is 65536 sectors. A longer length in a
 // request header means the stream desynchronized, not a large transfer.
 const MAX_REQUEST_LEN: u32 = 32 * 1024 * 1024;
@@ -45,7 +56,13 @@ thread_local! {
 #[derive(Debug, Clone)]
 pub struct NbdOptions {
     pub connections: u16,
+    /// How long the kernel waits for a request to be answered. After it the
+    /// request fails EIO and the kernel takes that connection down, which the
+    /// supervisor then replaces.
     pub io_timeout: Duration,
+    /// How long a request with no live connection waits for a replacement
+    /// before failing EIO. `None` fails it at once and shuts the device down,
+    /// which leaves the supervisor nothing to save.
     pub dead_conn_timeout: Option<Duration>,
     pub queue_depth: usize,
     pub backend_identifier: Option<String>,
@@ -61,7 +78,7 @@ impl Default for NbdOptions {
         Self {
             connections: 4,
             io_timeout: Duration::from_secs(90),
-            dead_conn_timeout: None,
+            dead_conn_timeout: Some(Duration::from_secs(30)),
             queue_depth: 64,
             backend_identifier: None,
             destroy_on_disconnect: false,
@@ -69,16 +86,75 @@ impl Default for NbdOptions {
     }
 }
 
+/// Why a connection worker stopped serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionExit {
+    /// The device asked for it, so nothing is wrong.
+    ShutdownRequested,
+    /// The kernel sent NBD_CMD_DISC: the whole device is going away.
+    Disconnected,
+    /// The socket died under the worker. The kernel closes it after an io
+    /// timeout, so this is the shape a stalled request leaves behind.
+    Lost,
+}
+
 struct ConnectionHandle {
     thread: thread::JoinHandle<()>,
-    finished: oneshot::Receiver<()>,
     shutdown: Option<oneshot::Sender<()>>,
 }
 
-/// The userspace side of one device's connections, ready to serve.
-struct Connections {
-    kernel_ends: Vec<OwnedFd>,
-    handles: Vec<ConnectionHandle>,
+impl ConnectionHandle {
+    /// Signals the worker and waits for its thread, which has already exited
+    /// when the caller got here through its exit report.
+    fn join(mut self) {
+        self.shutdown.take();
+        if self.thread.join().is_err() {
+            tracing::error!("an nbd connection worker thread panicked");
+        }
+    }
+}
+
+/// One connection's userspace end, before the kernel has been given the other.
+struct SpawnedConnection {
+    kernel_end: OwnedFd,
+    handle: ConnectionHandle,
+}
+
+/// A worker's exit, tagged so a report from a connection the supervisor has
+/// already replaced cannot be mistaken for its successor dying.
+type ExitReport = (u16, u64, ConnectionExit);
+
+/// Builds one replacement connection over the device's own target, which the
+/// supervisor cannot name because [`NbdDevice`] is not generic over it.
+type ConnectionFactory = Arc<
+    dyn Fn(
+            u16,
+            u64,
+            mpsc::UnboundedSender<ExitReport>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<SpawnedConnection>> + Send>>
+        + Send
+        + Sync,
+>;
+
+fn connection_factory<T: NbdTarget>(target: Arc<T>, queue_depth: usize) -> ConnectionFactory {
+    Arc::new(move |ordinal, generation, exits| {
+        let target = Arc::clone(&target);
+        Box::pin(
+            async move { spawn_connection(target, ordinal, generation, queue_depth, exits).await },
+        )
+    })
+}
+
+struct SupervisorHandle {
+    /// Dropping it is the stand-down signal.
+    _stand_down: watch::Sender<bool>,
+    commands: mpsc::UnboundedSender<SupervisorCommand>,
+    finished: oneshot::Receiver<()>,
+}
+
+enum SupervisorCommand {
+    DropConnection(u16),
 }
 
 /// A live `/dev/nbdN` served by this process.
@@ -87,7 +163,7 @@ pub struct NbdDevice {
     index: u32,
     device_path: PathBuf,
     backend_identifier: Option<String>,
-    connections: Vec<ConnectionHandle>,
+    supervisor: Option<SupervisorHandle>,
     stopped: bool,
 }
 
@@ -100,10 +176,9 @@ impl NbdDevice {
         let connections = opts.connections.max(1);
 
         let netlink = NbdNetlink::open()?;
-        let Connections {
-            kernel_ends,
-            handles,
-        } = spawn_connections(&target, &opts).await?;
+        let factory = connection_factory(target, opts.queue_depth.max(1));
+        let (exits_tx, exits_rx) = mpsc::unbounded_channel();
+        let (kernel_ends, handles) = spawn_all(&factory, connections, &exits_tx).await?;
 
         let spec = ConnectSpec {
             index: None,
@@ -124,7 +199,7 @@ impl NbdDevice {
             Ok(index) => index,
             Err(err) => {
                 drop(kernel_ends);
-                join_connections(handles).await;
+                join_all(handles);
                 return Err(err);
             }
         };
@@ -135,8 +210,10 @@ impl NbdDevice {
             netlink,
             index,
             device_path: PathBuf::from(format!("/dev/nbd{index}")),
-            backend_identifier: opts.backend_identifier,
-            connections: handles,
+            backend_identifier: opts.backend_identifier.clone(),
+            supervisor: Some(spawn_supervisor(
+                index, factory, handles, exits_tx, exits_rx, &opts,
+            )?),
             stopped: false,
         };
         if let Err(err) = wait_for_nbd_dev(index, geometry.size_bytes) {
@@ -169,10 +246,10 @@ impl NbdDevice {
         validate_geometry(&geometry)?;
         tokio::time::sleep(REATTACH_SETTLE).await;
         let netlink = NbdNetlink::open()?;
-        let Connections {
-            kernel_ends,
-            handles,
-        } = spawn_connections(&target, &opts).await?;
+        let connections = opts.connections.max(1);
+        let factory = connection_factory(target, opts.queue_depth.max(1));
+        let (exits_tx, exits_rx) = mpsc::unbounded_channel();
+        let (kernel_ends, handles) = spawn_all(&factory, connections, &exits_tx).await?;
 
         let spec = ReconfigureSpec {
             timeout: Some(opts.io_timeout),
@@ -183,7 +260,7 @@ impl NbdDevice {
         };
         if let Err(err) = netlink.reconfigure(index, &spec) {
             drop(kernel_ends);
-            join_connections(handles).await;
+            join_all(handles);
             return Err(err);
         }
         drop(kernel_ends);
@@ -191,15 +268,17 @@ impl NbdDevice {
         tracing::info!(
             index,
             target = T::DEV_NAME,
-            connections = opts.connections.max(1),
+            connections,
             "nbd device reattached"
         );
         Ok(Self {
             netlink,
             index,
             device_path: PathBuf::from(format!("/dev/nbd{index}")),
-            backend_identifier: opts.backend_identifier,
-            connections: handles,
+            backend_identifier: opts.backend_identifier.clone(),
+            supervisor: Some(spawn_supervisor(
+                index, factory, handles, exits_tx, exits_rx, &opts,
+            )?),
             stopped: false,
         })
     }
@@ -210,10 +289,33 @@ impl NbdDevice {
     pub async fn abandon(mut self) -> u32 {
         self.stopped = true;
         let index = self.index;
-        let connections = std::mem::take(&mut self.connections);
-        join_connections(connections).await;
+        self.stand_down().await;
         tracing::info!(index, "nbd device abandoned without a disconnect");
         index
+    }
+
+    /// Stops the supervisor and, with it, every connection worker. Nothing
+    /// replaces a connection from here on.
+    async fn stand_down(&mut self) {
+        let Some(supervisor) = self.supervisor.take() else {
+            return;
+        };
+        drop(supervisor._stand_down);
+        let _ = supervisor.finished.await;
+    }
+
+    /// Closes one connection and lets the supervisor rebuild it, the way a
+    /// worker that died is rebuilt. Returns once the supervisor has taken the
+    /// request, not once the replacement has landed.
+    pub fn drop_connection(&self, ordinal: u16) -> Result<()> {
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .context("this nbd device has no supervisor to rebuild a connection")?;
+        supervisor
+            .commands
+            .send(SupervisorCommand::DropConnection(ordinal))
+            .map_err(|_| anyhow::anyhow!("the nbd connection supervisor has stopped"))
     }
 
     pub fn index(&self) -> u32 {
@@ -249,6 +351,10 @@ impl NbdDevice {
     pub async fn stop(mut self) -> Result<()> {
         self.stopped = true;
         let index = self.index;
+        // The supervisor stands down first: a disconnect closes the sockets,
+        // and a supervisor still watching would read that as a connection to
+        // replace.
+        self.stand_down().await;
         if let Err(err) = self.netlink.disconnect(index) {
             match err.root_cause().downcast_ref::<std::io::Error>() {
                 Some(io_err)
@@ -256,15 +362,9 @@ impl NbdDevice {
                 {
                     tracing::info!(index, "nbd device was already gone at disconnect");
                 }
-                _ => {
-                    let connections = std::mem::take(&mut self.connections);
-                    join_connections(connections).await;
-                    return Err(err);
-                }
+                _ => return Err(err),
             }
         }
-        let connections = std::mem::take(&mut self.connections);
-        join_connections(connections).await;
         self.wait_for_teardown().await;
         tracing::info!(index, "nbd device disconnected");
         Ok(())
@@ -343,80 +443,306 @@ fn socket_pair() -> Result<(std::os::unix::net::UnixStream, OwnedFd)> {
     Ok((std::os::unix::net::UnixStream::from(ours), theirs))
 }
 
-/// Spawn one worker per connection and wait until each has initialized its
+/// Spawn every connection worker and wait until each has initialized its
 /// target; the returned kernel ends are what the netlink message hands over.
-async fn spawn_connections<T: NbdTarget>(
-    target: &Arc<T>,
-    opts: &NbdOptions,
-) -> Result<Connections> {
-    let connections = opts.connections.max(1);
-    let queue_depth = opts.queue_depth.max(1);
-    let mut kernel_ends: Vec<OwnedFd> = Vec::with_capacity(connections as usize);
-    let mut handles: Vec<ConnectionHandle> = Vec::with_capacity(connections as usize);
-    let mut ready = Vec::with_capacity(connections as usize);
-
-    for conn in 0..connections {
-        let (ours, theirs) = socket_pair().context("create the nbd connection socketpair")?;
-        let (ready_tx, ready_rx) = oneshot::channel();
-        let (finished_tx, finished_rx) = oneshot::channel();
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let spawned = thread::Builder::new()
-            .name(format!("nbd-c{conn}"))
-            .spawn({
-                let target = target.clone();
-                move || {
-                    connection_work(target, ours, conn, queue_depth, ready_tx, shutdown_rx);
-                    let _ = finished_tx.send(());
-                }
-            })
-            .context("spawn an nbd connection worker thread");
-        match spawned {
-            Ok(thread) => {
-                kernel_ends.push(theirs);
-                handles.push(ConnectionHandle {
-                    thread,
-                    finished: finished_rx,
-                    shutdown: Some(shutdown_tx),
-                });
-                ready.push(ready_rx);
+async fn spawn_all(
+    factory: &ConnectionFactory,
+    connections: u16,
+    exits: &mpsc::UnboundedSender<ExitReport>,
+) -> Result<(Vec<OwnedFd>, Vec<ConnectionHandle>)> {
+    let mut kernel_ends = Vec::with_capacity(connections as usize);
+    let mut handles = Vec::with_capacity(connections as usize);
+    for ordinal in 0..connections {
+        match factory(ordinal, 0, exits.clone()).await {
+            Ok(spawned) => {
+                kernel_ends.push(spawned.kernel_end);
+                handles.push(spawned.handle);
             }
             Err(err) => {
                 drop(kernel_ends);
-                join_connections(handles).await;
+                join_all(handles);
                 return Err(err);
             }
         }
     }
+    Ok((kernel_ends, handles))
+}
 
-    for (conn, rx) in ready.into_iter().enumerate() {
-        let outcome = rx
-            .await
-            .with_context(|| format!("nbd connection {conn} worker exited before it was ready"))
-            .and_then(|result| result);
-        if let Err(err) = outcome {
-            drop(kernel_ends);
-            join_connections(handles).await;
-            return Err(err);
+fn join_all(handles: Vec<ConnectionHandle>) {
+    // Every worker is signalled before any is waited on, so they wind down in
+    // parallel rather than one timeout at a time.
+    let mut handles = handles;
+    for handle in &mut handles {
+        handle.shutdown.take();
+    }
+    for handle in handles {
+        handle.join();
+    }
+}
+
+/// Bring up one connection: a socketpair, a worker thread over the target, and
+/// the wait until that worker has initialized it.
+async fn spawn_connection<T: NbdTarget>(
+    target: Arc<T>,
+    ordinal: u16,
+    generation: u64,
+    queue_depth: usize,
+    exits: mpsc::UnboundedSender<ExitReport>,
+) -> Result<SpawnedConnection> {
+    let (ours, theirs) = socket_pair().context("create the nbd connection socketpair")?;
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let thread = thread::Builder::new()
+        .name(format!("nbd-c{ordinal}"))
+        .spawn(move || {
+            let exit = connection_work(target, ours, ordinal, queue_depth, ready_tx, shutdown_rx);
+            let _ = exits.send((ordinal, generation, exit));
+        })
+        .context("spawn an nbd connection worker thread")?;
+    let handle = ConnectionHandle {
+        thread,
+        shutdown: Some(shutdown_tx),
+    };
+
+    match ready_rx.await {
+        Ok(Ok(())) => Ok(SpawnedConnection {
+            kernel_end: theirs,
+            handle,
+        }),
+        Ok(Err(err)) => {
+            handle.join();
+            Err(err)
+        }
+        Err(_) => {
+            handle.join();
+            bail!("nbd connection {ordinal} worker exited before it was ready")
         }
     }
+}
 
-    Ok(Connections {
-        kernel_ends,
-        handles,
+/// Replaces a connection the kernel took down, so a single timed-out request
+/// does not leave the device answering EIO for good.
+///
+/// What a guest sees: a request the kernel gave up on fails with EIO, a
+/// request submitted while the connection is being replaced waits (bounded by
+/// `dead_conn_timeout`), a request the kernel can still retry is held until the
+/// target answers, and everything issued after the replacement is served.
+struct Supervisor {
+    index: u32,
+    factory: ConnectionFactory,
+    slots: Vec<Slot>,
+    exits_tx: mpsc::UnboundedSender<ExitReport>,
+    exits: mpsc::UnboundedReceiver<ExitReport>,
+    commands: mpsc::UnboundedReceiver<SupervisorCommand>,
+    netlink: NbdNetlink,
+    backend_identifier: Option<String>,
+    io_timeout: Duration,
+    dead_conn_timeout: Option<Duration>,
+}
+
+struct Slot {
+    generation: u64,
+    handle: Option<ConnectionHandle>,
+}
+
+fn spawn_supervisor(
+    index: u32,
+    factory: ConnectionFactory,
+    handles: Vec<ConnectionHandle>,
+    exits_tx: mpsc::UnboundedSender<ExitReport>,
+    exits: mpsc::UnboundedReceiver<ExitReport>,
+    opts: &NbdOptions,
+) -> Result<SupervisorHandle> {
+    let (commands_tx, commands_rx) = mpsc::unbounded_channel();
+    let supervisor = Supervisor {
+        index,
+        factory,
+        slots: handles
+            .into_iter()
+            .map(|handle| Slot {
+                generation: 0,
+                handle: Some(handle),
+            })
+            .collect(),
+        exits_tx,
+        exits,
+        commands: commands_rx,
+        netlink: NbdNetlink::open().context("open the supervisor's netlink socket")?,
+        backend_identifier: opts.backend_identifier.clone(),
+        io_timeout: opts.io_timeout,
+        dead_conn_timeout: opts.dead_conn_timeout,
+    };
+    let (stand_down_tx, stand_down_rx) = watch::channel(false);
+    let (finished_tx, finished_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        supervisor.run(stand_down_rx).await;
+        let _ = finished_tx.send(());
+    });
+    Ok(SupervisorHandle {
+        _stand_down: stand_down_tx,
+        commands: commands_tx,
+        finished: finished_rx,
     })
 }
 
-async fn join_connections(mut connections: Vec<ConnectionHandle>) {
-    // Closing the channel is the signal, and every worker gets it before any
-    // is waited on so they wind down in parallel.
-    for connection in &mut connections {
-        connection.shutdown.take();
-    }
-    for connection in connections {
-        let _ = connection.finished.await;
-        if connection.thread.join().is_err() {
-            tracing::error!("an nbd connection worker thread panicked");
+impl Supervisor {
+    async fn run(mut self, mut stand_down: watch::Receiver<bool>) {
+        loop {
+            tokio::select! {
+                _ = stand_down.changed() => break,
+                command = self.commands.recv() => {
+                    let Some(SupervisorCommand::DropConnection(ordinal)) = command else {
+                        break;
+                    };
+                    self.drop_connection(ordinal, &mut stand_down).await;
+                }
+                report = self.exits.recv() => {
+                    let Some((ordinal, generation, exit)) = report else {
+                        break;
+                    };
+                    if self.observe(ordinal, generation, exit, &mut stand_down).await {
+                        break;
+                    }
+                }
+            }
         }
+        let handles = self
+            .slots
+            .iter_mut()
+            .filter_map(|slot| slot.handle.take())
+            .collect();
+        join_all(handles);
+    }
+
+    /// Returns whether the supervisor should stop watching.
+    async fn observe(
+        &mut self,
+        ordinal: u16,
+        generation: u64,
+        exit: ConnectionExit,
+        stand_down: &mut watch::Receiver<bool>,
+    ) -> bool {
+        let index = self.index;
+        let Some(slot) = self.slots.get_mut(ordinal as usize) else {
+            return false;
+        };
+        if slot.generation != generation {
+            // A connection this supervisor already gave up on; its successor is
+            // the one in the slot.
+            return false;
+        }
+        if let Some(handle) = slot.handle.take() {
+            handle.join();
+        }
+        match exit {
+            ConnectionExit::ShutdownRequested => false,
+            ConnectionExit::Disconnected => {
+                tracing::info!(index, ordinal, "nbd connection closed by the kernel");
+                true
+            }
+            ConnectionExit::Lost => {
+                tracing::warn!(
+                    index,
+                    ordinal,
+                    "nbd connection died; replacing it so the device keeps serving"
+                );
+                self.replace(ordinal, stand_down).await;
+                false
+            }
+        }
+    }
+
+    /// Closes one connection and rebuilds it, the way a worker that died is
+    /// rebuilt. The old worker's own exit carries the superseded generation, so
+    /// it is ignored when it arrives.
+    async fn drop_connection(&mut self, ordinal: u16, stand_down: &mut watch::Receiver<bool>) {
+        let Some(slot) = self.slots.get_mut(ordinal as usize) else {
+            return;
+        };
+        if let Some(handle) = slot.handle.take() {
+            handle.join();
+        }
+        tracing::warn!(
+            index = self.index,
+            ordinal,
+            "nbd connection dropped on request; replacing it"
+        );
+        self.replace(ordinal, stand_down).await;
+    }
+
+    async fn replace(&mut self, ordinal: u16, stand_down: &mut watch::Receiver<bool>) {
+        let index = self.index;
+        let generation = self.slots[ordinal as usize].generation + 1;
+        self.slots[ordinal as usize].generation = generation;
+
+        for (attempt, backoff) in REPLACEMENT_BACKOFF.iter().enumerate() {
+            if sleep_or_stand_down(*backoff, stand_down).await {
+                return;
+            }
+            let spawned = match (self.factory)(ordinal, generation, self.exits_tx.clone()).await {
+                Ok(spawned) => spawned,
+                Err(err) => {
+                    tracing::warn!(
+                        index,
+                        ordinal,
+                        attempt,
+                        err = format_args!("{err:#}"),
+                        "could not build a replacement nbd connection"
+                    );
+                    continue;
+                }
+            };
+            // The kernel takes a socket only into a slot it has already marked
+            // dead, and drops the surplus without saying so.
+            if sleep_or_stand_down(REATTACH_SETTLE, stand_down).await {
+                join_all(vec![spawned.handle]);
+                return;
+            }
+            let spec = ReconfigureSpec {
+                timeout: Some(self.io_timeout),
+                dead_conn_timeout: self.dead_conn_timeout,
+                sockets: vec![spawned.kernel_end.as_raw_fd()],
+                backend_identifier: self.backend_identifier.clone(),
+                ..Default::default()
+            };
+            match self.netlink.reconfigure(index, &spec) {
+                Ok(()) => {
+                    drop(spawned.kernel_end);
+                    self.slots[ordinal as usize].handle = Some(spawned.handle);
+                    tracing::info!(index, ordinal, attempt, "nbd connection replaced");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        index,
+                        ordinal,
+                        attempt,
+                        err = format_args!("{err:#}"),
+                        "the kernel refused a replacement nbd connection"
+                    );
+                    drop(spawned.kernel_end);
+                    join_all(vec![spawned.handle]);
+                }
+            }
+        }
+        tracing::error!(
+            index,
+            ordinal,
+            attempts = REPLACEMENT_BACKOFF.len(),
+            "gave up replacing an nbd connection; the device answers EIO on this slot until \
+             it is reattached"
+        );
+    }
+}
+
+/// Returns whether the wait ended because the supervisor was told to stop.
+async fn sleep_or_stand_down(wait: Duration, stand_down: &mut watch::Receiver<bool>) -> bool {
+    if wait.is_zero() {
+        return false;
+    }
+    tokio::select! {
+        _ = stand_down.changed() => true,
+        _ = tokio::time::sleep(wait) => false,
     }
 }
 
@@ -427,7 +753,7 @@ fn connection_work<T: NbdTarget>(
     queue_depth: usize,
     ready: oneshot::Sender<Result<()>>,
     shutdown: oneshot::Receiver<()>,
-) {
+) -> ConnectionExit {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .on_thread_park(move || {
@@ -447,7 +773,7 @@ fn connection_work<T: NbdTarget>(
         Ok(runtime) => runtime,
         Err(err) => {
             let _ = ready.send(Err(err));
-            return;
+            return ConnectionExit::ShutdownRequested;
         }
     };
 
@@ -491,12 +817,13 @@ fn connection_work<T: NbdTarget>(
             Ok(prepared) => prepared,
             Err(err) => {
                 let _ = ready.send(Err(err));
-                return;
+                // Never served, so there is no connection to replace.
+                return ConnectionExit::ShutdownRequested;
             }
         };
         let _ = ready.send(Ok(()));
-        serve(target, ring, sock, conn, queue_depth, shutdown).await;
-    });
+        serve(target, ring, sock, conn, queue_depth, shutdown).await
+    })
 }
 
 async fn serve<T: NbdTarget>(
@@ -506,14 +833,14 @@ async fn serve<T: NbdTarget>(
     conn: u16,
     queue_depth: usize,
     mut shutdown: oneshot::Receiver<()>,
-) {
+) -> ConnectionExit {
     let (mut reader, writer) = sock.into_split();
     let writer = Rc::new(Mutex::new(writer));
     let permits = Arc::new(Semaphore::new(queue_depth));
     let mut inflight = JoinSet::new();
     let mut header = [0u8; REQUEST_LEN];
 
-    loop {
+    let exit = loop {
         while inflight.try_join_next().is_some() {}
         // Cancelling a partially consumed header is safe: the loop only ever
         // leaves through a teardown.
@@ -521,27 +848,27 @@ async fn serve<T: NbdTarget>(
             read = reader.read_exact(&mut header) => read,
             _ = &mut shutdown => {
                 tracing::debug!(conn, "nbd connection worker asked to stop");
-                break;
+                break ConnectionExit::ShutdownRequested;
             }
         };
         match read {
             Ok(_) => {}
-            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break ConnectionExit::Lost,
             Err(err) => {
                 tracing::error!(conn, ?err, "nbd connection read failed");
-                break;
+                break ConnectionExit::Lost;
             }
         }
         let request = match NbdRequest::decode(&header) {
             Ok(request) => request,
             Err(err) => {
                 tracing::error!(conn, err = format_args!("{err:#}"), "nbd request refused");
-                break;
+                break ConnectionExit::Lost;
             }
         };
         if request.kind() == Some(NbdCommand::Disc) {
             tracing::debug!(conn, "nbd connection received a disconnect");
-            break;
+            break ConnectionExit::Disconnected;
         }
         if request.len > MAX_REQUEST_LEN {
             tracing::error!(
@@ -549,20 +876,20 @@ async fn serve<T: NbdTarget>(
                 len = request.len,
                 "nbd request length exceeds the kernel's maximum; closing the connection"
             );
-            break;
+            break ConnectionExit::Lost;
         }
         let payload = if request.kind() == Some(NbdCommand::Write) {
             let mut payload = vec![0u8; request.len as usize];
             if let Err(err) = reader.read_exact(&mut payload).await {
                 tracing::error!(conn, ?err, "nbd write payload read failed");
-                break;
+                break ConnectionExit::Lost;
             }
             payload
         } else {
             Vec::new()
         };
         let Ok(permit) = permits.clone().acquire_owned().await else {
-            break;
+            break ConnectionExit::Lost;
         };
         inflight.spawn_local(handle_request(
             target.clone(),
@@ -573,13 +900,14 @@ async fn serve<T: NbdTarget>(
             conn,
             permit,
         ));
-    }
+    };
 
     // The connection is going away, so a reply has nowhere to land: abort the
     // in-flight requests rather than wait for a target that may never answer.
     inflight.abort_all();
     while inflight.join_next().await.is_some() {}
-    tracing::debug!(conn, "nbd connection worker finished");
+    tracing::debug!(conn, ?exit, "nbd connection worker finished");
+    exit
 }
 
 async fn handle_request<T: NbdTarget>(
@@ -717,12 +1045,30 @@ mod tests {
     }
 
     #[test]
+    fn a_replacement_fits_inside_the_default_reconnect_window() {
+        let attempts: Duration = REPLACEMENT_BACKOFF.iter().sum::<Duration>()
+            + REATTACH_SETTLE * REPLACEMENT_BACKOFF.len() as u32;
+        let window = NbdOptions::default()
+            .dead_conn_timeout
+            .expect("a default reconnect window");
+        assert!(
+            attempts < window,
+            "every replacement attempt together takes {attempts:?}, which does not fit the \
+             {window:?} a request waits before it fails"
+        );
+    }
+
+    #[test]
     fn the_default_options_match_the_kernel_defaults_this_crate_assumes() {
         let options = NbdOptions::default();
         assert_eq!(options.connections, 4);
         assert_eq!(options.io_timeout, Duration::from_secs(90));
         assert_eq!(options.queue_depth, 64);
-        assert!(options.dead_conn_timeout.is_none());
+        assert_eq!(
+            options.dead_conn_timeout,
+            Some(Duration::from_secs(30)),
+            "without a reconnect window there is nothing for the supervisor to replace into"
+        );
         assert!(
             !options.destroy_on_disconnect,
             "destroying the gendisk drains the module's preallocated devices"

@@ -573,9 +573,15 @@ transport = "ublk"
 [ublk.nbd]
 # Sockets per device; each becomes a kernel hardware queue.
 connections = 4
-# Kernel request timeout in seconds; an unanswered request fails with EIO after
-# it. Keep it above the overlaybd download budget.
+# Kernel request timeout in seconds. After it the kernel takes that connection
+# down and retries the request on the one the daemon puts in its place; a
+# request the kernel gives up on fails with EIO. Keep this above the overlaybd
+# registry request timeout with room for its retries.
 io_timeout_secs = 90
+# How long a request with no live connection waits for that replacement before
+# it fails with EIO. 0 fails it at once, which leaves one stalled request enough
+# to turn the disk into permanent EIO.
+dead_conn_timeout_secs = 30
 
 [ublk.overlaybd]
 # Generated OverlayBD runtime config. The server rewrites it at every startup;

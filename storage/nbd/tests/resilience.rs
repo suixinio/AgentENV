@@ -8,10 +8,20 @@ use uvm_nbd::{MemTarget, NbdDevice, NbdOptions};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
+// Every test here runs on a multi-thread runtime, as the daemon and the node
+// do: the connection supervisor is a task on the caller's runtime, and a test
+// that blocks a current-thread runtime waiting on a reader would starve it.
+
+/// A reconnect window scaled to this suite's short io timeout: wide enough for
+/// a replacement to land, narrow enough that a test that must see a request
+/// give up does not wait out the production default.
+const RECONNECT_WINDOW: Duration = Duration::from_secs(9);
+
 fn timeout_options(connections: u16) -> NbdOptions {
     NbdOptions {
         connections,
         io_timeout: IO_TIMEOUT,
+        dead_conn_timeout: Some(RECONNECT_WINDOW),
         queue_depth: 8,
         ..options(connections)
     }
@@ -43,70 +53,143 @@ fn spawn_read(path: &std::path::Path, offset: u64, len: usize) -> mpsc::Receiver
     rx
 }
 
-#[tokio::test]
-async fn a_stalled_target_fails_the_reader_within_the_io_timeout() {
-    let name = "a_stalled_target_fails_the_reader_within_the_io_timeout";
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_target_that_stalls_past_the_io_timeout_once_keeps_serving_afterwards() {
+    let name = "a_target_that_stalls_past_the_io_timeout_once_keeps_serving_afterwards";
     if !nbd_available(name) {
         return;
     }
+    let payload = pattern(4096, 0x3C);
     let target = Arc::new(MemTarget::new(64 * MIB, BLOCK_SIZE));
-    target.fill(0, &pattern(64 * 1024, 0x3C));
+    target.fill(0, &payload);
+    let device = NbdDevice::start(target.clone(), timeout_options(2))
+        .await
+        .expect("start the nbd device");
+    let index = device.index();
+
+    // One stall longer than the io timeout, so the kernel takes a connection
+    // down, and then the target answers again.
+    target.stall(true);
+    std::thread::spawn({
+        let target = Arc::clone(&target);
+        move || {
+            std::thread::sleep(IO_TIMEOUT + IO_TIMEOUT / 5);
+            target.stall(false);
+        }
+    });
+    let outcome = spawn_read(device.device_path(), 0, 4096)
+        .recv_timeout(RECONNECT_WINDOW * 4)
+        .expect("the reader must not hang past the io timeout and the reconnect window");
+    eprintln!(
+        "nbd{index}: the read that met the stall ended as {:?} after {:?}",
+        outcome
+            .result
+            .as_ref()
+            .map(|_| "ok")
+            .map_err(|err| err.kind()),
+        outcome.elapsed
+    );
+
+    // Whether that one request survived its connection's death is the kernel's
+    // business. What must hold is that nothing reattaches by hand and the
+    // device serves again.
+    for round in 0..3 {
+        let after = spawn_read(device.device_path(), 0, 4096)
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a read after the stall must complete");
+        assert_eq!(
+            after.result.unwrap_or_else(|err| panic!(
+                "read {round} after the stall failed, so no replacement connection landed: {err:?}"
+            )),
+            payload
+        );
+    }
+
+    device.stop().await.expect("stop the nbd device");
+    assert_no_capacity(index);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_submitted_while_a_connection_is_replaced_waits_and_is_served() {
+    let name = "a_read_submitted_while_a_connection_is_replaced_waits_and_is_served";
+    if !nbd_available(name) {
+        return;
+    }
+    let payload = pattern(4096, 0x4F);
+    let target = Arc::new(MemTarget::new(64 * MIB, BLOCK_SIZE));
+    target.fill(8192, &payload);
+    // One connection, so dropping it leaves the device with none at all for
+    // the length of the settle. No timeout fired, so the kernel parks the read
+    // in its reconnect window instead of giving up on the device.
     let device = NbdDevice::start(target.clone(), timeout_options(1))
         .await
         .expect("start the nbd device");
     let index = device.index();
 
-    target.stall(true);
-    let outcome = spawn_read(device.device_path(), 0, 4096)
-        .recv_timeout(IO_TIMEOUT * 8)
-        .expect("the reader must not hang past the io timeout");
-    target.stall(false);
+    device.drop_connection(0).expect("drop connection 0");
+    std::thread::sleep(Duration::from_millis(50));
 
-    let errno = outcome
-        .result
-        .as_ref()
-        .err()
-        .and_then(|err| err.raw_os_error());
+    let waiting = spawn_read(device.device_path(), 8192, 4096)
+        .recv_timeout(Duration::from_secs(60))
+        .expect("a read issued during the replacement must not hang");
     eprintln!(
-        "nbd{index}: one connection, a stalled read failed with errno {errno:?} after {:?}",
-        outcome.elapsed
+        "nbd{index}: a read issued with no live connection returned after {:?}",
+        waiting.elapsed
     );
     assert_eq!(
-        errno,
-        Some(libc::EIO),
-        "a request the server never answers must reach the reader as EIO"
-    );
-    assert!(
-        outcome.elapsed >= IO_TIMEOUT && outcome.elapsed < IO_TIMEOUT * 4,
-        "the reader waited {:?}, which the {IO_TIMEOUT:?} io timeout does not explain",
-        outcome.elapsed
-    );
-
-    // The timeout does not merely fail one request: the kernel takes the
-    // connection down with it, and a device whose last connection is gone
-    // answers everything with EIO until it is reattached.
-    let after = spawn_read(device.device_path(), 0, 4096)
-        .recv_timeout(Duration::from_secs(30))
-        .expect("a read on a timed-out device must not hang either");
-    eprintln!(
-        "nbd{index}: after un-stalling, a fresh read still failed with {:?} after {:?}",
-        after
+        waiting
             .result
-            .as_ref()
-            .err()
-            .and_then(|err| err.raw_os_error()),
-        after.elapsed
+            .expect("a read issued during the replacement must be served, not failed"),
+        payload,
+        "the replacement served the wrong bytes"
     );
     assert!(
-        after.result.is_err(),
-        "un-stalling the target does not revive a device whose connection the timeout killed"
+        waiting.elapsed > Duration::from_millis(100),
+        "the read returned in {:?}, so it was served by a connection that never died",
+        waiting.elapsed
     );
 
     device.stop().await.expect("stop the nbd device");
     assert_no_capacity(index);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_one_connection_device_recovers_from_a_stall_like_any_other() {
+    let name = "a_one_connection_device_recovers_from_a_stall_like_any_other";
+    if !nbd_available(name) {
+        return;
+    }
+    let payload = pattern(4096, 0x27);
+    let target = Arc::new(MemTarget::new(16 * MIB, BLOCK_SIZE));
+    target.fill(0, &payload);
+    let device = NbdDevice::start(target.clone(), timeout_options(1))
+        .await
+        .expect("start the nbd device");
+    let index = device.index();
+
+    target.stall(true);
+    tokio::time::sleep(IO_TIMEOUT + IO_TIMEOUT / 5).await;
+    target.stall(false);
+
+    let after = spawn_read(device.device_path(), 0, 4096)
+        .recv_timeout(Duration::from_secs(60))
+        .expect("a read after the stall must complete");
+    eprintln!(
+        "nbd{index}: one connection, the read after the stall returned after {:?}",
+        after.elapsed
+    );
+    assert_eq!(
+        after
+            .result
+            .expect("one connection is enough: the supervisor replaces it like any other"),
+        payload
+    );
+
+    device.stop().await.expect("stop the nbd device");
+    assert_no_capacity(index);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_target_slower_than_a_request_but_inside_the_timeout_still_answers() {
     let name = "a_target_slower_than_a_request_but_inside_the_timeout_still_answers";
     if !nbd_available(name) {
@@ -145,54 +228,56 @@ async fn a_target_slower_than_a_request_but_inside_the_timeout_still_answers() {
     assert_no_capacity(index);
 }
 
-#[tokio::test]
-async fn a_stalled_target_costs_one_io_timeout_per_connection_before_it_fails() {
-    let name = "a_stalled_target_costs_one_io_timeout_per_connection_before_it_fails";
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stall_no_longer_ends_a_reader_in_eio_now_that_connections_are_replaced() {
+    let name = "a_stall_no_longer_ends_a_reader_in_eio_now_that_connections_are_replaced";
     if !nbd_available(name) {
         return;
     }
+    let payload = pattern(4096, 0x58);
     let target = Arc::new(MemTarget::new(64 * MIB, BLOCK_SIZE));
+    target.fill(0, &payload);
     let device = NbdDevice::start(target.clone(), timeout_options(2))
         .await
         .expect("start the nbd device");
     let index = device.index();
 
+    // Before supervision this read was answered EIO after one io timeout per
+    // connection. Now the kernel keeps finding a live connection to retry on,
+    // so it waits for the target instead of giving up on the device.
     target.stall(true);
-    let outcome = spawn_read(device.device_path(), 0, 4096)
-        .recv_timeout(IO_TIMEOUT * 12)
-        .expect("the reader must not hang past the io timeout");
+    let reader = spawn_read(device.device_path(), 0, 4096);
+    let still_waiting = reader.recv_timeout(IO_TIMEOUT * 3);
+    assert!(
+        still_waiting.is_err(),
+        "the reader gave up after {:?} of stall; the supervisor is meant to keep the device \
+         alive rather than let the request fail",
+        IO_TIMEOUT * 3
+    );
+
     target.stall(false);
-    let errno = outcome
-        .result
-        .as_ref()
-        .err()
-        .and_then(|err| err.raw_os_error());
+    let outcome = reader
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the reader must finish once the target answers again");
     eprintln!(
-        "nbd{index}: two connections, a stalled read failed with errno {errno:?} after {:?}",
+        "nbd{index}: a read held across a {:?} stall finished after {:?} in total",
+        IO_TIMEOUT * 3,
         outcome.elapsed
     );
-    assert_eq!(errno, Some(libc::EIO));
-    assert!(
-        outcome.elapsed >= IO_TIMEOUT,
-        "the reader gave up after {:?}, before even one io timeout could have fired",
-        outcome.elapsed
-    );
-    // Whether the kernel retries onto the second connection before giving up
-    // is not fixed -- observed between one and three timeouts -- but one
-    // timeout per connection plus a margin bounds it either way.
-    assert!(
-        outcome.elapsed < IO_TIMEOUT * 4,
-        "the reader waited {:?}, which one io timeout per connection does not explain",
-        outcome.elapsed
+    assert_eq!(
+        outcome
+            .result
+            .expect("a request retried across replacements must end in its bytes, not EIO"),
+        payload
     );
 
     device.stop().await.expect("stop the nbd device");
     assert_no_capacity(index);
 }
 
-#[tokio::test]
-async fn a_request_with_no_live_connection_fails_after_the_dead_connection_timeout() {
-    let name = "a_request_with_no_live_connection_fails_after_the_dead_connection_timeout";
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_on_an_abandoned_device_fails_after_the_dead_connection_timeout() {
+    let name = "a_request_on_an_abandoned_device_fails_after_the_dead_connection_timeout";
     if !nbd_available(name) {
         return;
     }
@@ -216,6 +301,9 @@ async fn a_request_with_no_live_connection_fails_after_the_dead_connection_timeo
         "an abandoned device must stay configured; that is what makes a reattach possible"
     );
 
+    // Abandoning stands the supervisor down with the server, so nothing
+    // rebuilds this connection. A device whose supervisor is still running
+    // replaces it instead, which the timeout tests above cover.
     let outcome = spawn_read(&path, 0, 4096)
         .recv_timeout(Duration::from_secs(60))
         .expect("a read with no live connection must not hang");
@@ -246,7 +334,58 @@ async fn a_request_with_no_live_connection_fails_after_the_dead_connection_timeo
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_that_dies_on_its_own_is_rebuilt_without_a_reattach() {
+    let name = "a_connection_that_dies_on_its_own_is_rebuilt_without_a_reattach";
+    if !nbd_available(name) {
+        return;
+    }
+    let payload = pattern(4096, 0x63);
+    let target = Arc::new(MemTarget::new(32 * MIB, BLOCK_SIZE));
+    target.fill(4096, &payload);
+    let device = NbdDevice::start(target.clone(), timeout_options(2))
+        .await
+        .expect("start the nbd device");
+    let index = device.index();
+    let path = device.device_path().to_path_buf();
+
+    // Both workers die the way a crashed thread would: their sockets close
+    // under the kernel with no disconnect and nobody outside asking.
+    device.drop_connection(0).expect("drop connection 0");
+    device.drop_connection(1).expect("drop connection 1");
+
+    let outcome = spawn_read(&path, 4096, 4096)
+        .recv_timeout(Duration::from_secs(60))
+        .expect("a read after the workers died must complete");
+    eprintln!(
+        "nbd{index}: a read across two rebuilt connections returned after {:?}",
+        outcome.elapsed
+    );
+    assert_eq!(
+        outcome
+            .result
+            .expect("the supervisor must rebuild a connection whose worker died"),
+        payload
+    );
+
+    let mut written = Aligned::filled(4096, 0x1D);
+    {
+        let file = direct(&path, true).expect("open the rebuilt device for write");
+        std::os::unix::fs::FileExt::write_all_at(&file, written.as_ref(), 8192)
+            .expect("write through the rebuilt connections");
+        file.sync_data().expect("fdatasync");
+    }
+    assert_eq!(
+        target.snapshot(8192, 4096),
+        written.as_mut(),
+        "writes after the rebuild must reach the same target"
+    );
+
+    device.stop().await.expect("stop the nbd device");
+    assert_no_capacity(index);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reattached_device_serves_reads_again_from_a_fresh_target() {
     let name = "a_reattached_device_serves_reads_again_from_a_fresh_target";
     if !nbd_available(name) {
@@ -314,7 +453,7 @@ async fn a_reattached_device_serves_reads_again_from_a_fresh_target() {
     assert_no_capacity(index);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_in_flight_when_the_server_crashes_is_re_sent_to_its_replacement() {
     let name = "a_read_in_flight_when_the_server_crashes_is_re_sent_to_its_replacement";
     if !nbd_available(name) {

@@ -115,6 +115,7 @@ pub struct UblkDaemonConfig {
     pub transport: uvm_ublk_daemon::Transport,
     pub nbd_connections: u16,
     pub nbd_io_timeout_secs: u64,
+    pub nbd_dead_conn_timeout_secs: u64,
 }
 
 impl UblkDaemonConfig {
@@ -157,6 +158,7 @@ impl UblkDaemonConfig {
             },
             nbd_connections: ublk.nbd.connections,
             nbd_io_timeout_secs: ublk.nbd.io_timeout_secs,
+            nbd_dead_conn_timeout_secs: ublk.nbd.dead_conn_timeout_secs,
         })
     }
 }
@@ -231,6 +233,7 @@ impl UblkDeviceManager {
                             transport: cfg.transport,
                             nbd_connections: cfg.nbd_connections,
                             nbd_io_timeout_secs: cfg.nbd_io_timeout_secs,
+                            nbd_dead_conn_timeout_secs: cfg.nbd_dead_conn_timeout_secs,
                         })
                         .await
                         {

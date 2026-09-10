@@ -1428,6 +1428,25 @@ mod live_device_tests {
         }
     }
 
+    /// The daemon's own formatter colours its fields, which would otherwise sit
+    /// between a field name and its value.
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(ch) = chars.next() {
+            if ch != '\u{1b}' {
+                out.push(ch);
+                continue;
+            }
+            for escaped in chars.by_ref() {
+                if escaped.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     fn device_sectors(device_path: &Path) -> u64 {
         let name = device_path.file_name().unwrap().to_str().unwrap();
         std::fs::read_to_string(format!("/sys/block/{name}/size"))
@@ -1556,6 +1575,53 @@ mod live_device_tests {
             .await
             .expect("release");
         daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_spawned_daemon_carries_the_dead_connection_timeout_from_its_cli() {
+        let name = "the_spawned_daemon_carries_the_dead_connection_timeout_from_its_cli";
+        if !transport_reachable(name) {
+            return;
+        }
+        let fixture = image_fixture(16 * 1024 * 1024).await;
+        let dir = tempfile::tempdir().unwrap();
+        let log_file = dir.path().join("daemon.log");
+        let socket_path = dir.path().join("daemon.sock");
+
+        let client = UblkDaemonClient::new(uvm_ublk_daemon::UblkDaemonSpawnConfig {
+            binary_path: Path::new(env!("CARGO_BIN_EXE_uvm-ublk-daemon")),
+            socket_path,
+            global_config: &fixture.global_config,
+            resize_global_config: &fixture.global_config,
+            app_config: None,
+            log_file: Some(&log_file),
+            metrics_listen_addr: "",
+            pool_config: None,
+            p2p_publish_url: None,
+            runtime_device_timeout: Duration::from_secs(120),
+            transport: selected_transport(),
+            nbd_connections: 2,
+            nbd_io_timeout_secs: 45,
+            nbd_dead_conn_timeout_secs: 17,
+        })
+        .await
+        .expect("spawn the daemon");
+
+        let (dev_id, device_path) = client
+            .create_overlaybd(&fixture.image_config, &fixture.global_config)
+            .await
+            .expect("create a device through the spawned daemon");
+        assert_eq!(device_sectors(&device_path) * 512, fixture.virtual_size);
+
+        let log = strip_ansi(&std::fs::read_to_string(&log_file).expect("read the daemon log"));
+        assert!(
+            log.contains("nbd_dead_conn_timeout_secs=17"),
+            "the daemon did not report the timeout its CLI was given; log was:\n{log}"
+        );
+        assert!(log.contains("nbd_io_timeout_secs=45"), "log was:\n{log}");
+
+        client.delete(dev_id).await.expect("delete");
+        client.shutdown().await.expect("shut the daemon down");
     }
 
     #[tokio::test]

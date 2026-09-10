@@ -126,6 +126,8 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub transport: crate::Transport,
     pub nbd_connections: u16,
     pub nbd_io_timeout_secs: u64,
+    /// `0` disables the wait for a replacement connection.
+    pub nbd_dead_conn_timeout_secs: u64,
 }
 
 struct UblkDaemonClientInner {
@@ -204,7 +206,9 @@ impl UblkDaemonClient {
             .arg("--nbd-connections")
             .arg(config.nbd_connections.to_string())
             .arg("--nbd-io-timeout-secs")
-            .arg(config.nbd_io_timeout_secs.to_string());
+            .arg(config.nbd_io_timeout_secs.to_string())
+            .arg("--nbd-dead-conn-timeout-secs")
+            .arg(config.nbd_dead_conn_timeout_secs.to_string());
         if let Some(url) = config.p2p_publish_url {
             cmd.arg("--p2p-publish-url").arg(url);
         }

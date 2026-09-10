@@ -5,6 +5,7 @@ use serde::Deserialize;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 use tracing_log::log::LevelFilter;
@@ -86,6 +87,11 @@ struct Cli {
     /// Kernel request timeout for nbd devices. Defaults to `[ublk.nbd].io_timeout_secs`.
     #[arg(long)]
     nbd_io_timeout_secs: Option<u64>,
+
+    /// How long an nbd request waits for a replacement connection; 0 disables.
+    /// Defaults to `[ublk.nbd].dead_conn_timeout_secs`.
+    #[arg(long)]
+    nbd_dead_conn_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -107,6 +113,7 @@ struct DaemonUblkTomlConfig {
 struct DaemonUblkNbdTomlConfig {
     connections: Option<u16>,
     io_timeout_secs: Option<u64>,
+    dead_conn_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +194,7 @@ const DEFAULT_DEPS_PATH: &str = "./env";
 const DEFAULT_RESIZE_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_NBD_CONNECTIONS: u16 = 4;
 const DEFAULT_NBD_IO_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_NBD_DEAD_CONN_TIMEOUT_SECS: u64 = 30;
 
 /// How the daemon exposes devices, and what nbd needs to bring one up.
 #[derive(Debug, PartialEq, Eq)]
@@ -194,6 +202,9 @@ struct TransportSettings {
     transport: Transport,
     nbd_connections: u16,
     nbd_io_timeout_secs: u64,
+    /// `None` when the operator set it to zero, which is what disables the
+    /// wait for a replacement connection.
+    nbd_dead_conn_timeout: Option<Duration>,
 }
 
 /// The CLI wins over the TOML file, which wins over the built-in default.
@@ -216,6 +227,14 @@ fn load_transport_settings(
             .nbd_io_timeout_secs
             .or_else(|| nbd.and_then(|nbd| nbd.io_timeout_secs))
             .unwrap_or(DEFAULT_NBD_IO_TIMEOUT_SECS),
+        nbd_dead_conn_timeout: match cli
+            .nbd_dead_conn_timeout_secs
+            .or_else(|| nbd.and_then(|nbd| nbd.dead_conn_timeout_secs))
+            .unwrap_or(DEFAULT_NBD_DEAD_CONN_TIMEOUT_SECS)
+        {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        },
     };
     anyhow::ensure!(
         settings.nbd_connections > 0,
@@ -367,6 +386,9 @@ fn main() -> Result<()> {
             transport = %transport_settings.transport,
             nbd_connections = transport_settings.nbd_connections,
             nbd_io_timeout_secs = transport_settings.nbd_io_timeout_secs,
+            nbd_dead_conn_timeout_secs = transport_settings
+                .nbd_dead_conn_timeout
+                .map_or(0, |timeout| timeout.as_secs()),
             "ublk daemon block transport selected"
         );
 
@@ -388,9 +410,8 @@ fn main() -> Result<()> {
                 }
                 TransportHandle::Nbd(uvm_nbd::NbdOptions {
                     connections: transport_settings.nbd_connections,
-                    io_timeout: std::time::Duration::from_secs(
-                        transport_settings.nbd_io_timeout_secs,
-                    ),
+                    io_timeout: Duration::from_secs(transport_settings.nbd_io_timeout_secs),
+                    dead_conn_timeout: transport_settings.nbd_dead_conn_timeout,
                     ..Default::default()
                 })
             }
@@ -530,6 +551,9 @@ mod tests {
                 transport: Transport::Ublk,
                 nbd_connections: DEFAULT_NBD_CONNECTIONS,
                 nbd_io_timeout_secs: DEFAULT_NBD_IO_TIMEOUT_SECS,
+                nbd_dead_conn_timeout: Some(Duration::from_secs(
+                    DEFAULT_NBD_DEAD_CONN_TIMEOUT_SECS
+                )),
             }
         );
     }
@@ -543,12 +567,45 @@ mod tests {
             [ublk.nbd]
             connections = 8
             io_timeout_secs = 30
+            dead_conn_timeout_secs = 12
             "#,
         );
         let settings = load_transport_settings(&cli(&[]), Some(&config)).unwrap();
         assert_eq!(settings.transport, Transport::Nbd);
         assert_eq!(settings.nbd_connections, 8);
         assert_eq!(settings.nbd_io_timeout_secs, 30);
+        assert_eq!(
+            settings.nbd_dead_conn_timeout,
+            Some(Duration::from_secs(12))
+        );
+    }
+
+    #[test]
+    fn the_cli_dead_connection_timeout_wins_over_the_config_file() {
+        let config = toml_config(
+            r#"
+            [ublk.nbd]
+            dead_conn_timeout_secs = 12
+            "#,
+        );
+        let settings =
+            load_transport_settings(&cli(&["--nbd-dead-conn-timeout-secs", "45"]), Some(&config))
+                .unwrap();
+        assert_eq!(
+            settings.nbd_dead_conn_timeout,
+            Some(Duration::from_secs(45))
+        );
+    }
+
+    #[test]
+    fn a_zero_dead_connection_timeout_disables_the_wait_rather_than_meaning_zero_seconds() {
+        let settings =
+            load_transport_settings(&cli(&["--nbd-dead-conn-timeout-secs", "0"]), None).unwrap();
+        assert_eq!(
+            settings.nbd_dead_conn_timeout, None,
+            "zero is what turns the wait off, and a zero-length wait would be the same thing \
+             spelled in a way the kernel refuses"
+        );
     }
 
     #[test]
@@ -591,6 +648,10 @@ mod tests {
         assert_eq!(settings.transport, Transport::Nbd);
         assert_eq!(settings.nbd_connections, DEFAULT_NBD_CONNECTIONS);
         assert_eq!(settings.nbd_io_timeout_secs, DEFAULT_NBD_IO_TIMEOUT_SECS);
+        assert_eq!(
+            settings.nbd_dead_conn_timeout,
+            Some(Duration::from_secs(DEFAULT_NBD_DEAD_CONN_TIMEOUT_SECS))
+        );
     }
 
     #[test]

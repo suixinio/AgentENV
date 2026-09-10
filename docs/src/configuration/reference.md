@@ -711,7 +711,8 @@ Settings that apply only when `[ublk].transport = "nbd"`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `connections` | integer | `4` | Sockets per device; each becomes a kernel hardware queue
-| `io_timeout_secs` | integer | `90` | Kernel request timeout; an unanswered request fails with `EIO` after it. Keep it above the overlaybd download budget
+| `io_timeout_secs` | integer | `90` | Kernel request timeout. After it the kernel takes that connection down and retries the request on the one the daemon puts in its place; a request the kernel gives up on fails with `EIO`. Keep it above the overlaybd registry request timeout (30 s per request) with room for its retries
+| `dead_conn_timeout_secs` | integer | `30` | How long a request with no live connection waits for that replacement before failing with `EIO`. `0` fails it at once, which leaves one stalled request enough to turn a sandbox's disk into permanent `EIO`
 
 ## `[ublk.overlaybd]`
 

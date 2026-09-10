@@ -27,6 +27,7 @@ members = [
     "thirdparty/envd",
     "storage/util",
     "storage/overlaybd",
+    "storage/nbd",
     "storage/ublk",
     "storage/ublk-daemon",
 ]

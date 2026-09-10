@@ -61,7 +61,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-ublk install-ublk build-egress \
 	fmt clippy check-crate-boundaries \
 	mutants coverage \
-	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
+	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk test-nbd \
 	test-e2e-compose test-e2e-k8s test-e2e-compose-split test-e2e-k8s-split test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store bench-placement-shadow \
 	ci-deps ci-deps-protoc \
@@ -195,7 +195,7 @@ HALF_OWNED_MODULES := aenv-node:orchestrator aenv-api:orchestrator
 # a substring is a way through, so any crate whose name happens to carry
 # `redis` or `postgres` would satisfy a control the real driver has stopped
 # satisfying.
-DEP_BYTE_HALF := ^(overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util) v[0-9]
+DEP_BYTE_HALF := ^(overlaybd|uvm-nbd|uvm-ublk|uvm-ublk-daemon|storage-util) v[0-9]
 # The two driver rules are spelled one alternative at a time so that each name
 # the api half really carries gets a control of its own: a control over the
 # whole alternation is satisfied by any single live name while every other name
@@ -214,7 +214,7 @@ DEP_REDIS := $(DEP_REDIS_NAMED)|$(DEP_REDIS_ABSENT)
 # adding it here would make the rule false rather than stricter.
 DEP_EMBEDDED_DB := ^(rocksdb|librocksdb-sys|sled|heed3?|libmdbx([_-][a-z0-9]+)?|persy|fjall) v[0-9]
 DEP_P2P_OR_GUEST := ^(iroh([_-][a-z0-9]+)?|envd) v[0-9]
-DEP_EGRESS_FORBIDDEN := ^(sqlx|deadpool-postgres|overlaybd|uvm-ublk|uvm-ublk-daemon|storage-util|aenv-core|rustls|tokio-rustls|hyper-rustls|rcgen) v[0-9]
+DEP_EGRESS_FORBIDDEN := ^(sqlx|deadpool-postgres|overlaybd|uvm-nbd|uvm-ublk|uvm-ublk-daemon|storage-util|aenv-core|rustls|tokio-rustls|hyper-rustls|rcgen) v[0-9]
 DEP_EGRESS_TLS_FEATURE := ^aenv-egress feature "tls"
 # `aenv-core`'s test seeds are gated on its `test-support` feature, which only
 # the halves' dev-dependencies may turn on. `{p} {f}` prints one line per
@@ -603,6 +603,15 @@ test-envd:
 test-ublk:
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p overlaybd -p uvm-ublk-daemon
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p overlaybd --test oss_backend_minio -- --ignored
+
+# The netlink side needs CAP_SYS_ADMIN, which the capability runner grants, and
+# /dev/nbd* must be group-accessible to the account it drops to, which
+# `scripts/tests/setup-nbd-access.sh` (or `--setup-host`) arranges.
+# `AENV_NBD_TEST_REQUIRED=1` turns either one missing into a failure instead of
+# a SKIPPED[nbd] line. One device at a time: the tests assert on the kernel's
+# view of the device they just created.
+test-nbd:
+	AENV_NBD_TEST_REQUIRED=1 $(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-nbd -- --test-threads=1
 
 bench:
 	$(MAKE) install-ublk PROFILE=release

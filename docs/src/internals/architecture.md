@@ -80,6 +80,7 @@ The same role as `storage/ublk` over the in-tree nbd driver: `NbdDevice::start` 
 2. One generic netlink `NBD_CMD_CONNECT` carrying every kernel-side socket, the size, the block size, the request timeout and the server flags; the kernel allocates the index and answers with it
 3. Each socket is a kernel hardware queue; the worker reads 28-byte requests, dispatches them bounded by a per-connection semaphore, and writes each reply under one lock
 4. `update_size` is `NBD_CMD_RECONFIGURE` with a new size; `stop` is `NBD_CMD_DISCONNECT` followed by a wait for the kernel to drop the connection
+5. A connection the kernel drops after `io_timeout` is rebuilt by the device itself and put back with `NBD_CMD_RECONFIGURE`, so the kernel retries the request there instead of failing the disk; `dead_conn_timeout` is the window it waits
 
 Writable devices advertise `SEND_FLUSH`, `SEND_FUA` and, when the image supports discard, `SEND_TRIM`; a flush reaches `ImageFile::sync`. Read-only devices are marked so in the kernel. Netlink needs `CAP_SYS_ADMIN`, which the DaemonSet and `scripts/run-with-capabilities.sh` grant. Requests cross the socket with one copy in each direction; there is no registered-buffer path.
 

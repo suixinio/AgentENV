@@ -65,7 +65,7 @@ made on benchmark numbers, not now.
 |---|---|---|
 | server flags | `SEND_FLUSH`, `SEND_FUA`, `SEND_TRIM` when the image supports discard | `READ_ONLY` |
 | flush | forwarded to `ImageFile::sync`, as `0f98414` intended | never sent |
-| timeout | must exceed the overlaybd download gate budget, or a slow first fetch turns into a guest `EIO` | same |
+| timeout | above the overlaybd registry request timeout with room for retries; after it the kernel drops the connection, the device rebuilds it and the kernel retries the request there | same |
 | connections | default 4 | default 4, revisit with benchmarks |
 
 Answering flush in the daemon keeps guest `fsync` durability. e2b's choice of
@@ -94,6 +94,35 @@ flag, not a code change.
    Switching is one DaemonSet patch (`AENV_UBLK_TRANSPORT=nbd` plus the image)
    after `modprobe nbd` on the hosts; every sandbox on the node dies with the
    node restart, as with any other node roll. The docs are updated.
+
+## What the kernel does, measured on 6.1
+
+The device suite established these and the code is shaped around them:
+
+- A request that outlives `io_timeout` takes its connection down. Without a
+  replacement the device answers `EIO` for good; with `dead_conn_timeout` set
+  the kernel holds requests that window long while a replacement lands, and
+  retries the timed-out request on it. `NbdDevice` therefore supervises its
+  connections: a dead one is rebuilt over the same target and put back with
+  `NBD_CMD_RECONFIGURE`, one slot at a time after a 500 ms settle, five
+  attempts over about 11 s. A read held across a 9 s stall finishes with its
+  bytes and no `EIO`.
+- `NBD_CMD_RECONFIGURE` reports success and drops the surplus when offered
+  more sockets than the kernel has marked dead, which is why the settle and
+  the one-at-a-time rule exist.
+- `dead_conn_timeout` is a reconnect window, not a teardown timer: an
+  abandoned device stays configured at its index, which is what lets a new
+  daemon reattach after a crash (`NbdDevice::reattach`); a request in flight
+  at the crash is re-sent to the replacement after one `io_timeout`.
+- `NBD_CFLAG_DESTROY_ON_DISCONNECT` removes the gendisk and its node for good,
+  so it is off by default; indices above `nbds_max` are allocated on demand
+  and their nodes persist.
+- The supervisor is a task on the caller's runtime; a current-thread runtime
+  that blocks on the device starves it. The daemon and the node run
+  multi-threaded runtimes.
+
+Thirty-two devices under 256 writers read back byte for byte; `O_DSYNC`,
+`fdatasync` and `BLKDISCARD` reach the target as FUA, flush and discard.
 
 ## Measured on the build machine (2026-09-10)
 
@@ -134,8 +163,11 @@ harness.
 - Under ublk, the `UpdateSize` RPC grows the kernel device without moving the
   target's own bound, so a read past the old end answers `EINVAL`. The nbd
   path sets the bound first. No production caller sends `UpdateSize` today.
-- `queue_depth`, `dead_conn_timeout` and `destroy_on_disconnect` are
-  `NbdOptions` fields without configuration keys.
+- `queue_depth` and `destroy_on_disconnect` are `NbdOptions` fields without
+  configuration keys.
+- A daemon crash still needs an operator: the device survives at its index
+  and `NbdDevice::reattach` is there, but nothing calls it yet. A restarted
+  daemon adopting the devices its predecessor left is the next step.
 
 ## Not in scope
 

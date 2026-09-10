@@ -71,7 +71,63 @@ pub enum DaemonRequest {
         dev_id: u32,
         new_sectors: u64,
     },
+    /// Serve a memory snapshot image over userfaultfd: the daemon binds
+    /// `socket_path`, waits there for Firecracker's handshake after a
+    /// snapshot load with the `Uffd` memory backend, and fills the guest's
+    /// page faults from the image. No block device is involved.
+    ServeMemoryUffd {
+        image_config: PathBuf,
+        global_config: PathBuf,
+        socket_path: PathBuf,
+        #[serde(default = "default_uffd_max_inflight")]
+        max_inflight: usize,
+        #[serde(default = "default_uffd_read_retry_secs")]
+        read_retry_secs: u64,
+    },
+    /// Stop a userfaultfd server. Its descriptor closes; a guest still
+    /// running on it is no longer backed.
+    StopMemoryUffd {
+        serve_id: u32,
+    },
+    /// The state and counters of a userfaultfd server.
+    QueryMemoryUffd {
+        serve_id: u32,
+    },
     Shutdown,
+}
+
+const fn default_uffd_max_inflight() -> usize {
+    64
+}
+
+const fn default_uffd_read_retry_secs() -> u64 {
+    60
+}
+
+/// Where a userfaultfd server is in its life.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum MemoryUffdState {
+    /// Bound, waiting for the handshake.
+    Starting,
+    /// Faults are being served.
+    Serving,
+    /// The server thread is gone; `error` is what ended it, if anything.
+    Exited { error: Option<String> },
+}
+
+/// Counters of a userfaultfd server, mirroring `uvm_uffd::StatsSnapshot`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUffdStats {
+    pub faults: u64,
+    pub pages_copied: u64,
+    pub pages_zeroed: u64,
+    pub already_present: u64,
+    pub duplicates: u64,
+    pub bytes_read: u64,
+    pub read_retries: u64,
+    pub copy_retries: u64,
+    pub removes: u64,
 }
 
 fn default_runtime_upper_mode() -> UpperMode {
@@ -123,6 +179,13 @@ pub enum DaemonResponse {
         flags: u64,
     },
     Deleted,
+    MemoryUffdServing {
+        serve_id: u32,
+    },
+    MemoryUffdStatus {
+        state: MemoryUffdState,
+        stats: MemoryUffdStats,
+    },
     RestackSnapshotCreated {
         descriptor: Option<LayerDescriptor>,
         /// Best-effort device usage stats captured after the restack. Absent
@@ -537,6 +600,60 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, DaemonRequest::Shutdown));
+    }
+
+    #[test]
+    fn request_serve_memory_uffd_defaults_for_old_requests() {
+        let json = r#"{
+            "kind":"serve_memory_uffd",
+            "image_config":"/snap/mem_image.json",
+            "global_config":"/global.json",
+            "socket_path":"/run/sbx/uffd.sock"
+        }"#;
+        let decoded: DaemonRequest = serde_json::from_str(json).unwrap();
+        match decoded {
+            DaemonRequest::ServeMemoryUffd {
+                max_inflight,
+                read_retry_secs,
+                socket_path,
+                ..
+            } => {
+                assert_eq!(max_inflight, 64);
+                assert_eq!(read_retry_secs, 60);
+                assert_eq!(socket_path, PathBuf::from("/run/sbx/uffd.sock"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_memory_uffd_status_round_trip() {
+        let resp = DaemonResponse::MemoryUffdStatus {
+            state: MemoryUffdState::Exited {
+                error: Some("read failed".into()),
+            },
+            stats: MemoryUffdStats {
+                faults: 3,
+                pages_copied: 2,
+                pages_zeroed: 1,
+                ..MemoryUffdStats::default()
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonResponse::MemoryUffdStatus { state, stats } => {
+                assert_eq!(
+                    state,
+                    MemoryUffdState::Exited {
+                        error: Some("read failed".into())
+                    }
+                );
+                assert_eq!(stats.faults, 3);
+                assert_eq!(stats.pages_zeroed, 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[test]

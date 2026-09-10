@@ -9,7 +9,8 @@ pub use client::{
     RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 pub use protocol::{
-    AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec, RestackSnapshotStats,
+    AccessMode, DaemonRequest, DaemonResponse, MemoryUffdState, MemoryUffdStats, ResizeToolSpec,
+    RestackSnapshotStats,
 };
 pub use server::UblkDaemonServer;
 pub use transport::{nbd_transport_usable, Transport, TransportHandle};

@@ -594,6 +594,11 @@ async fn handle_connection(
             dev_id,
             new_sectors,
         } => handle_update_size(&pool_state, dev_id, new_sectors).await,
+        DaemonRequest::ServeMemoryUffd { .. }
+        | DaemonRequest::StopMemoryUffd { .. }
+        | DaemonRequest::QueryMemoryUffd { .. } => Ok(DaemonResponse::Error {
+            message: "memory uffd serving is not implemented".to_string(),
+        }),
         DaemonRequest::Shutdown => {
             shutdown.notify_one();
             Ok(DaemonResponse::Ok)

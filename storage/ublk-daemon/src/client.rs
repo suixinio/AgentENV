@@ -9,7 +9,8 @@ use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, MemoryUffdState,
+    MemoryUffdStats, RestackSnapshotStats,
 };
 use overlaybd::config::UpperMode;
 
@@ -568,6 +569,68 @@ impl UblkDaemonClient {
                 bail!("daemon: release overlaybd dev_id={dev_id} failed: {message}")
             }
             other => bail!("daemon: unexpected response for release overlaybd: {other:?}"),
+        }
+    }
+
+    /// Serve a memory snapshot image over userfaultfd at `socket_path`.
+    /// Returns the serve id `stop_memory_uffd` takes.
+    pub async fn serve_memory_uffd(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        socket_path: &Path,
+        max_inflight: usize,
+        read_retry_secs: u64,
+    ) -> Result<u32> {
+        let request = DaemonRequest::ServeMemoryUffd {
+            image_config: image_config.to_path_buf(),
+            global_config: global_config.to_path_buf(),
+            socket_path: socket_path.to_path_buf(),
+            max_inflight,
+            read_retry_secs,
+        };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::MemoryUffdServing { serve_id } => Ok(serve_id),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: serve memory uffd failed terminally: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: serve memory uffd failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for serve memory uffd: {other:?}"),
+        }
+    }
+
+    /// Stop a userfaultfd server.
+    pub async fn stop_memory_uffd(&self, serve_id: u32) -> Result<()> {
+        let request = DaemonRequest::StopMemoryUffd { serve_id };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: stop memory uffd serve_id={serve_id} failed terminally: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: stop memory uffd serve_id={serve_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for stop memory uffd: {other:?}"),
+        }
+    }
+
+    /// The state and counters of a userfaultfd server.
+    pub async fn query_memory_uffd(
+        &self,
+        serve_id: u32,
+    ) -> Result<(MemoryUffdState, MemoryUffdStats)> {
+        let request = DaemonRequest::QueryMemoryUffd { serve_id };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::MemoryUffdStatus { state, stats } => Ok((state, stats)),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: query memory uffd serve_id={serve_id} failed terminally: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: query memory uffd serve_id={serve_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for query memory uffd: {other:?}"),
         }
     }
 

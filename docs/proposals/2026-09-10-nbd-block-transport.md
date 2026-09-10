@@ -1,7 +1,10 @@
 # NBD as the block transport, with the layer format unchanged
 
-Status: in progress. Written 2026-09-10 as the answer to the third open item of
-`2026-09-09-ublk-transport-resilience.md`. It replaces the kernel-facing half
+Status: phases 1 to 3 merged on `feat/nbd-block-transport`; phase 4 accepted on
+pve-mf on 2026-09-10 (both nodes on `transport = "nbd"`, 17 e2e suites
+169 pass / 9 skip / 0 fail, zero daemon warnings), with the memory-device
+benchmark and the CI runner change still open. Written 2026-09-10 as the answer
+to the third open item of `2026-09-09-ublk-transport-resilience.md`. It replaces the kernel-facing half
 of the device path and nothing else: overlaybd's LSMT layers, the `image.json`
 contract, the daemon protocol, the warm pool and the node-side
 `UblkDeviceManager` API all stay as they are.
@@ -85,11 +88,28 @@ flag, not a code change.
    `CAP_SYS_ADMIN` for netlink, which the DaemonSet already grants and
    `scripts/run-with-capabilities.sh` must add for bare-metal installs.
    `docker-setup.sh` stops requiring `ublk_drv` in that mode.
-4. Cluster acceptance on pve-mf with writable drives on nbd and the memory
-   device on ublk, then the benchmark that decides the memory device, then the
-   docs (`architecture.md`, `configuration/reference.md`,
-   `sandbox-testing.md`) and the removal of the three `ADD_DEV` workarounds in
-   the workflows.
+4. Cluster acceptance on pve-mf. The transport is one daemon-wide switch, so
+   the memory device went to nbd together with the writable drives; the
+   e2e suites, including the snapshot and template ones, passed on it.
+   Switching is one DaemonSet patch (`AENV_UBLK_TRANSPORT=nbd` plus the image)
+   after `modprobe nbd` on the hosts; every sandbox on the node dies with the
+   node restart, as with any other node roll. The docs are updated.
+
+## Still open
+
+- The benchmark that compares the memory device under both transports.
+  `crates/benchmarks/benches/ublk_overlaybd_benchmark.rs` drives ublk
+  in-process and needs an nbd twin; until it exists the memory device stays
+  on whichever transport the daemon runs, and pve-mf runs nbd.
+- The three workflows that pin `ubuntu-22.04` because of the ublk `ADD_DEV`
+  crash. `nbd-tests.yml` already runs on 24.04; moving the integration suite
+  there means running it under `AENV_UBLK_TRANSPORT=nbd`, which changes what
+  that suite covers and has not been exercised on a runner.
+- Under ublk, the `UpdateSize` RPC grows the kernel device without moving the
+  target's own bound, so a read past the old end answers `EINVAL`. The nbd
+  path sets the bound first. No production caller sends `UpdateSize` today.
+- `queue_depth`, `dead_conn_timeout` and `destroy_on_disconnect` are
+  `NbdOptions` fields without configuration keys.
 
 ## Not in scope
 

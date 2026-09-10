@@ -696,11 +696,22 @@ Userspace block device configuration. Rootfs is served through an OverlayBD-back
 | `daemon_socket_path` | string | `"$AENV_RUNTIME/ublk-daemon.sock"` | Unix socket path used by the daemon |
 | `daemon_log_path` | string | `"$AENV_HOME/logs/ublk-daemon.log"` | File path for daemon logs; deployments are responsible for rotation and retention |
 | `daemon_metrics_listen_addr` | string | `"0.0.0.0:9103"` | HTTP listen address for daemon Prometheus metrics; empty string disables it |
+| `transport` | string | `"ublk"` | Kernel block transport devices are exposed through: `ublk` (ublk_drv, kernel 6.8+) or `nbd` (in-tree nbd module; the daemon needs `CAP_SYS_ADMIN`) |
 
 Environment variable override:
 
 - `AENV_UBLK_DAEMON_BINARY_PATH`
 - `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR`
+- `AENV_UBLK_TRANSPORT`
+
+## `[ublk.nbd]`
+
+Settings that apply only when `[ublk].transport = "nbd"`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `connections` | integer | `4` | Sockets per device; each becomes a kernel hardware queue
+| `io_timeout_secs` | integer | `90` | Kernel request timeout; an unanswered request fails with `EIO` after it. Keep it above the overlaybd download budget
 
 ## `[ublk.overlaybd]`
 

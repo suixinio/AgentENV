@@ -51,7 +51,7 @@ pub fn ensure_host(config: &AppConfig, runtime_user: &str, runtime_group: &str) 
             "runtime user added to the kvm group; restart its session before starting AENV manually"
         );
     }
-    ublk::provision(runtime_group)?;
+    ublk::provision(runtime_group, config.ublk.transport)?;
     overlaybd::install_system_default_config(&config.deps_path, runtime_gid)?;
     network_capacity::install_persistent_config().context("install /etc/sysctl.d/99-aenv.conf")?;
     fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").context("enable host IPv4 forwarding")?;
@@ -97,7 +97,7 @@ fn is_valid_runtime_account_name(name: &str) -> bool {
 ///
 /// Steps:
 /// 1. Verify the configured KVM/PVM host mode and `/dev/kvm` access
-/// 2. Ensure ublk kernel module is loaded and permissions are set
+/// 2. Ensure the block transport kernel module is loaded and permissions are set
 /// 3. Download dependencies (firecracker, kernel, tools drive, overlaybd) if missing
 pub async fn ensure_environment(
     config: &AppConfig,
@@ -121,9 +121,9 @@ pub async fn ensure_environment(
     info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
     kvm::check(config.virtualization_mode)?;
 
-    // 3. ublk setup
-    info!("checking ublk module and permissions");
-    ublk::check()?;
+    // 3. block transport setup
+    info!(transport = %config.ublk.transport, "checking block transport module and permissions");
+    ublk::check(config.ublk.transport)?;
 
     // 4. Download dependencies and generate overlaybd runtime configs.
     ensure_dependencies(config).await?;

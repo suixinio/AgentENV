@@ -565,6 +565,17 @@ p2p_enabled = true
 # daemon_log_path = "$AENV_HOME/logs/ublk-daemon.log"
 # Prometheus metrics listen address; an empty string disables the endpoint.
 daemon_metrics_listen_addr = "0.0.0.0:9103"
+# Kernel block transport devices are exposed through. "ublk" needs the ublk_drv
+# module and kernel 6.8+; "nbd" needs the in-tree nbd module and CAP_SYS_ADMIN
+# for the daemon. Override with AENV_UBLK_TRANSPORT.
+transport = "ublk"
+
+[ublk.nbd]
+# Sockets per device; each becomes a kernel hardware queue.
+connections = 4
+# Kernel request timeout in seconds; an unanswered request fails with EIO after
+# it. Keep it above the overlaybd download budget.
+io_timeout_secs = 90
 
 [ublk.overlaybd]
 # Generated OverlayBD runtime config. The server rewrites it at every startup;

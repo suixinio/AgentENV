@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Host setup for running AgentENV in Docker.
-# Loads the ublk_drv kernel module (installing linux-modules-extra if missing),
-# persists it across reboots, and tunes the host kernel parameters that
-# AgentENV skips writing when it detects a container environment.
+# Loads the block transport kernel module selected by AENV_UBLK_TRANSPORT
+# (ublk_drv by default, installing linux-modules-extra if missing; nbd when set
+# to "nbd"), persists it across reboots, and tunes the host kernel parameters
+# that AgentENV skips writing when it detects a container environment.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
@@ -17,23 +18,33 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. ublk_drv kernel module
+# 1. Block transport kernel module
 # ---------------------------------------------------------------------------
-echo "Loading ublk_drv kernel module ..."
-if ! modprobe ublk_drv 2>/dev/null; then
-    echo "  ublk_drv not found; installing linux-modules-extra-$(uname -r) ..."
-    if ! command -v apt-get &>/dev/null; then
-        echo "error: apt-get not found — install linux-modules-extra-$(uname -r) with your package manager" >&2
+if [[ "${AENV_UBLK_TRANSPORT:-ublk}" == "nbd" ]]; then
+    echo "Loading nbd kernel module ..."
+    if ! modprobe nbd; then
+        echo "error: failed to load nbd" >&2
         exit 1
     fi
-    apt-get install -y "linux-modules-extra-$(uname -r)"
-    if ! modprobe ublk_drv; then
-        echo "error: failed to load ublk_drv — try upgrading the kernel to 6.8+" >&2
-        exit 1
+    echo nbd | tee /etc/modules-load.d/aenv-nbd.conf > /dev/null
+    echo "  nbd loaded and persisted in /etc/modules-load.d/aenv-nbd.conf"
+else
+    echo "Loading ublk_drv kernel module ..."
+    if ! modprobe ublk_drv 2>/dev/null; then
+        echo "  ublk_drv not found; installing linux-modules-extra-$(uname -r) ..."
+        if ! command -v apt-get &>/dev/null; then
+            echo "error: apt-get not found — install linux-modules-extra-$(uname -r) with your package manager" >&2
+            exit 1
+        fi
+        apt-get install -y "linux-modules-extra-$(uname -r)"
+        if ! modprobe ublk_drv; then
+            echo "error: failed to load ublk_drv — try upgrading the kernel to 6.8+" >&2
+            exit 1
+        fi
     fi
+    echo ublk_drv | tee /etc/modules-load.d/aenv-ublk.conf > /dev/null
+    echo "  ublk_drv loaded and persisted in /etc/modules-load.d/aenv-ublk.conf"
 fi
-echo ublk_drv | tee /etc/modules-load.d/aenv-ublk.conf > /dev/null
-echo "  ublk_drv loaded and persisted in /etc/modules-load.d/aenv-ublk.conf"
 
 # ---------------------------------------------------------------------------
 # 2. Host kernel parameters

@@ -1,0 +1,54 @@
+name: NBD Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      log_level:
+        description: "Log level for the tests"
+        required: false
+  pull_request:
+    paths:
+      - "storage/nbd/**"
+      - "storage/overlaybd/**"
+      - "storage/util/**"
+      - "crates/linux-cap/**"
+      - "scripts/run-with-capabilities.sh"
+      - "scripts/tests/setup-nbd-access.sh"
+      - "Makefile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/actions/rust-ci-setup/**"
+      - ".github/workflows/nbd-tests.yml"
+  push:
+    paths:
+      - "storage/nbd/**"
+      - "storage/overlaybd/**"
+      - "storage/util/**"
+      - "crates/linux-cap/**"
+      - "scripts/run-with-capabilities.sh"
+      - "scripts/tests/setup-nbd-access.sh"
+      - "Makefile"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/actions/rust-ci-setup/**"
+      - ".github/workflows/nbd-tests.yml"
+
+env:
+  RUST_LOG: ${{ github.event.inputs.log_level || 'info' }}
+  AENV_NBD_TEST_REQUIRED: "1"
+
+jobs:
+  nbd-tests:
+    # The nbd module is in-tree on every runner kernel; no ADD_DEV crash to avoid.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/rust-ci-setup
+      - name: Configure nbd test host
+        run: sudo scripts/tests/setup-nbd-access.sh "$(id -un)" "$(id -gn)"
+      - name: nbd tests
+        run: make test-nbd PROFILE=debug
+      - uses: ./.github/actions/sandbox-artifacts-cleanup
+        if: always()

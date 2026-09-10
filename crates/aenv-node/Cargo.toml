@@ -71,6 +71,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
 url = "2.5"
 uuid = { version = "1", features = ["serde", "v7"] }
+linux-cap = { path = "../linux-cap" }
 uvm-ublk = { path = "../../storage/ublk" }
 uvm-ublk-daemon = { path = "../../storage/ublk-daemon" }
 warm-pool = { path = "../warm-pool" }

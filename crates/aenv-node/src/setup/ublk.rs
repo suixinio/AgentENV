@@ -2,39 +2,51 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use nix::unistd::{access, AccessFlags};
 use tracing::{info, warn};
 use uvm_ublk::{load_ublk_module, ublk_module_loaded};
 
+use crate::cfg::BlockTransport;
+
 const UDEV_RULES_DIR: &str = "/etc/udev/rules.d";
+const NBD_MODULE_PATH: &str = "/sys/module/nbd";
+const NBD_FIRST_DEVICE: &str = "/dev/nbd0";
 
 fn supports_persistent_udev_rules() -> bool {
     Path::new(UDEV_RULES_DIR).exists()
 }
 
-fn write_udev_rule(current_group: &str) -> Result<()> {
+fn write_udev_rule(path: &str, rule_content: String) -> Result<()> {
     if !supports_persistent_udev_rules() {
         warn!(
             rules_dir = UDEV_RULES_DIR,
-            "udev rules directory not present; skipping persistent ublk rule install"
+            path, "udev rules directory not present; skipping persistent rule install"
         );
         return Ok(());
     }
+    std::fs::write(path, rule_content).with_context(|| format!("install {path}"))?;
+    Ok(())
+}
 
-    let rule_content = format!(
+fn ublk_udev_rule(current_group: &str) -> String {
+    format!(
         "# Managed by agentenv server setup\n\
          KERNEL==\"ublk-control\", MODE=\"0660\", GROUP=\"{current_group}\"\n\
          KERNEL==\"ublkc*\", MODE=\"0660\", GROUP=\"{current_group}\"\n\
          KERNEL==\"ublkb*\", MODE=\"0660\", GROUP=\"{current_group}\"\n"
-    );
-
-    std::fs::write("/etc/udev/rules.d/99-agentenv-ublk.rules", rule_content)
-        .context("install /etc/udev/rules.d/99-agentenv-ublk.rules")?;
-    Ok(())
+    )
 }
 
-fn reload_udev() -> Result<()> {
+fn nbd_udev_rule(current_group: &str) -> String {
+    format!(
+        "# Managed by agentenv server setup\n\
+         KERNEL==\"nbd*\", MODE=\"0660\", GROUP=\"{current_group}\"\n"
+    )
+}
+
+fn reload_udev(triggers: &[&[&str]]) -> Result<()> {
     if which::which("udevadm").is_err() {
-        warn!("udevadm not found; ublk permissions will apply after udev reloads rules");
+        warn!("udevadm not found; device permissions will apply after udev reloads rules");
         return Ok(());
     }
     let status = Command::new("udevadm")
@@ -44,17 +56,10 @@ fn reload_udev() -> Result<()> {
     if !status.success() {
         bail!("udevadm control --reload-rules failed with {status}");
     }
-    Command::new("udevadm")
-        .args([
-            "trigger",
-            "--subsystem-match=misc",
-            "--sysname-match=ublk-control",
-        ])
-        .status()
-        .ok();
-    for pattern in ["ublkc*", "ublkb*"] {
+    for trigger in triggers {
         Command::new("udevadm")
-            .args(["trigger", &format!("--sysname-match={pattern}")])
+            .arg("trigger")
+            .args(*trigger)
             .status()
             .ok();
     }
@@ -62,14 +67,7 @@ fn reload_udev() -> Result<()> {
     Ok(())
 }
 
-fn ensure_permissions(current_group: &str) -> Result<()> {
-    info!(group = current_group, "installing ublk device access rules");
-    write_udev_rule(current_group)?;
-    reload_udev()?;
-    Ok(())
-}
-
-pub fn provision(group: &str) -> Result<()> {
+fn provision_ublk(group: &str) -> Result<()> {
     if !ublk_module_loaded() {
         install_apt_extra_kernel_modules();
     }
@@ -77,11 +75,59 @@ pub fn provision(group: &str) -> Result<()> {
     std::fs::create_dir_all("/etc/modules-load.d").context("create /etc/modules-load.d")?;
     std::fs::write("/etc/modules-load.d/aenv-ublk.conf", "ublk_drv\n")
         .context("install /etc/modules-load.d/aenv-ublk.conf")?;
-    ensure_permissions(group)?;
+    info!(group, "installing ublk device access rules");
+    write_udev_rule(
+        "/etc/udev/rules.d/99-agentenv-ublk.rules",
+        ublk_udev_rule(group),
+    )?;
+    reload_udev(&[
+        &["--subsystem-match=misc", "--sysname-match=ublk-control"],
+        &["--sysname-match=ublkc*"],
+        &["--sysname-match=ublkb*"],
+    ])
+}
+
+fn nbd_module_loaded() -> bool {
+    Path::new(NBD_MODULE_PATH).exists()
+}
+
+fn load_nbd_module() -> Result<()> {
+    if nbd_module_loaded() {
+        return Ok(());
+    }
+    info!("nbd kernel module not loaded; attempting automatic load");
+    let status = Command::new("modprobe")
+        .arg("nbd")
+        .status()
+        .context("run modprobe nbd")?;
+    if !status.success() || !nbd_module_loaded() {
+        bail!("modprobe nbd failed with {status}; the kernel has no nbd module");
+    }
     Ok(())
 }
 
-pub fn check() -> Result<()> {
+fn provision_nbd(group: &str) -> Result<()> {
+    load_nbd_module()?;
+    std::fs::create_dir_all("/etc/modules-load.d").context("create /etc/modules-load.d")?;
+    std::fs::write("/etc/modules-load.d/aenv-nbd.conf", "nbd\n")
+        .context("install /etc/modules-load.d/aenv-nbd.conf")?;
+    info!(group, "installing nbd device access rules");
+    write_udev_rule(
+        "/etc/udev/rules.d/99-agentenv-nbd.rules",
+        nbd_udev_rule(group),
+    )?;
+    reload_udev(&[&["--subsystem-match=block", "--sysname-match=nbd*"]])
+}
+
+/// One-time root provisioning for the configured block transport.
+pub fn provision(group: &str, transport: BlockTransport) -> Result<()> {
+    match transport {
+        BlockTransport::Ublk => provision_ublk(group),
+        BlockTransport::Nbd => provision_nbd(group),
+    }
+}
+
+fn check_ublk() -> Result<()> {
     if !ublk_module_loaded() {
         bail!("ublk_drv is not loaded; run `server --setup-host` as root");
     }
@@ -93,11 +139,36 @@ pub fn check() -> Result<()> {
     Ok(())
 }
 
+fn check_nbd() -> Result<()> {
+    if !nbd_module_loaded() {
+        bail!("the nbd kernel module is not loaded; run `server --setup-host` as root");
+    }
+    access(NBD_FIRST_DEVICE, AccessFlags::R_OK | AccessFlags::W_OK).with_context(|| {
+        format!("{NBD_FIRST_DEVICE} is not readable and writable by this user; run `server --setup-host` as root")
+    })?;
+    if !linux_cap::has_effective_capabilities(&[linux_cap::CAP_SYS_ADMIN])
+        .context("read the process capability sets")?
+    {
+        bail!(
+            "the nbd transport needs CAP_SYS_ADMIN for the kernel netlink interface; \
+             run as root or through scripts/run-with-capabilities.sh"
+        );
+    }
+    Ok(())
+}
+
+/// Startup validation that the configured block transport is usable without elevation.
+pub fn check(transport: BlockTransport) -> Result<()> {
+    match transport {
+        BlockTransport::Ublk => check_ublk(),
+        BlockTransport::Nbd => check_nbd(),
+    }
+}
+
 fn install_apt_extra_kernel_modules() {
     if which::which("apt-get").is_err() {
         return;
     }
-
     let uname = Command::new("uname")
         .args(["-r"])
         .output()
@@ -106,7 +177,6 @@ fn install_apt_extra_kernel_modules() {
     if uname.is_empty() {
         return;
     }
-
     let pkg = format!("linux-modules-extra-{uname}");
     if !Command::new("apt-get")
         .args(["install", "-y", pkg.as_str()])

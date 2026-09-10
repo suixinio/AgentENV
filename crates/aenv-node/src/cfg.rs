@@ -207,6 +207,14 @@ pub fn validate_node_half(config: &AppConfig) -> Result<()> {
     if config.ublk.overlaybd.resize_timeout_secs == 0 {
         bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
     }
+    if config.ublk.transport == BlockTransport::Nbd {
+        if config.ublk.nbd.connections == 0 {
+            bail!("invalid ublk.nbd config: connections must be > 0");
+        }
+        if config.ublk.nbd.io_timeout_secs == 0 {
+            bail!("invalid ublk.nbd config: io_timeout_secs must be > 0");
+        }
+    }
     validate_memory_snapshot_options(config)?;
     validate_memory_snapshot_background_download(config)?;
     validate_overlaybd_global_config_paths(config)?;

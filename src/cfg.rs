@@ -533,8 +533,43 @@ pub struct UblkTomlConfig {
     /// HTTP listen address for ublk daemon metrics. Empty string disables it.
     #[config(env = "AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR", parse_env = parse_trimmed_string, default = "0.0.0.0:9103")]
     pub daemon_metrics_listen_addr: String,
+    /// Kernel block transport the daemon exposes devices through: `ublk` or `nbd`.
+    #[config(default = "ublk", env = "AENV_UBLK_TRANSPORT")]
+    pub transport: BlockTransport,
+    #[config(nested)]
+    pub nbd: UblkNbdTomlConfig,
     #[config(nested)]
     pub overlaybd: UblkOverlaybdTomlConfig,
+}
+
+/// Kernel block transport a daemon device is exposed through.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum BlockTransport {
+    #[default]
+    Ublk,
+    Nbd,
+}
+
+impl std::fmt::Display for BlockTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Ublk => "ublk",
+            Self::Nbd => "nbd",
+        })
+    }
+}
+
+/// Settings that apply only when `[ublk].transport = "nbd"`.
+#[derive(Debug, Config, Clone)]
+pub struct UblkNbdTomlConfig {
+    /// Sockets per device; each is a kernel hardware queue. Default: `4`.
+    #[config(default = 4u16)]
+    pub connections: u16,
+    /// Kernel request timeout in seconds, after which an unanswered request fails with EIO.
+    /// Must exceed the overlaybd download budget. Default: `90`.
+    #[config(default = 90u64)]
+    pub io_timeout_secs: u64,
 }
 
 /// Writable OverlayBD upper format, converted to the storage type at the boundary.
@@ -1055,6 +1090,7 @@ impl_config_default!(
     SnapshotImagePublishConfig,
     UblkTomlConfig,
     UblkOverlaybdTomlConfig,
+    UblkNbdTomlConfig,
     MemorySnapshotConfig,
     MemorySnapshotBackgroundDownloadConfig,
     ObservabilityConfig,

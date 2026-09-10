@@ -28,6 +28,7 @@ members = [
     "storage/util",
     "storage/overlaybd",
     "storage/nbd",
+    "storage/uffd",
     "storage/ublk",
     "storage/ublk-daemon",
 ]

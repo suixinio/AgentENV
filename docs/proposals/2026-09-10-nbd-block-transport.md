@@ -95,6 +95,32 @@ flag, not a code change.
    after `modprobe nbd` on the hosts; every sandbox on the node dies with the
    node restart, as with any other node roll. The docs are updated.
 
+## Measured on the build machine (2026-09-10)
+
+fio through `uvm-nbd expose-mem` (an in-memory target, 4 connections, queue
+depth 64) against a loop device over tmpfs, both `direct=1`, `libaio`, 12 s per
+profile, on a 16-vCPU build host with kernel 6.1. The loop numbers are the
+in-kernel ceiling; the gap is the cost of the socket hop and the daemon.
+
+| profile | nbd | loop over tmpfs |
+|---|---|---|
+| randread 4k, qd32 x 4 jobs | 127k IOPS, 1.0 ms avg | 269k IOPS, 0.47 ms avg |
+| randwrite 4k, qd32 x 4 jobs | 41k IOPS, 3.1 ms avg | 240k IOPS, 0.53 ms avg |
+| read 1M, qd8 | 1.4 GiB/s | 3.8 GiB/s |
+| randread 4k, qd1 | 14k IOPS, 61 us avg | 41k IOPS, 18 us avg |
+
+Reads sit at about half the kernel ceiling; writes at a sixth, because every
+write payload crosses the socket and lands in a per-request buffer before the
+target sees it. Both are far above what an overlaybd image behind the target
+delivers from a registry or a local layer file, so the transport is not the
+bottleneck for a sandbox; the write path is the first thing to optimise if it
+ever becomes one (a buffer pool, then more connections).
+
+The Firecracker integration suites also ran on this machine under
+`AENV_UBLK_TRANSPORT=nbd`: the 14 cases that do not need a snapshot catalog
+passed, the 7 that do failed exactly as they do under ublk on a node-only
+harness.
+
 ## Still open
 
 - The benchmark that compares the memory device under both transports.

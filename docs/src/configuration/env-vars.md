@@ -75,6 +75,10 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_UBLK_DAEMON_BINARY_PATH` | `$AENV_HOME/ublk/uvm-ublk-daemon` | Override path to the `uvm-ublk-daemon` binary |
 | `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR` | `0.0.0.0:9103` | Override ublk daemon Prometheus metrics listen address; empty string disables it |
 | `AENV_UBLK_TRANSPORT` | `ublk` | Override `[ublk].transport`: `ublk` or `nbd` |
+| `AENV_MEMORY_SNAPSHOT_BACKEND` | `block` | Override `[memory_snapshot].backend`: `block` restores memory through a read-only device, `uffd` has the ublk daemon answer Firecracker's page faults over a Unix socket. `uffd` requires `[memory_snapshot].track_dirty_pages = true`, which is refused under PVM. |
+| `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES` | `false` | Override `[memory_snapshot].track_dirty_pages`, Firecracker's KVM dirty-page tracking. Refused in PVM mode. |
+| `AENV_MEMORY_SNAPSHOT_UFFD_MAX_INFLIGHT` | `64` | Override `[memory_snapshot.uffd].max_inflight`, the faults the daemon resolves concurrently for one VM. Must be greater than zero. Read only when `backend = "uffd"`. |
+| `AENV_MEMORY_SNAPSHOT_UFFD_READ_RETRY_SECS` | `60` | Override `[memory_snapshot.uffd].read_retry_secs`, how long one faulting read retries the memory image before the handler gives up and exits. Must be greater than zero. Read only when `backend = "uffd"`. |
 | `AENV_FORCE_SYSCTL_TUNING` | unset | Set to `1` to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers. |
 | `AENV_FIRECRACKER_WORK_DIR` | `$AENV_HOME/firecracker-work` | Override the parent directory for per-sandbox Firecracker work directories. |
 | `AENV_FIRECRACKER_SERIAL_DIR` | `$AENV_HOME/logs/serial` | Override the directory for persistent Firecracker serial output. Files are grouped under `{serial_dir}/{sandbox_id}/`. |

@@ -269,6 +269,27 @@ fn validate_disk_rate_limit(config: &AppConfig) -> Result<()> {
 
 fn validate_memory_snapshot_options(config: &AppConfig) -> Result<()> {
     let memory = &config.memory_snapshot;
+    if memory.backend == MemorySnapshotBackend::Uffd {
+        if memory.uffd.max_inflight == 0 {
+            bail!("invalid memory_snapshot.uffd config: max_inflight must be > 0");
+        }
+        if memory.uffd.read_retry_secs == 0 {
+            bail!("invalid memory_snapshot.uffd config: read_retry_secs must be > 0");
+        }
+        if !memory.track_dirty_pages {
+            if config.virtualization_mode == VirtualizationMode::Pvm {
+                bail!(
+                    "memory_snapshot.backend=\"uffd\" needs memory_snapshot.track_dirty_pages=true, \
+                     which is disabled in PVM mode, so this backend is KVM-only"
+                );
+            }
+            bail!(
+                "memory_snapshot.backend=\"uffd\" requires memory_snapshot.track_dirty_pages=true \
+                 because every page userfaultfd installs is an anonymous page, so the mincore-based \
+                 dirty range readout would copy the whole faulted working set into each pause layer"
+            );
+        }
+    }
     if !memory.track_dirty_pages {
         return Ok(());
     }
@@ -446,6 +467,77 @@ mod tests {
                 None => result.expect("supported memory snapshot options should be valid"),
             }
         }
+    }
+
+    fn uffd_config(virtualization_mode: VirtualizationMode, track_dirty_pages: bool) -> AppConfig {
+        AppConfig {
+            virtualization_mode,
+            memory_snapshot: MemorySnapshotConfig {
+                backend: MemorySnapshotBackend::Uffd,
+                track_dirty_pages,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_memory_snapshot_options_accepts_uffd_with_dirty_page_tracking() {
+        validate_memory_snapshot_options(&uffd_config(VirtualizationMode::Kvm, true))
+            .expect("uffd with KVM dirty page tracking should be valid");
+    }
+
+    #[test]
+    fn validate_memory_snapshot_options_rejects_uffd_without_dirty_page_tracking() {
+        let error = validate_memory_snapshot_options(&uffd_config(VirtualizationMode::Kvm, false))
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("requires memory_snapshot.track_dirty_pages=true"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("anonymous page"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn validate_memory_snapshot_options_reports_uffd_as_kvm_only_under_pvm() {
+        let error = validate_memory_snapshot_options(&uffd_config(VirtualizationMode::Pvm, false))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("KVM-only"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_memory_snapshot_options_rejects_zero_uffd_bounds() {
+        for (max_inflight, read_retry_secs, expected) in [
+            (0, 60, "max_inflight must be > 0"),
+            (64, 0, "read_retry_secs must be > 0"),
+        ] {
+            let mut config = uffd_config(VirtualizationMode::Kvm, true);
+            config.memory_snapshot.uffd.max_inflight = max_inflight;
+            config.memory_snapshot.uffd.read_retry_secs = read_retry_secs;
+
+            let error = validate_memory_snapshot_options(&config).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected error containing {expected:?}, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_memory_snapshot_options_ignores_uffd_bounds_on_the_block_backend() {
+        let mut config = AppConfig::default();
+        config.memory_snapshot.uffd.max_inflight = 0;
+        config.memory_snapshot.uffd.read_retry_secs = 0;
+
+        validate_memory_snapshot_options(&config)
+            .expect("the block backend reads no uffd settings");
     }
 
     #[test]

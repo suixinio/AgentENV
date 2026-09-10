@@ -752,9 +752,29 @@ the default path on every startup.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
+| `backend` | string | `"block"` | Path snapshot memory is restored through: `block` mmaps a read-only device (ublk or nbd per `[ublk].transport`) built from the stacked memory layers, `uffd` has the ublk daemon answer Firecracker's page faults over a Unix socket and creates no device. `uffd` requires `track_dirty_pages = true`, which is refused under PVM, so `uffd` is KVM-only. |
 | `track_dirty_pages` | bool | `false` | Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true` to enable it. |
 | `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
 | `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
+
+Environment variable override:
+
+- `AENV_MEMORY_SNAPSHOT_BACKEND`
+- `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES`
+
+## `[memory_snapshot.uffd]`
+
+Settings that apply only when `[memory_snapshot].backend = "uffd"`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_inflight` | integer | `64` | Faults the daemon resolves concurrently for one VM; the queue behind it is bounded by the same number. Must be greater than zero |
+| `read_retry_secs` | integer | `60` | How long one faulting read retries the memory image before the handler gives up and exits, which fails the sandbox and leaves the guest unbacked. Keep it above the overlaybd registry request timeout (30 s per request) with room for its retries. Must be greater than zero |
+
+Environment variable override:
+
+- `AENV_MEMORY_SNAPSHOT_UFFD_MAX_INFLIGHT`
+- `AENV_MEMORY_SNAPSHOT_UFFD_READ_RETRY_SECS`
 
 ## `[memory_snapshot.background_download]`
 

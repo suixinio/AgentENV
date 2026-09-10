@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
-    UblkDaemonClient, UblkDaemonSpawnConfig,
+    CreateOverlaybdRuntimeDeviceRequest, MemoryUffdState, MemoryUffdStats, RestackSnapshotStats,
+    RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
 use super::overlaybd::OverlaybdConfig;
@@ -588,6 +588,127 @@ impl UblkDeviceManager {
 
         Ok(SharedMemDevice { inner })
     }
+
+    // ── Memory userfaultfd serving ──────────────────────────────────────
+
+    /// Have the daemon serve `image_config`'s pages over `socket_path`.
+    ///
+    /// When this returns the socket is bound and the daemon is waiting for
+    /// Firecracker's handshake, so `PUT /snapshot/load` may run: the load
+    /// itself faults while restoring device and vCPU state.
+    pub async fn serve_mem_uffd(
+        &self,
+        image_config: &Path,
+        socket_path: &Path,
+    ) -> Result<MemUffdServe> {
+        let client = self.require_client()?;
+        let memory = &crate::cfg::ConfigManager::global_config().memory_snapshot;
+
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "serve_memory_uffd");
+        let served = client
+            .serve_memory_uffd(
+                image_config,
+                &memory.overlaybd_global_config_path,
+                socket_path,
+                memory.uffd.max_inflight,
+                memory.uffd.read_retry_secs,
+            )
+            .await
+            .context("serve memory snapshot over userfaultfd via daemon");
+        metric.finish(&served);
+        let serve_id = served?;
+
+        info!(
+            serve_id,
+            image_config = %image_config.display(),
+            socket_path = %socket_path.display(),
+            "daemon is serving memory snapshot faults"
+        );
+        Ok(MemUffdServe {
+            serve_id,
+            socket_path: socket_path.to_path_buf(),
+            stopped: AtomicBool::new(false),
+        })
+    }
+}
+
+// ── Memory userfaultfd serve ────────────────────────────────────────────────
+
+/// A handle to one daemon-side userfaultfd server.
+///
+/// Dropping it stops the server best-effort; [`MemUffdServe::release`] is the
+/// path that reports the failure.
+pub struct MemUffdServe {
+    serve_id: u32,
+    socket_path: PathBuf,
+    stopped: AtomicBool,
+}
+
+impl MemUffdServe {
+    /// The daemon-assigned id this server is stopped and queried by.
+    pub fn serve_id(&self) -> u32 {
+        self.serve_id
+    }
+
+    /// The socket Firecracker connects to for the handshake.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// The server's state and counters as the daemon sees them.
+    pub async fn query(&self) -> Result<(MemoryUffdState, MemoryUffdStats)> {
+        UblkDeviceManager::global()
+            .require_client()?
+            .query_memory_uffd(self.serve_id)
+            .await
+            .context("query memory userfaultfd server via daemon")
+    }
+
+    pub async fn release(self) -> Result<()> {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        stop_mem_uffd_serve(self.serve_id).await
+    }
+}
+
+impl Drop for MemUffdServe {
+    fn drop(&mut self) {
+        if self.stopped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let serve_id = self.serve_id;
+        info!(
+            serve_id,
+            "last reference to memory userfaultfd server dropped, scheduling stop"
+        );
+        // Handle::try_current() guards the case where Drop runs after the tokio
+        // runtime has shut down: the node is exiting anyway and the daemon's
+        // server goes with its client.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                serve_id,
+                "tokio runtime unavailable during drop, skipping memory userfaultfd stop"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            let _ = stop_mem_uffd_serve(serve_id).await;
+        });
+    }
+}
+
+async fn stop_mem_uffd_serve(serve_id: u32) -> Result<()> {
+    let result = UblkDeviceManager::global()
+        .require_client()?
+        .stop_memory_uffd(serve_id)
+        .await
+        .context("stop memory userfaultfd server via daemon");
+    if let Err(error) = &result {
+        warn!(serve_id, %error, "failed to stop memory userfaultfd server");
+    }
+    result
 }
 
 // ── Shared memory device ────────────────────────────────────────────────────

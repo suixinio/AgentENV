@@ -1,7 +1,7 @@
 mod device;
 mod overlaybd;
 
-pub use device::{SharedMemDevice, UblkCreateSpec, UblkDevice};
+pub use device::{MemUffdServe, SharedMemDevice, UblkCreateSpec, UblkDevice};
 pub use device::{UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 pub use overlaybd::OverlaybdConfig;
 pub use overlaybd::{

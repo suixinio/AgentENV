@@ -621,10 +621,35 @@ pub enum MemorySnapshotCompressionAlgorithm {
     Zstd,
 }
 
+/// How snapshot memory reaches Firecracker on resume.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemorySnapshotBackend {
+    /// The stacked memory layers become a read-only block device Firecracker
+    /// mmaps as a `File` memory backend.
+    #[default]
+    Block,
+    /// No device exists: the daemon answers Firecracker's page faults over a
+    /// Unix socket it binds before `PUT /snapshot/load`.
+    Uffd,
+}
+
+impl std::fmt::Display for MemorySnapshotBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Block => "block",
+            Self::Uffd => "uffd",
+        })
+    }
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
+    /// Path snapshot memory is restored through: `block` or `uffd`.
+    #[config(default = "block", env = "AENV_MEMORY_SNAPSHOT_BACKEND")]
+    pub backend: MemorySnapshotBackend,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshots.
     /// Default: false, preserving the mincore-based path.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = false)]
@@ -638,7 +663,24 @@ pub struct MemorySnapshotConfig {
     #[config(default = 1)]
     pub compression_workers: usize,
     #[config(nested)]
+    pub uffd: MemorySnapshotUffdConfig,
+    #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
+}
+
+/// Settings that apply only when `[memory_snapshot].backend = "uffd"`.
+#[derive(Debug, Config, Clone)]
+pub struct MemorySnapshotUffdConfig {
+    /// Faults the daemon resolves concurrently for one VM; the queue behind it
+    /// is bounded by the same number. Default: `64`.
+    #[config(default = 64usize, env = "AENV_MEMORY_SNAPSHOT_UFFD_MAX_INFLIGHT")]
+    pub max_inflight: usize,
+    /// How long one faulting read retries the memory image before the handler
+    /// gives up and exits, leaving the guest unbacked. Must exceed the
+    /// overlaybd registry request timeout with room for its retries.
+    /// Default: `60`.
+    #[config(default = 60u64, env = "AENV_MEMORY_SNAPSHOT_UFFD_READ_RETRY_SECS")]
+    pub read_retry_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1097,6 +1139,7 @@ impl_config_default!(
     UblkOverlaybdTomlConfig,
     UblkNbdTomlConfig,
     MemorySnapshotConfig,
+    MemorySnapshotUffdConfig,
     MemorySnapshotBackgroundDownloadConfig,
     ObservabilityConfig,
     ObservabilitySchedulerReportConfig,

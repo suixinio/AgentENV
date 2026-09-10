@@ -633,6 +633,13 @@ fill_concurrency = 4
 # Generated OverlayBD config dedicated to memory snapshot devices.
 # overlaybd_global_config_path = "$AENV_HOME/overlaybd/mem-overlaybd-global.json"
 
+# Path snapshot memory is restored through. "block" mmaps a read-only device
+# built from the stacked memory layers; "uffd" has the ublk daemon answer
+# Firecracker's page faults over a Unix socket and creates no device. "uffd"
+# requires track_dirty_pages = true, which in turn is KVM-only.
+# Override with AENV_MEMORY_SNAPSHOT_BACKEND.
+backend = "block"
+
 # EXPERIMENTAL: use Firecracker KVM dirty-page tracking instead of mincore.
 # It is disabled for PVM. Memory snapshot packaging always uses the direct
 # OverlayBD path. Override with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
@@ -646,6 +653,16 @@ compression_algorithm = "lz4"
 # Workers compressing 4 KiB blocks. One is sequential; higher values run in
 # parallel without changing the output layout.
 compression_workers = 1
+
+[memory_snapshot.uffd]
+# Faults the daemon resolves concurrently for one VM; the queue behind it is
+# bounded by the same number. Must be positive.
+max_inflight = 64
+# How long one faulting read retries the memory image before the handler gives
+# up; the handler then exits, the sandbox fails, and the guest is no longer
+# backed by the image. Keep it above the overlaybd registry request timeout
+# with room for its retries. Must be positive.
+read_retry_secs = 60
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd

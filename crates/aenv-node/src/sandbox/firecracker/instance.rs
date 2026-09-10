@@ -484,14 +484,16 @@ impl FirecrackerInstance {
     }
 
     /// Loads a snapshot with uffd memory backend.
-    /// Pre-boot only.
-    #[allow(dead_code)]
+    /// Pre-boot only. A handler must already be bound to `uffd_uds_path`: the
+    /// load faults while restoring device and vCPU state.
     #[tracing::instrument(skip(self, network_overrides), fields(snapshot_path = %snapshot_path.display(), uffd_uds_path = %uffd_uds_path.display(), network_override_count = network_overrides.len()))]
     pub async fn load_snapshot_uffd(
         &self,
         snapshot_path: &Path,
         uffd_uds_path: &Path,
-        network_overrides: &[(String, String)],
+        network_overrides: &[(&str, &str)],
+        resume_vm: bool,
+        track_dirty_pages: bool,
     ) -> Result<()> {
         let snapshot_path = self.resolve_host_path(snapshot_path);
         let mut params = SnapshotLoadParams::new(snapshot_path.to_string_lossy().into_owned());
@@ -499,13 +501,14 @@ impl FirecrackerInstance {
             firecracker_client::models::memory_backend::BackendType::Uffd,
             uffd_uds_path.to_string_lossy().into_owned(),
         )));
-        params.resume_vm = Some(true);
+        params.resume_vm = Some(resume_vm);
+        params.track_dirty_pages = Some(track_dirty_pages);
         if !network_overrides.is_empty() {
             params.network_overrides = Some(
                 network_overrides
                     .iter()
                     .map(|(iface_id, host_dev_name)| {
-                        NetworkOverride::new(iface_id.clone(), host_dev_name.clone())
+                        NetworkOverride::new(iface_id.to_string(), host_dev_name.to_string())
                     })
                     .collect(),
             );

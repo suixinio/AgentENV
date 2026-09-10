@@ -9,7 +9,7 @@ use nix::libc;
 use tempfile::TempDir;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
-use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
+use uvm_ublk_daemon::{CreateOverlaybdRuntimeDeviceRequest, MemoryUffdState};
 
 use super::config::{
     create_firecracker_work_dir, FirecrackerCommonConfig, FirecrackerRuntimePolicy,
@@ -28,7 +28,7 @@ use crate::sandbox::custom_extension::{
 };
 use crate::types::FirecrackerSnapshotManifest;
 
-use crate::cfg::ConfigManager;
+use crate::cfg::{ConfigManager, MemorySnapshotBackend};
 use crate::runtime_snapshot::RunnableSnapshot;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
@@ -45,8 +45,8 @@ use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::process::SandboxExecutor;
 use crate::sandbox::ublk::{
-    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice, UblkBackend,
-    UblkCreateSpec, UblkDeviceManager,
+    MemUffdServe, OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice,
+    UblkBackend, UblkCreateSpec, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::types::{ExecutionId, SandboxId};
@@ -56,6 +56,9 @@ use crate::types::{ExecutionId, SandboxId};
 const VM_STATE_FILE_NAME: &str = "vm_state.bin";
 const ROOTFS_DRIVE_PATH: &str = "rootfs.ext4";
 const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
+/// Inside the Firecracker work dir, so the path dies with the sandbox and two
+/// sandboxes never contend for one socket name.
+const MEM_UFFD_SOCKET_NAME: &str = "mem-uffd.sock";
 
 // The tools drive mounts busybox here in every guest, whatever the user image
 // ships; `tools-image/pivot-init` is the other end.
@@ -187,6 +190,10 @@ pub struct FirecrackerSandbox {
     envd_instance: Option<EnvdInstance>,
     rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     mem_ublk_device: Option<SharedMemDevice>,
+    /// The daemon-side userfaultfd server answering this VM's memory faults.
+    /// Mutually exclusive with `mem_ublk_device`: which one is set follows
+    /// `[memory_snapshot].backend`.
+    mem_uffd: Option<MemUffdServe>,
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
@@ -202,6 +209,15 @@ pub struct FirecrackerSandbox {
     /// best-effort notification. `None` when no start hook was delivered (or
     /// no extension is configured).
     custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
+}
+
+/// What `PUT /snapshot/load` is handed as the memory backend, once the resume
+/// path has provisioned it.
+enum ResumeMemoryBackend {
+    /// The `/dev/ublkb<N>` or `/dev/nbd<N>` path of the shared memory device.
+    Block(PathBuf),
+    /// The socket the daemon's userfaultfd handler is bound to.
+    Uffd(PathBuf),
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -1110,6 +1126,14 @@ impl FirecrackerSandbox {
             }
         }
 
+        // Same for the userfaultfd server: stopping it here keeps the detached
+        // Drop from racing a following resume that binds the same socket.
+        if let Some(serve) = self.mem_uffd.take() {
+            if let Err(e) = serve.release().await {
+                warn!(error = %e, "failed to stop memory userfaultfd server during stop");
+            }
+        }
+
         for runtime in self.extra_drive_runtimes.drain(..) {
             if let Err(e) = UblkDeviceManager::global()
                 .release_device(&runtime.device)
@@ -1375,6 +1399,7 @@ impl Drop for FirecrackerSandbox {
         // via the orchestrator's stop() path.
         self.rootfs_runtime.take();
         self.mem_ublk_device.take();
+        self.mem_uffd.take();
         // In daemon mode, extra-drive devices survive sandbox drop. They are
         // explicitly deleted on the stop() path and otherwise cleaned up when
         // the daemon shuts down.
@@ -1421,6 +1446,7 @@ impl FirecrackerSandbox {
             envd_instance: None,
             rootfs_runtime: None,
             mem_ublk_device: None,
+            mem_uffd: None,
             mem_snapshot_image_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
@@ -1621,12 +1647,13 @@ impl FirecrackerSandbox {
         // the device — free_page_reporting will be absent for those VMs, which
         // is acceptable during rollout.
 
-        // Fail fast: memory restore requires a ublk device. Check before
-        // allocating any resources (Firecracker process, network namespace, …).
+        // Fail fast: memory restore goes through the daemon under either
+        // backend. Check before allocating any resources (Firecracker process,
+        // network namespace, …).
         anyhow::ensure!(
             UblkDeviceManager::global().is_available(),
             "snapshot resume requires an available ublk daemon client \
-             because memory restore uses a shared ublk device"
+             because memory restore is served by the daemon"
         );
 
         let global_config = ConfigManager::global_config();
@@ -1785,24 +1812,41 @@ impl FirecrackerSandbox {
             config.common.envd_access_token.clone(),
         ));
 
-        let mem_global_config = global_config
-            .memory_snapshot
-            .overlaybd_global_config_path
-            .clone();
-        let mem_device = UblkDeviceManager::global()
-            .get_or_create_shared_mem(
-                &UblkCreateSpec::Overlaybd {
-                    image_config: config.mem_overlaybd_config.image_config_path.clone(),
-                    global_config: mem_global_config,
-                },
-                config.mem_virtual_size,
-            )
-            .await
-            .context("create or reuse shared memory ublk device for resume")?;
-        let mem_device_path = mem_device.device_path().to_path_buf();
+        // The daemon keys held background downloads on this path under both
+        // backends, so it is set whichever one serves the memory.
         self.mem_snapshot_image_config_path =
             Some(config.mem_overlaybd_config.image_config_path.clone());
-        self.mem_ublk_device = Some(mem_device);
+
+        let mem_backend = match global_config.memory_snapshot.backend {
+            MemorySnapshotBackend::Block => {
+                let mem_global_config = global_config
+                    .memory_snapshot
+                    .overlaybd_global_config_path
+                    .clone();
+                let mem_device = UblkDeviceManager::global()
+                    .get_or_create_shared_mem(
+                        &UblkCreateSpec::Overlaybd {
+                            image_config: config.mem_overlaybd_config.image_config_path.clone(),
+                            global_config: mem_global_config,
+                        },
+                        config.mem_virtual_size,
+                    )
+                    .await
+                    .context("create or reuse shared memory ublk device for resume")?;
+                let mem_device_path = mem_device.device_path().to_path_buf();
+                self.mem_ublk_device = Some(mem_device);
+                ResumeMemoryBackend::Block(mem_device_path)
+            }
+            MemorySnapshotBackend::Uffd => {
+                let socket_path = self.work_dir.path().join(MEM_UFFD_SOCKET_NAME);
+                let serve = UblkDeviceManager::global()
+                    .serve_mem_uffd(&config.mem_overlaybd_config.image_config_path, &socket_path)
+                    .await
+                    .context("start memory userfaultfd server for resume")?;
+                self.mem_uffd = Some(serve);
+                ResumeMemoryBackend::Uffd(socket_path)
+            }
+        };
 
         if needs_socket_wait {
             self.fc_instance
@@ -1817,15 +1861,31 @@ impl FirecrackerSandbox {
 
         // Override the network interface to use the new tap0 in our namespace
         let network_overrides = [("eth0", "tap0")];
-        self.fc_instance
-            .load_snapshot_file(
-                &vm_state_src,
-                &mem_device_path,
-                &network_overrides,
-                false,
-                config.common.track_dirty_pages,
-            )
-            .await?;
+        match &mem_backend {
+            ResumeMemoryBackend::Block(mem_device_path) => {
+                self.fc_instance
+                    .load_snapshot_file(
+                        &vm_state_src,
+                        mem_device_path,
+                        &network_overrides,
+                        false,
+                        config.common.track_dirty_pages,
+                    )
+                    .await?;
+            }
+            ResumeMemoryBackend::Uffd(socket_path) => {
+                self.fc_instance
+                    .load_snapshot_uffd(
+                        &vm_state_src,
+                        socket_path,
+                        &network_overrides,
+                        false,
+                        config.common.track_dirty_pages,
+                    )
+                    .await?;
+                self.ensure_mem_uffd_serving().await?;
+            }
+        }
 
         let mmds_metadata = self.mmds_metadata(&config.common);
         self.fc_instance.set_mmds(&mmds_metadata).await?;
@@ -1846,6 +1906,43 @@ impl FirecrackerSandbox {
 
         debug!("sandbox restored from snapshot config");
         Ok(())
+    }
+
+    /// Fail the resume unless the daemon is actually serving this VM's faults.
+    ///
+    /// The load faults while restoring device and vCPU state, so a handler that
+    /// never saw the handshake means the load reported a success it could not
+    /// have had.
+    async fn ensure_mem_uffd_serving(&self) -> Result<()> {
+        let serve = self
+            .mem_uffd
+            .as_ref()
+            .context("memory userfaultfd server was not started for this resume")?;
+        let (state, stats) = serve
+            .query()
+            .await
+            .context("query the memory userfaultfd server after snapshot load")?;
+        match state {
+            MemoryUffdState::Serving => {
+                debug!(
+                    serve_id = serve.serve_id(),
+                    faults = stats.faults,
+                    pages_copied = stats.pages_copied,
+                    "memory userfaultfd server is serving the restored VM"
+                );
+                Ok(())
+            }
+            MemoryUffdState::Starting => bail!(
+                "memory userfaultfd server (serve_id={}) never received Firecracker's handshake on {}",
+                serve.serve_id(),
+                serve.socket_path().display()
+            ),
+            MemoryUffdState::Exited { error } => bail!(
+                "memory userfaultfd server (serve_id={}) exited: {}",
+                serve.serve_id(),
+                error.unwrap_or_else(|| "no error reported".to_string())
+            ),
+        }
     }
 
     /// Enable Firecracker logging when `firecracker_log_level` is configured.

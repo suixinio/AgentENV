@@ -81,7 +81,7 @@ fi
 capability_args=(
     "--inh-caps=-all,+net_admin,+sys_admin,+sys_ptrace"
     "--ambient-caps=-all,+net_admin,+sys_admin,+sys_ptrace"
-    "--bounding-set=-all,+net_admin,+sys_admin"
+    "--bounding-set=-all,+net_admin,+sys_admin,+sys_ptrace"
     --nnp
 )
 

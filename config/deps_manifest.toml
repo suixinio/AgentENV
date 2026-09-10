@@ -1,14 +1,14 @@
 [firecracker.kvm]
 version = "1.15.1-patch-v1"
-url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
+url = "https://github.com/suixinio/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
 
 [firecracker.pvm]
 version = "v1.17.0-next.1"
-url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version}/firecracker-next-{version}-{arch}.tgz"
+url = "https://github.com/suixinio/firecracker-next/releases/download/{version}/firecracker-next-{version}-{arch}.tgz"
 
 [kernel.kvm]
 version = "vmlinux-6.1.175"
-url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{version}-{arch}"
+url = "https://github.com/suixinio/firecracker/releases/download/aenv-deps/{version}-{arch}"
 
 [kernel.pvm]
 version = "6.12.33-pvm"

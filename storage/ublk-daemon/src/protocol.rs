@@ -128,6 +128,8 @@ pub struct MemoryUffdStats {
     pub read_retries: u64,
     pub copy_retries: u64,
     pub removes: u64,
+    #[serde(default)]
+    pub prefaulted: u64,
 }
 
 fn default_runtime_upper_mode() -> UpperMode {

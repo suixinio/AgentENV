@@ -1678,4 +1678,258 @@ mod live_device_tests {
         daemon.client.release_overlaybd(second_id).await.unwrap();
         daemon.stop().await;
     }
+    // ── Memory servers over userfaultfd ─────────────────────────────────
+
+    mod memory_uffd_tests {
+        use super::*;
+        use std::fs::OpenOptions;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use uvm_uffd::testing::{create_uffd_for_test, AnonRegion};
+        use uvm_uffd::{send_handshake, Uffd};
+
+        const PAGE: usize = 4096;
+        const IMAGE_SIZE: u64 = 8 * 1024 * 1024;
+
+        /// Playing the VMM side needs a userfaultfd of our own;
+        /// `AENV_UFFD_TEST_REQUIRED=1` turns a skip into a failure.
+        fn uffd_or_skip(test: &str) -> Option<Uffd> {
+            if let Some((uffd, _)) = create_uffd_for_test() {
+                return Some(uffd);
+            }
+            let reason = "cannot create a userfaultfd (needs CAP_SYS_PTRACE, vm.unprivileged_userfaultfd=1 or /dev/userfaultfd)";
+            if std::env::var("AENV_UFFD_TEST_REQUIRED").as_deref() == Ok("1") {
+                panic!("AENV_UFFD_TEST_REQUIRED=1 but {test} cannot run: {reason}");
+            }
+            eprintln!("SKIPPED[uffd]: {test} ({reason})");
+            None
+        }
+
+        /// Distinct non-zero bytes, so a served page is a copy and never a
+        /// zero page.
+        fn page_content(index: usize) -> Vec<u8> {
+            (0..PAGE)
+                .map(|byte| ((byte + index * 7) % 251 + 1) as u8)
+                .collect()
+        }
+
+        async fn wait_for_state(
+            client: &UblkDaemonClient,
+            serve_id: u32,
+            wanted: MemoryUffdState,
+        ) -> MemoryUffdState {
+            let mut state = MemoryUffdState::Starting;
+            for _ in 0..250 {
+                state = client.query_memory_uffd(serve_id).await.expect("query").0;
+                if state == wanted {
+                    return state;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            state
+        }
+
+        #[tokio::test]
+        async fn serve_memory_uffd_fills_guest_pages_from_the_image() {
+            let name = "serve_memory_uffd_fills_guest_pages_from_the_image";
+            if !transport_reachable(name) {
+                return;
+            }
+            let Some(uffd) = uffd_or_skip(name) else {
+                return;
+            };
+            let fixture = image_fixture(IMAGE_SIZE).await;
+            let daemon = RunningDaemon::start(&fixture.global_config, None).await;
+
+            // Seed known bytes through a device; the memory server reads the
+            // same image back once the device is gone.
+            let pages: Vec<(usize, Vec<u8>)> = [0usize, 1, 17, 129]
+                .into_iter()
+                .map(|index| (index, page_content(index)))
+                .collect();
+            let (dev_id, device_path) = daemon
+                .client
+                .create_overlaybd(&fixture.image_config, &fixture.global_config)
+                .await
+                .expect("create the seeding device");
+            {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&device_path)
+                    .expect("open the seeding device");
+                for (index, content) in &pages {
+                    file.write_all_at(content, (index * PAGE) as u64)
+                        .expect("pwrite");
+                }
+                file.sync_all().expect("fsync");
+            }
+            daemon.client.delete(dev_id).await.expect("delete");
+
+            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_path = socket_dir.path().join("mem.sock");
+            let serve_id = daemon
+                .client
+                .serve_memory_uffd(
+                    &fixture.image_config,
+                    &fixture.global_config,
+                    &socket_path,
+                    16,
+                    5,
+                )
+                .await
+                .expect("serve the memory image");
+
+            let region = Arc::new(AnonRegion::new(IMAGE_SIZE as usize).expect("map the region"));
+            region.register(&uffd, 0).expect("register the region");
+            let stream = UnixStream::connect(&socket_path).expect("connect to the memory server");
+            send_handshake(
+                &stream,
+                &[region.mapping(0, PAGE as u64)],
+                &[uffd.as_raw_fd()],
+            )
+            .expect("send the handshake");
+            assert_eq!(
+                wait_for_state(&daemon.client, serve_id, MemoryUffdState::Serving).await,
+                MemoryUffdState::Serving
+            );
+            // The server owns the descriptor it was handed.
+            drop(uffd);
+
+            let offsets: Vec<usize> = pages.iter().map(|(index, _)| index * PAGE).collect();
+            let faulted = {
+                let region = Arc::clone(&region);
+                tokio::task::spawn_blocking(move || {
+                    offsets
+                        .into_iter()
+                        .map(|at| region.read(at, PAGE))
+                        .collect::<Vec<_>>()
+                })
+                .await
+                .expect("fault the guest pages in")
+            };
+            for ((index, content), got) in pages.iter().zip(faulted) {
+                assert_eq!(&got, content, "page {index} came back with other bytes");
+            }
+
+            let (_, stats) = daemon
+                .client
+                .query_memory_uffd(serve_id)
+                .await
+                .expect("query the counters");
+            assert!(
+                stats.pages_copied > 0 && stats.faults >= pages.len() as u64,
+                "{stats:?}"
+            );
+
+            daemon
+                .client
+                .stop_memory_uffd(serve_id)
+                .await
+                .expect("stop the memory server");
+            assert!(
+                daemon.client.query_memory_uffd(serve_id).await.is_err(),
+                "a stopped serve id must be unknown"
+            );
+            assert!(
+                !socket_path.exists(),
+                "stopping the memory server must remove its socket"
+            );
+            daemon.stop().await;
+        }
+
+        #[tokio::test]
+        async fn two_uffd_servers_share_one_opened_image() {
+            let fixture = image_fixture(IMAGE_SIZE).await;
+            let daemon = RunningDaemon::start(&fixture.global_config, None).await;
+            let socket_dir = tempfile::tempdir().unwrap();
+
+            let mut serve_ids = Vec::new();
+            for name in ["first.sock", "second.sock"] {
+                serve_ids.push(
+                    daemon
+                        .client
+                        .serve_memory_uffd(
+                            &fixture.image_config,
+                            &fixture.global_config,
+                            &socket_dir.path().join(name),
+                            16,
+                            5,
+                        )
+                        .await
+                        .expect("serve the memory image"),
+                );
+            }
+            assert_ne!(serve_ids[0], serve_ids[1], "each server gets its own id");
+            assert_eq!(
+                daemon.server.memory_uffd_open_images(),
+                1,
+                "one image opened for both servers"
+            );
+
+            daemon.client.stop_memory_uffd(serve_ids[0]).await.unwrap();
+            assert_eq!(
+                daemon.server.memory_uffd_open_images(),
+                1,
+                "the image stays open while the second server reads it"
+            );
+            daemon.client.stop_memory_uffd(serve_ids[1]).await.unwrap();
+            assert_eq!(
+                daemon.server.memory_uffd_open_images(),
+                0,
+                "the last stop closes the image"
+            );
+            daemon.stop().await;
+        }
+
+        #[tokio::test]
+        async fn stop_memory_uffd_with_an_unknown_id_is_an_error() {
+            let fixture = image_fixture(IMAGE_SIZE).await;
+            let daemon = RunningDaemon::start(&fixture.global_config, None).await;
+
+            let err = daemon
+                .client
+                .stop_memory_uffd(4242)
+                .await
+                .expect_err("an unknown serve id has nothing to stop");
+            assert!(format!("{err:#}").contains("4242"), "{err:#}");
+            assert!(daemon.client.query_memory_uffd(4242).await.is_err());
+
+            daemon.stop().await;
+        }
+
+        #[tokio::test]
+        async fn shutdown_stops_uffd_servers() {
+            let fixture = image_fixture(IMAGE_SIZE).await;
+            let daemon = RunningDaemon::start(&fixture.global_config, None).await;
+            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_path = socket_dir.path().join("mem.sock");
+
+            daemon
+                .client
+                .serve_memory_uffd(
+                    &fixture.image_config,
+                    &fixture.global_config,
+                    &socket_path,
+                    16,
+                    5,
+                )
+                .await
+                .expect("serve the memory image");
+            assert_eq!(daemon.server.memory_uffd_open_images(), 1);
+
+            let server = Arc::clone(&daemon.server);
+            daemon.stop().await;
+
+            assert_eq!(
+                server.memory_uffd_open_images(),
+                0,
+                "shutdown closed the memory image"
+            );
+            assert!(
+                !socket_path.exists(),
+                "shutdown removed the memory server socket"
+            );
+        }
+    }
 }

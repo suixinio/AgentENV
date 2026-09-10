@@ -19,6 +19,7 @@ use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 use storage_util::io_ring::IoRingHandle;
 use uvm_ublk::{ublk_caps, UVMUblkCtrlBuilder};
 
+use crate::memory_uffd::{MemoryUffdServers, ServeMemoryUffdRequest};
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec,
 };
@@ -261,6 +262,7 @@ pub struct UblkDaemonServer {
     image_service_cache: Arc<ImageServiceCache>,
     default_image_service: ImageService,
     devices: Arc<DashMap<u32, ManagedDevice>>,
+    memory_uffd: Arc<MemoryUffdServers>,
     pool_state: Option<Arc<PoolState>>,
     resize_tool: Option<ResizeToolSpec>,
     resize_global_config: PathBuf,
@@ -312,12 +314,19 @@ impl UblkDaemonServer {
             image_service_cache: Arc::new(cache),
             default_image_service,
             devices: Arc::new(DashMap::new()),
+            memory_uffd: Arc::new(MemoryUffdServers::new()),
             pool_state: None,
             resize_tool: None,
             resize_global_config,
             resize_permit: Arc::new(Mutex::new(())),
             shutdown: Arc::new(Notify::new()),
         }
+    }
+
+    /// Memory images currently open for userfaultfd serving; the servers
+    /// sharing one image count once.
+    pub fn memory_uffd_open_images(&self) -> usize {
+        self.memory_uffd.open_images()
     }
 
     /// Configure the daemon-local OverlayBD resize tool.
@@ -406,6 +415,7 @@ impl UblkDaemonServer {
                 accept = listener.accept() => {
                     let (stream, _) = accept.context("accept daemon connection")?;
                     let devices = Arc::clone(&self.devices);
+                    let memory_uffd = Arc::clone(&self.memory_uffd);
                     let transport = self.transport.clone();
                     let image_service_cache = Arc::clone(&self.image_service_cache);
                     let pool_state = self.pool_state.as_ref().map(Arc::clone);
@@ -417,6 +427,7 @@ impl UblkDaemonServer {
                         if let Err(err) = handle_connection(
                             stream,
                             devices,
+                            memory_uffd,
                             transport,
                             image_service_cache,
                             pool_state,
@@ -436,7 +447,8 @@ impl UblkDaemonServer {
             }
         }
 
-        // Graceful cleanup: stop all devices.
+        // Graceful cleanup: stop every memory server and every device.
+        self.memory_uffd.stop_all().await;
         self.stop_all_devices().await;
 
         // Remove socket file.
@@ -498,6 +510,7 @@ impl UblkDaemonServer {
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     devices: Arc<DashMap<u32, ManagedDevice>>,
+    memory_uffd: Arc<MemoryUffdServers>,
     transport: TransportHandle,
     image_service_cache: Arc<ImageServiceCache>,
     pool_state: Option<Arc<PoolState>>,
@@ -594,11 +607,28 @@ async fn handle_connection(
             dev_id,
             new_sectors,
         } => handle_update_size(&pool_state, dev_id, new_sectors).await,
-        DaemonRequest::ServeMemoryUffd { .. }
-        | DaemonRequest::StopMemoryUffd { .. }
-        | DaemonRequest::QueryMemoryUffd { .. } => Ok(DaemonResponse::Error {
-            message: "memory uffd serving is not implemented".to_string(),
-        }),
+        DaemonRequest::ServeMemoryUffd {
+            image_config,
+            global_config,
+            socket_path,
+            max_inflight,
+            read_retry_secs,
+        } => {
+            memory_uffd
+                .serve(
+                    &image_service_cache,
+                    ServeMemoryUffdRequest {
+                        image_config: &image_config,
+                        global_config: &global_config,
+                        socket_path: &socket_path,
+                        max_inflight,
+                        read_retry_secs,
+                    },
+                )
+                .await
+        }
+        DaemonRequest::StopMemoryUffd { serve_id } => memory_uffd.stop(serve_id).await,
+        DaemonRequest::QueryMemoryUffd { serve_id } => memory_uffd.query(serve_id),
         DaemonRequest::Shutdown => {
             shutdown.notify_one();
             Ok(DaemonResponse::Ok)

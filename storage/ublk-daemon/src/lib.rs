@@ -1,4 +1,5 @@
 pub mod client;
+pub(crate) mod memory_uffd;
 pub mod protocol;
 pub(crate) mod runtime;
 pub mod server;

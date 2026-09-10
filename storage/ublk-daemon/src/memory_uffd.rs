@@ -1,0 +1,434 @@
+//! The daemon's userfaultfd memory servers: one per restored VM, reading an
+//! overlaybd memory image the daemon opens once per (image config, global
+//! config) and every server on that image shares.
+
+use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use dashmap::mapref::entry::Entry;
+use dashmap::DashMap;
+use overlaybd::image_file::ImageFile;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use uvm_uffd::{HandlerOptions, HandlerState, OverlaybdSource, StatsSnapshot, UffdHandler};
+
+use crate::protocol::{DaemonResponse, MemoryUffdState, MemoryUffdStats};
+use crate::server::ImageServiceCache;
+
+/// How long a server waits for Firecracker to connect and hand over the
+/// descriptor. A snapshot load that never reaches the socket must end the
+/// server rather than hold the image open forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Canonical key for a shared opened memory image: (image_config, global_config).
+type ImageKey = (PathBuf, PathBuf);
+
+/// One opened memory image, refcounted by the servers reading it.
+struct SharedImage {
+    image: Arc<ImageFile>,
+    refcount: usize,
+}
+
+struct ActiveServe {
+    /// The watcher task holds the second reference; a stop joins the watcher
+    /// before it takes the handler back to join its thread.
+    handler: Arc<UffdHandler>,
+    watcher: JoinHandle<()>,
+    cancel_watcher: oneshot::Sender<()>,
+    socket_path: PathBuf,
+    image_key: ImageKey,
+}
+
+pub(crate) struct ServeMemoryUffdRequest<'a> {
+    pub(crate) image_config: &'a Path,
+    pub(crate) global_config: &'a Path,
+    pub(crate) socket_path: &'a Path,
+    pub(crate) max_inflight: usize,
+    pub(crate) read_retry_secs: u64,
+}
+
+/// Every userfaultfd memory server this daemon owns.
+pub(crate) struct MemoryUffdServers {
+    next_serve_id: AtomicU32,
+    serves: DashMap<u32, ActiveServe>,
+    images: DashMap<ImageKey, SharedImage>,
+}
+
+impl MemoryUffdServers {
+    pub(crate) fn new() -> Self {
+        Self {
+            // Serve ids start at one, so zero is never a live server.
+            next_serve_id: AtomicU32::new(1),
+            serves: DashMap::new(),
+            images: DashMap::new(),
+        }
+    }
+
+    /// Memory images currently open for userfaultfd serving; the servers
+    /// sharing one image count once.
+    pub(crate) fn open_images(&self) -> usize {
+        self.images.len()
+    }
+
+    pub(crate) async fn serve(
+        &self,
+        image_service_cache: &ImageServiceCache,
+        request: ServeMemoryUffdRequest<'_>,
+    ) -> Result<DaemonResponse> {
+        let key: ImageKey = (
+            request.image_config.to_path_buf(),
+            request.global_config.to_path_buf(),
+        );
+        let image = self.acquire_image(image_service_cache, &key).await?;
+        match self.start_serve(&request, &key, image) {
+            Ok(serve_id) => Ok(DaemonResponse::MemoryUffdServing { serve_id }),
+            Err(err) => {
+                self.release_image(&key);
+                Err(err)
+            }
+        }
+    }
+
+    pub(crate) async fn stop(&self, serve_id: u32) -> Result<DaemonResponse> {
+        let Some((_, serve)) = self.serves.remove(&serve_id) else {
+            bail!("memory uffd server {serve_id} not found");
+        };
+        self.shutdown_serve(serve_id, serve).await;
+        Ok(DaemonResponse::Ok)
+    }
+
+    pub(crate) fn query(&self, serve_id: u32) -> Result<DaemonResponse> {
+        let Some(serve) = self.serves.get(&serve_id) else {
+            bail!("memory uffd server {serve_id} not found");
+        };
+        Ok(DaemonResponse::MemoryUffdStatus {
+            state: state_of(serve.handler.state()),
+            stats: stats_of(serve.handler.stats()),
+        })
+    }
+
+    /// Stops every server; a guest still faulting on one is no longer backed.
+    pub(crate) async fn stop_all(&self) {
+        let serve_ids: Vec<u32> = self.serves.iter().map(|entry| *entry.key()).collect();
+        for serve_id in serve_ids {
+            if let Some((_, serve)) = self.serves.remove(&serve_id) {
+                tracing::info!(serve_id, "stopping memory uffd server during shutdown");
+                self.shutdown_serve(serve_id, serve).await;
+            }
+        }
+    }
+
+    fn start_serve(
+        &self,
+        request: &ServeMemoryUffdRequest<'_>,
+        key: &ImageKey,
+        image: Arc<ImageFile>,
+    ) -> Result<u32> {
+        let listener = bind_handshake_socket(request.socket_path)?;
+        let source = Arc::new(
+            OverlaybdSource::from_opened_image(request.image_config.to_path_buf(), image)
+                .context("build the page source for the memory image")?,
+        );
+        let serve_id = self.next_serve_id.fetch_add(1, Ordering::Relaxed);
+        let started = UffdHandler::serve_socket(
+            listener,
+            source,
+            HandlerOptions {
+                max_inflight: request.max_inflight,
+                read_retry_budget: Duration::from_secs(request.read_retry_secs),
+                handshake_timeout: HANDSHAKE_TIMEOUT,
+                name: format!("mem-{serve_id}"),
+                ..Default::default()
+            },
+        );
+        let handler = match started {
+            Ok(handler) => Arc::new(handler),
+            Err(err) => {
+                let _ = std::fs::remove_file(request.socket_path);
+                return Err(err.context(format!(
+                    "start the memory uffd server on {}",
+                    request.socket_path.display()
+                )));
+            }
+        };
+
+        let (cancel_watcher, cancelled) = oneshot::channel();
+        let watcher = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            let image_config = request.image_config.to_path_buf();
+            async move {
+                tokio::select! {
+                    exit = handler.wait_exit() => match exit {
+                        Some(error) => tracing::error!(
+                            serve_id,
+                            image_config = %image_config.display(),
+                            error = %error,
+                            "memory uffd server exited with an error"
+                        ),
+                        None => tracing::info!(
+                            serve_id,
+                            image_config = %image_config.display(),
+                            "memory uffd server exited"
+                        ),
+                    },
+                    _ = cancelled => {}
+                }
+            }
+        });
+
+        self.serves.insert(
+            serve_id,
+            ActiveServe {
+                handler,
+                watcher,
+                cancel_watcher,
+                socket_path: request.socket_path.to_path_buf(),
+                image_key: key.clone(),
+            },
+        );
+        tracing::info!(
+            serve_id,
+            image_config = %request.image_config.display(),
+            socket = %request.socket_path.display(),
+            max_inflight = request.max_inflight,
+            "serving a memory image over userfaultfd"
+        );
+        Ok(serve_id)
+    }
+
+    async fn shutdown_serve(&self, serve_id: u32, serve: ActiveServe) {
+        let ActiveServe {
+            handler,
+            watcher,
+            cancel_watcher,
+            socket_path,
+            image_key,
+        } = serve;
+
+        // Joining the watcher leaves this the only reference to the handler,
+        // which the blocking join below needs to own.
+        let _ = cancel_watcher.send(());
+        let _ = watcher.await;
+        match Arc::into_inner(handler) {
+            Some(handler) => match tokio::task::spawn_blocking(move || handler.stop()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::error!(
+                    serve_id,
+                    error = %format!("{err:#}"),
+                    "memory uffd server ended with an error"
+                ),
+                Err(err) => tracing::error!(
+                    serve_id,
+                    error = %err,
+                    "joining the memory uffd server thread failed"
+                ),
+            },
+            None => tracing::error!(
+                serve_id,
+                "the memory uffd handler is still shared; stopping it without a join"
+            ),
+        }
+
+        if let Err(err) = std::fs::remove_file(&socket_path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    serve_id,
+                    path = %socket_path.display(),
+                    error = %err,
+                    "removing the memory uffd socket failed"
+                );
+            }
+        }
+        self.release_image(&image_key);
+        tracing::info!(serve_id, "memory uffd server stopped");
+    }
+
+    async fn acquire_image(
+        &self,
+        image_service_cache: &ImageServiceCache,
+        key: &ImageKey,
+    ) -> Result<Arc<ImageFile>> {
+        let (image_config, global_config) = key;
+        if let Some(mut shared) = self.images.get_mut(key) {
+            shared.refcount += 1;
+            tracing::debug!(
+                image_config = %image_config.display(),
+                refcount = shared.refcount,
+                "reusing the opened memory image"
+            );
+            return Ok(Arc::clone(&shared.image));
+        }
+
+        let image_service = image_service_cache
+            .get_or_create(global_config)
+            .await
+            .context("resolve image service for the memory image")?;
+        // The image config path is the download gate's device key, so
+        // NotifySandboxReady releases the held background downloads of an
+        // image served over userfaultfd as it does for a device.
+        let image = Arc::new(
+            image_service
+                .create_image_file(image_config)
+                .await
+                .with_context(|| {
+                    format!("open overlaybd memory image: {}", image_config.display())
+                })?,
+        );
+
+        match self.images.entry(key.clone()) {
+            Entry::Occupied(mut entry) => {
+                let shared = entry.get_mut();
+                shared.refcount += 1;
+                let existing = Arc::clone(&shared.image);
+                drop(entry);
+                drop(image);
+                tracing::debug!(
+                    image_config = %image_config.display(),
+                    "a concurrent serve opened the same memory image first"
+                );
+                Ok(existing)
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(SharedImage {
+                    image: Arc::clone(&image),
+                    refcount: 1,
+                });
+                Ok(image)
+            }
+        }
+    }
+
+    fn release_image(&self, key: &ImageKey) {
+        let (image_config, _) = key;
+        let mut closed = None;
+        if let Entry::Occupied(mut entry) = self.images.entry(key.clone()) {
+            let shared = entry.get_mut();
+            shared.refcount = shared.refcount.saturating_sub(1);
+            if shared.refcount == 0 {
+                closed = Some(entry.remove());
+            }
+        }
+        if closed.is_some() {
+            tracing::debug!(
+                image_config = %image_config.display(),
+                "closed the memory image behind the last userfaultfd server"
+            );
+        }
+    }
+}
+
+/// The socket Firecracker connects to. A file left behind by an earlier server
+/// is removed first; the parent directory must already exist.
+fn bind_handshake_socket(socket_path: &Path) -> Result<UnixListener> {
+    if let Err(err) = std::fs::remove_file(socket_path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            return Err(err).with_context(|| {
+                format!(
+                    "remove the stale memory uffd socket {}",
+                    socket_path.display()
+                )
+            });
+        }
+    }
+    UnixListener::bind(socket_path)
+        .with_context(|| format!("bind the memory uffd socket {}", socket_path.display()))
+}
+
+fn state_of(state: HandlerState) -> MemoryUffdState {
+    match state {
+        HandlerState::Starting => MemoryUffdState::Starting,
+        HandlerState::Serving => MemoryUffdState::Serving,
+        HandlerState::Exited(error) => MemoryUffdState::Exited { error },
+    }
+}
+
+fn stats_of(stats: StatsSnapshot) -> MemoryUffdStats {
+    MemoryUffdStats {
+        faults: stats.faults,
+        pages_copied: stats.pages_copied,
+        pages_zeroed: stats.pages_zeroed,
+        already_present: stats.already_present,
+        duplicates: stats.duplicates,
+        bytes_read: stats.bytes_read,
+        read_retries: stats.read_retries,
+        copy_retries: stats.copy_retries,
+        removes: stats.removes,
+        prefaulted: stats.prefaulted,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_handler_state_maps_onto_the_wire_state() {
+        assert_eq!(state_of(HandlerState::Starting), MemoryUffdState::Starting);
+        assert_eq!(state_of(HandlerState::Serving), MemoryUffdState::Serving);
+        assert_eq!(
+            state_of(HandlerState::Exited(None)),
+            MemoryUffdState::Exited { error: None }
+        );
+        assert_eq!(
+            state_of(HandlerState::Exited(Some("read failed".to_string()))),
+            MemoryUffdState::Exited {
+                error: Some("read failed".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn every_wire_counter_carries_the_handler_counter_of_the_same_name() {
+        let stats = StatsSnapshot {
+            faults: 1,
+            pages_copied: 2,
+            pages_zeroed: 3,
+            already_present: 4,
+            duplicates: 5,
+            bytes_read: 6,
+            read_retries: 7,
+            copy_retries: 8,
+            removes: 9,
+            prefaulted: 10,
+        };
+        assert_eq!(
+            stats_of(stats),
+            MemoryUffdStats {
+                faults: 1,
+                pages_copied: 2,
+                pages_zeroed: 3,
+                already_present: 4,
+                duplicates: 5,
+                bytes_read: 6,
+                read_retries: 7,
+                copy_retries: 8,
+                removes: 9,
+                prefaulted: 10,
+            }
+        );
+    }
+
+    #[test]
+    fn binding_replaces_a_socket_an_earlier_server_left_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("mem.sock");
+        let stale = bind_handshake_socket(&socket_path).expect("bind");
+        drop(stale);
+        assert!(socket_path.exists());
+
+        let listener = bind_handshake_socket(&socket_path).expect("rebind over the stale socket");
+        assert!(listener.local_addr().is_ok());
+    }
+
+    #[test]
+    fn binding_under_a_missing_directory_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = bind_handshake_socket(&dir.path().join("absent").join("mem.sock"))
+            .expect_err("the parent directory must already exist");
+        assert!(format!("{err:#}").contains("bind the memory uffd socket"));
+    }
+}

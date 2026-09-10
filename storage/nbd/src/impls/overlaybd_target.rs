@@ -99,6 +99,13 @@ impl OverlaybdTarget {
         Ok(())
     }
 
+    /// Refuse writes from here on without changing the backing image.
+    pub fn set_read_only(&self) {
+        let mut state = TargetState::clone(&self.state.load());
+        state.writable = false;
+        self.state.store(Arc::new(state));
+    }
+
     /// Re-advertise the capacity without changing the backing image, for a
     /// device whose image grew under it.
     pub fn set_dev_sectors(&self, dev_sectors: u64) -> Result<()> {
@@ -423,6 +430,19 @@ mod tests {
             buf.iter().all(|&byte| byte == 0),
             "the swapped-in image must not answer with the previous image's bytes"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_target_made_read_only_stops_advertising_discard() {
+        let tmp = TempDir::new().expect("tempdir");
+        let target = open_target(&tmp, 1 << 20).await;
+        assert!(!target.geometry().read_only);
+        assert!(target.geometry().supports_discard);
+        target.set_read_only();
+        let geometry = target.geometry();
+        assert!(geometry.read_only);
+        assert!(!geometry.supports_discard);
+        assert_eq!(geometry.size_bytes, 1 << 20);
     }
 
     #[tokio::test(flavor = "current_thread")]

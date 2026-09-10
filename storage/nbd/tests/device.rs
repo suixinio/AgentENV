@@ -1,138 +1,12 @@
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+mod support;
+
+use std::fs::OpenOptions;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use support::*;
 use uvm_nbd::{device_size_bytes, MemTarget, NbdDevice, NbdOptions, OverlaybdTarget};
-
-const MIB: usize = 1024 * 1024;
-const BLOCK_SIZE: u32 = 4096;
-const BLKDISCARD: libc::c_ulong = 0x1277;
-
-// CAP_SYS_ADMIN is not probed: a caller that reaches the device nodes but
-// cannot reach the netlink family gets a loud EPERM from the first connect.
-fn nbd_available(test: &str) -> bool {
-    let reason = if !Path::new("/sys/module/nbd").exists() {
-        Some("the nbd module is not loaded")
-    } else if !a_device_node_is_writable() {
-        Some(
-            "no /dev/nbd* node is readable and writable by this account; run              scripts/tests/setup-nbd-access.sh",
-        )
-    } else {
-        None
-    };
-    let Some(reason) = reason else {
-        return true;
-    };
-    if std::env::var("AENV_NBD_TEST_REQUIRED").as_deref() == Ok("1") {
-        panic!("AENV_NBD_TEST_REQUIRED=1 but {test} cannot run: {reason}");
-    }
-    eprintln!("SKIPPED[nbd]: {test} ({reason})");
-    false
-}
-
-// The kernel allocates a device on connect when none is free, so an empty
-// /dev/nbd* is not on its own a reason to skip; an unreachable node is.
-fn a_device_node_is_writable() -> bool {
-    let Ok(entries) = std::fs::read_dir("/dev") else {
-        return false;
-    };
-    let mut nodes = 0usize;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.starts_with("nbd") || !name[3..].chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        nodes += 1;
-        let path = std::ffi::CString::new(entry.path().as_os_str().as_encoded_bytes())
-            .expect("a /dev path holds no interior nul");
-        if unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) } == 0 {
-            return true;
-        }
-    }
-    nodes == 0
-}
-
-fn options(connections: u16) -> NbdOptions {
-    NbdOptions {
-        connections,
-        io_timeout: Duration::from_secs(30),
-        dead_conn_timeout: None,
-        queue_depth: 32,
-        backend_identifier: None,
-        destroy_on_disconnect: false,
-    }
-}
-
-// A heap buffer with a 4 KiB aligned window, which O_DIRECT requires.
-struct Aligned {
-    raw: Vec<u8>,
-    offset: usize,
-    len: usize,
-}
-
-impl Aligned {
-    fn new(len: usize) -> Self {
-        let raw = vec![0u8; len + BLOCK_SIZE as usize];
-        let offset = raw.as_ptr().align_offset(BLOCK_SIZE as usize);
-        Self { raw, offset, len }
-    }
-
-    fn filled(len: usize, byte: u8) -> Self {
-        let mut buf = Self::new(len);
-        buf.as_mut().fill(byte);
-        buf
-    }
-
-    fn as_ref(&self) -> &[u8] {
-        &self.raw[self.offset..self.offset + self.len]
-    }
-
-    fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.raw[self.offset..self.offset + self.len]
-    }
-}
-
-fn direct(path: &Path, write: bool) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(write)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-}
-
-fn pattern(len: usize, seed: u8) -> Vec<u8> {
-    (0..len)
-        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
-        .collect()
-}
-
-fn sys_block_size(index: u32) -> Option<u64> {
-    let path = format!("/sys/block/nbd{index}/size");
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<u64>().ok())
-}
-
-fn raise_max_sectors(index: u32) -> Option<u64> {
-    let hw =
-        std::fs::read_to_string(format!("/sys/block/nbd{index}/queue/max_hw_sectors_kb")).ok()?;
-    let hw = hw.trim().to_string();
-    let path = format!("/sys/block/nbd{index}/queue/max_sectors_kb");
-    let mut file = OpenOptions::new().write(true).open(&path).ok()?;
-    file.write_all(hw.as_bytes()).ok()?;
-    hw.parse::<u64>().ok()
-}
-
-fn assert_no_capacity(index: u32) {
-    let size = sys_block_size(index);
-    assert!(
-        matches!(size, None | Some(0)),
-        "nbd{index} still reports {size:?} sectors after stop"
-    );
-}
 
 #[tokio::test]
 async fn a_memory_target_comes_up_as_a_device_node_reporting_its_size() {
@@ -549,39 +423,196 @@ async fn an_overlaybd_image_serves_reads_and_writes_through_the_device() {
     assert_no_capacity(index);
 }
 
-fn write_global_config(tmp: &tempfile::TempDir) -> PathBuf {
-    let path = tmp.path().join("overlaybd-global.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "registryFsVersion": "v2",
-            "nrIoRings": 1,
-            "cacheConfig": {
-                "cacheType": "file",
-                "cacheDir": tmp.path().join("cache"),
-                "cacheSizeGB": 1,
-                "refillSize": 262144,
-                "blockSize": 65536
-            },
-            "download": { "enable": false }
-        }))
-        .expect("encode the overlaybd global config"),
-    )
-    .expect("write the overlaybd global config");
-    path
+#[tokio::test]
+async fn an_o_dsync_write_and_an_fdatasync_reach_the_target() {
+    let name = "an_o_dsync_write_and_an_fdatasync_reach_the_target";
+    if !nbd_available(name) {
+        return;
+    }
+    let target = Arc::new(MemTarget::new(16 * MIB, BLOCK_SIZE));
+    let device = NbdDevice::start(target.clone(), options(2))
+        .await
+        .expect("start the nbd device");
+    let index = device.index();
+
+    let payload = Aligned::filled(4096, 0xA1);
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_DIRECT | libc::O_DSYNC)
+            .open(device.device_path())
+            .expect("open the device with O_DSYNC");
+        file.write_all_at(payload.as_ref(), 4096)
+            .expect("O_DSYNC pwrite");
+    }
+    let durable = target.fua_writes() + target.flushes();
+    eprintln!(
+        "nbd{index}: after an O_DSYNC write the target saw {} FUA writes and {} flushes",
+        target.fua_writes(),
+        target.flushes()
+    );
+    assert!(
+        durable > 0,
+        "an O_DSYNC write must reach the target as a FUA write or a flush, not as a plain write"
+    );
+    assert_eq!(target.snapshot(4096, 4096), payload.as_ref());
+
+    let flushes_before = target.flushes();
+    {
+        let file = direct(device.device_path(), true).expect("open the device with O_DIRECT");
+        let second = Aligned::filled(4096, 0xB2);
+        file.write_all_at(second.as_ref(), 8192).expect("pwrite");
+        file.sync_data().expect("fdatasync");
+    }
+    eprintln!(
+        "nbd{index}: an explicit fdatasync took the flush count from {flushes_before} to {}",
+        target.flushes()
+    );
+    assert!(
+        target.flushes() > flushes_before,
+        "an explicit fdatasync must reach the target's flush handler"
+    );
+
+    device.stop().await.expect("stop the nbd device");
+    assert_no_capacity(index);
 }
 
-fn write_image_config(tmp: &tempfile::TempDir, upper_data: &Path) -> PathBuf {
-    let path = tmp.path().join("overlaybd-image.json");
-    std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "lowers": [],
-            "upper": { "mode": "sparse", "data": upper_data },
-            "resultFile": tmp.path().join("result.txt")
-        }))
-        .expect("encode the overlaybd image config"),
+#[tokio::test]
+async fn an_overlaybd_write_and_flush_are_visible_to_a_reopened_image() {
+    let name = "an_overlaybd_write_and_flush_are_visible_to_a_reopened_image";
+    if !nbd_available(name) {
+        return;
+    }
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let global_config = write_global_config(&tmp);
+    let upper_data = tmp.path().join("upper.data");
+    overlaybd::helper::prepare_runtime_upper(
+        &upper_data,
+        None,
+        16 * MIB as u64,
+        overlaybd::config::UpperMode::Sparse,
     )
-    .expect("write the overlaybd image config");
-    path
+    .expect("prepare the sparse upper");
+    let image_config = write_image_config(&tmp, &upper_data);
+
+    let target = Arc::new(
+        OverlaybdTarget::open(&global_config, &image_config)
+            .await
+            .expect("open the overlaybd target"),
+    );
+    let device = NbdDevice::start(target, options(2))
+        .await
+        .expect("start the nbd device");
+    let index = device.index();
+
+    let payload = pattern(8192, 0x4D);
+    let mut buf = Aligned::new(8192);
+    buf.as_mut().copy_from_slice(&payload);
+    {
+        let file = direct(device.device_path(), true).expect("open the device with O_DIRECT");
+        file.write_all_at(buf.as_ref(), 12288).expect("pwrite");
+        file.sync_data().expect("fdatasync");
+    }
+    device.stop().await.expect("stop the nbd device");
+    assert_no_capacity(index);
+
+    let service = overlaybd::ImageService::from_config_path(&global_config)
+        .await
+        .expect("open the image service");
+    let image = service
+        .create_image_file(&image_config)
+        .await
+        .expect("reopen the image");
+    let read = overlaybd::virtual_file::VirtualFile::read_at(&image, 12288, 8192)
+        .await
+        .expect("read the image");
+    assert_eq!(
+        read.as_ref(),
+        payload.as_slice(),
+        "the flushed bytes must be in the image, not only in the device's cache"
+    );
+}
+
+#[tokio::test]
+async fn a_discard_through_the_device_zeroes_the_overlaybd_image() {
+    let name = "a_discard_through_the_device_zeroes_the_overlaybd_image";
+    if !nbd_available(name) {
+        return;
+    }
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let global_config = write_global_config(&tmp);
+    let upper_data = tmp.path().join("upper.data");
+    overlaybd::helper::prepare_runtime_upper(
+        &upper_data,
+        None,
+        16 * MIB as u64,
+        overlaybd::config::UpperMode::Sparse,
+    )
+    .expect("prepare the sparse upper");
+    let image_config = write_image_config(&tmp, &upper_data);
+
+    let target = Arc::new(
+        OverlaybdTarget::open(&global_config, &image_config)
+            .await
+            .expect("open the overlaybd target"),
+    );
+    let device = NbdDevice::start(target, options(2))
+        .await
+        .expect("start the nbd device");
+    let index = device.index();
+
+    let primed = Aligned::filled(32768, 0xE7);
+    {
+        let file = direct(device.device_path(), true).expect("open the device with O_DIRECT");
+        file.write_all_at(primed.as_ref(), 0).expect("pwrite");
+        file.sync_data().expect("fdatasync");
+
+        let range: [u64; 2] = [8192, 16384];
+        let rc = unsafe {
+            libc::ioctl(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                BLKDISCARD,
+                std::ptr::addr_of!(range),
+            )
+        };
+        assert_eq!(
+            rc,
+            0,
+            "BLKDISCARD failed: {:?}",
+            std::io::Error::last_os_error()
+        );
+        file.sync_data().expect("fdatasync after discard");
+    }
+
+    let mut read_back = Aligned::new(32768);
+    {
+        let file = direct(device.device_path(), false).expect("open the device with O_DIRECT");
+        file.read_exact_at(read_back.as_mut(), 0).expect("pread");
+    }
+    let bytes = read_back.as_ref();
+    assert!(bytes[..8192].iter().all(|&byte| byte == 0xE7));
+    assert!(
+        bytes[8192..24576].iter().all(|&byte| byte == 0),
+        "the discarded range must read back as zeros through the device"
+    );
+    assert!(bytes[24576..].iter().all(|&byte| byte == 0xE7));
+
+    device.stop().await.expect("stop the nbd device");
+    assert_no_capacity(index);
+
+    let service = overlaybd::ImageService::from_config_path(&global_config)
+        .await
+        .expect("open the image service");
+    let image = service
+        .create_image_file(&image_config)
+        .await
+        .expect("reopen the image");
+    let read = overlaybd::virtual_file::VirtualFile::read_at(&image, 8192, 16384)
+        .await
+        .expect("read the image");
+    assert!(
+        read.iter().all(|&byte| byte == 0),
+        "the discard must have reached the image, not only the device's cache"
+    );
 }

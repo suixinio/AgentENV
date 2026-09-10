@@ -1,8 +1,9 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use storage_util::io_ring::AsyncIoRing;
 
 use crate::target::{Geometry, NbdTarget};
@@ -17,6 +18,8 @@ pub struct MemTarget {
     supports_discard: bool,
     largest_request: AtomicUsize,
     flushes: AtomicUsize,
+    fua_writes: AtomicUsize,
+    stalled: AtomicBool,
 }
 
 impl MemTarget {
@@ -28,6 +31,8 @@ impl MemTarget {
             supports_discard: true,
             largest_request: AtomicUsize::new(0),
             flushes: AtomicUsize::new(0),
+            fua_writes: AtomicUsize::new(0),
+            stalled: AtomicBool::new(false),
         }
     }
 
@@ -68,6 +73,24 @@ impl MemTarget {
         self.flushes.load(Ordering::Relaxed)
     }
 
+    /// Writes the kernel marked FUA, which it only sends when the device
+    /// advertises both a volatile cache and FUA support.
+    pub fn fua_writes(&self) -> usize {
+        self.fua_writes.load(Ordering::Relaxed)
+    }
+
+    /// Hold every request until this is cleared, so a caller can watch what the
+    /// kernel does with a server that stops answering.
+    pub fn stall(&self, stalled: bool) {
+        self.stalled.store(stalled, Ordering::SeqCst);
+    }
+
+    async fn wait_while_stalled(&self) {
+        while self.stalled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn observe(&self, len: usize) {
         self.largest_request.fetch_max(len, Ordering::Relaxed);
     }
@@ -102,6 +125,7 @@ impl NbdTarget for MemTarget {
     }
 
     async fn read(self: &Arc<Self>, _io_ring: &AsyncIoRing, offset: u64, buf: &mut [u8]) -> i32 {
+        self.wait_while_stalled().await;
         let Ok((start, len)) = self.range(offset, buf.len() as u64) else {
             return -libc::EINVAL;
         };
@@ -115,10 +139,14 @@ impl NbdTarget for MemTarget {
         _io_ring: &AsyncIoRing,
         offset: u64,
         data: &[u8],
-        _fua: bool,
+        fua: bool,
     ) -> i32 {
+        self.wait_while_stalled().await;
         if self.read_only {
             return -libc::EPERM;
+        }
+        if fua {
+            self.fua_writes.fetch_add(1, Ordering::Relaxed);
         }
         let Ok((start, len)) = self.range(offset, data.len() as u64) else {
             return -libc::EINVAL;
@@ -129,6 +157,7 @@ impl NbdTarget for MemTarget {
     }
 
     async fn flush(self: &Arc<Self>, _io_ring: &AsyncIoRing) -> i32 {
+        self.wait_while_stalled().await;
         self.flushes.fetch_add(1, Ordering::Relaxed);
         0
     }
@@ -206,6 +235,36 @@ mod tests {
         assert_eq!(target.discard(&ring, 4096, 4096).await, 0);
         assert!(target.snapshot(0, 4096).iter().all(|&byte| byte == 0xFF));
         assert!(target.snapshot(4096, 4096).iter().all(|&byte| byte == 0));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_fua_write_is_counted_apart_from_a_plain_one() {
+        let target = Arc::new(MemTarget::new(8192, 4096));
+        let ring = ring();
+        assert_eq!(target.write(&ring, 0, &[0u8; 4096], false).await, 0);
+        assert_eq!(target.fua_writes(), 0);
+        assert_eq!(target.write(&ring, 0, &[0u8; 4096], true).await, 0);
+        assert_eq!(target.fua_writes(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stalled_target_answers_nothing_until_it_is_released() {
+        let target = Arc::new(MemTarget::new(8192, 4096));
+        let ring = ring();
+        target.stall(true);
+        let mut buf = [0u8; 4096];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(120), target.read(&ring, 0, &mut buf))
+                .await
+                .is_err()
+        );
+        target.stall(false);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), target.read(&ring, 0, &mut buf))
+                .await
+                .expect("a released target answers again"),
+            0
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

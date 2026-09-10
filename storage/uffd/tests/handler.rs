@@ -443,3 +443,52 @@ fn no_handshake_within_the_timeout_ends_the_handler() -> Result<()> {
     assert!(handler.stop().is_err());
     Ok(())
 }
+
+#[test]
+fn faulted_pages_report_the_working_set_and_prefault_installs_ahead() -> Result<()> {
+    let Some(uffd) =
+        uffd_or_skip("faulted_pages_report_the_working_set_and_prefault_installs_ahead")
+    else {
+        return Ok(());
+    };
+    let size = 2 * MIB;
+    let region = AnonRegion::new(size)?;
+    region.register(&uffd, 0)?;
+    let source = Arc::new(MemSource::patterned(size, PAGE, 0));
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![region.mapping(0, PAGE as u64)],
+        Arc::clone(&source),
+        opts("prefault"),
+    )?;
+
+    for p in [9usize, 0, 5] {
+        let _ = region.read_byte(p * PAGE);
+    }
+    assert_eq!(handler.faulted_pages(), vec![0, 5, 9]);
+
+    // Page 5 is present already, page 4096 lies past the region.
+    handler.prefault(vec![1, 2, 3, 5, 4096])?;
+    assert!(
+        wait_for(|| handler.stats().prefaulted == 3, Duration::from_secs(5)),
+        "three pages were prefaulted: {:?}",
+        handler.stats()
+    );
+    let faults_before = handler.stats().faults;
+    for p in [1usize, 2, 3] {
+        let got = region.read(p * PAGE, PAGE);
+        assert_eq!(
+            &got[..],
+            &source.as_slice()[p * PAGE..(p + 1) * PAGE],
+            "page {p}"
+        );
+    }
+    assert_eq!(
+        handler.stats().faults,
+        faults_before,
+        "prefaulted pages do not fault"
+    );
+    assert_eq!(handler.faulted_pages(), vec![0, 1, 2, 3, 5, 9]);
+    handler.stop()?;
+    Ok(())
+}

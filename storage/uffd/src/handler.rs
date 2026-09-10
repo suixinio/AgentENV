@@ -15,7 +15,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +23,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use storage_util::io_ring::{AsyncIoRing, AsyncIoRingBuilder};
 use tokio::io::unix::AsyncFd;
 use tokio::net::UnixListener;
-use tokio::sync::{oneshot, watch, Notify, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::handshake::{recv_handshake, GuestRegionUffdMapping};
 use crate::proto::{Event, Uffd, UffdMsg};
@@ -78,6 +78,8 @@ pub struct StatsSnapshot {
     pub copy_retries: u64,
     /// `UFFD_EVENT_REMOVE` events.
     pub removes: u64,
+    /// Pages installed ahead of the guest by `prefault`.
+    pub prefaulted: u64,
 }
 
 #[derive(Default)]
@@ -91,6 +93,7 @@ struct Stats {
     read_retries: AtomicU64,
     copy_retries: AtomicU64,
     removes: AtomicU64,
+    prefaulted: AtomicU64,
 }
 
 impl Stats {
@@ -106,6 +109,7 @@ impl Stats {
             read_retries: load(&self.read_retries),
             copy_retries: load(&self.copy_retries),
             removes: load(&self.removes),
+            prefaulted: load(&self.prefaulted),
         }
     }
 }
@@ -131,6 +135,19 @@ pub struct UffdHandler {
     thread: Option<thread::JoinHandle<()>>,
     state: watch::Receiver<HandlerState>,
     stats: Arc<Stats>,
+    prefault: mpsc::UnboundedSender<Vec<u64>>,
+    /// One bit per image page, set once the page is installed in the guest.
+    served: Arc<Mutex<Vec<u64>>>,
+}
+
+/// What the handler thread runs with.
+struct ThreadInputs {
+    entry: Entry,
+    opts: HandlerOptions,
+    stats: Arc<Stats>,
+    served: Arc<Mutex<Vec<u64>>>,
+    prefault_rx: mpsc::UnboundedReceiver<Vec<u64>>,
+    stop: oneshot::Receiver<()>,
 }
 
 impl std::fmt::Debug for UffdHandler {
@@ -173,13 +190,22 @@ impl UffdHandler {
         }
         let (stop_tx, stop_rx) = oneshot::channel();
         let (state_tx, state_rx) = watch::channel(HandlerState::Starting);
+        let (prefault_tx, prefault_rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Stats::default());
-        let thread_stats = Arc::clone(&stats);
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let inputs = ThreadInputs {
+            entry,
+            opts: opts.clone(),
+            stats: Arc::clone(&stats),
+            served: Arc::clone(&served),
+            prefault_rx,
+            stop: stop_rx,
+        };
         let name = opts.name.clone();
         let thread = thread::Builder::new()
             .name(format!("uffd-{name}"))
             .spawn(move || {
-                let result = thread_main(entry, source, opts, thread_stats, stop_rx, &state_tx);
+                let result = thread_main(inputs, source, &state_tx);
                 let error = result.err().map(|err| format!("{err:#}"));
                 if let Some(error) = &error {
                     tracing::error!(name, error, "uffd handler exited with an error");
@@ -194,7 +220,38 @@ impl UffdHandler {
             thread: Some(thread),
             state: state_rx,
             stats,
+            prefault: prefault_tx,
+            served,
         })
+    }
+
+    /// Page indices (image offset over page size) installed in the guest so
+    /// far, ascending: the working set to prefault on the next resume of the
+    /// same image.
+    pub fn faulted_pages(&self) -> Vec<u64> {
+        let served = self
+            .served
+            .lock()
+            .expect("the served bitmap is never poisoned");
+        let mut pages = Vec::new();
+        for (word_idx, word) in served.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as u64;
+                pages.push(word_idx as u64 * 64 + bit);
+                bits &= bits - 1;
+            }
+        }
+        pages
+    }
+
+    /// Installs `pages` (page indices) in the background ahead of the guest,
+    /// on a fraction of the fault budget; pages already present, discarded or
+    /// outside the mapped regions are skipped. Fails once the thread is gone.
+    pub fn prefault(&self, pages: Vec<u64>) -> Result<()> {
+        self.prefault
+            .send(pages)
+            .map_err(|_| anyhow!("uffd handler is not running"))
     }
 
     pub fn state(&self) -> HandlerState {
@@ -278,13 +335,18 @@ thread_local! {
 }
 
 fn thread_main<S: PageSource>(
-    entry: Entry,
+    inputs: ThreadInputs,
     source: Arc<S>,
-    opts: HandlerOptions,
-    stats: Arc<Stats>,
-    mut stop: oneshot::Receiver<()>,
     state: &watch::Sender<HandlerState>,
 ) -> Result<()> {
+    let ThreadInputs {
+        entry,
+        opts,
+        stats,
+        served,
+        prefault_rx,
+        mut stop,
+    } = inputs;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .on_thread_park(|| {
@@ -307,7 +369,13 @@ fn thread_main<S: PageSource>(
                 None => return Ok(()),
             },
         };
-        run(uffd, mappings, source, opts, stats, &mut stop, state).await
+        let inputs = RunInputs {
+            opts,
+            stats,
+            served,
+            prefault_rx,
+        };
+        run(uffd, mappings, source, inputs, &mut stop, state).await
     })
 }
 
@@ -347,6 +415,13 @@ async fn accept_handshake(
     Ok(Some((uffd, handshake.mappings)))
 }
 
+struct RunInputs {
+    opts: HandlerOptions,
+    stats: Arc<Stats>,
+    served: Arc<Mutex<Vec<u64>>>,
+    prefault_rx: mpsc::UnboundedReceiver<Vec<u64>>,
+}
+
 struct Ctx<S> {
     uffd: AsyncFd<Uffd>,
     mappings: Vec<GuestRegionUffdMapping>,
@@ -357,6 +432,8 @@ struct Ctx<S> {
     opts: HandlerOptions,
     inflight: RefCell<HashSet<u64>>,
     removed: RefCell<Vec<u64>>,
+    served: Arc<Mutex<Vec<u64>>>,
+    prefault_permits: Arc<Semaphore>,
     pool: RefCell<Vec<Vec<u8>>>,
     zero_page: Vec<u8>,
     fatal: RefCell<Option<anyhow::Error>>,
@@ -368,6 +445,33 @@ struct Ctx<S> {
 impl<S: PageSource> Ctx<S> {
     fn mapping_for(&self, host_addr: u64) -> Option<&GuestRegionUffdMapping> {
         self.mappings.iter().find(|m| m.contains(host_addr))
+    }
+
+    fn host_addr_for_offset(&self, offset: u64) -> Option<u64> {
+        self.mappings
+            .iter()
+            .find(|m| offset >= m.offset && offset < m.end_offset())
+            .map(|m| m.host_addr(offset))
+    }
+
+    fn is_served(&self, page_idx: u64) -> bool {
+        let served = self
+            .served
+            .lock()
+            .expect("the served bitmap is never poisoned");
+        let word = (page_idx / 64) as usize;
+        word < served.len() && served[word] & (1u64 << (page_idx % 64)) != 0
+    }
+
+    fn mark_served(&self, page_idx: u64) {
+        let mut served = self
+            .served
+            .lock()
+            .expect("the served bitmap is never poisoned");
+        let word = (page_idx / 64) as usize;
+        if word < served.len() {
+            served[word] |= 1u64 << (page_idx % 64);
+        }
     }
 
     fn set_fatal(&self, err: anyhow::Error) {
@@ -422,11 +526,16 @@ async fn run<S: PageSource>(
     uffd: Uffd,
     mappings: Vec<GuestRegionUffdMapping>,
     source: Arc<S>,
-    opts: HandlerOptions,
-    stats: Arc<Stats>,
+    inputs: RunInputs,
     stop: &mut oneshot::Receiver<()>,
     state: &watch::Sender<HandlerState>,
 ) -> Result<()> {
+    let RunInputs {
+        opts,
+        stats,
+        served,
+        mut prefault_rx,
+    } = inputs;
     let page_size = mappings
         .first()
         .map(|m| m.page_size())
@@ -466,6 +575,8 @@ async fn run<S: PageSource>(
     uffd.set_nonblocking(true)
         .context("put the userfaultfd in non-blocking mode")?;
     let uffd = AsyncFd::new(uffd).context("register the userfaultfd with the reactor")?;
+    let bitmap_words = total_pages.div_ceil(64) as usize;
+    *served.lock().expect("the served bitmap is never poisoned") = vec![0u64; bitmap_words];
 
     let ctx = Rc::new(Ctx {
         uffd,
@@ -475,7 +586,9 @@ async fn run<S: PageSource>(
         ring,
         stats,
         inflight: RefCell::new(HashSet::new()),
-        removed: RefCell::new(vec![0u64; total_pages.div_ceil(64) as usize]),
+        removed: RefCell::new(vec![0u64; bitmap_words]),
+        served,
+        prefault_permits: Arc::new(Semaphore::new((opts.max_inflight / 4).max(1))),
         pool: RefCell::new(Vec::new()),
         zero_page: vec![0u8; page_size as usize],
         fatal: RefCell::new(None),
@@ -495,10 +608,17 @@ async fn run<S: PageSource>(
     );
 
     let mut msgs = vec![UffdMsg::default(); EVENT_BATCH];
+    let mut prefault_open = true;
     let outcome = loop {
         tokio::select! {
             _ = &mut *stop => break Ok(()),
             _ = ctx.fatal_notify.notified() => break Err(()),
+            pages = prefault_rx.recv(), if prefault_open => match pages {
+                Some(pages) => {
+                    tokio::task::spawn_local(prefault_all(Rc::clone(&ctx), pages));
+                }
+                None => prefault_open = false,
+            },
             guard = ctx.uffd.readable() => {
                 let mut guard = guard.context("poll the userfaultfd")?;
                 let n = match guard.try_io(|fd| fd.get_ref().read_events(&mut msgs)) {
@@ -571,22 +691,63 @@ async fn dispatch<S: PageSource>(
         .acquire_owned()
         .await
         .expect("the inflight semaphore is never closed");
+    spawn_serve(ctx, offset, aligned, permit, false);
+    Ok(())
+}
+
+/// Reads and installs one page on its own task. `host_addr` is already in
+/// the inflight set; the task takes it out again.
+fn spawn_serve<S: PageSource>(
+    ctx: &Rc<Ctx<S>>,
+    offset: u64,
+    host_addr: u64,
+    permit: OwnedSemaphorePermit,
+    prefault: bool,
+) {
     ctx.active.set(ctx.active.get() + 1);
     let ctx = Rc::clone(ctx);
     tokio::task::spawn_local(async move {
-        let result = serve_page(&ctx, offset, aligned).await;
+        let result = serve_page(&ctx, offset, host_addr).await;
         drop(permit);
-        ctx.inflight.borrow_mut().remove(&aligned);
+        ctx.inflight.borrow_mut().remove(&host_addr);
         let active = ctx.active.get() - 1;
         ctx.active.set(active);
         if active == 0 {
             ctx.drained.notify_one();
         }
-        if let Err(err) = result {
-            ctx.set_fatal(err);
+        match result {
+            Ok(()) => {
+                ctx.mark_served(offset / ctx.page_size);
+                if prefault {
+                    bump(&ctx.stats.prefaulted);
+                }
+            }
+            Err(err) => ctx.set_fatal(err),
         }
     });
-    Ok(())
+}
+
+async fn prefault_all<S: PageSource>(ctx: Rc<Ctx<S>>, pages: Vec<u64>) {
+    for idx in pages {
+        if ctx.is_served(idx) || ctx.is_removed(idx) {
+            continue;
+        }
+        let offset = idx * ctx.page_size;
+        let Some(host_addr) = ctx.host_addr_for_offset(offset) else {
+            continue;
+        };
+        if ctx.inflight.borrow().contains(&host_addr) {
+            continue;
+        }
+        let Ok(permit) = Arc::clone(&ctx.prefault_permits).acquire_owned().await else {
+            return;
+        };
+        // A fault may have served the page while this waited for a permit.
+        if ctx.is_served(idx) || !ctx.inflight.borrow_mut().insert(host_addr) {
+            continue;
+        }
+        spawn_serve(&ctx, offset, host_addr, permit, true);
+    }
 }
 
 async fn serve_page<S: PageSource>(ctx: &Ctx<S>, offset: u64, host_addr: u64) -> Result<()> {

@@ -10,7 +10,6 @@ use crate::cfg::BlockTransport;
 
 const UDEV_RULES_DIR: &str = "/etc/udev/rules.d";
 const NBD_MODULE_PATH: &str = "/sys/module/nbd";
-const NBD_FIRST_DEVICE: &str = "/dev/nbd0";
 
 fn supports_persistent_udev_rules() -> bool {
     Path::new(UDEV_RULES_DIR).exists()
@@ -139,13 +138,42 @@ fn check_ublk() -> Result<()> {
     Ok(())
 }
 
+fn first_nbd_device_node() -> Option<std::path::PathBuf> {
+    let mut nodes: Vec<std::path::PathBuf> = std::fs::read_dir("/dev")
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.strip_prefix("nbd").is_some_and(|rest| {
+                        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                    })
+                })
+        })
+        .collect();
+    nodes.sort();
+    nodes.into_iter().next()
+}
+
 fn check_nbd() -> Result<()> {
     if !nbd_module_loaded() {
         bail!("the nbd kernel module is not loaded; run `server --setup-host` as root");
     }
-    access(NBD_FIRST_DEVICE, AccessFlags::R_OK | AccessFlags::W_OK).with_context(|| {
-        format!("{NBD_FIRST_DEVICE} is not readable and writable by this user; run `server --setup-host` as root")
-    })?;
+    // The kernel allocates indices on connect, so the preallocated nodes may
+    // all have been consumed; the access check runs against whichever exists.
+    match first_nbd_device_node() {
+        Some(node) => {
+            access(node.as_path(), AccessFlags::R_OK | AccessFlags::W_OK).with_context(|| {
+                format!(
+                    "{} is not readable and writable by this user; run `server --setup-host` as root",
+                    node.display()
+                )
+            })?;
+        }
+        None => warn!("no /dev/nbd* node exists yet; device access is checked at first connect"),
+    }
     if !linux_cap::has_effective_capabilities(&[linux_cap::CAP_SYS_ADMIN])
         .context("read the process capability sets")?
     {

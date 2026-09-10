@@ -613,6 +613,7 @@ async fn handle_connection(
             socket_path,
             max_inflight,
             read_retry_secs,
+            prefetch_path,
         } => {
             memory_uffd
                 .serve(
@@ -623,6 +624,7 @@ async fn handle_connection(
                         socket_path: &socket_path,
                         max_inflight,
                         read_retry_secs,
+                        prefetch_path: prefetch_path.as_deref(),
                     },
                 )
                 .await

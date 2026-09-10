@@ -1686,7 +1686,7 @@ mod live_device_tests {
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
         use uvm_uffd::testing::{create_uffd_for_test, AnonRegion};
-        use uvm_uffd::{send_handshake, Uffd};
+        use uvm_uffd::{send_handshake, PrefetchList, Uffd};
 
         const PAGE: usize = 4096;
         const IMAGE_SIZE: u64 = 8 * 1024 * 1024;
@@ -1776,6 +1776,7 @@ mod live_device_tests {
                     &socket_path,
                     16,
                     5,
+                    None,
                 )
                 .await
                 .expect("serve the memory image");
@@ -1855,6 +1856,7 @@ mod live_device_tests {
                             &socket_dir.path().join(name),
                             16,
                             5,
+                            None,
                         )
                         .await
                         .expect("serve the memory image"),
@@ -1899,6 +1901,148 @@ mod live_device_tests {
         }
 
         #[tokio::test]
+        async fn a_resume_records_its_working_set_and_the_next_one_prefaults_it() {
+            let name = "a_resume_records_its_working_set_and_the_next_one_prefaults_it";
+            if !transport_reachable(name) {
+                return;
+            }
+            let Some(uffd) = uffd_or_skip(name) else {
+                return;
+            };
+            let fixture = image_fixture(IMAGE_SIZE).await;
+            let daemon = RunningDaemon::start(&fixture.global_config, None).await;
+            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_path = socket_dir.path().join("mem.sock");
+            let prefetch_path = socket_dir.path().join("mem_prefetch.json");
+            let pages: Vec<usize> = (0..12).map(|i| i * 3).collect();
+
+            let serve_id = daemon
+                .client
+                .serve_memory_uffd(
+                    &fixture.image_config,
+                    &fixture.global_config,
+                    &socket_path,
+                    16,
+                    5,
+                    Some(&prefetch_path),
+                )
+                .await
+                .expect("serve the memory image");
+            {
+                let region =
+                    Arc::new(AnonRegion::new(IMAGE_SIZE as usize).expect("map the region"));
+                region.register(&uffd, 0).expect("register the region");
+                let stream = UnixStream::connect(&socket_path).expect("connect");
+                send_handshake(
+                    &stream,
+                    &[region.mapping(0, PAGE as u64)],
+                    &[uffd.as_raw_fd()],
+                )
+                .expect("send the handshake");
+                assert_eq!(
+                    wait_for_state(&daemon.client, serve_id, MemoryUffdState::Serving).await,
+                    MemoryUffdState::Serving
+                );
+                drop(uffd);
+                let faulter = Arc::clone(&region);
+                let touched = pages.clone();
+                tokio::task::spawn_blocking(move || {
+                    for p in touched {
+                        let _ = faulter.read_byte(p * PAGE);
+                    }
+                })
+                .await
+                .expect("fault the pages in");
+                daemon
+                    .client
+                    .stop_memory_uffd(serve_id)
+                    .await
+                    .expect("stop");
+            }
+            let list = PrefetchList::read(&prefetch_path)
+                .expect("read the list")
+                .expect("the first resume recorded its working set");
+            assert_eq!(
+                list.pages,
+                pages.iter().map(|p| *p as u64).collect::<Vec<_>>()
+            );
+
+            let Some(uffd) = uffd_or_skip(name) else {
+                return;
+            };
+            let serve_id = daemon
+                .client
+                .serve_memory_uffd(
+                    &fixture.image_config,
+                    &fixture.global_config,
+                    &socket_path,
+                    16,
+                    5,
+                    Some(&prefetch_path),
+                )
+                .await
+                .expect("serve the memory image again");
+            let region = Arc::new(AnonRegion::new(IMAGE_SIZE as usize).expect("map the region"));
+            region.register(&uffd, 0).expect("register the region");
+            let stream = UnixStream::connect(&socket_path).expect("connect");
+            send_handshake(
+                &stream,
+                &[region.mapping(0, PAGE as u64)],
+                &[uffd.as_raw_fd()],
+            )
+            .expect("send the handshake");
+            assert_eq!(
+                wait_for_state(&daemon.client, serve_id, MemoryUffdState::Serving).await,
+                MemoryUffdState::Serving
+            );
+            drop(uffd);
+            let mut stats = MemoryUffdStats::default();
+            for _ in 0..250 {
+                stats = daemon
+                    .client
+                    .query_memory_uffd(serve_id)
+                    .await
+                    .expect("query")
+                    .1;
+                if stats.prefaulted as usize == pages.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert_eq!(stats.prefaulted as usize, pages.len(), "{stats:?}");
+
+            let faulter = Arc::clone(&region);
+            let touched = pages.clone();
+            tokio::task::spawn_blocking(move || {
+                for p in touched {
+                    let _ = faulter.read_byte(p * PAGE);
+                }
+            })
+            .await
+            .expect("read the prefaulted pages");
+            let (_, after) = daemon
+                .client
+                .query_memory_uffd(serve_id)
+                .await
+                .expect("query");
+            assert_eq!(
+                after.faults, stats.faults,
+                "prefaulted pages are present and do not fault"
+            );
+            daemon
+                .client
+                .stop_memory_uffd(serve_id)
+                .await
+                .expect("stop");
+            assert_eq!(
+                PrefetchList::read(&prefetch_path).unwrap().unwrap(),
+                list,
+                "a later resume does not rewrite the list"
+            );
+            daemon.stop().await;
+        }
+
+        #[tokio::test]
         async fn shutdown_stops_uffd_servers() {
             let fixture = image_fixture(IMAGE_SIZE).await;
             let daemon = RunningDaemon::start(&fixture.global_config, None).await;
@@ -1913,6 +2057,7 @@ mod live_device_tests {
                     &socket_path,
                     16,
                     5,
+                    None,
                 )
                 .await
                 .expect("serve the memory image");

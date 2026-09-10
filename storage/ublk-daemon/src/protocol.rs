@@ -83,6 +83,10 @@ pub enum DaemonRequest {
         max_inflight: usize,
         #[serde(default = "default_uffd_read_retry_secs")]
         read_retry_secs: u64,
+        /// The working-set list of this image: replayed once the handshake
+        /// is done when it exists, recorded at stop when it does not.
+        #[serde(default)]
+        prefetch_path: Option<PathBuf>,
     },
     /// Stop a userfaultfd server. Its descriptor closes; a guest still
     /// running on it is no longer backed.
@@ -618,11 +622,13 @@ mod tests {
                 max_inflight,
                 read_retry_secs,
                 socket_path,
+                prefetch_path,
                 ..
             } => {
                 assert_eq!(max_inflight, 64);
                 assert_eq!(read_retry_secs, 60);
                 assert_eq!(socket_path, PathBuf::from("/run/sbx/uffd.sock"));
+                assert_eq!(prefetch_path, None);
             }
             other => panic!("unexpected request: {other:?}"),
         }

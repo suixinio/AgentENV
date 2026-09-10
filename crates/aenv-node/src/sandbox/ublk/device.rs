@@ -604,6 +604,11 @@ impl UblkDeviceManager {
         let client = self.require_client()?;
         let memory = &crate::cfg::ConfigManager::global_config().memory_snapshot;
 
+        // The working set recorded next to the image by its first resume;
+        // every later resume of the same image replays it.
+        let prefetch_path = image_config
+            .parent()
+            .map(|dir| dir.join(MEM_PREFETCH_FILE_NAME));
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "serve_memory_uffd");
         let served = client
             .serve_memory_uffd(
@@ -612,6 +617,7 @@ impl UblkDeviceManager {
                 socket_path,
                 memory.uffd.max_inflight,
                 memory.uffd.read_retry_secs,
+                prefetch_path.as_deref(),
             )
             .await
             .context("serve memory snapshot over userfaultfd via daemon");
@@ -633,6 +639,9 @@ impl UblkDeviceManager {
 }
 
 // ── Memory userfaultfd serve ────────────────────────────────────────────────
+
+/// Sibling of `mem_image.json` in a snapshot directory.
+const MEM_PREFETCH_FILE_NAME: &str = "mem_prefetch.json";
 
 /// A handle to one daemon-side userfaultfd server.
 ///

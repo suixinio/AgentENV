@@ -581,6 +581,7 @@ impl UblkDaemonClient {
         socket_path: &Path,
         max_inflight: usize,
         read_retry_secs: u64,
+        prefetch_path: Option<&Path>,
     ) -> Result<u32> {
         let request = DaemonRequest::ServeMemoryUffd {
             image_config: image_config.to_path_buf(),
@@ -588,6 +589,7 @@ impl UblkDaemonClient {
             socket_path: socket_path.to_path_buf(),
             max_inflight,
             read_retry_secs,
+            prefetch_path: prefetch_path.map(Path::to_path_buf),
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::MemoryUffdServing { serve_id } => Ok(serve_id),

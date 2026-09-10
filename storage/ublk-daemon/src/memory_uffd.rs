@@ -14,7 +14,9 @@ use dashmap::DashMap;
 use overlaybd::image_file::ImageFile;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use uvm_uffd::{HandlerOptions, HandlerState, OverlaybdSource, StatsSnapshot, UffdHandler};
+use uvm_uffd::{
+    HandlerOptions, HandlerState, OverlaybdSource, PrefetchList, StatsSnapshot, UffdHandler,
+};
 
 use crate::protocol::{DaemonResponse, MemoryUffdState, MemoryUffdStats};
 use crate::server::ImageServiceCache;
@@ -41,6 +43,8 @@ struct ActiveServe {
     cancel_watcher: oneshot::Sender<()>,
     socket_path: PathBuf,
     image_key: ImageKey,
+    /// Where the working set is recorded at stop, unless a list exists.
+    prefetch_path: Option<PathBuf>,
 }
 
 pub(crate) struct ServeMemoryUffdRequest<'a> {
@@ -49,6 +53,7 @@ pub(crate) struct ServeMemoryUffdRequest<'a> {
     pub(crate) socket_path: &'a Path,
     pub(crate) max_inflight: usize,
     pub(crate) read_retry_secs: u64,
+    pub(crate) prefetch_path: Option<&'a Path>,
 }
 
 /// Every userfaultfd memory server this daemon owns.
@@ -156,13 +161,23 @@ impl MemoryUffdServers {
             }
         };
 
+        let prefetch = request
+            .prefetch_path
+            .map(|path| (path.to_path_buf(), read_prefetch_list(path)));
         let (cancel_watcher, cancelled) = oneshot::channel();
         let watcher = tokio::spawn({
             let handler = Arc::clone(&handler);
             let image_config = request.image_config.to_path_buf();
+            let replay = prefetch.as_ref().and_then(|(_, list)| list.clone());
             async move {
+                let serve = async {
+                    if let Some(list) = replay {
+                        replay_prefetch(serve_id, &handler, list).await;
+                    }
+                    handler.wait_exit().await
+                };
                 tokio::select! {
-                    exit = handler.wait_exit() => match exit {
+                    exit = serve => match exit {
                         Some(error) => tracing::error!(
                             serve_id,
                             image_config = %image_config.display(),
@@ -188,6 +203,7 @@ impl MemoryUffdServers {
                 cancel_watcher,
                 socket_path: request.socket_path.to_path_buf(),
                 image_key: key.clone(),
+                prefetch_path: prefetch.map(|(path, _)| path),
             },
         );
         tracing::info!(
@@ -207,12 +223,16 @@ impl MemoryUffdServers {
             cancel_watcher,
             socket_path,
             image_key,
+            prefetch_path,
         } = serve;
 
         // Joining the watcher leaves this the only reference to the handler,
         // which the blocking join below needs to own.
         let _ = cancel_watcher.send(());
         let _ = watcher.await;
+        if let Some(path) = prefetch_path {
+            record_prefetch_list(serve_id, &handler, &path);
+        }
         match Arc::into_inner(handler) {
             Some(handler) => match tokio::task::spawn_blocking(move || handler.stop()).await {
                 Ok(Ok(())) => {}
@@ -336,6 +356,74 @@ fn bind_handshake_socket(socket_path: &Path) -> Result<UnixListener> {
     }
     UnixListener::bind(socket_path)
         .with_context(|| format!("bind the memory uffd socket {}", socket_path.display()))
+}
+
+fn read_prefetch_list(path: &Path) -> Option<PrefetchList> {
+    match PrefetchList::read(path) {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %format!("{err:#}"),
+                "ignoring an unreadable memory prefetch list"
+            );
+            None
+        }
+    }
+}
+
+/// Installs the recorded working set once the handshake has fixed the page
+/// size; a list for another page size is left alone.
+async fn replay_prefetch(serve_id: u32, handler: &UffdHandler, list: PrefetchList) {
+    if handler.wait_serving().await.is_err() {
+        return;
+    }
+    let page_size = handler.page_size().unwrap_or(0);
+    match list.pages_for(page_size) {
+        Some(pages) => {
+            tracing::info!(
+                serve_id,
+                pages = pages.len(),
+                "prefaulting the recorded working set"
+            );
+            if let Err(err) = handler.prefault(pages.to_vec()) {
+                tracing::warn!(serve_id, error = %err, "prefault request was not accepted");
+            }
+        }
+        None => tracing::warn!(
+            serve_id,
+            recorded_page_size = list.page_size,
+            page_size,
+            "ignoring a memory prefetch list recorded for another page size"
+        ),
+    }
+}
+
+/// Records the pages this server installed as the image's working set,
+/// unless a list exists already: the first resume of an image wins.
+fn record_prefetch_list(serve_id: u32, handler: &UffdHandler, path: &Path) {
+    let Some(page_size) = handler.page_size() else {
+        return;
+    };
+    let list = PrefetchList::new(page_size, handler.faulted_pages());
+    if !list.is_worth_recording() {
+        return;
+    }
+    match list.write_if_absent(path) {
+        Ok(true) => tracing::info!(
+            serve_id,
+            pages = list.pages.len(),
+            path = %path.display(),
+            "recorded the memory working set"
+        ),
+        Ok(false) => {}
+        Err(err) => tracing::warn!(
+            serve_id,
+            path = %path.display(),
+            error = %format!("{err:#}"),
+            "recording the memory working set failed"
+        ),
+    }
 }
 
 fn state_of(state: HandlerState) -> MemoryUffdState {

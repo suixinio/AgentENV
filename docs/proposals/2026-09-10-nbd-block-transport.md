@@ -150,12 +150,50 @@ The Firecracker integration suites also ran on this machine under
 passed, the 7 that do failed exactly as they do under ublk on a node-only
 harness.
 
+## nbd against ublk on one host (pve-mf worker, 2026-09-10)
+
+Both transports serving the same 1 GiB in-memory target on the same host
+(8 vCPU, kernel 6.8, 4 queues or connections, queue depth 64, request limit
+raised to the hardware maximum on both), `uvm-ublk create ... mem` against
+`uvm-nbd expose-mem`, with a loop device over tmpfs as the in-kernel ceiling.
+fio `direct=1`, `libaio`, 12 s per profile.
+
+| profile | ublk | nbd | loop over tmpfs |
+|---|---|---|---|
+| randread 4k, qd32 x 4 | 924k IOPS, 135 us | 220k IOPS, 572 us | 808k IOPS, 155 us |
+| randwrite 4k, qd32 x 4 | 680k IOPS, 185 us | 164k IOPS, 770 us | 607k IOPS, 208 us |
+| read 1M, qd8 | 3.9 GiB/s | 2.8 GiB/s | 4.5 GiB/s |
+| write 1M, qd8 | 4.0 GiB/s | 2.2 GiB/s | 3.9 GiB/s |
+| randread 4k, qd1 | 42k IOPS, 18.3 us | 23k IOPS, 38.2 us | 45k IOPS, 16.7 us |
+| randrw 4k, qd32 x 4 | 406k + 406k IOPS | 109k + 109k IOPS | 262k + 262k IOPS |
+
+ublk sits at the in-kernel ceiling: its mmap'd descriptor ring and io_uring
+completion path add nothing measurable. nbd pays the socket hop: a quarter of
+the small-request throughput, twice the single-request latency, 60 to 75
+percent of the large sequential bandwidth. The build-machine numbers above
+(6.1, 16 vCPU) show the same shape at lower absolute values.
+
+What this means per device kind:
+
+- Writable rootfs and extra drives: nbd's 160k to 220k small-request IOPS per
+  device is above what an overlaybd image delivers from a registry or a
+  local layer file, and the resilience it buys (a stalled request no longer
+  kills the disk, a crashed daemon can reattach) is worth the hop.
+- The memory snapshot device: every guest page fault on a not-yet-resident
+  page is one 4 KiB read at queue depth close to one, and nbd doubles the
+  transport part of it, 18 to 38 microseconds. Against a registry or OSS
+  fetch that is noise; against a warm local layer it is the difference. The
+  measured case for keeping the memory device on ublk where the kernel
+  allows is therefore real, and it needs the daemon to run both transports
+  at once, one per device kind, which it cannot today.
+
 ## Still open
 
-- The benchmark that compares the memory device under both transports.
-  `crates/benchmarks/benches/ublk_overlaybd_benchmark.rs` drives ublk
-  in-process and needs an nbd twin; until it exists the memory device stays
-  on whichever transport the daemon runs, and pve-mf runs nbd.
+- A transport per device kind. The same-host numbers say the memory device
+  wants ublk and the writable drives want nbd; the daemon holds one
+  `TransportHandle` and would need both, with `AcquireOverlaybd` (the memory
+  device's path) choosing ublk when the kernel has it. Until then the
+  transport is one switch per node, and pve-mf runs nbd for everything.
 - The three workflows that pin `ubuntu-22.04` because of the ublk `ADD_DEV`
   crash. `nbd-tests.yml` already runs on 24.04; moving the integration suite
   there means running it under `AENV_UBLK_TRANSPORT=nbd`, which changes what

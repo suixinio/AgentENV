@@ -5,6 +5,7 @@ mod network_capacity;
 pub mod overlaybd;
 mod packages;
 mod ublk;
+mod uffd;
 
 use anyhow::{Context, Result};
 use nix::sys::resource::{getrlimit, setrlimit, Resource};
@@ -52,6 +53,9 @@ pub fn ensure_host(config: &AppConfig, runtime_user: &str, runtime_group: &str) 
         );
     }
     ublk::provision(runtime_group, config.ublk.transport)?;
+    if config.memory_snapshot.backend == crate::cfg::MemorySnapshotBackend::Uffd {
+        uffd::provision(runtime_group)?;
+    }
     overlaybd::install_system_default_config(&config.deps_path, runtime_gid)?;
     network_capacity::install_persistent_config().context("install /etc/sysctl.d/99-aenv.conf")?;
     fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").context("enable host IPv4 forwarding")?;
@@ -124,6 +128,10 @@ pub async fn ensure_environment(
     // 3. block transport setup
     info!(transport = %config.ublk.transport, "checking block transport module and permissions");
     ublk::check(config.ublk.transport)?;
+    if config.memory_snapshot.backend == crate::cfg::MemorySnapshotBackend::Uffd {
+        info!("checking userfaultfd access for the memory backend");
+        uffd::check()?;
+    }
 
     // 4. Download dependencies and generate overlaybd runtime configs.
     ensure_dependencies(config).await?;

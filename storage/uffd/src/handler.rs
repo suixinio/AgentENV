@@ -138,6 +138,8 @@ pub struct UffdHandler {
     prefault: mpsc::UnboundedSender<Vec<u64>>,
     /// One bit per image page, set once the page is installed in the guest.
     served: Arc<Mutex<Vec<u64>>>,
+    /// The regions' page size, 0 until the handshake.
+    page_size: Arc<AtomicU64>,
 }
 
 /// What the handler thread runs with.
@@ -146,6 +148,7 @@ struct ThreadInputs {
     opts: HandlerOptions,
     stats: Arc<Stats>,
     served: Arc<Mutex<Vec<u64>>>,
+    page_size: Arc<AtomicU64>,
     prefault_rx: mpsc::UnboundedReceiver<Vec<u64>>,
     stop: oneshot::Receiver<()>,
 }
@@ -193,11 +196,13 @@ impl UffdHandler {
         let (prefault_tx, prefault_rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Stats::default());
         let served = Arc::new(Mutex::new(Vec::new()));
+        let page_size = Arc::new(AtomicU64::new(0));
         let inputs = ThreadInputs {
             entry,
             opts: opts.clone(),
             stats: Arc::clone(&stats),
             served: Arc::clone(&served),
+            page_size: Arc::clone(&page_size),
             prefault_rx,
             stop: stop_rx,
         };
@@ -222,7 +227,16 @@ impl UffdHandler {
             stats,
             prefault: prefault_tx,
             served,
+            page_size,
         })
+    }
+
+    /// The page size of the served regions; `None` before the handshake.
+    pub fn page_size(&self) -> Option<u64> {
+        match self.page_size.load(Ordering::Acquire) {
+            0 => None,
+            size => Some(size),
+        }
     }
 
     /// Page indices (image offset over page size) installed in the guest so
@@ -344,6 +358,7 @@ fn thread_main<S: PageSource>(
         opts,
         stats,
         served,
+        page_size,
         prefault_rx,
         mut stop,
     } = inputs;
@@ -373,6 +388,7 @@ fn thread_main<S: PageSource>(
             opts,
             stats,
             served,
+            page_size,
             prefault_rx,
         };
         run(uffd, mappings, source, inputs, &mut stop, state).await
@@ -419,6 +435,7 @@ struct RunInputs {
     opts: HandlerOptions,
     stats: Arc<Stats>,
     served: Arc<Mutex<Vec<u64>>>,
+    page_size: Arc<AtomicU64>,
     prefault_rx: mpsc::UnboundedReceiver<Vec<u64>>,
 }
 
@@ -534,6 +551,7 @@ async fn run<S: PageSource>(
         opts,
         stats,
         served,
+        page_size: page_size_out,
         mut prefault_rx,
     } = inputs;
     let page_size = mappings
@@ -577,6 +595,7 @@ async fn run<S: PageSource>(
     let uffd = AsyncFd::new(uffd).context("register the userfaultfd with the reactor")?;
     let bitmap_words = total_pages.div_ceil(64) as usize;
     *served.lock().expect("the served bitmap is never poisoned") = vec![0u64; bitmap_words];
+    page_size_out.store(page_size, Ordering::Release);
 
     let ctx = Rc::new(Ctx {
         uffd,

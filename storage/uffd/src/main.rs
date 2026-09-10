@@ -7,7 +7,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use uvm_uffd::testing::{create_uffd_for_test, AnonRegion};
 use uvm_uffd::{
-    FileSource, HandlerOptions, MemSource, OverlaybdSource, PageSource, StatsSnapshot, UffdHandler,
+    FileSource, HandlerOptions, MemSource, OverlaybdSource, PageSource, PrefetchList,
+    StatsSnapshot, UffdHandler,
 };
 
 #[derive(Debug, Parser)]
@@ -32,6 +33,8 @@ enum Command {
         global_config: PathBuf,
         #[arg(long, default_value_t = 64)]
         max_inflight: usize,
+        #[command(flatten)]
+        prefetch: PrefetchArgs,
     },
     /// Serve a raw memory file to the VM that connects to the socket.
     ServeFile {
@@ -41,6 +44,8 @@ enum Command {
         file: PathBuf,
         #[arg(long, default_value_t = 64)]
         max_inflight: usize,
+        #[command(flatten)]
+        prefetch: PrefetchArgs,
     },
     /// Fault an in-memory image through this process's own userfaultfd and
     /// report the fault rate.
@@ -52,6 +57,16 @@ enum Command {
         #[arg(long, default_value_t = 4)]
         threads: usize,
     },
+}
+
+#[derive(Debug, Default, clap::Args)]
+struct PrefetchArgs {
+    /// Replay this working-set list once the handshake is done.
+    #[arg(long)]
+    prefault: Option<PathBuf>,
+    /// Record the working set here at exit, unless the file exists.
+    #[arg(long)]
+    record_prefetch: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -73,19 +88,21 @@ fn main() -> Result<()> {
             image_config,
             global_config,
             max_inflight,
+            prefetch,
         } => runtime.block_on(async move {
             let source = OverlaybdSource::open(&global_config, &image_config)
                 .await
                 .context("open the overlaybd memory image")?;
-            serve(socket, Arc::new(source), max_inflight).await
+            serve(socket, Arc::new(source), max_inflight, prefetch).await
         }),
         Command::ServeFile {
             socket,
             file,
             max_inflight,
+            prefetch,
         } => runtime.block_on(async move {
             let source = FileSource::open(&file)?;
-            serve(socket, Arc::new(source), max_inflight).await
+            serve(socket, Arc::new(source), max_inflight, prefetch).await
         }),
         Command::Selftest {
             size_mib,
@@ -95,7 +112,12 @@ fn main() -> Result<()> {
     }
 }
 
-async fn serve<S: PageSource>(socket: PathBuf, source: Arc<S>, max_inflight: usize) -> Result<()> {
+async fn serve<S: PageSource>(
+    socket: PathBuf,
+    source: Arc<S>,
+    max_inflight: usize,
+    prefetch: PrefetchArgs,
+) -> Result<()> {
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("bind the handshake socket {}", socket.display()))?;
@@ -108,22 +130,57 @@ async fn serve<S: PageSource>(socket: PathBuf, source: Arc<S>, max_inflight: usi
     println!("ready");
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("install the SIGTERM handler")?;
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {}
-        _ = sigterm.recv() => {}
-        err = handler.wait_exit() => {
-            if let Some(err) = err {
-                bail!("uffd handler failed: {err}");
+    let replay = async {
+        let Some(path) = prefetch.prefault.as_deref() else {
+            return Ok(());
+        };
+        let Some(list) = PrefetchList::read(path)? else {
+            return Ok(());
+        };
+        handler.wait_serving().await?;
+        let page_size = handler.page_size().unwrap_or(0);
+        match list.pages_for(page_size) {
+            Some(pages) => {
+                eprintln!("prefaulting {} pages from {}", pages.len(), path.display());
+                handler.prefault(pages.to_vec())
+            }
+            None => {
+                eprintln!(
+                    "ignoring {}: recorded for page size {}, serving {page_size}",
+                    path.display(),
+                    list.page_size
+                );
+                Ok(())
+            }
+        }
+    };
+    let exited = async {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => Ok(()),
+            _ = sigterm.recv() => Ok(()),
+            err = handler.wait_exit() => match err {
+                Some(err) => Err(anyhow::anyhow!("uffd handler failed: {err}")),
+                None => Ok(()),
+            },
+        }
+    };
+    let (replayed, exit) = tokio::join!(replay, exited);
+    replayed?;
+    let stats = handler.stats();
+    if let Some(path) = prefetch.record_prefetch.as_deref() {
+        if let Some(page_size) = handler.page_size() {
+            let list = PrefetchList::new(page_size, handler.faulted_pages());
+            if list.is_worth_recording() && list.write_if_absent(path)? {
+                eprintln!("recorded {} pages to {}", list.pages.len(), path.display());
             }
         }
     }
-    let stats = handler.stats();
     let result = tokio::task::spawn_blocking(move || handler.stop())
         .await
         .context("join the uffd handler")?;
     print_stats(&stats);
     let _ = std::fs::remove_file(&socket);
-    result
+    exit.and(result)
 }
 
 fn print_stats(stats: &StatsSnapshot) {

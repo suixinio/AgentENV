@@ -522,6 +522,7 @@ resumed_sandbox.stop().await?;
 8. Run `make test-agent-integration` to run the `agentenv` integration test modules in `tests/integration/` as a non-root user with the required capabilities, plus the Docker/MinIO-backed OSS snapshot repository test (`crates/e2e-tests/tests/snapshot_oss_e2e_test.rs`).
 9. Run `make test-ublk` to run the `uvm-ublk` and `overlaybd` storage tests, including the Docker/MinIO-backed OSS backend test (`storage/overlaybd/tests/oss_backend_minio.rs`).
 10. Run `make test-nbd` to run the `uvm-nbd` device suite against real `/dev/nbdN`; it needs the nbd module and group access to `/dev/nbd*` (`sudo scripts/tests/setup-nbd-access.sh <user> <group>` once), and it runs on any kernel with the in-tree module, including the 6.1 build machine that cannot run `test-ublk`.
+11. With `AENV_UBLK_TRANSPORT=nbd` in the environment, the integration suites of step 8 run on that same 6.1 machine: the whole Firecracker path (boot, pause, resume, memory snapshot device) goes through nbd. The seven `snapshot::*`, `snapshot_attached_drive::*` and `orchestrator::*` cases that need a snapshot catalog still fail there, because the node-only harness holds none; that is independent of the transport.
 
 ## 4.1) Firecracker Client and Runtime Upgrade Checklist
 

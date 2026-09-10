@@ -119,6 +119,10 @@ jobs:
           # above.
           AENV_PG_TEST_REQUIRED: "1"
         run: make test-unit PROFILE=debug
+      # The uffd suite creates its own userfaultfd with UFFD_USER_MODE_ONLY,
+      # so it runs unprivileged on the stock runner kernel.
+      - name: userfaultfd handler suite
+        run: make test-uffd PROFILE=debug
       # 🔴 The step above is what makes those 67 run; this one is what keeps
       # them running. `test-with-redis` is the target CLAUDE.md names as the one
       # that must be run by anything touching either metadata store, and it

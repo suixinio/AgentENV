@@ -61,7 +61,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-ublk install-ublk build-egress \
 	fmt clippy check-crate-boundaries \
 	mutants coverage \
-	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk test-nbd \
+	test test-unit test-integration test-with-redis test-with-postgres prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk test-nbd test-ublk-daemon-nbd \
 	test-e2e-compose test-e2e-k8s test-e2e-compose-split test-e2e-k8s-split test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store bench-placement-shadow \
 	ci-deps ci-deps-protoc \
@@ -612,6 +612,11 @@ test-ublk:
 # view of the device they just created.
 test-nbd:
 	AENV_NBD_TEST_REQUIRED=1 $(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-nbd -- --test-threads=1
+
+# The same daemon suite `test-ublk` runs, over the nbd transport instead. Same
+# host requirements as `test-nbd`.
+test-ublk-daemon-nbd:
+	AENV_NBD_TEST_REQUIRED=1 AENV_DAEMON_TEST_TRANSPORT=nbd $(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk-daemon -- --test-threads=1
 
 bench:
 	$(MAKE) install-ublk PROFILE=release

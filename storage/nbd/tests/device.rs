@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uvm_nbd::{device_size_bytes, MemTarget, NbdDevice, NbdOptions, OverlaybdTarget};
 
 const MIB: usize = 1024 * 1024;
@@ -411,6 +411,10 @@ async fn a_device_asked_to_self_destroy_leaves_no_node_behind() {
     .expect("start the nbd device");
     let index = device.index();
     device.stop().await.expect("stop the nbd device");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sys_block_size(index).is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         sys_block_size(index),
         None,

@@ -16,8 +16,58 @@ use tokio::sync::oneshot;
 use uvm_ublk_daemon::protocol::{recv_message, send_message, DaemonRequest, DaemonResponse};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, RestackSnapshotTerminalFailure,
-    UblkDaemonClient,
+    Transport, TransportHandle, UblkDaemonClient,
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// Transport selection
+// ════════════════════════════════════════════════════════════════════════════
+
+const TRANSPORT_ENV: &str = "AENV_DAEMON_TEST_TRANSPORT";
+
+/// The transport the whole suite runs against. `ublk` unless
+/// `AENV_DAEMON_TEST_TRANSPORT=nbd`.
+fn selected_transport() -> Transport {
+    match std::env::var(TRANSPORT_ENV) {
+        Ok(value) if !value.trim().is_empty() => value
+            .parse()
+            .unwrap_or_else(|err| panic!("{TRANSPORT_ENV}: {err}")),
+        _ => Transport::Ublk,
+    }
+}
+
+/// Keeps the ublk control ring's worker thread alive for as long as the server
+/// that borrows it.
+struct TestTransport {
+    handle: TransportHandle,
+    _ctrl_ring_worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TestTransport {
+    fn handle(&self) -> TransportHandle {
+        self.handle.clone()
+    }
+}
+
+fn test_transport() -> TestTransport {
+    match selected_transport() {
+        Transport::Ublk => {
+            let (ctrl_ring, worker) =
+                storage_util::io_ring::spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+            TestTransport {
+                handle: TransportHandle::Ublk(ctrl_ring),
+                _ctrl_ring_worker: Some(worker),
+            }
+        }
+        Transport::Nbd => TestTransport {
+            handle: TransportHandle::Nbd(uvm_nbd::NbdOptions {
+                connections: 2,
+                ..Default::default()
+            }),
+            _ctrl_ring_worker: None,
+        },
+    }
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Mock server infrastructure
@@ -763,7 +813,6 @@ mod server_tests {
     use uvm_ublk_daemon::UblkDaemonServer;
 
     use overlaybd::image_service::ImageService;
-    use storage_util::io_ring::spawn_io_ring_worker;
 
     /// Helper to create a minimal `ImageService` for tests.
     ///
@@ -796,10 +845,10 @@ mod server_tests {
         let sock_path = dir.path().join("server.sock");
 
         let image_service = test_image_service(dir.path()).await;
-        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let transport = test_transport();
         let server = UblkDaemonServer::new(
             sock_path.clone(),
-            ctrl_ring,
+            transport.handle(),
             image_service,
             dir.path().join("resize-overlaybd-global.json"),
         );
@@ -836,10 +885,10 @@ mod server_tests {
         let sock_path = dir.path().join("server.sock");
 
         let image_service = test_image_service(dir.path()).await;
-        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let transport = test_transport();
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
-            ctrl_ring,
+            transport.handle(),
             image_service,
             dir.path().join("resize-overlaybd-global.json"),
         ));
@@ -872,10 +921,10 @@ mod server_tests {
         assert!(sock_path.exists(), "stale socket should exist");
 
         let image_service = test_image_service(dir.path()).await;
-        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let transport = test_transport();
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
-            ctrl_ring,
+            transport.handle(),
             image_service,
             dir.path().join("resize-overlaybd-global.json"),
         ));
@@ -908,10 +957,10 @@ mod server_tests {
         let _active_listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
 
         let image_service = test_image_service(dir.path()).await;
-        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let transport = test_transport();
         let server = UblkDaemonServer::new(
             sock_path.clone(),
-            ctrl_ring,
+            transport.handle(),
             image_service,
             dir.path().join("resize-overlaybd-global.json"),
         );
@@ -929,10 +978,10 @@ mod server_tests {
         let sock_path = dir.path().join("server.sock");
 
         let image_service = test_image_service(dir.path()).await;
-        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let transport = test_transport();
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
-            ctrl_ring,
+            transport.handle(),
             image_service,
             dir.path().join("resize-overlaybd-global.json"),
         ));
@@ -974,10 +1023,10 @@ mod server_tests {
         let sock_path = dir.path().join("server.sock");
 
         let image_service = test_image_service(dir.path()).await;
-        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let transport = test_transport();
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
-            ctrl_ring,
+            transport.handle(),
             image_service,
             dir.path().join("resize-overlaybd-global.json"),
         ));
@@ -1019,10 +1068,10 @@ mod server_tests {
         let sock_path = dir.path().join("server.sock");
 
         let image_service = test_image_service(dir.path()).await;
-        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let transport = test_transport();
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
-            ctrl_ring,
+            transport.handle(),
             image_service,
             dir.path().join("resize-overlaybd-global.json"),
         ));
@@ -1060,10 +1109,10 @@ mod server_tests {
         let sock_path = dir.path().join("server.sock");
 
         let image_service = test_image_service(dir.path()).await;
-        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let transport = test_transport();
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
-            ctrl_ring,
+            transport.handle(),
             image_service,
             dir.path().join("resize-overlaybd-global.json"),
         ));
@@ -1234,5 +1283,323 @@ mod server_tests {
             .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("pool not enabled"));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Live device tests: a real server over the selected transport, real devices
+// ════════════════════════════════════════════════════════════════════════════
+
+mod live_device_tests {
+    use super::*;
+    use overlaybd::config::UpperMode as OverlaybdUpperMode;
+    use overlaybd::image_service::ImageService;
+    use std::os::unix::fs::FileExt;
+    use uvm_ublk_daemon::{AccessMode, UblkDaemonServer};
+
+    /// Live devices need the selected transport to be reachable from this
+    /// process; `AENV_NBD_TEST_REQUIRED=1` turns a skip into a failure.
+    fn transport_reachable(test: &str) -> bool {
+        let reason = match selected_transport() {
+            Transport::Nbd if uvm_ublk_daemon::nbd_transport_usable() => return true,
+            Transport::Nbd => "the nbd transport is not reachable here",
+            Transport::Ublk if Path::new("/dev/ublk-control").exists() => return true,
+            Transport::Ublk => "/dev/ublk-control is absent; the ublk_drv module is not loaded",
+        };
+        if std::env::var("AENV_NBD_TEST_REQUIRED").as_deref() == Ok("1")
+            && selected_transport() == Transport::Nbd
+        {
+            panic!("AENV_NBD_TEST_REQUIRED=1 but {test} cannot run: {reason}");
+        }
+        eprintln!("SKIPPED[{}]: {test} ({reason})", selected_transport());
+        false
+    }
+
+    struct ImageFixture {
+        _dir: tempfile::TempDir,
+        global_config: PathBuf,
+        image_config: PathBuf,
+        virtual_size: u64,
+    }
+
+    async fn image_fixture(virtual_size: u64) -> ImageFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_dir = dir.path().join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let global_config = dir.path().join("global.json");
+        std::fs::write(
+            &global_config,
+            serde_json::to_vec(&serde_json::json!({
+                "registryFsVersion": "v2",
+                "nrIoRings": 1,
+                "cacheConfig": {
+                    "cacheType": "file",
+                    "cacheDir": cache_dir,
+                    "cacheSizeGB": 1,
+                    "refillSize": 262144,
+                    "blockSize": 65536
+                },
+                "download": { "enable": false }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upper_data = dir.path().join("upper.data");
+        overlaybd::helper::prepare_runtime_upper(
+            &upper_data,
+            None,
+            virtual_size,
+            OverlaybdUpperMode::Sparse,
+        )
+        .unwrap();
+        let image_config = dir.path().join("image.json");
+        std::fs::write(
+            &image_config,
+            serde_json::to_vec(&serde_json::json!({
+                "lowers": [],
+                "upper": { "mode": "sparse", "data": upper_data },
+                "resultFile": dir.path().join("result.txt")
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        ImageFixture {
+            _dir: dir,
+            global_config,
+            image_config,
+            virtual_size,
+        }
+    }
+
+    async fn image_service(global_config: &Path) -> ImageService {
+        ImageService::from_config_path(global_config).await.unwrap()
+    }
+
+    struct RunningDaemon {
+        client: Arc<UblkDaemonClient>,
+        server: Arc<UblkDaemonServer>,
+        task: tokio::task::JoinHandle<anyhow::Result<()>>,
+        _dir: tempfile::TempDir,
+        _transport: TestTransport,
+    }
+
+    impl RunningDaemon {
+        async fn start(global_config: &Path, pool: Option<uvm_ublk_daemon::PoolConfig>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let sock_path = dir.path().join("daemon.sock");
+            let transport = test_transport();
+            let mut server = UblkDaemonServer::new(
+                sock_path.clone(),
+                transport.handle(),
+                image_service(global_config).await,
+                dir.path().join("resize-overlaybd-global.json"),
+            );
+            let pool_enabled = pool.is_some();
+            if let Some(pool) = pool {
+                server.enable_pool(pool).await.unwrap();
+            }
+            let server = Arc::new(server);
+            let task = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move { server.run().await })
+            };
+            for _ in 0..100 {
+                if sock_path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            let client = UblkDaemonClient::new_for_test(sock_path, false);
+            let _ = pool_enabled;
+            Self {
+                client,
+                server,
+                task,
+                _dir: dir,
+                _transport: transport,
+            }
+        }
+
+        async fn stop(self) {
+            self.server.request_shutdown();
+            let _ = tokio::time::timeout(Duration::from_secs(30), self.task).await;
+        }
+    }
+
+    fn device_sectors(device_path: &Path) -> u64 {
+        let name = device_path.file_name().unwrap().to_str().unwrap();
+        std::fs::read_to_string(format!("/sys/block/{name}/size"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_created_device_serves_the_image_and_is_gone_after_delete() {
+        let name = "a_created_device_serves_the_image_and_is_gone_after_delete";
+        if !transport_reachable(name) {
+            return;
+        }
+        let fixture = image_fixture(16 * 1024 * 1024).await;
+        let daemon = RunningDaemon::start(&fixture.global_config, None).await;
+
+        let (dev_id, device_path) = daemon
+            .client
+            .create_overlaybd(&fixture.image_config, &fixture.global_config)
+            .await
+            .expect("create the device");
+        assert_eq!(
+            device_sectors(&device_path) * 512,
+            fixture.virtual_size,
+            "the device must advertise the image's virtual size"
+        );
+
+        let payload: Vec<u8> = (0..4096u32).map(|index| (index % 251) as u8).collect();
+        {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&device_path)
+                .expect("open the device");
+            file.write_all_at(&payload, 8192).expect("pwrite");
+            file.sync_all().expect("fsync");
+        }
+        {
+            let file = std::fs::File::open(&device_path).expect("reopen the device");
+            let mut back = vec![0u8; 4096];
+            file.read_exact_at(&mut back, 8192).expect("pread");
+            assert_eq!(back, payload);
+        }
+
+        daemon.client.delete(dev_id).await.expect("delete");
+        let name = device_path.file_name().unwrap().to_str().unwrap();
+        let size = std::fs::read_to_string(format!("/sys/block/{name}/size"))
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u64>().ok());
+        assert!(
+            matches!(size, None | Some(0)),
+            "{} still reports {size:?} sectors after delete",
+            device_path.display()
+        );
+
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_released_device_is_reused_for_an_image_of_a_different_size() {
+        let name = "a_released_device_is_reused_for_an_image_of_a_different_size";
+        if !transport_reachable(name) {
+            return;
+        }
+        let small = image_fixture(16 * 1024 * 1024).await;
+        let large = image_fixture(48 * 1024 * 1024).await;
+        let daemon = RunningDaemon::start(
+            &small.global_config,
+            Some(uvm_ublk_daemon::PoolConfig {
+                low_watermark: 0,
+                high_watermark: 2,
+                maintenance_enabled: false,
+                startup_prewarm: false,
+            }),
+        )
+        .await;
+
+        let (first_id, first_path) = daemon
+            .client
+            .acquire_overlaybd(
+                &small.image_config,
+                &small.global_config,
+                small.virtual_size,
+                AccessMode::Exclusive,
+            )
+            .await
+            .expect("acquire the small image");
+        assert_eq!(device_sectors(&first_path) * 512, small.virtual_size);
+        daemon
+            .client
+            .release_overlaybd(first_id)
+            .await
+            .expect("release");
+
+        let (second_id, second_path) = daemon
+            .client
+            .acquire_overlaybd(
+                &large.image_config,
+                &large.global_config,
+                large.virtual_size,
+                AccessMode::Exclusive,
+            )
+            .await
+            .expect("acquire the large image");
+        assert_eq!(
+            second_id, first_id,
+            "a transport that can resize must reuse the idle device rather than create one"
+        );
+        assert_eq!(
+            device_sectors(&second_path) * 512,
+            large.virtual_size,
+            "the reused device must advertise the new image's size"
+        );
+
+        let mut tail = vec![0u8; 4096];
+        let file = std::fs::File::open(&second_path).expect("open the reused device");
+        file.read_exact_at(&mut tail, large.virtual_size - 4096)
+            .expect("a read past the previous image's end must be served");
+        drop(file);
+
+        daemon
+            .client
+            .release_overlaybd(second_id)
+            .await
+            .expect("release");
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_shared_device_is_refcounted_across_two_acquires() {
+        let name = "a_shared_device_is_refcounted_across_two_acquires";
+        if !transport_reachable(name) {
+            return;
+        }
+        let fixture = image_fixture(16 * 1024 * 1024).await;
+        let daemon = RunningDaemon::start(
+            &fixture.global_config,
+            Some(uvm_ublk_daemon::PoolConfig {
+                low_watermark: 0,
+                high_watermark: 2,
+                maintenance_enabled: false,
+                startup_prewarm: false,
+            }),
+        )
+        .await;
+
+        let (first_id, _) = daemon
+            .client
+            .acquire_overlaybd(
+                &fixture.image_config,
+                &fixture.global_config,
+                fixture.virtual_size,
+                AccessMode::Shared,
+            )
+            .await
+            .expect("first shared acquire");
+        let (second_id, _) = daemon
+            .client
+            .acquire_overlaybd(
+                &fixture.image_config,
+                &fixture.global_config,
+                fixture.virtual_size,
+                AccessMode::Shared,
+            )
+            .await
+            .expect("second shared acquire");
+        assert_eq!(first_id, second_id, "one image, one shared device");
+
+        daemon.client.release_overlaybd(first_id).await.unwrap();
+        daemon.client.release_overlaybd(second_id).await.unwrap();
+        daemon.stop().await;
     }
 }

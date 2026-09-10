@@ -111,6 +111,10 @@ pub struct UblkDaemonConfig {
     pub p2p_publish_url: Option<String>,
     /// Client-side timeout for runtime-device RPCs.
     pub runtime_device_timeout: Duration,
+    /// Kernel block transport the daemon exposes devices through.
+    pub transport: uvm_ublk_daemon::Transport,
+    pub nbd_connections: u16,
+    pub nbd_io_timeout_secs: u64,
 }
 
 impl UblkDaemonConfig {
@@ -147,6 +151,12 @@ impl UblkDaemonConfig {
             pool_config,
             p2p_publish_url: None,
             runtime_device_timeout,
+            transport: match ublk.transport {
+                aenv_core::cfg::BlockTransport::Ublk => uvm_ublk_daemon::Transport::Ublk,
+                aenv_core::cfg::BlockTransport::Nbd => uvm_ublk_daemon::Transport::Nbd,
+            },
+            nbd_connections: ublk.nbd.connections,
+            nbd_io_timeout_secs: ublk.nbd.io_timeout_secs,
         })
     }
 }
@@ -218,6 +228,9 @@ impl UblkDeviceManager {
                             pool_config: cfg.pool_config.as_ref(),
                             p2p_publish_url: cfg.p2p_publish_url.as_deref(),
                             runtime_device_timeout: cfg.runtime_device_timeout,
+                            transport: cfg.transport,
+                            nbd_connections: cfg.nbd_connections,
+                            nbd_io_timeout_secs: cfg.nbd_io_timeout_secs,
                         })
                         .await
                         {

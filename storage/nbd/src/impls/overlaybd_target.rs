@@ -99,6 +99,18 @@ impl OverlaybdTarget {
         Ok(())
     }
 
+    /// Re-advertise the capacity without changing the backing image, for a
+    /// device whose image grew under it.
+    pub fn set_dev_sectors(&self, dev_sectors: u64) -> Result<()> {
+        if dev_sectors == 0 {
+            bail!("overlaybd nbd target capacity must be non-zero");
+        }
+        let mut state = TargetState::clone(&self.state.load());
+        state.dev_sectors = dev_sectors;
+        self.state.store(Arc::new(state));
+        Ok(())
+    }
+
     fn checked_range(state: &TargetState, offset: u64, len: u64) -> std::result::Result<(), i32> {
         let end = offset.checked_add(len).ok_or(-libc::EINVAL)?;
         if end > state.dev_bytes() {
@@ -411,6 +423,31 @@ mod tests {
             buf.iter().all(|&byte| byte == 0),
             "the swapped-in image must not answer with the previous image's bytes"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_new_capacity_widens_the_range_the_target_answers() {
+        let tmp = TempDir::new().expect("tempdir");
+        let target = open_target(&tmp, 1 << 20).await;
+        let ring = AsyncIoRingBuilder::new()
+            .nr_sparse_buffer(2)
+            .nr_sparse_file(4)
+            .sqe_entries(8)
+            .cqe_entries(16)
+            .build()
+            .expect("build async io ring");
+        target.set_dev_sectors(1024).expect("shrink");
+        assert_eq!(target.geometry().size_bytes, 1024 * 512);
+        let mut buf = vec![0u8; 512];
+        assert_eq!(
+            target.read(&ring, 1024 * 512, &mut buf).await,
+            -libc::EINVAL
+        );
+
+        target.set_dev_sectors(2048).expect("grow");
+        assert_eq!(target.geometry().size_bytes, 2048 * 512);
+        assert_eq!(target.read(&ring, 1024 * 512, &mut buf).await, 0);
+        assert!(target.set_dev_sectors(0).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

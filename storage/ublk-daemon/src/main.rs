@@ -11,7 +11,9 @@ use tracing_log::log::LevelFilter;
 
 use overlaybd::image_service::ImageService;
 use storage_util::io_ring::spawn_io_ring_worker;
-use uvm_ublk_daemon::{server::UblkDaemonServer, ResizeToolSpec};
+use uvm_ublk_daemon::{
+    nbd_transport_usable, server::UblkDaemonServer, ResizeToolSpec, Transport, TransportHandle,
+};
 
 mod metrics_server;
 
@@ -72,6 +74,18 @@ struct Cli {
     /// Local HTTP endpoint used to publish completed overlaybd layers into P2P.
     #[arg(long)]
     p2p_publish_url: Option<String>,
+
+    /// Kernel block transport: `ublk` or `nbd`. Defaults to `[ublk].transport`.
+    #[arg(long)]
+    transport: Option<Transport>,
+
+    /// Sockets per nbd device. Defaults to `[ublk.nbd].connections`.
+    #[arg(long)]
+    nbd_connections: Option<u16>,
+
+    /// Kernel request timeout for nbd devices. Defaults to `[ublk.nbd].io_timeout_secs`.
+    #[arg(long)]
+    nbd_io_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +99,14 @@ struct DaemonTomlConfig {
 #[derive(Debug, Deserialize)]
 struct DaemonUblkTomlConfig {
     overlaybd: Option<DaemonUblkOverlaybdTomlConfig>,
+    transport: Option<Transport>,
+    nbd: Option<DaemonUblkNbdTomlConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonUblkNbdTomlConfig {
+    connections: Option<u16>,
+    io_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,6 +185,48 @@ const HOME_PATH_PLACEHOLDER: &str = "$AENV_HOME";
 const DEFAULT_HOME_PATH: &str = "/var/lib/aenv";
 const DEFAULT_DEPS_PATH: &str = "./env";
 const DEFAULT_RESIZE_TIMEOUT_SECS: u64 = 120;
+const DEFAULT_NBD_CONNECTIONS: u16 = 4;
+const DEFAULT_NBD_IO_TIMEOUT_SECS: u64 = 90;
+
+/// How the daemon exposes devices, and what nbd needs to bring one up.
+#[derive(Debug, PartialEq, Eq)]
+struct TransportSettings {
+    transport: Transport,
+    nbd_connections: u16,
+    nbd_io_timeout_secs: u64,
+}
+
+/// The CLI wins over the TOML file, which wins over the built-in default.
+fn load_transport_settings(
+    cli: &Cli,
+    config: Option<&DaemonTomlConfig>,
+) -> Result<TransportSettings> {
+    let ublk = config.and_then(|config| config.ublk.as_ref());
+    let nbd = ublk.and_then(|ublk| ublk.nbd.as_ref());
+    let settings = TransportSettings {
+        transport: cli
+            .transport
+            .or_else(|| ublk.and_then(|ublk| ublk.transport))
+            .unwrap_or_default(),
+        nbd_connections: cli
+            .nbd_connections
+            .or_else(|| nbd.and_then(|nbd| nbd.connections))
+            .unwrap_or(DEFAULT_NBD_CONNECTIONS),
+        nbd_io_timeout_secs: cli
+            .nbd_io_timeout_secs
+            .or_else(|| nbd.and_then(|nbd| nbd.io_timeout_secs))
+            .unwrap_or(DEFAULT_NBD_IO_TIMEOUT_SECS),
+    };
+    anyhow::ensure!(
+        settings.nbd_connections > 0,
+        "invalid ublk.nbd config: connections must be > 0"
+    );
+    anyhow::ensure!(
+        settings.nbd_io_timeout_secs > 0,
+        "invalid ublk.nbd config: io_timeout_secs must be > 0"
+    );
+    Ok(settings)
+}
 
 fn load_resize_tool_config(
     config_path: Option<&PathBuf>,
@@ -295,18 +359,50 @@ fn main() -> Result<()> {
             )
         })?;
 
-        // Create the shared ctrl io_uring for ublk control commands.
-        let (ctrl_ring, _ctrl_ring_handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let daemon_config =
+            load_daemon_config(cli.config.as_ref()).context("load daemon config")?;
+        let transport_settings = load_transport_settings(&cli, daemon_config.as_ref())
+            .context("load block transport config")?;
+        tracing::info!(
+            transport = %transport_settings.transport,
+            nbd_connections = transport_settings.nbd_connections,
+            nbd_io_timeout_secs = transport_settings.nbd_io_timeout_secs,
+            "ublk daemon block transport selected"
+        );
+
+        // Under nbd nothing opens /dev/ublk-control, so the ublk control ring
+        // is not created either.
+        let mut _ctrl_ring_handle = None;
+        let transport = match transport_settings.transport {
+            Transport::Ublk => {
+                let (ctrl_ring, handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+                _ctrl_ring_handle = Some(handle);
+                TransportHandle::Ublk(ctrl_ring)
+            }
+            Transport::Nbd => {
+                if !nbd_transport_usable() {
+                    tracing::warn!(
+                        "the nbd transport is not reachable: load the nbd module and give this \
+                         account read/write access to /dev/nbd* (`aenv-node --setup-host`)"
+                    );
+                }
+                TransportHandle::Nbd(uvm_nbd::NbdOptions {
+                    connections: transport_settings.nbd_connections,
+                    io_timeout: std::time::Duration::from_secs(
+                        transport_settings.nbd_io_timeout_secs,
+                    ),
+                    ..Default::default()
+                })
+            }
+        };
 
         let mut server = UblkDaemonServer::new_with_p2p_publish_url(
             cli.socket_path.clone(),
-            ctrl_ring,
+            transport,
             image_service,
             cli.resize_global_config.clone(),
             cli.p2p_publish_url.clone(),
         );
-        let daemon_config =
-            load_daemon_config(cli.config.as_ref()).context("load daemon config")?;
         if let Some(resize_tool) =
             load_resize_tool_config(cli.config.as_ref(), daemon_config.as_ref())
                 .context("load overlaybd resize tool config")?
@@ -401,4 +497,141 @@ fn pidfd_open(pid: nix::unistd::Pid) -> Result<OwnedFd> {
         return Err(err).context("pidfd_open");
     }
     Ok(unsafe { OwnedFd::from_raw_fd(ret as i32) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut args = vec![
+            "uvm-ublk-daemon",
+            "--socket-path",
+            "/run/daemon.sock",
+            "--global-config",
+            "/etc/overlaybd.json",
+            "--resize-global-config",
+            "/etc/overlaybd-resize.json",
+        ];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).expect("parse daemon cli")
+    }
+
+    fn toml_config(text: &str) -> DaemonTomlConfig {
+        toml::from_str(text).expect("parse daemon toml")
+    }
+
+    #[test]
+    fn the_transport_defaults_to_ublk_when_neither_the_cli_nor_the_file_names_one() {
+        let settings = load_transport_settings(&cli(&[]), None).unwrap();
+        assert_eq!(
+            settings,
+            TransportSettings {
+                transport: Transport::Ublk,
+                nbd_connections: DEFAULT_NBD_CONNECTIONS,
+                nbd_io_timeout_secs: DEFAULT_NBD_IO_TIMEOUT_SECS,
+            }
+        );
+    }
+
+    #[test]
+    fn the_config_file_transport_is_used_when_the_cli_is_silent() {
+        let config = toml_config(
+            r#"
+            [ublk]
+            transport = "nbd"
+            [ublk.nbd]
+            connections = 8
+            io_timeout_secs = 30
+            "#,
+        );
+        let settings = load_transport_settings(&cli(&[]), Some(&config)).unwrap();
+        assert_eq!(settings.transport, Transport::Nbd);
+        assert_eq!(settings.nbd_connections, 8);
+        assert_eq!(settings.nbd_io_timeout_secs, 30);
+    }
+
+    #[test]
+    fn the_cli_transport_wins_over_the_config_file() {
+        let config = toml_config(
+            r#"
+            [ublk]
+            transport = "ublk"
+            [ublk.nbd]
+            connections = 8
+            io_timeout_secs = 30
+            "#,
+        );
+        let settings = load_transport_settings(
+            &cli(&[
+                "--transport",
+                "nbd",
+                "--nbd-connections",
+                "2",
+                "--nbd-io-timeout-secs",
+                "15",
+            ]),
+            Some(&config),
+        )
+        .unwrap();
+        assert_eq!(settings.transport, Transport::Nbd);
+        assert_eq!(settings.nbd_connections, 2);
+        assert_eq!(settings.nbd_io_timeout_secs, 15);
+    }
+
+    #[test]
+    fn a_config_file_without_an_nbd_section_falls_back_to_the_built_in_defaults() {
+        let config = toml_config(
+            r#"
+            [ublk]
+            transport = "nbd"
+            "#,
+        );
+        let settings = load_transport_settings(&cli(&[]), Some(&config)).unwrap();
+        assert_eq!(settings.transport, Transport::Nbd);
+        assert_eq!(settings.nbd_connections, DEFAULT_NBD_CONNECTIONS);
+        assert_eq!(settings.nbd_io_timeout_secs, DEFAULT_NBD_IO_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn a_zero_connection_count_or_timeout_is_refused_by_name() {
+        let err = load_transport_settings(&cli(&["--nbd-connections", "0"]), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("connections"), "{err}");
+
+        let err = load_transport_settings(&cli(&["--nbd-io-timeout-secs", "0"]), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("io_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_transport_name_is_refused_by_argument_parsing() {
+        let args = [
+            "uvm-ublk-daemon",
+            "--socket-path",
+            "/run/daemon.sock",
+            "--global-config",
+            "/etc/overlaybd.json",
+            "--resize-global-config",
+            "/etc/overlaybd-resize.json",
+            "--transport",
+            "virtio",
+        ];
+        assert!(Cli::try_parse_from(args).is_err());
+    }
+
+    #[test]
+    fn a_transport_key_the_file_spells_wrong_fails_the_whole_parse() {
+        let err = toml::from_str::<DaemonTomlConfig>(
+            r#"
+            [ublk]
+            transport = "NBD"
+            "#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("transport"), "{err}");
+    }
 }

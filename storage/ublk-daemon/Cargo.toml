@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+uvm-nbd = { path = "../nbd" }
 uvm-ublk = { path = "../ublk" }
 overlaybd = { path = "../overlaybd" }
 storage-util = { path = "../util" }

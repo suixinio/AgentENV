@@ -2,6 +2,7 @@ pub mod client;
 pub mod protocol;
 pub(crate) mod runtime;
 pub mod server;
+pub mod transport;
 
 pub use client::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, OverlaybdRuntimeDevice,
@@ -11,4 +12,5 @@ pub use protocol::{
     AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec, RestackSnapshotStats,
 };
 pub use server::UblkDaemonServer;
+pub use transport::{nbd_transport_usable, Transport, TransportHandle};
 pub use warm_pool::PoolConfig;

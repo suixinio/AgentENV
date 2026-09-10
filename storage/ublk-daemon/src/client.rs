@@ -123,6 +123,9 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub pool_config: Option<&'a PoolConfig>,
     pub p2p_publish_url: Option<&'a str>,
     pub runtime_device_timeout: Duration,
+    pub transport: crate::Transport,
+    pub nbd_connections: u16,
+    pub nbd_io_timeout_secs: u64,
 }
 
 struct UblkDaemonClientInner {
@@ -158,6 +161,7 @@ impl UblkDaemonClient {
             metrics_listen_addr = config.metrics_listen_addr,
             pool_enabled = config.pool_config.is_some(),
             p2p_publish_enabled = config.p2p_publish_url.is_some(),
+            transport = %config.transport,
             "spawning ublk daemon"
         );
 
@@ -193,6 +197,14 @@ impl UblkDaemonClient {
 
         cmd.arg("--metrics-listen-addr")
             .arg(config.metrics_listen_addr);
+        // Always passed: the node resolved them from the same config the daemon
+        // would read, and the CLI is what wins there.
+        cmd.arg("--transport")
+            .arg(config.transport.to_string())
+            .arg("--nbd-connections")
+            .arg(config.nbd_connections.to_string())
+            .arg("--nbd-io-timeout-secs")
+            .arg(config.nbd_io_timeout_secs.to_string());
         if let Some(url) = config.p2p_publish_url {
             cmd.arg("--p2p-publish-url").arg(url);
         }

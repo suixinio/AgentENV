@@ -9,6 +9,7 @@ on:
   pull_request:
     paths:
       - "storage/nbd/**"
+      - "storage/ublk-daemon/**"
       - "storage/overlaybd/**"
       - "storage/util/**"
       - "crates/linux-cap/**"
@@ -23,6 +24,7 @@ on:
   push:
     paths:
       - "storage/nbd/**"
+      - "storage/ublk-daemon/**"
       - "storage/overlaybd/**"
       - "storage/util/**"
       - "crates/linux-cap/**"
@@ -50,5 +52,7 @@ jobs:
         run: sudo scripts/tests/setup-nbd-access.sh "$(id -un)" "$(id -gn)"
       - name: nbd tests
         run: make test-nbd PROFILE=debug
+      - name: ublk daemon over the nbd transport
+        run: make test-ublk-daemon-nbd PROFILE=debug
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()

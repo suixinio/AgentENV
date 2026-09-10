@@ -29,7 +29,7 @@ flowchart TD
 
 ## Storage 
 
-The storage subsystem turns layered image files into block devices mountable by VMs, and provides ublk-backed memory snapshot restore for snapshot resume. Four crates compose the active subsystem:
+The storage subsystem turns layered image files into block devices mountable by VMs, and provides block-device-backed memory snapshot restore for snapshot resume. Five crates compose the active subsystem; `[ublk].transport` picks which of the two kernel transports (`ublk` or `nbd`) the daemon exposes devices through, and everything above the daemon protocol is the same under both:
 
 ### overlaybd (`storage/overlaybd/`)
 
@@ -71,15 +71,29 @@ Async userspace block device server using Linux's ublk kernel driver. Exposes Ov
 
 **Key files**: `lib.rs` (public API), `ctrl.rs` (device controller), `dev.rs` (device + queue management), `queue.rs` (I/O descriptor handling), `io_buffer.rs`, `impls/overlaybd_target.rs`.
 
+### nbd (`storage/nbd/`)
+
+The same role as `storage/ublk` over the in-tree nbd driver: `NbdDevice::start` exposes an `NbdTarget` as `/dev/nbdN`, and `OverlaybdTarget` adapts an `ImageFile` with the same `from_opened_image` / `swap_state` shape as the ublk target.
+
+**Device lifecycle**:
+1. One `socketpair` per connection; one worker thread per connection, each with a tokio current-thread runtime, a `LocalSet` and its own `AsyncIoRing`
+2. One generic netlink `NBD_CMD_CONNECT` carrying every kernel-side socket, the size, the block size, the request timeout and the server flags; the kernel allocates the index and answers with it
+3. Each socket is a kernel hardware queue; the worker reads 28-byte requests, dispatches them bounded by a per-connection semaphore, and writes each reply under one lock
+4. `update_size` is `NBD_CMD_RECONFIGURE` with a new size; `stop` is `NBD_CMD_DISCONNECT` followed by a wait for the kernel to drop the connection
+
+Writable devices advertise `SEND_FLUSH`, `SEND_FUA` and, when the image supports discard, `SEND_TRIM`; a flush reaches `ImageFile::sync`. Read-only devices are marked so in the kernel. Netlink needs `CAP_SYS_ADMIN`, which the DaemonSet and `scripts/run-with-capabilities.sh` grant. Requests cross the socket with one copy in each direction; there is no registered-buffer path.
+
+**Key files**: `netlink.rs` (generic netlink over a raw socket), `proto.rs` (transmission framing), `device.rs` (connections and workers), `target.rs` (`NbdTarget`), `impls/overlaybd_target.rs`, `impls/mem_target.rs` (the in-memory reference target the device suite uses).
+
 ### ublk-daemon (`storage/ublk-daemon/`)
 
-Long-running daemon process (`uvm-ublk-daemon`) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.
+Long-running daemon process (`uvm-ublk-daemon`) that manages every block device in one process and communicates with the AgentENV node over a Unix domain socket. `--transport ublk|nbd` (from `[ublk].transport`) picks the kernel transport; a device is either a `UVMUblkDev` or an `NbdDevice` behind one `BlockDevice`, and the protocol, the warm pool and `RestackSnapshot` do not know which.
 
 - Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.
 - `UblkDaemonClient` spawns and monitors the daemon process from the node runtime.
 - `UblkDeviceManager` (`crates/aenv-node/src/sandbox/ublk/device.rs`) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.
 
-This separation keeps ublk device ownership and io_uring control in a dedicated process while the node server orchestrates lifecycle state.
+This separation keeps device ownership and io_uring control in a dedicated process while the node server orchestrates lifecycle state.
 
 ### storage-util (`storage/util/`)
 
@@ -97,9 +111,9 @@ Shared io_uring abstractions used by both ublk and overlaybd.
 
 ### Memory Snapshot Restore
 
-Memory snapshot restore uses ublk-backed overlaybd devices rather than userfaultfd. On resume, a read-only ublk device is created from the stacked memory overlaybd layers and passed to Firecracker as a `BackendType::File` memory backend. Firecracker mmaps the block device and COWs pages into anonymous memory on first write, so the underlying device is never modified.
+Memory snapshot restore uses block-device-backed overlaybd devices rather than userfaultfd. On resume, a read-only device (ublk or nbd, per `[ublk].transport`) is created from the stacked memory overlaybd layers and passed to Firecracker as a `BackendType::File` memory backend. Firecracker mmaps the block device and COWs pages into anonymous memory on first write, so the underlying device is never modified.
 
-**Sharing**: Multiple sandboxes booting from the same snapshot template share a single memory ublk device via reference counting. This allows the Linux page cache to be reused across all sandboxes using the same memory image, significantly reducing I/O for concurrent launches from the same template.
+**Sharing**: Multiple sandboxes booting from the same snapshot template share a single memory device via reference counting. This allows the Linux page cache to be reused across all sandboxes using the same memory image, significantly reducing I/O for concurrent launches from the same template.
 
 **Memory snapshot creation**: On pause, Firecracker creates a state-only diff snapshot. AgentENV queries Firecracker's dirty/present memory ranges, reads the selected memory with `process_vm_readv`, and directly creates the OverlayBD memory layer. Parent layers from previous snapshots are stacked, forming the full layered memory image.
 
@@ -276,7 +290,8 @@ storage/
 │   ├── io_buffer.rs            # zero-copy + traditional buffers
 │   └── impls/                  # target implementations
 │       └── overlaybd_target.rs # OverlaybdTarget
-├── ublk-daemon/src/            # ublk daemon (unix socket RPC)
+├── nbd/src/                    # kernel nbd transport (netlink control, per-connection workers)
+├── ublk-daemon/src/            # block device daemon (unix socket RPC, ublk or nbd transport)
 │   ├── client.rs               # daemon client used by node runtime
 │   ├── server.rs               # daemon server + request loop
 │   └── protocol.rs             # RPC message types

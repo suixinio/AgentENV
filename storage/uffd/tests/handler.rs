@@ -41,6 +41,8 @@ fn opts(name: &str) -> HandlerOptions {
         read_timeout: Duration::from_secs(30),
         handshake_timeout: Duration::from_secs(5),
         drain_timeout: Duration::from_millis(200),
+        prefetch_block_bytes: 256 * 1024,
+        prefetch_concurrency: 8,
         name: name.to_string(),
     }
 }
@@ -448,6 +450,76 @@ fn no_handshake_within_the_timeout_ends_the_handler() -> Result<()> {
         "{err:?}"
     );
     assert!(handler.stop().is_err());
+    Ok(())
+}
+
+#[test]
+fn the_fetch_pass_reads_one_page_per_block_not_one_per_listed_page() -> Result<()> {
+    let Some(uffd) =
+        uffd_or_skip("the_fetch_pass_reads_one_page_per_block_not_one_per_listed_page")
+    else {
+        return Ok(());
+    };
+    let size = 2 * MIB;
+    let region = AnonRegion::new(size)?;
+    region.register(&uffd, 0)?;
+    let source = Arc::new(MemSource::patterned(size, PAGE, 0));
+    let mut options = opts("fetch-pass");
+    // Four pages to a block, so the list below spans exactly three of them.
+    options.prefetch_block_bytes = 4 * PAGE as u64;
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![region.mapping(0, PAGE as u64)],
+        Arc::clone(&source),
+        options,
+    )?;
+
+    let pages: Vec<u64> = (0..8).chain(std::iter::once(20)).collect();
+    handler.prefault(pages.clone())?;
+    assert!(
+        wait_for(
+            || handler.stats().prefaulted == pages.len() as u64,
+            Duration::from_secs(5)
+        ),
+        "every listed page was installed: {:?}",
+        handler.stats()
+    );
+    assert_eq!(
+        handler.stats().blocks_prefetched,
+        3,
+        "blocks 0, 1 and 5 are read once each, not nine times: {:?}",
+        handler.stats()
+    );
+    handler.stop()?;
+    Ok(())
+}
+
+#[test]
+fn a_block_no_larger_than_a_page_leaves_the_fetch_pass_out() -> Result<()> {
+    let Some(uffd) = uffd_or_skip("a_block_no_larger_than_a_page_leaves_the_fetch_pass_out") else {
+        return Ok(());
+    };
+    let size = 2 * MIB;
+    let region = AnonRegion::new(size)?;
+    region.register(&uffd, 0)?;
+    let source = Arc::new(MemSource::patterned(size, PAGE, 0));
+    let mut options = opts("no-fetch-pass");
+    options.prefetch_block_bytes = PAGE as u64;
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![region.mapping(0, PAGE as u64)],
+        Arc::clone(&source),
+        options,
+    )?;
+
+    handler.prefault((0..8).collect())?;
+    assert!(
+        wait_for(|| handler.stats().prefaulted == 8, Duration::from_secs(5)),
+        "{:?}",
+        handler.stats()
+    );
+    assert_eq!(handler.stats().blocks_prefetched, 0);
+    handler.stop()?;
     Ok(())
 }
 

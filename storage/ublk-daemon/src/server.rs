@@ -616,6 +616,8 @@ async fn handle_connection(
             handshake_timeout_secs,
             source_block_bytes,
             source_cache_bytes,
+            prefetch_block_bytes,
+            prefetch_concurrency,
             prefetch_path,
         } => {
             memory_uffd
@@ -630,6 +632,8 @@ async fn handle_connection(
                         handshake_timeout_secs,
                         source_block_bytes,
                         source_cache_bytes,
+                        prefetch_block_bytes,
+                        prefetch_concurrency,
                         prefetch_path: prefetch_path.as_deref(),
                     },
                 )

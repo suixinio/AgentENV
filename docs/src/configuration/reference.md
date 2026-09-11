@@ -780,6 +780,8 @@ Settings that apply only when `[memory_snapshot].backend = "uffd"`.
 | `write_protect` | bool | `true` | Expect the Firecracker build to register guest memory for userfaultfd write protection: a pause then captures exactly the pages the guest wrote, read from the VMM's pagemap, and `track_dirty_pages` may stay `false` on KVM and PVM alike. A resume on a build without the write-protect patch fails. `false` falls back to the KVM dirty log, which requires `track_dirty_pages = true`. |
 | `source_block_bytes` | integer | `0` | Bytes the daemon reads from the memory image per fault that misses, held in a per-server cache. `0` and any value below one page turn it off and every fault reads its own page. It pays only where reading the image is what a fault waits on: against a local layer that read is ~9 µs of a ~108 µs fault, while a 4 MiB block measured 15x read amplification and seconds of extra resume; against object storage a miss is a round trip and the size is what removes them. |
 | `source_cache_bytes` | integer | `33554432` | Bytes of those blocks one VM's server holds. Host memory on top of the guest's own pages, so it buys locality rather than residency. |
+| `prefetch_block_bytes` | integer | `262144` | Bytes one fetch-pass read covers. Before installing a replayed working-set list the server reads one page per distinct block of this size, which leaves the block in the image's own cache and takes the fetch off each install. Set it to what the image fetches per miss — overlaybd's `refillSize` for a remote layer; `source_block_bytes` raises it when the daemon's own cache is on. At or below one page the pass is off. |
+| `prefetch_concurrency` | integer | `64` | Fetch-pass reads in flight. A remote image charges a round trip per block, so this covers its latency rather than matching the install path: a measured resume's whole working set is a few hundred blocks. `0` turns the pass off. |
 
 Environment variable override:
 
@@ -789,6 +791,8 @@ Environment variable override:
 - `AENV_MEMORY_SNAPSHOT_UFFD_READ_RETRY_SECS`
 - `AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_BLOCK_BYTES`
 - `AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_CACHE_BYTES`
+- `AENV_MEMORY_SNAPSHOT_UFFD_PREFETCH_BLOCK_BYTES`
+- `AENV_MEMORY_SNAPSHOT_UFFD_PREFETCH_CONCURRENCY`
 
 ## `[memory_snapshot.background_download]`
 

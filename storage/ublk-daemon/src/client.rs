@@ -164,6 +164,8 @@ pub struct MemoryUffdServeOptions {
     pub handshake_timeout_secs: u64,
     pub source_block_bytes: u64,
     pub source_cache_bytes: u64,
+    pub prefetch_block_bytes: u64,
+    pub prefetch_concurrency: usize,
 }
 
 impl UblkDaemonClient {
@@ -614,6 +616,8 @@ impl UblkDaemonClient {
             handshake_timeout_secs: options.handshake_timeout_secs,
             source_block_bytes: options.source_block_bytes,
             source_cache_bytes: options.source_cache_bytes,
+            prefetch_block_bytes: options.prefetch_block_bytes,
+            prefetch_concurrency: options.prefetch_concurrency,
             prefetch_path: prefetch_path.map(Path::to_path_buf),
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {

@@ -714,6 +714,20 @@ source_block_bytes = 0
 # Override with AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_CACHE_BYTES.
 source_cache_bytes = 33554432
 
+# Bytes one fetch-pass read covers (262144 = 256 KiB). Before installing a
+# replayed working-set list the server reads one page per distinct block of
+# this size, leaving the block in the image's own cache so the installs do not
+# each pay for a fetch. Set it to what the image fetches per miss --
+# overlaybd's refillSize for a remote layer; source_block_bytes raises it when
+# the daemon's own cache is on. At or below one page the pass is off.
+# Override with AENV_MEMORY_SNAPSHOT_UFFD_PREFETCH_BLOCK_BYTES.
+prefetch_block_bytes = 262144
+# Fetch-pass reads in flight. A remote image charges a round trip per block,
+# so this covers its latency rather than matching the install path: a measured
+# resume's whole working set is a few hundred blocks.
+# Override with AENV_MEMORY_SNAPSHOT_UFFD_PREFETCH_CONCURRENCY.
+prefetch_concurrency = 64
+
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd
 # becomes ready.

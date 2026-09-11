@@ -631,6 +631,8 @@ impl UblkDeviceManager {
                     handshake_timeout_secs: memory.uffd.handshake_timeout_secs,
                     source_block_bytes: memory.uffd.source_block_bytes,
                     source_cache_bytes: memory.uffd.source_cache_bytes,
+                    prefetch_block_bytes: memory.uffd.prefetch_block_bytes,
+                    prefetch_concurrency: memory.uffd.prefetch_concurrency,
                 },
                 prefetch_path,
             )

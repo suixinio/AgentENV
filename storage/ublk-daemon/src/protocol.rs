@@ -94,6 +94,13 @@ pub enum DaemonRequest {
         source_block_bytes: u64,
         #[serde(default = "default_uffd_source_cache_bytes")]
         source_cache_bytes: u64,
+        /// What the fetch pass ahead of a replayed list reads per source
+        /// block, and how many such reads it keeps in flight. A block at or
+        /// below one page turns the pass off.
+        #[serde(default = "default_uffd_prefetch_block_bytes")]
+        prefetch_block_bytes: u64,
+        #[serde(default = "default_uffd_prefetch_concurrency")]
+        prefetch_concurrency: usize,
         /// The working-set list of this image: replayed once the handshake
         /// is done when it exists, recorded at stop when it does not.
         #[serde(default)]
@@ -129,6 +136,14 @@ const fn default_uffd_source_block_bytes() -> u64 {
 
 const fn default_uffd_source_cache_bytes() -> u64 {
     32 * 1024 * 1024
+}
+
+const fn default_uffd_prefetch_block_bytes() -> u64 {
+    256 * 1024
+}
+
+const fn default_uffd_prefetch_concurrency() -> usize {
+    64
 }
 
 /// Where a userfaultfd server is in its life.

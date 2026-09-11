@@ -1759,6 +1759,8 @@ mod live_device_tests {
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 1,
+                        prefetch_block_bytes: 256 * 1024,
+                        prefetch_concurrency: 8,
                     },
                     None,
                 )
@@ -1850,6 +1852,8 @@ mod live_device_tests {
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 60,
+                        prefetch_block_bytes: 256 * 1024,
+                        prefetch_concurrency: 8,
                     },
                     None,
                 )
@@ -1940,6 +1944,8 @@ mod live_device_tests {
                                 max_inflight: 16,
                                 read_retry_secs: 5,
                                 handshake_timeout_secs: 60,
+                                prefetch_block_bytes: 256 * 1024,
+                                prefetch_concurrency: 8,
                             },
                             None,
                         )
@@ -2013,6 +2019,8 @@ mod live_device_tests {
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 60,
+                        prefetch_block_bytes: 256 * 1024,
+                        prefetch_concurrency: 8,
                     },
                     Some(&prefetch_path),
                 )
@@ -2072,6 +2080,8 @@ mod live_device_tests {
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 60,
+                        prefetch_block_bytes: 256 * 1024,
+                        prefetch_concurrency: 8,
                     },
                     Some(&prefetch_path),
                 )
@@ -2157,6 +2167,8 @@ mod live_device_tests {
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 60,
+                        prefetch_block_bytes: 256 * 1024,
+                        prefetch_concurrency: 8,
                     },
                     None,
                 )

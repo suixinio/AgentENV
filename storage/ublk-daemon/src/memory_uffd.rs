@@ -56,6 +56,8 @@ pub(crate) struct ServeMemoryUffdRequest<'a> {
     pub(crate) handshake_timeout_secs: u64,
     pub(crate) source_block_bytes: u64,
     pub(crate) source_cache_bytes: u64,
+    pub(crate) prefetch_block_bytes: u64,
+    pub(crate) prefetch_concurrency: usize,
     pub(crate) prefetch_path: Option<&'a Path>,
 }
 
@@ -176,6 +178,11 @@ impl MemoryUffdServers {
                 max_inflight: request.max_inflight,
                 read_retry_budget: Duration::from_secs(request.read_retry_secs),
                 handshake_timeout: Duration::from_secs(request.handshake_timeout_secs),
+                // The fetch pass reads whole source blocks, so it coalesces at
+                // whichever layer actually fetches: our own block cache when it
+                // is on, the image's refill granularity when it is not.
+                prefetch_block_bytes: request.prefetch_block_bytes.max(request.source_block_bytes),
+                prefetch_concurrency: request.prefetch_concurrency,
                 name: format!("mem-{serve_id}"),
                 ..Default::default()
             },
@@ -446,6 +453,10 @@ fn record_final_stats(stats: &StatsSnapshot) {
         ("uffd_memory_read_retries_total", stats.read_retries),
         ("uffd_memory_removes_total", stats.removes),
         ("uffd_memory_prefaulted_total", stats.prefaulted),
+        (
+            "uffd_memory_blocks_prefetched_total",
+            stats.blocks_prefetched,
+        ),
         ("uffd_memory_unmapped_faults_total", stats.unmapped),
     ];
     for (name, value) in totals {
@@ -586,6 +597,7 @@ mod tests {
             copy_retries: 8,
             removes: 9,
             prefaulted: 10,
+            blocks_prefetched: 13,
             unmapped: 11,
             wp_faults: 12,
         };

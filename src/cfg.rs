@@ -720,6 +720,29 @@ pub struct MemorySnapshotUffdConfig {
         env = "AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_CACHE_BYTES"
     )]
     pub source_cache_bytes: u64,
+    /// Bytes one fetch-pass read covers. Before installing a replayed
+    /// working-set list the server reads one page per distinct block of this
+    /// size, which leaves the block in the image's own cache and takes the
+    /// fetch off each install. Set it to what the image fetches per miss --
+    /// overlaybd's `refillSize` for a remote layer. `source_block_bytes`
+    /// raises it when the daemon's own cache is on. At or below one page the
+    /// pass is off and the list is installed directly. Default: `262144`
+    /// (256 KiB).
+    #[config(
+        default = 262_144u64,
+        env = "AENV_MEMORY_SNAPSHOT_UFFD_PREFETCH_BLOCK_BYTES"
+    )]
+    pub prefetch_block_bytes: u64,
+    /// Fetch-pass reads in flight. These are what a remote image charges a
+    /// round trip for, so size this to cover its latency rather than to match
+    /// the install path: a measured resume's whole working set is a few
+    /// hundred blocks, and this is how many of them travel at once.
+    /// Default: `64`.
+    #[config(
+        default = 64usize,
+        env = "AENV_MEMORY_SNAPSHOT_UFFD_PREFETCH_CONCURRENCY"
+    )]
+    pub prefetch_concurrency: usize,
 }
 
 #[derive(Debug, Config, Clone)]

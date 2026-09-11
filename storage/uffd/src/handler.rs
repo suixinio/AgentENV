@@ -53,6 +53,17 @@ pub struct HandlerOptions {
     pub handshake_timeout: Duration,
     /// How long `stop` waits for in-flight pages before cancelling them.
     pub drain_timeout: Duration,
+    /// Bytes the page source fetches per miss. A prefetch reads one page per
+    /// distinct block of this size instead of one per listed page: the read
+    /// leaves the block in the source's own cache and the installs that
+    /// follow find it there. A value at or below the page size turns the
+    /// fetch pass off and the list is installed directly.
+    pub prefetch_block_bytes: u64,
+    /// Fetch-pass reads in flight. Sized to cover the source's latency, not
+    /// the install path's slot count: walking a sorted list with the install
+    /// path's concurrency keeps every read inside one block, which is one
+    /// round trip's worth of work however many slots it uses.
+    pub prefetch_concurrency: usize,
     /// Thread name and log tag.
     pub name: String,
 }
@@ -65,6 +76,8 @@ impl Default for HandlerOptions {
             read_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(60),
             drain_timeout: Duration::from_secs(2),
+            prefetch_block_bytes: 256 * 1024,
+            prefetch_concurrency: 64,
             name: "uffd".to_string(),
         }
     }
@@ -97,6 +110,8 @@ pub struct StatsSnapshot {
     pub removes: u64,
     /// Pages installed ahead of the guest by `prefault`.
     pub prefaulted: u64,
+    /// Source blocks read by the fetch pass ahead of those installs.
+    pub blocks_prefetched: u64,
     /// Faults at addresses no handshake region covers, answered with a zero
     /// page.
     pub unmapped: u64,
@@ -117,6 +132,7 @@ struct Stats {
     copy_retries: AtomicU64,
     removes: AtomicU64,
     prefaulted: AtomicU64,
+    blocks_prefetched: AtomicU64,
     unmapped: AtomicU64,
     wp_faults: AtomicU64,
 }
@@ -135,6 +151,7 @@ impl Stats {
             copy_retries: load(&self.copy_retries),
             removes: load(&self.removes),
             prefaulted: load(&self.prefaulted),
+            blocks_prefetched: load(&self.blocks_prefetched),
             unmapped: load(&self.unmapped),
             wp_faults: load(&self.wp_faults),
         }
@@ -574,6 +591,7 @@ struct Ctx<S> {
     permits: Arc<Semaphore>,
     pending: RefCell<VecDeque<(u64, u64)>>,
     prefault_permits: Arc<Semaphore>,
+    prefetch_permits: Arc<Semaphore>,
     pool: RefCell<Vec<Vec<u8>>>,
     zero_page: Vec<u8>,
     fatal: RefCell<Option<anyhow::Error>>,
@@ -690,6 +708,11 @@ async fn run<S: PageSource>(
         bail!("unsupported page size {page_size}");
     }
     opts.max_inflight = inflight_for_page_size(opts.max_inflight, page_size);
+    // A block that cannot hold more than one page has no fetch pass to run,
+    // so it claims no ring depth either. Hugepage VMs land here.
+    if opts.prefetch_block_bytes <= page_size {
+        opts.prefetch_concurrency = 0;
+    }
     let write_protect = probe_write_protect(&uffd, &mappings, page_size);
     let total_pages = mappings
         .iter()
@@ -698,11 +721,14 @@ async fn run<S: PageSource>(
         .unwrap_or(0)
         .div_ceil(page_size);
 
+    // Fault installs, prefaults and the fetch pass all submit on this ring,
+    // so its depth covers their slot counts together.
+    let ring_slots = opts.max_inflight + opts.prefetch_concurrency;
     let ring = AsyncIoRingBuilder::new()
-        .nr_sparse_buffer(opts.max_inflight * 2)
+        .nr_sparse_buffer(ring_slots * 2)
         .nr_sparse_file(16)
-        .sqe_entries(opts.max_inflight * 2)
-        .cqe_entries(opts.max_inflight * 4)
+        .sqe_entries(ring_slots * 2)
+        .cqe_entries(ring_slots * 4)
         .build()
         .context("create the io uring for the uffd handler")?;
     if HANDLER_URING.with(|uring| uring.set(ring.clone())).is_err() {
@@ -731,6 +757,7 @@ async fn run<S: PageSource>(
         permits: Arc::new(Semaphore::new(opts.max_inflight)),
         pending: RefCell::new(VecDeque::new()),
         prefault_permits: Arc::new(Semaphore::new((opts.max_inflight / 4).max(1))),
+        prefetch_permits: Arc::new(Semaphore::new(opts.prefetch_concurrency.max(1))),
         pool: RefCell::new(Vec::new()),
         zero_page: vec![0u8; page_size as usize],
         fatal: RefCell::new(None),
@@ -967,6 +994,7 @@ fn spawn_serve<S: PageSource>(
 }
 
 async fn prefault_all<S: PageSource>(ctx: Rc<Ctx<S>>, pages: Vec<u64>) {
+    prefetch_blocks(&ctx, &pages).await;
     for idx in pages {
         if ctx.is_served(idx) || ctx.is_removed(idx) {
             continue;
@@ -986,6 +1014,111 @@ async fn prefault_all<S: PageSource>(ctx: Rc<Ctx<S>>, pages: Vec<u64>) {
             continue;
         }
         spawn_serve(&ctx, offset, host_addr, permit, true);
+    }
+}
+
+/// Reads one page from each distinct source block the list covers and drops
+/// the bytes: what it buys is the block in the source's own cache, so the
+/// installs that follow find it there instead of each paying for a fetch.
+/// Returns once every read has finished, so the installs do not race it.
+///
+/// The list is ascending, so a block's pages are adjacent in it and the
+/// in-flight reads of an install-ordered walk all sit inside one block. That
+/// is one round trip's work however many slots it occupies, which is why this
+/// pass exists and why its concurrency is its own.
+async fn prefetch_blocks<S: PageSource>(ctx: &Rc<Ctx<S>>, pages: &[u64]) {
+    let block_bytes = ctx.opts.prefetch_block_bytes;
+    if block_bytes <= ctx.page_size || ctx.opts.prefetch_concurrency == 0 {
+        return;
+    }
+    let size = ctx.source.size();
+    let mut issued = Vec::new();
+    let mut last_block = None;
+    for &idx in pages {
+        let offset = idx * ctx.page_size;
+        if offset >= size {
+            continue;
+        }
+        let block = offset / block_bytes;
+        if last_block == Some(block) {
+            continue;
+        }
+        last_block = Some(block);
+        if ctx.is_served(idx) || ctx.is_removed(idx) {
+            continue;
+        }
+        let Ok(permit) = Arc::clone(&ctx.prefetch_permits).acquire_owned().await else {
+            break;
+        };
+        issued.push(spawn_prefetch(ctx, offset, permit));
+    }
+    let blocks = issued.len();
+    for task in issued {
+        let _ = task.await;
+    }
+    if blocks > 0 {
+        tracing::debug!(
+            name = ctx.opts.name,
+            blocks,
+            block_bytes,
+            "fetch pass finished"
+        );
+    }
+}
+
+fn spawn_prefetch<S: PageSource>(
+    ctx: &Rc<Ctx<S>>,
+    offset: u64,
+    permit: OwnedSemaphorePermit,
+) -> tokio::task::JoinHandle<()> {
+    // Counted like an install so `stop` drains it: the ring may still be
+    // writing this buffer when the handler is asked to end.
+    ctx.active.set(ctx.active.get() + 1);
+    let ctx = Rc::clone(ctx);
+    tokio::task::spawn_local(async move {
+        let result = prefetch_read(&ctx, offset).await;
+        drop(permit);
+        let active = ctx.active.get() - 1;
+        ctx.active.set(active);
+        if active == 0 {
+            ctx.drained.notify_one();
+        }
+        match result {
+            Ok(()) => bump(&ctx.stats.blocks_prefetched),
+            // Not fatal: the fault that needs this page reads it again on its
+            // own retry budget and fails there if the source is truly broken.
+            Err(err) => tracing::debug!(
+                name = ctx.opts.name,
+                offset,
+                error = %format!("{err:#}"),
+                "fetch pass read failed"
+            ),
+        }
+    })
+}
+
+/// One attempt, no retry: the fetch pass is ahead of the guest, so a failure
+/// costs the fault that follows nothing it would not have paid anyway.
+async fn prefetch_read<S: PageSource>(ctx: &Ctx<S>, offset: u64) -> Result<()> {
+    let mut buf = ctx.take_buf();
+    match tokio::time::timeout(
+        ctx.opts.read_timeout,
+        ctx.source.read_page(&ctx.ring, offset, &mut buf),
+    )
+    .await
+    {
+        Ok(result) => {
+            ctx.give_buf(buf);
+            result
+        }
+        Err(_elapsed) => {
+            // The ring may still write this buffer, so it cannot be reused.
+            std::mem::forget(buf);
+            Err(anyhow!(
+                "fetch pass read timed out after {:?}",
+                ctx.opts.read_timeout
+            ))
+        }
     }
 }
 

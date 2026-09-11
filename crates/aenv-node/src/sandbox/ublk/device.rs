@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, MemoryUffdState, MemoryUffdStats, RestackSnapshotStats,
-    RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
+    CreateOverlaybdRuntimeDeviceRequest, MemoryUffdServeOptions, MemoryUffdState, MemoryUffdStats,
+    RestackSnapshotStats, RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
 use super::overlaybd::OverlaybdConfig;
@@ -596,28 +596,44 @@ impl UblkDeviceManager {
     /// When this returns the socket is bound and the daemon is waiting for
     /// Firecracker's handshake, so `PUT /snapshot/load` may run: the load
     /// itself faults while restoring device and vCPU state.
+    /// The state and counters of a userfaultfd server by id, for callers
+    /// that do not hold its handle.
+    pub async fn query_mem_uffd(
+        &self,
+        serve_id: u32,
+    ) -> Result<(MemoryUffdState, MemoryUffdStats)> {
+        self.require_client()?
+            .query_memory_uffd(serve_id)
+            .await
+            .context("query memory userfaultfd server via daemon")
+    }
+
     pub async fn serve_mem_uffd(
         &self,
         image_config: &Path,
         socket_path: &Path,
+        prefetch_path: Option<&Path>,
     ) -> Result<MemUffdServe> {
         let client = self.require_client()?;
         let memory = &crate::cfg::ConfigManager::global_config().memory_snapshot;
 
-        // The working set recorded next to the image by its first resume;
-        // every later resume of the same image replays it.
-        let prefetch_path = image_config
-            .parent()
-            .map(|dir| dir.join(MEM_PREFETCH_FILE_NAME));
+        if let Some(dir) = prefetch_path.and_then(Path::parent) {
+            std::fs::create_dir_all(dir).with_context(|| {
+                format!("create the memory prefetch directory {}", dir.display())
+            })?;
+        }
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "serve_memory_uffd");
         let served = client
             .serve_memory_uffd(
                 image_config,
                 &memory.overlaybd_global_config_path,
                 socket_path,
-                memory.uffd.max_inflight,
-                memory.uffd.read_retry_secs,
-                prefetch_path.as_deref(),
+                MemoryUffdServeOptions {
+                    max_inflight: memory.uffd.max_inflight,
+                    read_retry_secs: memory.uffd.read_retry_secs,
+                    handshake_timeout_secs: memory.uffd.handshake_timeout_secs,
+                },
+                prefetch_path,
             )
             .await
             .context("serve memory snapshot over userfaultfd via daemon");
@@ -639,9 +655,6 @@ impl UblkDeviceManager {
 }
 
 // ── Memory userfaultfd serve ────────────────────────────────────────────────
-
-/// Sibling of `mem_image.json` in a snapshot directory.
-const MEM_PREFETCH_FILE_NAME: &str = "mem_prefetch.json";
 
 /// A handle to one daemon-side userfaultfd server.
 ///
@@ -667,10 +680,8 @@ impl MemUffdServe {
     /// The server's state and counters as the daemon sees them.
     pub async fn query(&self) -> Result<(MemoryUffdState, MemoryUffdStats)> {
         UblkDeviceManager::global()
-            .require_client()?
-            .query_memory_uffd(self.serve_id)
+            .query_mem_uffd(self.serve_id)
             .await
-            .context("query memory userfaultfd server via daemon")
     }
 
     pub async fn release(self) -> Result<()> {

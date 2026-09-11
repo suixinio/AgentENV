@@ -681,6 +681,14 @@ pub struct MemorySnapshotUffdConfig {
     /// Default: `60`.
     #[config(default = 60u64, env = "AENV_MEMORY_SNAPSHOT_UFFD_READ_RETRY_SECS")]
     pub read_retry_secs: u64,
+    /// How long the daemon waits for Firecracker to connect to the fault
+    /// socket after the server starts; the snapshot load must reach it
+    /// within this. Default: `60`.
+    #[config(
+        default = 60u64,
+        env = "AENV_MEMORY_SNAPSHOT_UFFD_HANDSHAKE_TIMEOUT_SECS"
+    )]
+    pub handshake_timeout_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]

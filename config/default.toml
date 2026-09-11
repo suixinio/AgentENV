@@ -663,6 +663,10 @@ max_inflight = 64
 # backed by the image. Keep it above the overlaybd registry request timeout
 # with room for its retries. Must be positive.
 read_retry_secs = 60
+# How long the daemon waits for Firecracker to connect to the fault socket
+# after the server starts. A cold snapshot load that takes longer than this
+# fails the resume. Must be positive.
+handshake_timeout_secs = 60
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd

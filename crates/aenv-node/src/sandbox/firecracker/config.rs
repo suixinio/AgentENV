@@ -481,6 +481,11 @@ pub struct FirecrackerSnapshotConfig {
     /// `Some` is used for keeping the snapshot directory alive across multiple pause/resume cycles.
     #[serde(skip)]
     pub managed_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Where the `uffd` memory backend keeps this snapshot's working-set list
+    /// on this node. `None` for a snapshot resumed at most once (a sandbox's
+    /// pause row) and for captures, which record nothing.
+    #[serde(skip)]
+    pub mem_prefetch_path: Option<PathBuf>,
 }
 
 impl FirecrackerSnapshotConfig {
@@ -544,12 +549,25 @@ impl FirecrackerSnapshotConfig {
             runtime_upper_mode: UpperMode::LogStructured,
         };
 
+        // A template is resumed many times and its first resume's working
+        // set pays off for every later one; a pause row is resumed once and
+        // then replaced, so a list for it would never be read.
+        let mem_prefetch_path = match snapshot.record().source {
+            crate::snapshot::SnapshotSource::Template { .. } => Some(
+                app_config
+                    .home_path
+                    .join("mem-prefetch")
+                    .join(format!("{}.json", snapshot.record().id)),
+            ),
+            crate::snapshot::SnapshotSource::Sandbox { .. } => None,
+        };
         Ok(Self {
             common: snapshot_common,
             vm_state_path: manifest.vm_state.path.clone(),
             mem_overlaybd_config,
             mem_virtual_size: manifest.memory.virtual_size,
             managed_snapshot_root: None,
+            mem_prefetch_path,
         })
     }
 
@@ -867,6 +885,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            mem_prefetch_path: None,
         };
 
         let err = snapshot

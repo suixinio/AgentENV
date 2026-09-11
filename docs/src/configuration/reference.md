@@ -770,10 +770,12 @@ Settings that apply only when `[memory_snapshot].backend = "uffd"`.
 |-----|------|---------|-------------|
 | `max_inflight` | integer | `64` | Faults the daemon resolves concurrently for one VM; the queue behind it is bounded by the same number. Must be greater than zero |
 | `read_retry_secs` | integer | `60` | How long one faulting read retries the memory image before the handler gives up and exits, which fails the sandbox and leaves the guest unbacked. Keep it above the overlaybd registry request timeout (30 s per request) with room for its retries. Must be greater than zero |
+| `handshake_timeout_secs` | integer | `60` | How long the daemon waits for Firecracker to connect to the fault socket after the server starts; a snapshot load that takes longer fails the resume. Must be greater than zero |
 
 Environment variable override:
 
 - `AENV_MEMORY_SNAPSHOT_UFFD_MAX_INFLIGHT`
+- `AENV_MEMORY_SNAPSHOT_UFFD_HANDSHAKE_TIMEOUT_SECS`
 - `AENV_MEMORY_SNAPSHOT_UFFD_READ_RETRY_SECS`
 
 ## `[memory_snapshot.background_download]`

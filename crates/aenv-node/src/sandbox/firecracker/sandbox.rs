@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
-use tracing::{debug, trace, warn};
+use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::{CreateOverlaybdRuntimeDeviceRequest, MemoryUffdState};
 
@@ -59,6 +59,53 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// Inside the Firecracker work dir, so the path dies with the sandbox and two
 /// sandboxes never contend for one socket name.
 const MEM_UFFD_SOCKET_NAME: &str = "mem-uffd.sock";
+/// `sun_path` is 108 bytes including the terminator.
+const MAX_UNIX_SOCKET_PATH_LEN: usize = 108;
+/// How often a resumed VM's fault server is asked whether it still serves.
+const MEM_UFFD_MONITOR_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// Consecutive query failures after which the daemon is taken as gone.
+const MEM_UFFD_MONITOR_FAILURES: u32 = 3;
+
+/// Kills the VMM once its fault server has exited or the daemon stops
+/// answering: with the descriptor closed every later fault is a plain zero
+/// page, and the next pause would capture those zeros as guest memory. The
+/// task runs until the sandbox stops it.
+fn spawn_mem_uffd_monitor(serve_id: u32, pid: nix::unistd::Pid) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut failures = 0u32;
+        loop {
+            tokio::time::sleep(MEM_UFFD_MONITOR_INTERVAL).await;
+            let reason = match UblkDeviceManager::global().query_mem_uffd(serve_id).await {
+                Ok((MemoryUffdState::Serving | MemoryUffdState::Starting, _)) => {
+                    failures = 0;
+                    continue;
+                }
+                Ok((MemoryUffdState::Exited { error }, stats)) => format!(
+                    "memory userfaultfd server exited ({}); stats: {stats:?}",
+                    error.unwrap_or_else(|| "no error reported".to_string())
+                ),
+                Err(err) => {
+                    failures += 1;
+                    if failures < MEM_UFFD_MONITOR_FAILURES {
+                        warn!(serve_id, %err, failures, "memory userfaultfd server query failed");
+                        continue;
+                    }
+                    format!("the ublk daemon stopped answering for {failures} checks: {err:#}")
+                }
+            };
+            error!(
+                serve_id,
+                pid = pid.as_raw(),
+                reason,
+                "the guest is no longer backed by its memory image; killing the VMM"
+            );
+            if let Err(err) = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL) {
+                warn!(serve_id, pid = pid.as_raw(), %err, "killing the VMM failed");
+            }
+            return;
+        }
+    })
+}
 
 // The tools drive mounts busybox here in every guest, whatever the user image
 // ships; `tools-image/pivot-init` is the other end.
@@ -194,6 +241,9 @@ pub struct FirecrackerSandbox {
     /// Mutually exclusive with `mem_ublk_device`: which one is set follows
     /// `[memory_snapshot].backend`.
     mem_uffd: Option<MemUffdServe>,
+    /// Watches `mem_uffd` for a mid-life exit and kills the VMM when it
+    /// happens; aborted on stop.
+    mem_uffd_monitor: Option<tokio::task::JoinHandle<()>>,
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
@@ -1039,6 +1089,7 @@ impl FirecrackerSandbox {
             mem_overlaybd_config,
             mem_virtual_size,
             managed_snapshot_root: None,
+            mem_prefetch_path: None,
         };
 
         debug!(
@@ -1101,6 +1152,9 @@ impl FirecrackerSandbox {
     pub async fn stop(&mut self) -> Result<()> {
         debug!("stopping firecracker sandbox");
 
+        if let Some(monitor) = self.mem_uffd_monitor.take() {
+            monitor.abort();
+        }
         self.fc_instance
             .stop(self.runtime_policy.socket_timeout)
             .await?;
@@ -1399,7 +1453,11 @@ impl Drop for FirecrackerSandbox {
         // via the orchestrator's stop() path.
         self.rootfs_runtime.take();
         self.mem_ublk_device.take();
-        self.mem_uffd.take();
+        if let Some(monitor) = self.mem_uffd_monitor.take() {
+            monitor.abort();
+        }
+        // `mem_uffd` is declared after `fc_instance`, so its descriptor
+        // closes only once the VMM has been signalled.
         // In daemon mode, extra-drive devices survive sandbox drop. They are
         // explicitly deleted on the stop() path and otherwise cleaned up when
         // the daemon shuts down.
@@ -1447,6 +1505,7 @@ impl FirecrackerSandbox {
             rootfs_runtime: None,
             mem_ublk_device: None,
             mem_uffd: None,
+            mem_uffd_monitor: None,
             mem_snapshot_image_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
@@ -1839,8 +1898,21 @@ impl FirecrackerSandbox {
             }
             MemorySnapshotBackend::Uffd => {
                 let socket_path = self.work_dir.path().join(MEM_UFFD_SOCKET_NAME);
+                // Both bind and connect truncate a longer path silently.
+                anyhow::ensure!(
+                    socket_path.as_os_str().len() < MAX_UNIX_SOCKET_PATH_LEN,
+                    "memory userfaultfd socket path {} is {} bytes; AF_UNIX allows fewer than {}. \
+                     Shorten [firecracker].work_dir",
+                    socket_path.display(),
+                    socket_path.as_os_str().len(),
+                    MAX_UNIX_SOCKET_PATH_LEN
+                );
                 let serve = UblkDeviceManager::global()
-                    .serve_mem_uffd(&config.mem_overlaybd_config.image_config_path, &socket_path)
+                    .serve_mem_uffd(
+                        &config.mem_overlaybd_config.image_config_path,
+                        &socket_path,
+                        config.mem_prefetch_path.as_deref(),
+                    )
                     .await
                     .context("start memory userfaultfd server for resume")?;
                 self.mem_uffd = Some(serve);
@@ -1884,6 +1956,13 @@ impl FirecrackerSandbox {
                     )
                     .await?;
                 self.ensure_mem_uffd_serving().await?;
+                let serve_id = self
+                    .mem_uffd
+                    .as_ref()
+                    .map(MemUffdServe::serve_id)
+                    .context("memory userfaultfd server was not started for this resume")?;
+                self.mem_uffd_monitor =
+                    Some(spawn_mem_uffd_monitor(serve_id, self.fc_instance.pid()?));
             }
         }
 
@@ -2419,6 +2498,7 @@ mod tests {
                 read_only: true,
                 runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
             },
+            mem_prefetch_path: None,
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
         };

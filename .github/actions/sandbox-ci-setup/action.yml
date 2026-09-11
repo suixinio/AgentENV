@@ -130,7 +130,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        sudo --preserve-env=AENV_DEPS_PATH,AENV_HOME_PATH \
+        sudo --preserve-env=AENV_DEPS_PATH,AENV_HOME_PATH,AENV_MEMORY_SNAPSHOT_BACKEND \
           "${CARGO_TARGET_DIR:-${GITHUB_WORKSPACE}/target}/debug/server" \
           --setup-host --runtime-user "$USER" --runtime-group "$(id -gn)"
 

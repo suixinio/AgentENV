@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -7,6 +8,7 @@ use tracing::{info, warn};
 
 const DEV_USERFAULTFD: &str = "/dev/userfaultfd";
 const UNPRIVILEGED_SYSCTL: &str = "/proc/sys/vm/unprivileged_userfaultfd";
+const UNPRIVILEGED_SYSCTL_CONF: &str = "/etc/sysctl.d/99-agentenv-uffd.conf";
 const UDEV_RULES_DIR: &str = "/etc/udev/rules.d";
 const UDEV_RULE_PATH: &str = "/etc/udev/rules.d/99-agentenv-uffd.rules";
 
@@ -20,27 +22,48 @@ fn udev_rule(group: &str) -> String {
 /// One-time root provisioning for the userfaultfd memory backend: Firecracker
 /// creates the descriptor itself, and on a kernel that has `/dev/userfaultfd`
 /// its userfaultfd crate opens that device and nothing else, so the runtime
-/// group needs read and write access to it.
+/// group needs read and write access to it. Without the device, the
+/// `userfaultfd(2)` fallback needs `vm.unprivileged_userfaultfd=1`.
 pub fn provision(group: &str) -> Result<()> {
     if !Path::new(DEV_USERFAULTFD).exists() {
-        warn!(
-            "{DEV_USERFAULTFD} does not exist on this kernel; the runtime account needs \
-             CAP_SYS_PTRACE or vm.unprivileged_userfaultfd=1 for Firecracker's userfaultfd(2)"
+        info!(
+            "{DEV_USERFAULTFD} does not exist on this kernel; allowing unprivileged userfaultfd(2)"
         );
+        std::fs::create_dir_all("/etc/sysctl.d").context("create /etc/sysctl.d")?;
+        std::fs::write(
+            UNPRIVILEGED_SYSCTL_CONF,
+            "# Managed by agentenv server setup\nvm.unprivileged_userfaultfd = 1\n",
+        )
+        .with_context(|| format!("install {UNPRIVILEGED_SYSCTL_CONF}"))?;
+        std::fs::write(UNPRIVILEGED_SYSCTL, "1\n")
+            .with_context(|| format!("write {UNPRIVILEGED_SYSCTL}"))?;
         return Ok(());
     }
+    let gid = nix::unistd::Group::from_name(group)
+        .with_context(|| format!("look up group {group}"))?
+        .with_context(|| format!("group {group} does not exist"))?
+        .gid;
+    // The device node is fixed right away; the udev rule keeps it that way
+    // across reboots and device re-creation.
+    info!(
+        group,
+        "granting the runtime group access to {DEV_USERFAULTFD}"
+    );
+    nix::unistd::chown(DEV_USERFAULTFD, None, Some(gid))
+        .with_context(|| format!("chown {DEV_USERFAULTFD} to group {group}"))?;
+    std::fs::set_permissions(DEV_USERFAULTFD, std::fs::Permissions::from_mode(0o660))
+        .with_context(|| format!("chmod 0660 {DEV_USERFAULTFD}"))?;
     if !Path::new(UDEV_RULES_DIR).exists() {
         warn!(
             rules_dir = UDEV_RULES_DIR,
-            "udev rules directory not present; skipping persistent rule install"
+            "udev rules directory not present; the device access will not survive a reboot"
         );
         return Ok(());
     }
-    info!(group, "installing userfaultfd device access rule");
     std::fs::write(UDEV_RULE_PATH, udev_rule(group))
         .with_context(|| format!("install {UDEV_RULE_PATH}"))?;
     if which::which("udevadm").is_err() {
-        warn!("udevadm not found; device permissions will apply after udev reloads rules");
+        warn!("udevadm not found; the udev rule applies after the next reload");
         return Ok(());
     }
     let status = Command::new("udevadm")

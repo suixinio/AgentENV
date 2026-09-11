@@ -276,6 +276,9 @@ fn validate_memory_snapshot_options(config: &AppConfig) -> Result<()> {
         if memory.uffd.read_retry_secs == 0 {
             bail!("invalid memory_snapshot.uffd config: read_retry_secs must be > 0");
         }
+        if memory.uffd.handshake_timeout_secs == 0 {
+            bail!("invalid memory_snapshot.uffd config: handshake_timeout_secs must be > 0");
+        }
         if !memory.track_dirty_pages {
             if config.virtualization_mode == VirtualizationMode::Pvm {
                 bail!(
@@ -514,13 +517,15 @@ mod tests {
 
     #[test]
     fn validate_memory_snapshot_options_rejects_zero_uffd_bounds() {
-        for (max_inflight, read_retry_secs, expected) in [
-            (0, 60, "max_inflight must be > 0"),
-            (64, 0, "read_retry_secs must be > 0"),
+        for (max_inflight, read_retry_secs, handshake_timeout_secs, expected) in [
+            (0, 60, 60, "max_inflight must be > 0"),
+            (64, 0, 60, "read_retry_secs must be > 0"),
+            (64, 60, 0, "handshake_timeout_secs must be > 0"),
         ] {
             let mut config = uffd_config(VirtualizationMode::Kvm, true);
             config.memory_snapshot.uffd.max_inflight = max_inflight;
             config.memory_snapshot.uffd.read_retry_secs = read_retry_secs;
+            config.memory_snapshot.uffd.handshake_timeout_secs = handshake_timeout_secs;
 
             let error = validate_memory_snapshot_options(&config).unwrap_err();
             assert!(
@@ -535,6 +540,7 @@ mod tests {
         let mut config = AppConfig::default();
         config.memory_snapshot.uffd.max_inflight = 0;
         config.memory_snapshot.uffd.read_retry_secs = 0;
+        config.memory_snapshot.uffd.handshake_timeout_secs = 0;
 
         validate_memory_snapshot_options(&config)
             .expect("the block backend reads no uffd settings");

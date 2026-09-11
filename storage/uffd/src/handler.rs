@@ -19,7 +19,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,7 +31,7 @@ use tokio::net::UnixListener;
 use tokio::sync::{mpsc, oneshot, watch, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::handshake::{recv_handshake, GuestRegionUffdMapping};
-use crate::proto::{Event, Uffd, UffdMsg};
+use crate::proto::{Event, Uffd, UffdMsg, UFFDIO_COPY_MODE_WP, UFFD_PAGEFAULT_FLAG_WP};
 use crate::source::PageSource;
 
 const EVENT_BATCH: usize = 64;
@@ -100,6 +100,9 @@ pub struct StatsSnapshot {
     /// Faults at addresses no handshake region covers, answered with a zero
     /// page.
     pub unmapped: u64,
+    /// Write-protect faults resolved by unprotecting the page (synchronous
+    /// write protection only; under `WP_ASYNC` the kernel resolves them).
+    pub wp_faults: u64,
 }
 
 #[derive(Default)]
@@ -115,6 +118,7 @@ struct Stats {
     removes: AtomicU64,
     prefaulted: AtomicU64,
     unmapped: AtomicU64,
+    wp_faults: AtomicU64,
 }
 
 impl Stats {
@@ -132,6 +136,7 @@ impl Stats {
             removes: load(&self.removes),
             prefaulted: load(&self.prefaulted),
             unmapped: load(&self.unmapped),
+            wp_faults: load(&self.wp_faults),
         }
     }
 }
@@ -163,7 +168,16 @@ pub struct UffdHandler {
     served: Arc<Mutex<Vec<u64>>>,
     /// The regions' page size, 0 until the handshake.
     page_size: Arc<AtomicU64>,
+    /// Whether the regions are registered for write protection: 0 unknown,
+    /// 1 no, 2 yes.
+    write_protect: Arc<AtomicU8>,
+    /// The handshake's regions, empty until it arrives.
+    mappings: Arc<Mutex<Vec<GuestRegionUffdMapping>>>,
 }
+
+const WP_UNKNOWN: u8 = 0;
+const WP_OFF: u8 = 1;
+const WP_ON: u8 = 2;
 
 /// What the handler thread runs with.
 struct ThreadInputs {
@@ -172,6 +186,8 @@ struct ThreadInputs {
     stats: Arc<Stats>,
     served: Arc<Mutex<Vec<u64>>>,
     page_size: Arc<AtomicU64>,
+    write_protect: Arc<AtomicU8>,
+    mappings: Arc<Mutex<Vec<GuestRegionUffdMapping>>>,
     prefault_rx: mpsc::UnboundedReceiver<Vec<u64>>,
     stop: oneshot::Receiver<()>,
 }
@@ -220,12 +236,16 @@ impl UffdHandler {
         let stats = Arc::new(Stats::default());
         let served = Arc::new(Mutex::new(Vec::new()));
         let page_size = Arc::new(AtomicU64::new(0));
+        let write_protect = Arc::new(AtomicU8::new(WP_UNKNOWN));
+        let mappings = Arc::new(Mutex::new(Vec::new()));
         let inputs = ThreadInputs {
             entry,
             opts: opts.clone(),
             stats: Arc::clone(&stats),
             served: Arc::clone(&served),
             page_size: Arc::clone(&page_size),
+            write_protect: Arc::clone(&write_protect),
+            mappings: Arc::clone(&mappings),
             prefault_rx,
             stop: stop_rx,
         };
@@ -262,7 +282,28 @@ impl UffdHandler {
             prefault: prefault_tx,
             served,
             page_size,
+            write_protect,
+            mappings,
         })
+    }
+
+    /// Whether the served regions are registered for write protection, so
+    /// every page goes in write-protected and a written page shows up in
+    /// `/proc/<pid>/pagemap` without the bit; `None` before the handshake.
+    pub fn write_protect(&self) -> Option<bool> {
+        match self.write_protect.load(Ordering::Acquire) {
+            WP_ON => Some(true),
+            WP_OFF => Some(false),
+            _ => None,
+        }
+    }
+
+    /// The regions from the handshake; empty before it.
+    pub fn regions(&self) -> Vec<GuestRegionUffdMapping> {
+        self.mappings
+            .lock()
+            .expect("the mappings are never poisoned")
+            .clone()
     }
 
     /// The page size of the served regions; `None` before the handshake.
@@ -425,6 +466,8 @@ fn thread_main<S: PageSource>(
         stats,
         served,
         page_size,
+        write_protect,
+        mappings: mappings_out,
         prefault_rx,
         mut stop,
     } = inputs;
@@ -455,6 +498,8 @@ fn thread_main<S: PageSource>(
             stats,
             served,
             page_size,
+            write_protect,
+            mappings: mappings_out,
             prefault_rx,
         };
         run(uffd, mappings, source, inputs, &mut stop, state).await
@@ -505,11 +550,16 @@ struct RunInputs {
     stats: Arc<Stats>,
     served: Arc<Mutex<Vec<u64>>>,
     page_size: Arc<AtomicU64>,
+    write_protect: Arc<AtomicU8>,
+    mappings: Arc<Mutex<Vec<GuestRegionUffdMapping>>>,
     prefault_rx: mpsc::UnboundedReceiver<Vec<u64>>,
 }
 
 struct Ctx<S> {
     uffd: AsyncFd<Uffd>,
+    /// Installs carry `UFFDIO_COPY_MODE_WP` and zero pages are copied from
+    /// a zero buffer, so every page starts write-protected.
+    write_protect: bool,
     mappings: Vec<GuestRegionUffdMapping>,
     page_size: u64,
     source: Arc<S>,
@@ -625,6 +675,8 @@ async fn run<S: PageSource>(
         stats,
         served,
         page_size: page_size_out,
+        write_protect: write_protect_out,
+        mappings: mappings_out,
         mut prefault_rx,
     } = inputs;
     let page_size = mappings
@@ -638,6 +690,7 @@ async fn run<S: PageSource>(
         bail!("unsupported page size {page_size}");
     }
     opts.max_inflight = inflight_for_page_size(opts.max_inflight, page_size);
+    let write_protect = probe_write_protect(&uffd, &mappings, page_size);
     let total_pages = mappings
         .iter()
         .map(|m| m.end_offset())
@@ -661,8 +714,12 @@ async fn run<S: PageSource>(
     let bitmap_words = total_pages.div_ceil(64) as usize;
     *served.lock().expect("the served bitmap is never poisoned") = vec![0u64; bitmap_words];
 
+    *mappings_out
+        .lock()
+        .expect("the mappings are never poisoned") = mappings.clone();
     let ctx = Rc::new(Ctx {
         uffd,
+        write_protect,
         mappings,
         page_size,
         source,
@@ -699,6 +756,10 @@ async fn run<S: PageSource>(
         .await
         .context("init the page source")?;
     page_size_out.store(page_size, Ordering::Release);
+    write_protect_out.store(
+        if write_protect { WP_ON } else { WP_OFF },
+        Ordering::Release,
+    );
     let _ = state.send(HandlerState::Serving);
     tracing::info!(
         name = ctx.opts.name,
@@ -706,6 +767,7 @@ async fn run<S: PageSource>(
         page_size,
         total_pages,
         max_inflight = ctx.opts.max_inflight,
+        write_protect,
         "uffd handler serving"
     );
 
@@ -735,7 +797,13 @@ async fn run<S: PageSource>(
                 }
                 for msg in &msgs[..n] {
                     match msg.decode() {
-                        Event::Pagefault { address, .. } => dispatch(&ctx, address),
+                        Event::Pagefault { address, flags } => {
+                            if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
+                                resolve_write_protect(&ctx, address);
+                            } else {
+                                dispatch(&ctx, address);
+                            }
+                        }
                         Event::Remove { start, end } => {
                             bump(&ctx.stats.removes);
                             ctx.mark_removed(start, end);
@@ -773,6 +841,45 @@ async fn run<S: PageSource>(
             .borrow_mut()
             .take()
             .unwrap_or_else(|| anyhow!("uffd handler failed"))),
+    }
+}
+
+/// A synchronous write-protect fault: the page is present and the guest
+/// wants to write it. Unprotecting it is the answer; the cleared bit is what
+/// the pause reads back as dirty. Never waits, like `dispatch`.
+fn resolve_write_protect<S: PageSource>(ctx: &Rc<Ctx<S>>, address: u64) {
+    bump(&ctx.stats.wp_faults);
+    let aligned = address & !(ctx.page_size - 1);
+    if let Err(err) = ctx.uffd.get_ref().write_protect(aligned, ctx.page_size, 0) {
+        // ENOENT: the range is gone (unmapped or unregistered); the faulting
+        // thread is released either way.
+        tracing::debug!(
+            name = ctx.opts.name,
+            address = format!("{address:#x}"),
+            error = %err,
+            "resolving a write-protect fault failed"
+        );
+        let _ = ctx.uffd.get_ref().wake(aligned, ctx.page_size);
+    }
+}
+
+/// Whether the regions are registered for write protection: unprotecting
+/// one absent page is a no-op on a `WRITE_PROTECT` registration and
+/// `ENOENT` (or `EINVAL`) on a `MISSING`-only one.
+fn probe_write_protect(uffd: &Uffd, mappings: &[GuestRegionUffdMapping], page_size: u64) -> bool {
+    let Some(first) = mappings.first() else {
+        return false;
+    };
+    match uffd.write_protect(first.base_host_virt_addr, page_size, 0) {
+        Ok(()) => true,
+        Err(err) if matches!(err.raw_os_error(), Some(libc::ENOENT) | Some(libc::EINVAL)) => false,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "write-protect probe failed; serving without write protection"
+            );
+            false
+        }
     }
 }
 
@@ -971,12 +1078,18 @@ async fn install<S: PageSource>(
         } else {
             content
         };
+        let mode = if ctx.write_protect {
+            UFFDIO_COPY_MODE_WP
+        } else {
+            0
+        };
         let result = match content {
-            Some(buf) => uffd.copy(host_addr, buf.as_ptr(), len, 0),
-            // The shared zero page exists for 4 KiB pages only; a huge page
-            // is copied from a zero buffer.
-            None if len == 4096 => uffd.zeropage(host_addr, len, 0),
-            None => uffd.copy(host_addr, ctx.zero_page.as_ptr(), len, 0),
+            Some(buf) => uffd.copy(host_addr, buf.as_ptr(), len, mode),
+            // The shared zero page exists for 4 KiB pages only and cannot be
+            // installed write-protected; a huge or protected zero page is
+            // copied from a zero buffer.
+            None if len == 4096 && !ctx.write_protect => uffd.zeropage(host_addr, len, 0),
+            None => uffd.copy(host_addr, ctx.zero_page.as_ptr(), len, mode),
         };
         match result {
             Ok(()) => {

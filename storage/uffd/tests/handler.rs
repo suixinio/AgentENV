@@ -8,9 +8,11 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Result};
 use storage_util::io_ring::AsyncIoRing;
 use uvm_uffd::proto::{
-    UFFD_FEATURE_EVENT_REMOVE, UFFD_FEATURE_MISSING_HUGETLBFS, UFFD_USER_MODE_ONLY,
+    UFFDIO_REGISTER_MODE_MISSING, UFFDIO_REGISTER_MODE_WP, UFFD_FEATURE_EVENT_REMOVE,
+    UFFD_FEATURE_MISSING_HUGETLBFS, UFFD_FEATURE_PAGEFAULT_FLAG_WP, UFFD_USER_MODE_ONLY,
 };
 use uvm_uffd::testing::{create_uffd_for_test, AnonRegion};
+use uvm_uffd::{dirty_ranges, DirtyRange};
 use uvm_uffd::{
     send_handshake, HandlerOptions, HandlerState, LocalBoxFuture, MemSource, PageSource, Uffd,
     UffdHandler,
@@ -88,6 +90,8 @@ fn pages_come_from_the_source() -> Result<()> {
     assert_eq!(stats.pages_copied, 8);
     assert_eq!(stats.bytes_read, 8 * PAGE as u64);
     assert_eq!(handler.state(), HandlerState::Serving);
+    assert_eq!(handler.write_protect(), Some(false));
+    assert_eq!(handler.regions(), vec![region.mapping(0, PAGE as u64)]);
     handler.stop()?;
     Ok(())
 }
@@ -807,6 +811,80 @@ fn hugepage_regions_are_served_a_whole_page_at_a_time() -> Result<()> {
     let before = handler.stats().faults;
     let _ = region.read_byte(3 * HUGE + HUGE - 1);
     assert_eq!(handler.stats().faults, before);
+    handler.stop()?;
+    Ok(())
+}
+
+#[test]
+fn write_protected_pages_read_clean_and_a_write_shows_up_as_dirty() -> Result<()> {
+    let Some(uffd) = uffd_or_skip("write_protected_pages_read_clean_and_a_write_shows_up_as_dirty")
+    else {
+        return Ok(());
+    };
+    let size = MIB;
+    let region = Arc::new(AnonRegion::new(size)?);
+    let granted = match region.register_with_mode(
+        &uffd,
+        UFFD_FEATURE_PAGEFAULT_FLAG_WP,
+        UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP,
+    ) {
+        Ok(granted) => granted,
+        Err(err) => {
+            eprintln!(
+                "SKIPPED[uffd]: write_protected_pages_read_clean_and_a_write_shows_up_as_dirty (no write protection: {err:#})"
+            );
+            return Ok(());
+        }
+    };
+    if granted & UFFD_FEATURE_PAGEFAULT_FLAG_WP == 0 {
+        eprintln!("SKIPPED[uffd]: write_protected_pages_read_clean_and_a_write_shows_up_as_dirty (no PAGEFAULT_FLAG_WP)");
+        return Ok(());
+    }
+    // Every fourth page is zero, so the zero path is exercised under
+    // protection too.
+    let source = Arc::new(MemSource::patterned(size, PAGE, 4));
+    let mapping = region.mapping(0, PAGE as u64);
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![mapping.clone()],
+        Arc::clone(&source),
+        opts("wp"),
+    )?;
+    let pid = std::process::id();
+
+    assert_eq!(region.read_byte(PAGE + 5), source.as_slice()[PAGE + 5]);
+    assert!(region.read(4 * PAGE, PAGE).iter().all(|b| *b == 0));
+    assert_eq!(handler.write_protect(), Some(true));
+    let dirty = dirty_ranges(pid, std::slice::from_ref(&mapping))?;
+    assert!(dirty.is_empty(), "read pages are clean: {dirty:?}");
+
+    // The first write is a write-protect fault the handler resolves by
+    // unprotecting the page; the cleared bit is the dirty mark.
+    region.write_byte(PAGE + 7, 0xAA);
+    assert_eq!(region.read_byte(PAGE + 7), 0xAA);
+    region.write_byte(4 * PAGE + 1, 0xBB);
+    let stats = handler.stats();
+    assert_eq!(stats.wp_faults, 2, "{stats:?}");
+    assert_eq!(stats.pages_copied + stats.pages_zeroed, 2);
+    let dirty = dirty_ranges(pid, std::slice::from_ref(&mapping))?;
+    assert_eq!(
+        dirty,
+        vec![
+            DirtyRange {
+                host_addr: region.addr() + PAGE as u64,
+                image_offset: PAGE as u64,
+                len: PAGE as u64,
+            },
+            DirtyRange {
+                host_addr: region.addr() + 4 * PAGE as u64,
+                image_offset: 4 * PAGE as u64,
+                len: PAGE as u64,
+            },
+        ]
+    );
+    // A second write to an unprotected page is not a fault.
+    region.write_byte(PAGE + 8, 0xCC);
+    assert_eq!(handler.stats().wp_faults, 2);
     handler.stop()?;
     Ok(())
 }

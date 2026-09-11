@@ -82,8 +82,15 @@ impl AnonRegion {
     /// Registers the whole region for missing-page faults; `features` go to
     /// `UFFDIO_API` first. Returns the granted feature set.
     pub fn register(&self, uffd: &Uffd, features: u64) -> Result<u64> {
+        self.register_with_mode(uffd, features, UFFDIO_REGISTER_MODE_MISSING)
+    }
+
+    /// Registers the whole region with the given `UFFDIO_REGISTER` mode
+    /// bits, the way a Firecracker build that write-protects guest memory
+    /// does with `MISSING | WP`.
+    pub fn register_with_mode(&self, uffd: &Uffd, features: u64, mode: u64) -> Result<u64> {
         let granted = uffd.api(features).context("UFFDIO_API")?;
-        uffd.register(self.addr(), self.len as u64, UFFDIO_REGISTER_MODE_MISSING)
+        uffd.register(self.addr(), self.len as u64, mode)
             .context("UFFDIO_REGISTER")?;
         Ok(granted)
     }

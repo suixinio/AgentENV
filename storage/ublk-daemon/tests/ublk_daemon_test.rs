@@ -1754,6 +1754,8 @@ mod live_device_tests {
                     &fixture.global_config,
                     &socket_path,
                     MemoryUffdServeOptions {
+                        source_block_bytes: 4 * 1024 * 1024,
+                        source_cache_bytes: 32 * 1024 * 1024,
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 1,
@@ -1843,6 +1845,8 @@ mod live_device_tests {
                     &fixture.global_config,
                     &socket_path,
                     MemoryUffdServeOptions {
+                        source_block_bytes: 4 * 1024 * 1024,
+                        source_cache_bytes: 32 * 1024 * 1024,
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 60,
@@ -1931,6 +1935,8 @@ mod live_device_tests {
                             &fixture.global_config,
                             &socket_dir.path().join(name),
                             MemoryUffdServeOptions {
+                                source_block_bytes: 4 * 1024 * 1024,
+                                source_cache_bytes: 32 * 1024 * 1024,
                                 max_inflight: 16,
                                 read_retry_secs: 5,
                                 handshake_timeout_secs: 60,
@@ -2002,6 +2008,8 @@ mod live_device_tests {
                     &fixture.global_config,
                     &socket_path,
                     MemoryUffdServeOptions {
+                        source_block_bytes: 4 * 1024 * 1024,
+                        source_cache_bytes: 32 * 1024 * 1024,
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 60,
@@ -2059,6 +2067,8 @@ mod live_device_tests {
                     &fixture.global_config,
                     &socket_path,
                     MemoryUffdServeOptions {
+                        source_block_bytes: 4 * 1024 * 1024,
+                        source_cache_bytes: 32 * 1024 * 1024,
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 60,
@@ -2142,6 +2152,8 @@ mod live_device_tests {
                     &fixture.global_config,
                     &socket_path,
                     MemoryUffdServeOptions {
+                        source_block_bytes: 4 * 1024 * 1024,
+                        source_cache_bytes: 32 * 1024 * 1024,
                         max_inflight: 16,
                         read_retry_secs: 5,
                         handshake_timeout_secs: 60,

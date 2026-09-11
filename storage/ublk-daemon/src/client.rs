@@ -162,6 +162,8 @@ pub struct MemoryUffdServeOptions {
     pub max_inflight: usize,
     pub read_retry_secs: u64,
     pub handshake_timeout_secs: u64,
+    pub source_block_bytes: u64,
+    pub source_cache_bytes: u64,
 }
 
 impl UblkDaemonClient {
@@ -610,6 +612,8 @@ impl UblkDaemonClient {
             max_inflight: options.max_inflight,
             read_retry_secs: options.read_retry_secs,
             handshake_timeout_secs: options.handshake_timeout_secs,
+            source_block_bytes: options.source_block_bytes,
+            source_cache_bytes: options.source_cache_bytes,
             prefetch_path: prefetch_path.map(Path::to_path_buf),
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {

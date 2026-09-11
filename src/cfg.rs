@@ -700,6 +700,26 @@ pub struct MemorySnapshotUffdConfig {
     /// A resume on a build without the patch fails. Default: `true`.
     #[config(default = true, env = "AENV_MEMORY_SNAPSHOT_UFFD_WRITE_PROTECT")]
     pub write_protect: bool,
+    /// Bytes the daemon reads from the memory image per fault that misses.
+    /// A guest walking its memory then pays one read per block instead of one
+    /// per page; a scattered one pays a whole block for a single page.
+    ///
+    /// Off by default, because it only pays where reading the image is what a
+    /// fault waits on. Against a local layer that read is ~9 us of a ~108 us
+    /// fault, so blocks buy at most a few percent and a 4 MiB one measured 15x
+    /// read amplification and seconds of extra resume. Against object storage,
+    /// where a refill is a round trip, it is the difference the size is for.
+    /// Below one page every fault reads its page alone. Default: `0`.
+    #[config(default = 0u64, env = "AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_BLOCK_BYTES")]
+    pub source_block_bytes: u64,
+    /// Bytes of those blocks one VM's server holds at once. It is host memory
+    /// on top of the guest's own pages, so it buys locality, not residency:
+    /// a few blocks per faulting thread is enough. Default: `33554432` (32 MiB).
+    #[config(
+        default = 33_554_432u64,
+        env = "AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_CACHE_BYTES"
+    )]
+    pub source_cache_bytes: u64,
 }
 
 #[derive(Debug, Config, Clone)]

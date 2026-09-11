@@ -16,7 +16,7 @@ pub mod testing;
 
 pub use handler::{HandlerOptions, HandlerState, StatsSnapshot, UffdHandler};
 pub use handshake::{recv_handshake, send_handshake, GuestRegionUffdMapping, Handshake};
-pub use impls::{FileSource, MemSource, OverlaybdSource};
+pub use impls::{BlockCacheSource, BlockCacheStats, FileSource, MemSource, OverlaybdSource};
 pub use pagemap::{dirty_ranges, DirtyRange, DirtySource};
 pub use prefetch::PrefetchList;
 pub use proc_maps::guest_regions_backed_by;

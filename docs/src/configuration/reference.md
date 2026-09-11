@@ -778,6 +778,8 @@ Settings that apply only when `[memory_snapshot].backend = "uffd"`.
 | `read_retry_secs` | integer | `60` | How long one faulting read retries the memory image before the handler gives up and exits, which fails the sandbox and leaves the guest unbacked. Keep it above the overlaybd registry request timeout (30 s per request) with room for its retries. Must be greater than zero |
 | `handshake_timeout_secs` | integer | `60` | How long the daemon waits for Firecracker to connect to the fault socket after the server starts; a snapshot load that takes longer fails the resume. Must be greater than zero |
 | `write_protect` | bool | `true` | Expect the Firecracker build to register guest memory for userfaultfd write protection: a pause then captures exactly the pages the guest wrote, read from the VMM's pagemap, and `track_dirty_pages` may stay `false` on KVM and PVM alike. A resume on a build without the write-protect patch fails. `false` falls back to the KVM dirty log, which requires `track_dirty_pages = true`. |
+| `source_block_bytes` | integer | `0` | Bytes the daemon reads from the memory image per fault that misses, held in a per-server cache. `0` and any value below one page turn it off and every fault reads its own page. It pays only where reading the image is what a fault waits on: against a local layer that read is ~9 µs of a ~108 µs fault, while a 4 MiB block measured 15x read amplification and seconds of extra resume; against object storage a miss is a round trip and the size is what removes them. |
+| `source_cache_bytes` | integer | `33554432` | Bytes of those blocks one VM's server holds. Host memory on top of the guest's own pages, so it buys locality rather than residency. |
 
 Environment variable override:
 
@@ -785,6 +787,8 @@ Environment variable override:
 - `AENV_MEMORY_SNAPSHOT_UFFD_HANDSHAKE_TIMEOUT_SECS`
 - `AENV_MEMORY_SNAPSHOT_UFFD_WRITE_PROTECT`
 - `AENV_MEMORY_SNAPSHOT_UFFD_READ_RETRY_SECS`
+- `AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_BLOCK_BYTES`
+- `AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_CACHE_BYTES`
 
 ## `[memory_snapshot.background_download]`
 

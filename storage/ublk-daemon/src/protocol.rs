@@ -88,6 +88,12 @@ pub enum DaemonRequest {
         /// takes longer than this fails at `QueryMemoryUffd`.
         #[serde(default = "default_uffd_handshake_timeout_secs")]
         handshake_timeout_secs: u64,
+        /// Bytes read from the image per missing fault, and how many of those
+        /// blocks one server holds. A block below one page turns the cache off.
+        #[serde(default = "default_uffd_source_block_bytes")]
+        source_block_bytes: u64,
+        #[serde(default = "default_uffd_source_cache_bytes")]
+        source_cache_bytes: u64,
         /// The working-set list of this image: replayed once the handshake
         /// is done when it exists, recorded at stop when it does not.
         #[serde(default)]
@@ -115,6 +121,14 @@ const fn default_uffd_read_retry_secs() -> u64 {
 
 const fn default_uffd_handshake_timeout_secs() -> u64 {
     60
+}
+
+const fn default_uffd_source_block_bytes() -> u64 {
+    4 * 1024 * 1024
+}
+
+const fn default_uffd_source_cache_bytes() -> u64 {
+    32 * 1024 * 1024
 }
 
 /// Where a userfaultfd server is in its life.

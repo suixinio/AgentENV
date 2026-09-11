@@ -697,6 +697,23 @@ handshake_timeout_secs = 60
 # Override with AENV_MEMORY_SNAPSHOT_UFFD_WRITE_PROTECT.
 write_protect = true
 
+# Bytes read from the memory image per fault that misses. 0 is off: every
+# fault reads its own page.
+#
+# It only pays where reading the image is what a fault waits on. Against a
+# local layer that read measured ~9 us of a ~108 us fault, so blocks bought a
+# few percent at best, while a 4 MiB one measured 15x read amplification and
+# added seconds to every resume. Against object storage, where a refill is a
+# round trip, that is what the size is for -- 4194304 (4 MiB) is the value
+# both comparable systems use there.
+# Override with AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_BLOCK_BYTES.
+source_block_bytes = 0
+# Bytes of those blocks one VM's server holds (33554432 = 32 MiB). This is
+# host memory on top of the guest's own pages and buys locality, not
+# residency: a few blocks per faulting thread is enough.
+# Override with AENV_MEMORY_SNAPSHOT_UFFD_SOURCE_CACHE_BYTES.
+source_cache_bytes = 33554432
+
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd
 # becomes ready.

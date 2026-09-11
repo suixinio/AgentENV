@@ -15,7 +15,8 @@ use overlaybd::image_file::ImageFile;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use uvm_uffd::{
-    HandlerOptions, HandlerState, OverlaybdSource, PrefetchList, StatsSnapshot, UffdHandler,
+    BlockCacheSource, HandlerOptions, HandlerState, OverlaybdSource, PrefetchList, StatsSnapshot,
+    UffdHandler,
 };
 
 use crate::protocol::{DaemonResponse, MemoryUffdRegion, MemoryUffdState, MemoryUffdStats};
@@ -42,6 +43,8 @@ struct ActiveServe {
     image_size: u64,
     /// Where the working set is recorded at stop, unless a list exists.
     prefetch_path: Option<PathBuf>,
+    /// Read once at stop: how much of the image the block reads pulled in.
+    cache: Arc<BlockCacheSource<OverlaybdSource>>,
 }
 
 pub(crate) struct ServeMemoryUffdRequest<'a> {
@@ -51,6 +54,8 @@ pub(crate) struct ServeMemoryUffdRequest<'a> {
     pub(crate) max_inflight: usize,
     pub(crate) read_retry_secs: u64,
     pub(crate) handshake_timeout_secs: u64,
+    pub(crate) source_block_bytes: u64,
+    pub(crate) source_cache_bytes: u64,
     pub(crate) prefetch_path: Option<&'a Path>,
 }
 
@@ -143,11 +148,18 @@ impl MemoryUffdServers {
         key: &ImageKey,
         image: Arc<ImageFile>,
     ) -> Result<u32> {
-        let source = Arc::new(
+        let overlaybd =
             OverlaybdSource::from_opened_image(request.image_config.to_path_buf(), image)
-                .context("build the page source for the memory image")?,
-        );
-        let image_size = source.image().size_bytes();
+                .context("build the page source for the memory image")?;
+        let image_size = overlaybd.image().size_bytes();
+        // Whole blocks, so a guest walking its memory pays one image read per
+        // block rather than one per page.
+        let source = Arc::new(BlockCacheSource::new(
+            overlaybd,
+            request.source_block_bytes,
+            request.source_cache_bytes,
+        ));
+        let cache = Arc::clone(&source);
         let listener = bind_handshake_socket(request.socket_path)?;
         let serve_id = loop {
             let id = self.next_serve_id.fetch_add(1, Ordering::Relaxed);
@@ -235,6 +247,7 @@ impl MemoryUffdServers {
                 image_key: key.clone(),
                 image_size,
                 prefetch_path: prefetch.map(|(path, _)| path),
+                cache,
             },
         );
         metrics::gauge!("uffd_memory_servers").set(self.serves.len() as f64);
@@ -243,6 +256,7 @@ impl MemoryUffdServers {
             image_config = %request.image_config.display(),
             socket = %request.socket_path.display(),
             max_inflight = request.max_inflight,
+            source_block_bytes = request.source_block_bytes,
             "serving a memory image over userfaultfd"
         );
         Ok(serve_id)
@@ -257,6 +271,7 @@ impl MemoryUffdServers {
             image_key,
             image_size,
             prefetch_path,
+            cache,
         } = serve;
 
         // Joining the watcher leaves this the only reference to the handler,
@@ -268,7 +283,14 @@ impl MemoryUffdServers {
         }
         let stats = handler.stats();
         record_final_stats(&stats);
-        tracing::info!(serve_id, ?stats, "memory uffd server final counters");
+        let blocks = cache.stats();
+        record_block_cache_stats(&blocks);
+        tracing::info!(
+            serve_id,
+            ?stats,
+            ?blocks,
+            "memory uffd server final counters"
+        );
         // Stopping is asked for before the ownership check, so a handler
         // some other reference still holds is told to stop rather than
         // left serving a socket that is about to be unlinked.
@@ -462,6 +484,20 @@ async fn replay_prefetch(
             image_size,
             "ignoring a memory prefetch list recorded for another page size or image"
         ),
+    }
+}
+
+/// Publishes what the block reads cost this server. `bytes_read` over the
+/// bytes the guest actually faulted is the amplification the block size bought.
+fn record_block_cache_stats(stats: &uvm_uffd::BlockCacheStats) {
+    for (name, value) in [
+        ("uffd_memory_block_hits_total", stats.hits),
+        ("uffd_memory_block_misses_total", stats.misses),
+        ("uffd_memory_block_waits_total", stats.waits),
+        ("uffd_memory_block_bytes_read_total", stats.bytes_read),
+        ("uffd_memory_block_evictions_total", stats.evictions),
+    ] {
+        metrics::counter!(name).increment(value);
     }
 }
 

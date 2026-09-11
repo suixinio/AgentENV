@@ -629,6 +629,8 @@ impl UblkDeviceManager {
                     max_inflight: memory.uffd.max_inflight,
                     read_retry_secs: memory.uffd.read_retry_secs,
                     handshake_timeout_secs: memory.uffd.handshake_timeout_secs,
+                    source_block_bytes: memory.uffd.source_block_bytes,
+                    source_cache_bytes: memory.uffd.source_cache_bytes,
                 },
                 prefetch_path,
             )

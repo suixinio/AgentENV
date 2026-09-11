@@ -614,6 +614,8 @@ async fn handle_connection(
             max_inflight,
             read_retry_secs,
             handshake_timeout_secs,
+            source_block_bytes,
+            source_cache_bytes,
             prefetch_path,
         } => {
             memory_uffd
@@ -626,6 +628,8 @@ async fn handle_connection(
                         max_inflight,
                         read_retry_secs,
                         handshake_timeout_secs,
+                        source_block_bytes,
+                        source_cache_bytes,
                         prefetch_path: prefetch_path.as_deref(),
                     },
                 )

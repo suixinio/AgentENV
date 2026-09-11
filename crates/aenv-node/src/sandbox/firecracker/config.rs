@@ -933,6 +933,32 @@ mod tests {
     }
 
     #[test]
+    fn only_a_template_snapshot_gets_a_prefetch_list_under_the_home_path() -> Result<()> {
+        let template = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let template_id = template.id.to_string();
+        let snapshot = RunnableSnapshot::from_test_manifest(template, Vec::new());
+        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
+        assert_eq!(
+            config.mem_prefetch_path,
+            Some(
+                ConfigManager::global_config()
+                    .home_path
+                    .join("mem-prefetch")
+                    .join(format!("{template_id}.json"))
+            )
+        );
+
+        let mut paused = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        paused.source = crate::snapshot::SnapshotSource::Sandbox {
+            source_sandbox_id: "sbx-1".to_string(),
+        };
+        let snapshot = RunnableSnapshot::from_test_manifest(paused, Vec::new());
+        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
+        assert_eq!(config.mem_prefetch_path, None);
+        Ok(())
+    }
+
+    #[test]
     fn runnable_snapshot_without_tools_drive_version_is_not_launchable() {
         let mut committed = CommittedSnapshot::mock();
         committed.runtime_versions.tools_drive_version.clear();

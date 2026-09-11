@@ -43,6 +43,30 @@ impl AnonRegion {
         })
     }
 
+    /// A 2 MiB hugetlbfs mapping. The pool is charged at map time (no
+    /// `MAP_NORESERVE`), so a region that maps can be touched; a host with
+    /// no pool answers `ENOMEM` here rather than `SIGBUS` later.
+    pub fn new_hugetlb(len: usize) -> Result<Self> {
+        // SAFETY: anonymous mapping with no file and no fixed address.
+        let ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_HUGETLB,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error()).context("mmap a hugetlb region");
+        }
+        Ok(Self {
+            ptr: ptr.cast(),
+            len,
+        })
+    }
+
     pub fn addr(&self) -> u64 {
         self.ptr as u64
     }

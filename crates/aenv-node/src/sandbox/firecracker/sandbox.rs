@@ -2103,6 +2103,7 @@ impl FirecrackerSandbox {
                 config.vcpu_count,
                 false,
                 config.common.track_dirty_pages,
+                config.common.huge_pages,
             )
             .await?;
 

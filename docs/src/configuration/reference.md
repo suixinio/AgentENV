@@ -754,6 +754,7 @@ the default path on every startup.
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
 | `backend` | string | `"block"` | Path snapshot memory is restored through: `block` mmaps a read-only device (ublk or nbd per `[ublk].transport`) built from the stacked memory layers, `uffd` has the ublk daemon answer Firecracker's page faults over a Unix socket and creates no device. `uffd` requires `track_dirty_pages = true`, which is refused under PVM, so `uffd` is KVM-only. |
 | `track_dirty_pages` | bool | `false` | Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true` to enable it. |
+| `huge_pages` | bool | `false` | Boot new VMs with guest memory on 2 MiB hugetlbfs pages, so one resume fault covers 2 MiB. Fixed at boot and recorded in every snapshot of the VM; such a snapshot restores only through `backend = "uffd"`, and a node that receives one must be able to hand out 2 MiB pages (`--setup-host` sets `vm.nr_overcommit_hugepages` to cover RAM; a boot-time `vm.nr_hugepages` reservation is the operator's, and is what survives memory fragmentation). Requires `backend = "uffd"`. |
 | `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
 | `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
 
@@ -761,6 +762,7 @@ Environment variable override:
 
 - `AENV_MEMORY_SNAPSHOT_BACKEND`
 - `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES`
+- `AENV_MEMORY_SNAPSHOT_HUGE_PAGES`
 
 ## `[memory_snapshot.uffd]`
 

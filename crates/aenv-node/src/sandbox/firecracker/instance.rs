@@ -288,10 +288,15 @@ impl FirecrackerInstance {
         vcpu_count: u32,
         smt: bool,
         track_dirty_pages: bool,
+        huge_pages: bool,
     ) -> Result<()> {
         let mut machine_config = MachineConfiguration::new(mem_size_mib as i32, vcpu_count as i32);
         machine_config.smt = Some(smt);
         machine_config.track_dirty_pages = Some(track_dirty_pages);
+        if huge_pages {
+            machine_config.huge_pages =
+                Some(firecracker_client::models::machine_configuration::HugePages::Variant2M);
+        }
         self.client
             .request_no_content(Method::PUT, "/machine-config", Some(&machine_config))
             .await

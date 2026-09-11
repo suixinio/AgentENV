@@ -95,6 +95,7 @@ async fn publish_captured_snapshot_for_test(
                 runtime_versions: sample_runtime_versions(),
                 virtualization_mode: aenv_node::cfg::ConfigManager::global_config()
                     .virtualization_mode,
+                huge_pages: false,
                 image_configs: aenv_node::types::ImageConfigs::new(),
                 custom_extension_params: None,
                 paused_sandbox: None,

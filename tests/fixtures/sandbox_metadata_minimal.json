@@ -10,6 +10,7 @@
   },
   "execution_id": "0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c09",
   "expires_at": null,
+  "huge_pages": false,
   "id": "0199c9a1-4f2e-7c31-a0b4-6d5e8f2a1c08",
   "max_lifetime": null,
   "network_policy": {

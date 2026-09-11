@@ -443,6 +443,7 @@ mod tests {
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
             virtualization_mode: metadata.virtualization_mode,
+            huge_pages: false,
             image_configs: metadata.image_configs.clone(),
             rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
                 digest: "sharedfs:missing".to_string(),
@@ -501,6 +502,7 @@ mod tests {
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
             virtualization_mode: metadata.virtualization_mode,
+            huge_pages: false,
             image_configs: metadata.image_configs.clone(),
             rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
                 digest: "sharedfs:test".to_string(),

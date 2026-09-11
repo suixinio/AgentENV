@@ -237,6 +237,7 @@ impl SnapshotCommit {
                 startup: metadata.startup.clone(),
                 runtime_versions: metadata.runtime_versions.clone(),
                 virtualization_mode: metadata.virtualization_mode,
+                huge_pages: metadata.huge_pages,
                 image_configs: metadata.image_configs.clone(),
                 custom_extension_params: metadata.custom_extension_params.clone(),
                 paused_sandbox: metadata.paused_sandbox.clone(),

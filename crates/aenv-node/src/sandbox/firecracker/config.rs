@@ -133,6 +133,10 @@ pub struct FirecrackerCommonConfig {
     /// The serde default keeps older persisted snapshot configs compatible.
     #[serde(default)]
     pub track_dirty_pages: bool,
+    /// Boot with guest memory on 2 MiB hugetlbfs pages. A snapshot carries
+    /// the setting of the VM it was taken from.
+    #[serde(default)]
+    pub huge_pages: bool,
     pub envd_version: String,
     /// Control plane port inside the VM (default: 49983).
     pub control_plane_port: u16,
@@ -184,6 +188,7 @@ impl FirecrackerCommonConfig {
             firecracker_log_level: None,
             runtime_policy,
             track_dirty_pages: false,
+            huge_pages: false,
             envd_version: EnvdConfig::default().version,
             control_plane_port: ToolsConfig::default().control_plane_port,
             env_vars: None,
@@ -212,6 +217,7 @@ impl FirecrackerCommonConfig {
         common.envd_version = config.envd.version.clone();
         common.disk_rate_limit = config.machine.disk_rate_limit.clone();
         common.track_dirty_pages = config.memory_snapshot.track_dirty_pages;
+        common.huge_pages = config.memory_snapshot.huge_pages;
         common.rootfs_allow_shrink = config.ublk.overlaybd.allow_shrink;
         common.control_plane_port = config.tools.control_plane_port;
         common.firecracker_work_base_dir = config.firecracker.work_dir.clone();
@@ -511,6 +517,25 @@ impl FirecrackerSnapshotConfig {
             );
         }
         base_common.tools_drive_version = tools_drive_version.clone();
+        // Hugepage backing is the snapshot's, not the node's: Firecracker
+        // restores with the page size the VM was booted with, and only over
+        // userfaultfd.
+        base_common.huge_pages = snapshot.committed().huge_pages;
+        if base_common.huge_pages {
+            if app_config.memory_snapshot.backend != crate::cfg::MemorySnapshotBackend::Uffd {
+                bail!(
+                    "snapshot '{}' has hugepage-backed guest memory, which restores only through \
+                     memory_snapshot.backend=\"uffd\"; this node uses the block backend",
+                    snapshot.record().id
+                );
+            }
+            crate::setup::hugepages::check().with_context(|| {
+                format!(
+                    "snapshot '{}' has hugepage-backed guest memory and this host cannot provide 2 MiB pages",
+                    snapshot.record().id
+                )
+            })?;
+        }
         let rootfs_image_config = OverlaybdConfig {
             image_config_path: manifest.rootfs.image_config_path.clone(),
             read_only: app_config.ublk.overlaybd.read_only,
@@ -956,6 +981,21 @@ mod tests {
         let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
         assert_eq!(config.mem_prefetch_path, None);
         Ok(())
+    }
+
+    #[test]
+    fn a_hugepage_snapshot_is_refused_on_the_block_backend() {
+        let mut committed = CommittedSnapshot::mock();
+        committed.huge_pages = true;
+        let snapshot =
+            RunnableSnapshot::from_test_manifest(SnapshotRecord::mock_ready(committed), Vec::new());
+        // The default config restores through the block backend.
+        let err = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)
+            .expect_err("a hugepage snapshot needs the uffd backend");
+        assert!(
+            err.to_string().contains("hugepage-backed guest memory"),
+            "{err}"
+        );
     }
 
     #[test]

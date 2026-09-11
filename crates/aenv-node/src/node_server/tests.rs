@@ -2147,6 +2147,7 @@ async fn a_built_templates_metadata_survives_stage_encode_decode_and_commit() {
         build_snapshot_id.clone(),
         resources,
         VirtualizationMode::Kvm,
+        false,
         build_execution,
     );
     assert!(

@@ -645,6 +645,16 @@ backend = "block"
 # OverlayBD path. Override with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
 track_dirty_pages = false
 
+# Boot new VMs with guest memory on 2 MiB hugetlbfs pages: one page fault
+# covers 2 MiB instead of 4 KiB on resume. Fixed at boot and kept by every
+# snapshot of the VM, which then restores only through backend = "uffd"; the
+# host needs a hugepage pool (--setup-host allows on-demand assembly, a
+# boot-time reservation with vm.nr_hugepages is the operator's). With
+# track_dirty_pages = true KVM still maps the guest at 4 KiB, so the TLB
+# benefit is absent until dirty pages come from userfaultfd write protection.
+# Override with AENV_MEMORY_SNAPSHOT_HUGE_PAGES.
+huge_pages = false
+
 # Compress memory snapshot layers. The algorithm is parsed but ignored when
 # compression is disabled.
 compression_enabled = false

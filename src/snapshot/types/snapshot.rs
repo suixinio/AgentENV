@@ -27,6 +27,11 @@ pub struct SnapshotPublishMetadata {
     pub resources: SandboxResources,
     pub runtime_versions: SnapshotRuntimeVersions,
     pub virtualization_mode: VirtualizationMode,
+    /// Guest memory backed by 2 MiB hugetlbfs pages. Fixed at boot and kept
+    /// by every snapshot of the VM; such a snapshot restores only through
+    /// the `uffd` memory backend.
+    #[serde(default)]
+    pub huge_pages: bool,
     pub image_configs: ImageConfigs,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Template launches inherit it unless overridden at create time.
@@ -55,6 +60,7 @@ impl SnapshotPublishMetadata {
                 tools_drive_version: "0.1.0".to_string(),
             },
             virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
+            huge_pages: false,
             image_configs: ImageConfigs::new(),
             custom_extension_params: None,
             paused_sandbox: None,
@@ -294,6 +300,9 @@ pub struct CommittedSnapshot {
     /// Node virtualization ABI used to capture this snapshot.
     #[serde(default)]
     pub virtualization_mode: VirtualizationMode,
+    /// See `SnapshotPublishMetadata::huge_pages`.
+    #[serde(default)]
+    pub huge_pages: bool,
     #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
     pub image_configs: ImageConfigs,
     pub rootfs_layers: Vec<OverlaybdLayerRef>,
@@ -323,6 +332,7 @@ impl CommittedSnapshot {
                 tools_drive_version: "0.1.0".to_string(),
             },
             virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
+            huge_pages: false,
             image_configs: ImageConfigs::new(),
             rootfs_layers: Vec::new(),
             attached_drives: Vec::new(),

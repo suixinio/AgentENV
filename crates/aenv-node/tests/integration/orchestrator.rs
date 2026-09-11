@@ -321,6 +321,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                     resources: capture.metadata.resources,
                     runtime_versions: capture.metadata.runtime_versions.clone(),
                     virtualization_mode: capture.metadata.virtualization_mode,
+                    huge_pages: false,
                     image_configs: capture.metadata.image_configs.clone(),
                     custom_extension_params: None,
                     paused_sandbox: None,

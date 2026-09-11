@@ -654,6 +654,11 @@ pub struct MemorySnapshotConfig {
     /// Default: false, preserving the mincore-based path.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = false)]
     pub track_dirty_pages: bool,
+    /// Boot new VMs with guest memory on 2 MiB hugetlbfs pages. A snapshot
+    /// of such a VM restores only through the `uffd` backend, so this
+    /// requires `backend = "uffd"`. Default: `false`.
+    #[config(default = false, env = "AENV_MEMORY_SNAPSHOT_HUGE_PAGES")]
+    pub huge_pages: bool,
     #[config(default = false)]
     pub compression_enabled: bool,
     #[config(default = "lz4")]

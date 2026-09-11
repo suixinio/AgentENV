@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use storage_util::io_ring::AsyncIoRing;
-use uvm_uffd::proto::{UFFD_FEATURE_EVENT_REMOVE, UFFD_USER_MODE_ONLY};
+use uvm_uffd::proto::{
+    UFFD_FEATURE_EVENT_REMOVE, UFFD_FEATURE_MISSING_HUGETLBFS, UFFD_USER_MODE_ONLY,
+};
 use uvm_uffd::testing::{create_uffd_for_test, AnonRegion};
 use uvm_uffd::{
     send_handshake, HandlerOptions, HandlerState, LocalBoxFuture, MemSource, PageSource, Uffd,
@@ -753,6 +755,58 @@ fn a_handshake_body_split_across_segments_is_reassembled() -> Result<()> {
         region.read_byte(9 * PAGE + 1),
         source.as_slice()[9 * PAGE + 1]
     );
+    handler.stop()?;
+    Ok(())
+}
+
+#[test]
+fn hugepage_regions_are_served_a_whole_page_at_a_time() -> Result<()> {
+    let Some(uffd) = uffd_or_skip("hugepage_regions_are_served_a_whole_page_at_a_time") else {
+        return Ok(());
+    };
+    const HUGE: usize = 2 << 20;
+    let size = 4 * HUGE;
+    let region = match AnonRegion::new_hugetlb(size) {
+        Ok(region) => region,
+        Err(err) => {
+            eprintln!(
+                "SKIPPED[uffd]: hugepage_regions_are_served_a_whole_page_at_a_time (no hugetlb pool: {err:#})"
+            );
+            return Ok(());
+        }
+    };
+    let granted = region.register(&uffd, UFFD_FEATURE_MISSING_HUGETLBFS)?;
+    if granted & UFFD_FEATURE_MISSING_HUGETLBFS == 0 {
+        eprintln!("SKIPPED[uffd]: hugepage_regions_are_served_a_whole_page_at_a_time (no MISSING_HUGETLBFS)");
+        return Ok(());
+    }
+    // Every other 2 MiB page is zero, so both install paths run on a page
+    // size that has no shared zero page.
+    let source = Arc::new(MemSource::patterned(size, HUGE, 2));
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![region.mapping(0, HUGE as u64)],
+        Arc::clone(&source),
+        opts("huge"),
+    )?;
+
+    for p in 0..4 {
+        let at = p * HUGE + 1234;
+        assert_eq!(
+            region.read(at, 64),
+            &source.as_slice()[at..at + 64],
+            "page {p}"
+        );
+    }
+    assert_eq!(handler.page_size(), Some(HUGE as u64));
+    let stats = handler.stats();
+    assert_eq!(stats.pages_copied + stats.pages_zeroed, 4, "{stats:?}");
+    assert_eq!(stats.pages_zeroed, 2, "{stats:?}");
+    assert_eq!(stats.bytes_read, size as u64);
+    // A second touch anywhere in a served page does not fault.
+    let before = handler.stats().faults;
+    let _ = region.read_byte(3 * HUGE + HUGE - 1);
+    assert_eq!(handler.stats().faults, before);
     handler.stop()?;
     Ok(())
 }

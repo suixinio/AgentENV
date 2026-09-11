@@ -70,6 +70,9 @@ pub struct TemplateBuildContext {
     pub base: TemplateBuildBase,
     pub cpu_config_json: Option<String>,
     pub virtualization_mode: VirtualizationMode,
+    /// Guest memory on 2 MiB pages: the node's setting for a fresh build,
+    /// the base snapshot's for a derived one.
+    pub huge_pages: bool,
 }
 
 impl TemplateBuildContext {

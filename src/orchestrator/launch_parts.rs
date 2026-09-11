@@ -98,6 +98,7 @@ pub fn snapshot_create_parts(
         snapshot_id: record.id.to_string(),
         snapshot_alias: record.alias.as_ref().map(ToString::to_string),
         virtualization_mode: committed.virtualization_mode,
+        huge_pages: committed.huge_pages,
         runtime_versions: committed.runtime_versions.clone(),
         resources: record.resources,
         context: committed.context.clone(),

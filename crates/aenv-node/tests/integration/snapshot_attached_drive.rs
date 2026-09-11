@@ -184,6 +184,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
                 .to_string(),
         },
         virtualization_mode: aenv_node::cfg::ConfigManager::global_config().virtualization_mode,
+        huge_pages: false,
         image_configs: aenv_node::types::ImageConfigs::new(),
         custom_extension_params: None,
         paused_sandbox: None,

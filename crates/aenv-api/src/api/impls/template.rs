@@ -721,6 +721,7 @@ fn adopted_build_metadata(
             tools_drive_version: String::new(),
         },
         virtualization_mode: VirtualizationMode::default(),
+        huge_pages: false,
         image_configs: ImageConfigs::new(),
         custom_extension_params: None,
         paused_sandbox: None,

@@ -1,5 +1,6 @@
 mod deps;
 mod egress_socket;
+pub mod hugepages;
 mod kvm;
 mod network_capacity;
 pub mod overlaybd;
@@ -55,6 +56,9 @@ pub fn ensure_host(config: &AppConfig, runtime_user: &str, runtime_group: &str) 
     ublk::provision(runtime_group, config.ublk.transport)?;
     if config.memory_snapshot.backend == crate::cfg::MemorySnapshotBackend::Uffd {
         uffd::provision(runtime_group)?;
+    }
+    if config.memory_snapshot.huge_pages {
+        hugepages::provision()?;
     }
     overlaybd::install_system_default_config(&config.deps_path, runtime_gid)?;
     network_capacity::install_persistent_config().context("install /etc/sysctl.d/99-aenv.conf")?;
@@ -131,6 +135,10 @@ pub async fn ensure_environment(
     if config.memory_snapshot.backend == crate::cfg::MemorySnapshotBackend::Uffd {
         info!("checking userfaultfd access for the memory backend");
         uffd::check()?;
+    }
+    if config.memory_snapshot.huge_pages {
+        info!("checking 2 MiB hugepage availability for guest memory");
+        hugepages::check()?;
     }
 
     // 4. Download dependencies and generate overlaybd runtime configs.

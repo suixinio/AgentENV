@@ -198,6 +198,10 @@ pub struct SandboxMetadata {
     /// Virtualization mode used by this sandbox for its entire lifecycle.
     #[serde(default)]
     pub virtualization_mode: VirtualizationMode,
+    /// Guest memory on 2 MiB hugetlbfs pages, fixed at boot and inherited
+    /// by every snapshot and resume of this sandbox.
+    #[serde(default)]
+    pub huge_pages: bool,
     pub runtime_versions: SnapshotRuntimeVersions,
     pub resources: SandboxResources,
     pub context: CommandContext,
@@ -255,6 +259,7 @@ impl Default for SandboxMetadata {
             expires_at: None,
             auto_resume: false,
             virtualization_mode: VirtualizationMode::default(),
+            huge_pages: false,
             runtime_versions: SnapshotRuntimeVersions::new(
                 "unknown".to_string(),
                 "unknown".to_string(),
@@ -1014,6 +1019,7 @@ mod golden {
             expires_at: Some(UNIX_EPOCH + Duration::new(1_755_562_500, 0)),
             auto_resume: true,
             virtualization_mode: VirtualizationMode::Pvm,
+            huge_pages: false,
             runtime_versions: SnapshotRuntimeVersions::new(
                 "6.1.102".to_string(),
                 "1.13.1".to_string(),

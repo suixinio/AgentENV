@@ -137,6 +137,7 @@ impl TemplateBuilder {
                     resources,
                     runtime_versions: build_execution.runtime_versions,
                     virtualization_mode: context.virtualization_mode,
+                    huge_pages: context.huge_pages,
                     image_configs: build_execution.image_configs,
                     // Template builds intentionally do not propagate the base
                     // snapshot's extension custom config: it is a per-sandbox
@@ -230,6 +231,7 @@ impl TemplateBuilder {
             base,
             cpu_config_json: self.current_cpu_config(),
             virtualization_mode: ConfigManager::global_config().virtualization_mode,
+            huge_pages: ConfigManager::global_config().memory_snapshot.huge_pages,
         })
     }
 
@@ -294,6 +296,7 @@ impl TemplateBuilder {
             },
             cpu_config_json: self.current_cpu_config(),
             virtualization_mode: base_mode,
+            huge_pages: base_snapshot.committed().huge_pages,
         })
     }
 

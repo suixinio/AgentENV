@@ -229,6 +229,7 @@ impl NodeSandboxService {
             context.build_snapshot_id.clone(),
             context.resources,
             context.virtualization_mode,
+            context.huge_pages,
             build_execution,
         );
 
@@ -528,6 +529,7 @@ pub fn template_build_publish_metadata(
     build_snapshot_id: SnapshotId,
     resources: crate::types::SandboxResources,
     virtualization_mode: crate::virtualization::VirtualizationMode,
+    huge_pages: bool,
     build_execution: crate::template::TemplateBuildExecution,
 ) -> (
     SnapshotPublishMetadata,
@@ -551,6 +553,7 @@ pub fn template_build_publish_metadata(
         resources,
         runtime_versions: build_execution.runtime_versions,
         virtualization_mode,
+        huge_pages,
         image_configs: build_execution.image_configs,
         custom_extension_params: None,
         paused_sandbox: None,

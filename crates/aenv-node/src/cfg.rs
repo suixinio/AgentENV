@@ -293,6 +293,12 @@ fn validate_memory_snapshot_options(config: &AppConfig) -> Result<()> {
             );
         }
     }
+    if memory.huge_pages && memory.backend != MemorySnapshotBackend::Uffd {
+        bail!(
+            "memory_snapshot.huge_pages=true requires memory_snapshot.backend=\"uffd\": Firecracker \
+             restores a hugepage-backed snapshot only through a userfaultfd memory backend"
+        );
+    }
     if !memory.track_dirty_pages {
         return Ok(());
     }
@@ -513,6 +519,21 @@ mod tests {
             error.to_string().contains("KVM-only"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn validate_memory_snapshot_options_requires_uffd_for_huge_pages() {
+        let mut config = AppConfig::default();
+        config.memory_snapshot.huge_pages = true;
+        let error = validate_memory_snapshot_options(&config).unwrap_err();
+        assert!(
+            error.to_string().contains("huge_pages=true requires"),
+            "unexpected error: {error}"
+        );
+
+        let mut config = uffd_config(VirtualizationMode::Kvm, true);
+        config.memory_snapshot.huge_pages = true;
+        validate_memory_snapshot_options(&config).expect("huge pages over uffd are valid");
     }
 
     #[test]

@@ -703,6 +703,7 @@ where
                     snapshot_id: image_ref,
                     snapshot_alias: None,
                     virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                    huge_pages: ConfigManager::global_config().memory_snapshot.huge_pages,
                     runtime_versions: configured_runtime_versions(),
                     resources,
                     context,
@@ -759,6 +760,7 @@ where
                     snapshot_id: image_ref,
                     snapshot_alias: None,
                     virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                    huge_pages: ConfigManager::global_config().memory_snapshot.huge_pages,
                     runtime_versions: configured_runtime_versions(),
                     resources,
                     // Resolution facts are filled from the node's start response.

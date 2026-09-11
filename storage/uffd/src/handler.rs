@@ -621,7 +621,7 @@ async fn run<S: PageSource>(
     state: &watch::Sender<HandlerState>,
 ) -> Result<()> {
     let RunInputs {
-        opts,
+        mut opts,
         stats,
         served,
         page_size: page_size_out,
@@ -637,6 +637,7 @@ async fn run<S: PageSource>(
     if !page_size.is_power_of_two() || page_size < 4096 {
         bail!("unsupported page size {page_size}");
     }
+    opts.max_inflight = inflight_for_page_size(opts.max_inflight, page_size);
     let total_pages = mappings
         .iter()
         .map(|m| m.end_offset())
@@ -704,6 +705,7 @@ async fn run<S: PageSource>(
         regions = ctx.mappings.len(),
         page_size,
         total_pages,
+        max_inflight = ctx.opts.max_inflight,
         "uffd handler serving"
     );
 
@@ -1044,6 +1046,18 @@ async fn retry_install<S: PageSource>(
     }
 }
 
+/// The install slots for a page size. `max_inflight` is sized for 4 KiB
+/// pages; a larger page gets proportionally fewer slots, floored at 8, so the
+/// bytes in flight and the buffer pool stay near the configured figure
+/// instead of growing 512-fold on 2 MiB pages.
+fn inflight_for_page_size(max_inflight: usize, page_size: u64) -> usize {
+    if page_size <= 4096 {
+        return max_inflight;
+    }
+    let scaled = (max_inflight as u64 * 4096 / page_size) as usize;
+    scaled.clamp(8.min(max_inflight), max_inflight).max(1)
+}
+
 fn is_all_zero(buf: &[u8]) -> bool {
     let (chunks, rest) = buf.as_chunks::<8>();
     chunks.iter().all(|c| u64::from_ne_bytes(*c) == 0) && rest.iter().all(|b| *b == 0)
@@ -1052,6 +1066,16 @@ fn is_all_zero(buf: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_slots_shrink_with_the_page_size() {
+        assert_eq!(inflight_for_page_size(64, 4096), 64);
+        assert_eq!(inflight_for_page_size(64, 2 << 20), 8);
+        assert_eq!(inflight_for_page_size(4096, 2 << 20), 8);
+        assert_eq!(inflight_for_page_size(16384, 2 << 20), 32);
+        assert_eq!(inflight_for_page_size(4, 2 << 20), 4);
+        assert_eq!(inflight_for_page_size(1, 2 << 20), 1);
+    }
 
     #[test]
     fn zero_detection_sees_every_byte() {

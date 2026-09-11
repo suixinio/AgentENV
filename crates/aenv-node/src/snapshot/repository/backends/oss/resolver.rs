@@ -5,15 +5,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use overlaybd::config::{DownloadConfig, LayerConfig};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
-use super::client::OssClient;
+use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
 use crate::image::cache::OverlaybdLayerStore;
 use crate::p2p::P2pTransport;
 use crate::runtime_snapshot::RuntimeArtifactLease;
 use crate::runtime_snapshot::{ResolvedAttachedDrive, RunnableSnapshot};
 use crate::snapshot::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
+use crate::snapshot::mem_prefetch;
 use crate::snapshot::p2p;
 use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::runtime_support::{
@@ -198,6 +199,7 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let cache_lease: Arc<dyn RuntimeArtifactLease> =
             Arc::new(CacheArtifactLease { _handles: handles });
 
+        self.sync_mem_prefetch_list(&snapshot, &layout).await;
         let runtime_manifest = hydrate_runtime_manifest(
             committed_manifest,
             vm_state_path,
@@ -215,6 +217,70 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
 // ── private helpers ───────────────────────────────────────────────────
 
 impl OssRuntimeResolver {
+    /// Brings the template's working-set list here or into the repository,
+    /// whichever side lacks it. Best effort: a resume runs without a list.
+    async fn sync_mem_prefetch_list(
+        &self,
+        snapshot: &SnapshotRecord,
+        layout: &OssSnapshotArtifactLayout<'_>,
+    ) {
+        if !matches!(
+            snapshot.source,
+            crate::snapshot::SnapshotSource::Template { .. }
+        ) {
+            return;
+        }
+        let local = mem_prefetch::local_path(
+            &crate::cfg::ConfigManager::global_config().home_path,
+            &snapshot.id,
+        );
+        let key = layout.artifact_key(mem_prefetch::ARTIFACT_NAME);
+        let client = Arc::clone(&self.client);
+        let outcome = mem_prefetch::sync(
+            &local,
+            |part| {
+                let client = Arc::clone(&client);
+                let key = key.clone();
+                async move {
+                    if !client.exists(&key).await? {
+                        return Ok(false);
+                    }
+                    client.get_to_file(&key, &part).await?;
+                    Ok(true)
+                }
+            },
+            {
+                let client = Arc::clone(&client);
+                let key = key.clone();
+                move || async move { client.exists(&key).await }
+            },
+            {
+                let client = Arc::clone(&client);
+                let key = key.clone();
+                move |path| async move {
+                    client
+                        .put_file(&key, &path, OssUploadArtifact::MemoryPrefetch)
+                        .await
+                }
+            },
+        )
+        .await;
+        match outcome {
+            Ok(mem_prefetch::SyncOutcome::Downloaded) => {
+                info!(snapshot_id = %snapshot.id, "fetched the memory prefetch list from the repository")
+            }
+            Ok(mem_prefetch::SyncOutcome::Uploaded) => {
+                info!(snapshot_id = %snapshot.id, "uploaded this node's memory prefetch list to the repository")
+            }
+            Ok(_) => {}
+            Err(error) => warn!(
+                snapshot_id = %snapshot.id,
+                error = %format!("{error:#}"),
+                "syncing the memory prefetch list failed; resuming without it"
+            ),
+        }
+    }
+
     /// Materialize an image config from layers and pin it in the cache.
     async fn materialize_layers_and_pin(
         &self,

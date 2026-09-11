@@ -45,6 +45,8 @@ pub enum OssUploadArtifact {
     FirecrackerManifest,
     CatalogRecord,
     Alias,
+    /// The working-set list a resume of a template snapshot records.
+    MemoryPrefetch,
 }
 
 impl OssUploadArtifact {
@@ -57,6 +59,7 @@ impl OssUploadArtifact {
             Self::FirecrackerManifest => "manifest",
             Self::CatalogRecord => "record",
             Self::Alias => "alias",
+            Self::MemoryPrefetch => "memory_prefetch",
         }
     }
 }

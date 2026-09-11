@@ -578,12 +578,12 @@ impl FirecrackerSnapshotConfig {
         // set pays off for every later one; a pause row is resumed once and
         // then replaced, so a list for it would never be read.
         let mem_prefetch_path = match snapshot.record().source {
-            crate::snapshot::SnapshotSource::Template { .. } => Some(
-                app_config
-                    .home_path
-                    .join("mem-prefetch")
-                    .join(format!("{}.json", snapshot.record().id)),
-            ),
+            crate::snapshot::SnapshotSource::Template { .. } => {
+                Some(crate::snapshot::mem_prefetch::local_path(
+                    &app_config.home_path,
+                    &snapshot.record().id,
+                ))
+            }
             crate::snapshot::SnapshotSource::Sandbox { .. } => None,
         };
         Ok(Self {

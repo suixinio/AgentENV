@@ -9,7 +9,7 @@ use firecracker_client::models::DirtyMemoryRanges;
 use nix::libc;
 use nix::unistd::Pid;
 use tempfile::TempDir;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::{CreateOverlaybdRuntimeDeviceRequest, MemoryUffdRegion, MemoryUffdState};
 
@@ -1178,11 +1178,18 @@ impl FirecrackerSandbox {
                 .context("query the memory userfaultfd server before capturing memory")?;
             if status.write_protect == Some(true) && !status.regions.is_empty() {
                 let regions = status.regions;
-                return tokio::task::spawn_blocking(move || {
-                    dirty_ranges_from_pagemap(pid, &regions)
-                })
-                .await
-                .context("join the pagemap read")?;
+                let ranges =
+                    tokio::task::spawn_blocking(move || dirty_ranges_from_pagemap(pid, &regions))
+                        .await
+                        .context("join the pagemap read")??;
+                info!(
+                    serve_id = serve.serve_id(),
+                    ranges = ranges.ranges.len(),
+                    bytes = ranges.ranges.iter().map(|r| r.length).sum::<i64>(),
+                    wp_faults = status.stats.wp_faults,
+                    "captured the written pages from the VMM's pagemap"
+                );
+                return Ok(ranges);
             }
         }
         self.fc_instance.get_dirty_memory_ranges().await

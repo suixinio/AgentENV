@@ -81,6 +81,24 @@ Kernel floor: `WP_ASYNC` is 6.7. The pve-mf workers run 6.8; the 6.1 build
 machine can run step 1 only, so the step 2 suites are gated on the feature
 probe, not on a version string.
 
+Status (2026-09-11): implemented, with two departures from the sketch above.
+The node, not the daemon, reads the pagemap: it already holds the VMM's pid
+for `process_vm_readv`, and the daemon only has to report the handshake
+regions and whether the registration carried write protection
+(`QueryMemoryUffd`). And the Firecracker patch (`1.15.1-patch-v3`) does not
+require `WP_ASYNC`: a kernel that refuses the feature gets synchronous write
+protection instead, where the handler answers each first write by
+unprotecting the page, and a kernel without userfaultfd write protection at
+all (before 5.7) gets the missing-page registration only. Under both
+protected modes the written set is the same pagemap readout, so the 6.1
+build machine runs the whole path, only with one event per first write. The
+handler detects the registration by unprotecting one absent page, so no
+configuration ties the daemon to a Firecracker build; the node's
+`[memory_snapshot.uffd].write_protect` (default on) says whether a build
+without the patch is an error at resume. `dirty-memory-ranges` and
+`guest-memory-regions` stay in the patch set for the block path and for
+`write_protect = false`.
+
 ### Not in this proposal
 
 e2b's `use_memfd` (Firecracker keeps guest memory on a memfd and hands the fd

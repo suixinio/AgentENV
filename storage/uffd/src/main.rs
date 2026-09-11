@@ -185,7 +185,7 @@ async fn serve<S: PageSource>(
 
 fn print_stats(stats: &StatsSnapshot) {
     println!(
-        "faults={} copied={} zeroed={} present={} duplicates={} bytes_read={} read_retries={} copy_retries={} removes={}",
+        "faults={} copied={} zeroed={} present={} duplicates={} bytes_read={} read_retries={} copy_retries={} removes={} prefaulted={} unmapped={}",
         stats.faults,
         stats.pages_copied,
         stats.pages_zeroed,
@@ -194,7 +194,9 @@ fn print_stats(stats: &StatsSnapshot) {
         stats.bytes_read,
         stats.read_retries,
         stats.copy_retries,
-        stats.removes
+        stats.removes,
+        stats.prefaulted,
+        stats.unmapped
     );
 }
 

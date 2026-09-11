@@ -103,12 +103,41 @@ pub fn recv_handshake(stream: &UnixStream) -> Result<Handshake> {
     if n == 0 {
         bail!("uffd handshake carried no mapping data");
     }
-    let mappings: Vec<GuestRegionUffdMapping> = serde_json::from_slice(&body[..n])
-        .with_context(|| format!("decode uffd region mappings ({n} bytes)"))?;
+    let mappings = recv_mappings_body(stream, &mut body, n)?;
     if mappings.is_empty() {
         bail!("uffd handshake carried an empty mapping set");
     }
     Ok(Handshake { fds, mappings })
+}
+
+/// Decodes the mapping JSON, reading more of the stream while it is only
+/// truncated: the sender's one `sendmsg` may land in several segments, and
+/// the connection stays open afterwards, so the end of the document is the
+/// only end there is.
+fn recv_mappings_body(
+    stream: &UnixStream,
+    body: &mut [u8],
+    mut len: usize,
+) -> Result<Vec<GuestRegionUffdMapping>> {
+    use std::io::Read;
+    loop {
+        match serde_json::from_slice::<Vec<GuestRegionUffdMapping>>(&body[..len]) {
+            Ok(mappings) => return Ok(mappings),
+            Err(err) if err.is_eof() && len < body.len() => {
+                let read = (&*stream)
+                    .read(&mut body[len..])
+                    .context("read the rest of the uffd handshake")?;
+                if read == 0 {
+                    bail!("uffd handshake ended after {len} bytes of truncated mapping data");
+                }
+                len += read;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("decode uffd region mappings ({len} bytes)"))
+            }
+        }
+    }
 }
 
 /// Sends a handshake the way Firecracker does; used by tests and the

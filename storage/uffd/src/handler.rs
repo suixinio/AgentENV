@@ -8,11 +8,16 @@
 //! is all zeros, was discarded by a `REMOVE` event, or lies past the image).
 //! A source read that keeps failing past `read_retry_budget` is fatal: the
 //! handler exits, its descriptor closes, and the guest is no longer backed.
+//!
+//! The event loop never waits on a page: a fault that finds every install
+//! slot taken queues until one frees, so `REMOVE` events, `stop` and a fatal
+//! error are seen while the source is slow or hung.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixListener as StdUnixListener;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +45,9 @@ pub struct HandlerOptions {
     pub max_inflight: usize,
     /// How long a page read may keep failing before the handler gives up.
     pub read_retry_budget: Duration,
+    /// How long one read attempt may take before it counts as failed and is
+    /// retried; a hung source is otherwise indistinguishable from a slow one.
+    pub read_timeout: Duration,
     /// How long `serve_socket` waits for Firecracker to connect and send the
     /// handshake.
     pub handshake_timeout: Duration,
@@ -54,10 +62,19 @@ impl Default for HandlerOptions {
         Self {
             max_inflight: 64,
             read_retry_budget: Duration::from_secs(60),
+            read_timeout: Duration::from_secs(10),
             handshake_timeout: Duration::from_secs(60),
             drain_timeout: Duration::from_secs(2),
             name: "uffd".to_string(),
         }
+    }
+}
+
+impl HandlerOptions {
+    /// The longest `stop` waits for the thread after asking it to stop: the
+    /// drain, one read attempt that may be mid-cancel, and slack.
+    fn stop_deadline(&self) -> Duration {
+        self.drain_timeout + self.read_timeout + Duration::from_secs(5)
     }
 }
 
@@ -80,6 +97,9 @@ pub struct StatsSnapshot {
     pub removes: u64,
     /// Pages installed ahead of the guest by `prefault`.
     pub prefaulted: u64,
+    /// Faults at addresses no handshake region covers, answered with a zero
+    /// page.
+    pub unmapped: u64,
 }
 
 #[derive(Default)]
@@ -94,6 +114,7 @@ struct Stats {
     copy_retries: AtomicU64,
     removes: AtomicU64,
     prefaulted: AtomicU64,
+    unmapped: AtomicU64,
 }
 
 impl Stats {
@@ -110,6 +131,7 @@ impl Stats {
             copy_retries: load(&self.copy_retries),
             removes: load(&self.removes),
             prefaulted: load(&self.prefaulted),
+            unmapped: load(&self.unmapped),
         }
     }
 }
@@ -131,8 +153,9 @@ pub enum HandlerState {
 /// A running fault handler. Dropping it asks the thread to stop without
 /// waiting; `stop` waits.
 pub struct UffdHandler {
-    stop: Option<oneshot::Sender<()>>,
+    stop: Mutex<Option<oneshot::Sender<()>>>,
     thread: Option<thread::JoinHandle<()>>,
+    opts: HandlerOptions,
     state: watch::Receiver<HandlerState>,
     stats: Arc<Stats>,
     prefault: mpsc::UnboundedSender<Vec<u64>>,
@@ -210,7 +233,17 @@ impl UffdHandler {
         let thread = thread::Builder::new()
             .name(format!("uffd-{name}"))
             .spawn(move || {
-                let result = thread_main(inputs, source, &state_tx);
+                // A panic anywhere on the thread still publishes `Exited`, so
+                // a query never reports a dead handler as serving.
+                let result =
+                    match catch_unwind(AssertUnwindSafe(|| thread_main(inputs, source, &state_tx)))
+                    {
+                        Ok(result) => result,
+                        Err(payload) => Err(anyhow!(
+                            "uffd handler thread panicked: {}",
+                            panic_message(payload.as_ref())
+                        )),
+                    };
                 let error = result.err().map(|err| format!("{err:#}"));
                 if let Some(error) = &error {
                     tracing::error!(name, error, "uffd handler exited with an error");
@@ -221,8 +254,9 @@ impl UffdHandler {
             })
             .context("spawn the uffd handler thread")?;
         Ok(Self {
-            stop: Some(stop_tx),
+            stop: Mutex::new(Some(stop_tx)),
             thread: Some(thread),
+            opts,
             state: state_rx,
             stats,
             prefault: prefault_tx,
@@ -314,19 +348,41 @@ impl UffdHandler {
 
     /// Asks the thread to stop and waits for it. Blocks; call it from a
     /// blocking context. Returns the error the thread ended with, if any.
+    /// A thread that does not stop within the options' deadline is left
+    /// running and reported as an error rather than blocking the caller.
     pub fn stop(mut self) -> Result<()> {
-        self.signal_stop();
+        self.request_stop();
         self.join()
     }
 
-    fn signal_stop(&mut self) {
-        if let Some(stop) = self.stop.take() {
+    /// Asks the thread to stop without waiting; `wait_exit` or `stop`
+    /// observe the outcome.
+    pub fn request_stop(&self) {
+        let sender = self
+            .stop
+            .lock()
+            .expect("the stop sender is never poisoned")
+            .take();
+        if let Some(stop) = sender {
             let _ = stop.send(());
         }
     }
 
     fn join(&mut self) -> Result<()> {
         if let Some(thread) = self.thread.take() {
+            let deadline = Instant::now() + self.opts.stop_deadline();
+            while !thread.is_finished() {
+                if Instant::now() >= deadline {
+                    // Leave it running: joining would block on whatever the
+                    // source is stuck in, and the descriptor is already
+                    // unusable for the guest once the thread's loop stopped.
+                    bail!(
+                        "the uffd handler thread did not stop within {:?}",
+                        self.opts.stop_deadline()
+                    );
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
             thread
                 .join()
                 .map_err(|_| anyhow!("the uffd handler thread panicked"))?;
@@ -340,7 +396,17 @@ impl UffdHandler {
 
 impl Drop for UffdHandler {
     fn drop(&mut self) {
-        self.signal_stop();
+        self.request_stop();
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -423,7 +489,10 @@ async fn accept_handshake(
         .context("set the uffd handshake read timeout")?;
     let handshake = recv_handshake(&stream)?;
     let mut fds = handshake.fds.into_iter();
-    let uffd = Uffd::from(fds.next().expect("recv_handshake yields at least one fd"));
+    let uffd = Uffd::from(
+        fds.next()
+            .ok_or_else(|| anyhow!("uffd handshake carried no descriptor"))?,
+    );
     let extra = fds.count();
     if extra > 0 {
         tracing::debug!(extra, "uffd handshake carried extra descriptors; closed");
@@ -450,6 +519,10 @@ struct Ctx<S> {
     inflight: RefCell<HashSet<u64>>,
     removed: RefCell<Vec<u64>>,
     served: Arc<Mutex<Vec<u64>>>,
+    /// Install slots for guest faults; a fault that finds none waits in
+    /// `pending` rather than blocking the event loop.
+    permits: Arc<Semaphore>,
+    pending: RefCell<VecDeque<(u64, u64)>>,
     prefault_permits: Arc<Semaphore>,
     pool: RefCell<Vec<Vec<u8>>>,
     zero_page: Vec<u8>,
@@ -578,24 +651,14 @@ async fn run<S: PageSource>(
         .cqe_entries(opts.max_inflight * 4)
         .build()
         .context("create the io uring for the uffd handler")?;
-    tokio::task::spawn_local({
-        let ring = ring.clone();
-        async move {
-            if let Err(err) = ring.handle_completion().await {
-                panic!("uffd handler uring handle_completion exited: {err:?}");
-            }
-        }
-    });
     if HANDLER_URING.with(|uring| uring.set(ring.clone())).is_err() {
         bail!("the uffd handler uring was already initialized on this thread");
     }
-    source.init(&ring).await.context("init the page source")?;
     uffd.set_nonblocking(true)
         .context("put the userfaultfd in non-blocking mode")?;
     let uffd = AsyncFd::new(uffd).context("register the userfaultfd with the reactor")?;
     let bitmap_words = total_pages.div_ceil(64) as usize;
     *served.lock().expect("the served bitmap is never poisoned") = vec![0u64; bitmap_words];
-    page_size_out.store(page_size, Ordering::Release);
 
     let ctx = Rc::new(Ctx {
         uffd,
@@ -607,6 +670,8 @@ async fn run<S: PageSource>(
         inflight: RefCell::new(HashSet::new()),
         removed: RefCell::new(vec![0u64; bitmap_words]),
         served,
+        permits: Arc::new(Semaphore::new(opts.max_inflight)),
+        pending: RefCell::new(VecDeque::new()),
         prefault_permits: Arc::new(Semaphore::new((opts.max_inflight / 4).max(1))),
         pool: RefCell::new(Vec::new()),
         zero_page: vec![0u8; page_size as usize],
@@ -616,7 +681,23 @@ async fn run<S: PageSource>(
         drained: Notify::new(),
         opts,
     });
-    let permits = Arc::new(Semaphore::new(ctx.opts.max_inflight));
+    // The completion task ending is the ring being unusable: every read in
+    // flight would wait forever, so it ends the handler instead.
+    tokio::task::spawn_local({
+        let ctx = Rc::clone(&ctx);
+        async move {
+            let outcome = ctx.ring.handle_completion().await;
+            ctx.set_fatal(match outcome {
+                Ok(()) => anyhow!("the uffd handler uring completion loop ended"),
+                Err(err) => anyhow!(err).context("the uffd handler uring completion loop failed"),
+            });
+        }
+    });
+    ctx.source
+        .init(&ctx.ring)
+        .await
+        .context("init the page source")?;
+    page_size_out.store(page_size, Ordering::Release);
     let _ = state.send(HandlerState::Serving);
     tracing::info!(
         name = ctx.opts.name,
@@ -641,7 +722,9 @@ async fn run<S: PageSource>(
             guard = ctx.uffd.readable() => {
                 let mut guard = guard.context("poll the userfaultfd")?;
                 let n = match guard.try_io(|fd| fd.get_ref().read_events(&mut msgs)) {
-                    Ok(read) => read.context("read userfaultfd events")?,
+                    Ok(Ok(n)) => n,
+                    Ok(Err(err)) if err.raw_os_error() == Some(libc::EINTR) => continue,
+                    Ok(Err(err)) => return Err(err).context("read userfaultfd events"),
                     Err(_would_block) => continue,
                 };
                 if n == 0 {
@@ -650,7 +733,7 @@ async fn run<S: PageSource>(
                 }
                 for msg in &msgs[..n] {
                     match msg.decode() {
-                        Event::Pagefault { address, .. } => dispatch(&ctx, address, &permits).await?,
+                        Event::Pagefault { address, .. } => dispatch(&ctx, address),
                         Event::Remove { start, end } => {
                             bump(&ctx.stats.removes);
                             ctx.mark_removed(start, end);
@@ -691,27 +774,54 @@ async fn run<S: PageSource>(
     }
 }
 
-async fn dispatch<S: PageSource>(
-    ctx: &Rc<Ctx<S>>,
-    address: u64,
-    permits: &Arc<Semaphore>,
-) -> Result<()> {
+/// Routes one fault: a page already in flight is a duplicate, a page no
+/// region covers gets a zero page, everything else takes an install slot or
+/// queues for one. Never waits, so the event loop keeps reading.
+fn dispatch<S: PageSource>(ctx: &Rc<Ctx<S>>, address: u64) {
     bump(&ctx.stats.faults);
-    let Some(mapping) = ctx.mapping_for(address) else {
-        bail!("page fault at {address:#x} outside every registered region");
-    };
     let aligned = address & !(ctx.page_size - 1);
+    let Some(mapping) = ctx.mapping_for(address) else {
+        // Registered with the kernel but absent from the handshake: nothing
+        // in the image backs it. A wake alone would refault forever.
+        bump(&ctx.stats.unmapped);
+        tracing::warn!(
+            name = ctx.opts.name,
+            address = format!("{address:#x}"),
+            "page fault outside every handshake region; installing a zero page"
+        );
+        let ctx = Rc::clone(ctx);
+        tokio::task::spawn_local(async move {
+            if let Err(err) = install_zero(&ctx, aligned).await {
+                ctx.set_fatal(err);
+            }
+        });
+        return;
+    };
     let offset = mapping.image_offset(aligned);
     if !ctx.inflight.borrow_mut().insert(aligned) {
         bump(&ctx.stats.duplicates);
-        return Ok(());
+        return;
     }
-    let permit = Arc::clone(permits)
-        .acquire_owned()
-        .await
-        .expect("the inflight semaphore is never closed");
-    spawn_serve(ctx, offset, aligned, permit, false);
-    Ok(())
+    match Arc::clone(&ctx.permits).try_acquire_owned() {
+        Ok(permit) => spawn_serve(ctx, offset, aligned, permit, false),
+        Err(_) => ctx.pending.borrow_mut().push_back((offset, aligned)),
+    }
+}
+
+/// Starts queued faults on the slots that just freed.
+fn pump_pending<S: PageSource>(ctx: &Rc<Ctx<S>>) {
+    loop {
+        let Some((offset, host_addr)) = ctx.pending.borrow_mut().pop_front() else {
+            return;
+        };
+        match Arc::clone(&ctx.permits).try_acquire_owned() {
+            Ok(permit) => spawn_serve(ctx, offset, host_addr, permit, false),
+            Err(_) => {
+                ctx.pending.borrow_mut().push_front((offset, host_addr));
+                return;
+            }
+        }
+    }
 }
 
 /// Reads and installs one page on its own task. `host_addr` is already in
@@ -729,6 +839,7 @@ fn spawn_serve<S: PageSource>(
         let result = serve_page(&ctx, offset, host_addr).await;
         drop(permit);
         ctx.inflight.borrow_mut().remove(&host_addr);
+        pump_pending(&ctx);
         let active = ctx.active.get() - 1;
         ctx.active.set(active);
         if active == 0 {
@@ -771,19 +882,20 @@ async fn prefault_all<S: PageSource>(ctx: Rc<Ctx<S>>, pages: Vec<u64>) {
 
 async fn serve_page<S: PageSource>(ctx: &Ctx<S>, offset: u64, host_addr: u64) -> Result<()> {
     let page_size = ctx.page_size;
-    if ctx.is_removed(offset / page_size) || offset >= ctx.source.size() {
+    let page_idx = offset / page_size;
+    if ctx.is_removed(page_idx) || offset >= ctx.source.size() {
         return install_zero(ctx, host_addr).await;
     }
-    let mut buf = ctx.take_buf();
-    let read = read_with_retry(ctx, offset, &mut buf).await;
+    let (read, buf) = read_with_retry(ctx, offset).await;
     let result = match read {
         Ok(()) => {
             ctx.stats.bytes_read.fetch_add(page_size, Ordering::Relaxed);
-            if is_all_zero(&buf) {
-                install_zero(ctx, host_addr).await
+            let content = if is_all_zero(&buf) {
+                None
             } else {
-                install_copy(ctx, host_addr, &buf).await
-            }
+                Some(&buf[..])
+            };
+            install(ctx, host_addr, page_idx, content).await
         }
         Err(err) => Err(err),
     };
@@ -791,47 +903,86 @@ async fn serve_page<S: PageSource>(ctx: &Ctx<S>, offset: u64, host_addr: u64) ->
     result
 }
 
-async fn read_with_retry<S: PageSource>(ctx: &Ctx<S>, offset: u64, buf: &mut [u8]) -> Result<()> {
+/// Reads the page at `offset` into a pool buffer, retrying failures with
+/// backoff until `read_retry_budget` runs out. An attempt that outlives
+/// `read_timeout` is abandoned: its buffer may still be written by the ring,
+/// so it is forgotten rather than reused, and the retry takes a fresh one.
+async fn read_with_retry<S: PageSource>(ctx: &Ctx<S>, offset: u64) -> (Result<()>, Vec<u8>) {
     let started = Instant::now();
     let mut attempt = 0u32;
+    let mut buf = ctx.take_buf();
     loop {
-        match ctx.source.read_page(&ctx.ring, offset, buf).await {
-            Ok(()) => return Ok(()),
-            Err(err) => {
-                let elapsed = started.elapsed();
-                if elapsed >= ctx.opts.read_retry_budget {
-                    return Err(err.context(format!(
-                        "page read at offset {offset} failed for {elapsed:?} ({attempt} retries)"
-                    )));
-                }
-                bump(&ctx.stats.read_retries);
-                let backoff = READ_RETRY_BASE
-                    .saturating_mul(1u32 << attempt.min(6))
-                    .min(READ_RETRY_MAX)
-                    .min(ctx.opts.read_retry_budget.saturating_sub(elapsed));
-                tracing::warn!(
-                    name = ctx.opts.name,
-                    offset,
-                    attempt,
-                    ?backoff,
-                    error = format!("{err:#}"),
-                    "uffd page read failed; retrying"
-                );
-                attempt += 1;
-                tokio::time::sleep(backoff).await;
+        let attempt_result = tokio::time::timeout(
+            ctx.opts.read_timeout,
+            ctx.source.read_page(&ctx.ring, offset, &mut buf),
+        )
+        .await;
+        let err = match attempt_result {
+            Ok(Ok(())) => return (Ok(()), buf),
+            Ok(Err(err)) => err,
+            Err(_elapsed) => {
+                std::mem::forget(std::mem::replace(&mut buf, ctx.take_buf()));
+                anyhow!("page read timed out after {:?}", ctx.opts.read_timeout)
             }
+        };
+        let elapsed = started.elapsed();
+        if elapsed >= ctx.opts.read_retry_budget {
+            let err = err.context(format!(
+                "page read at offset {offset} failed for {elapsed:?} ({attempt} retries)"
+            ));
+            return (Err(err), buf);
         }
+        bump(&ctx.stats.read_retries);
+        let backoff = READ_RETRY_BASE
+            .saturating_mul(1u32 << attempt.min(6))
+            .min(READ_RETRY_MAX)
+            .min(ctx.opts.read_retry_budget.saturating_sub(elapsed));
+        tracing::warn!(
+            name = ctx.opts.name,
+            offset,
+            attempt,
+            ?backoff,
+            error = format!("{err:#}"),
+            "uffd page read failed; retrying"
+        );
+        attempt += 1;
+        tokio::time::sleep(backoff).await;
     }
 }
 
-async fn install_copy<S: PageSource>(ctx: &Ctx<S>, host_addr: u64, buf: &[u8]) -> Result<()> {
+/// Installs `content` at `host_addr`, or the zero page when `content` is
+/// `None`. A `REMOVE` that arrived while the page was being read wins: the
+/// check sits right before each ioctl with no await in between, and the
+/// event loop runs on this thread, so what it sees is current.
+async fn install<S: PageSource>(
+    ctx: &Ctx<S>,
+    host_addr: u64,
+    page_idx: u64,
+    content: Option<&[u8]>,
+) -> Result<()> {
     let uffd = ctx.uffd.get_ref();
     let len = ctx.page_size;
     let mut attempt = 0u32;
     loop {
-        match uffd.copy(host_addr, buf.as_ptr(), len, 0) {
+        let content = if ctx.is_removed(page_idx) {
+            None
+        } else {
+            content
+        };
+        let result = match content {
+            Some(buf) => uffd.copy(host_addr, buf.as_ptr(), len, 0),
+            // The shared zero page exists for 4 KiB pages only; a huge page
+            // is copied from a zero buffer.
+            None if len == 4096 => uffd.zeropage(host_addr, len, 0),
+            None => uffd.copy(host_addr, ctx.zero_page.as_ptr(), len, 0),
+        };
+        match result {
             Ok(()) => {
-                bump(&ctx.stats.pages_copied);
+                bump(if content.is_some() {
+                    &ctx.stats.pages_copied
+                } else {
+                    &ctx.stats.pages_zeroed
+                });
                 return Ok(());
             }
             Err(err) => match retry_install(ctx, host_addr, err, &mut attempt).await? {
@@ -843,28 +994,7 @@ async fn install_copy<S: PageSource>(ctx: &Ctx<S>, host_addr: u64, buf: &[u8]) -
 }
 
 async fn install_zero<S: PageSource>(ctx: &Ctx<S>, host_addr: u64) -> Result<()> {
-    let uffd = ctx.uffd.get_ref();
-    let len = ctx.page_size;
-    let mut attempt = 0u32;
-    loop {
-        // The shared zero page exists for 4 KiB pages only; a huge page is
-        // copied from a zero buffer.
-        let result = if len == 4096 {
-            uffd.zeropage(host_addr, len, 0)
-        } else {
-            uffd.copy(host_addr, ctx.zero_page.as_ptr(), len, 0)
-        };
-        match result {
-            Ok(()) => {
-                bump(&ctx.stats.pages_zeroed);
-                return Ok(());
-            }
-            Err(err) => match retry_install(ctx, host_addr, err, &mut attempt).await? {
-                InstallOutcome::Done => return Ok(()),
-                InstallOutcome::Retry => {}
-            },
-        }
-    }
+    install(ctx, host_addr, u64::MAX, None).await
 }
 
 enum InstallOutcome {
@@ -885,6 +1015,17 @@ async fn retry_install<S: PageSource>(
             // covered every waiter in range; this one is belt and braces.
             bump(&ctx.stats.already_present);
             let _ = ctx.uffd.get_ref().wake(host_addr, ctx.page_size);
+            Ok(InstallOutcome::Done)
+        }
+        Some(libc::ENOENT) => {
+            // The range is no longer registered (unmapped or unregistered
+            // under the fault): nothing to install and nobody left waiting.
+            bump(&ctx.stats.already_present);
+            tracing::debug!(
+                name = ctx.opts.name,
+                host_addr = format!("{host_addr:#x}"),
+                "install on a range that is no longer registered"
+            );
             Ok(InstallOutcome::Done)
         }
         Some(libc::EAGAIN) => {

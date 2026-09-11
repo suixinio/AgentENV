@@ -34,6 +34,7 @@ fn opts(name: &str) -> HandlerOptions {
     HandlerOptions {
         max_inflight: 16,
         read_retry_budget: Duration::from_secs(5),
+        read_timeout: Duration::from_secs(30),
         handshake_timeout: Duration::from_secs(5),
         drain_timeout: Duration::from_millis(200),
         name: name.to_string(),
@@ -489,6 +490,269 @@ fn faulted_pages_report_the_working_set_and_prefault_installs_ahead() -> Result<
         "prefaulted pages do not fault"
     );
     assert_eq!(handler.faulted_pages(), vec![0, 1, 2, 3, 5, 9]);
+    handler.stop()?;
+    Ok(())
+}
+
+#[test]
+fn stop_returns_with_more_hung_faults_than_install_slots() -> Result<()> {
+    let Some(uffd) = uffd_or_skip("stop_returns_with_more_hung_faults_than_install_slots") else {
+        return Ok(());
+    };
+    let size = MIB;
+    let region = Arc::new(AnonRegion::new(size)?);
+    region.register(&uffd, 0)?;
+    let source = Arc::new(HangingSource {
+        size: size as u64,
+        entered: AtomicBool::new(false),
+    });
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![region.mapping(0, PAGE as u64)],
+        Arc::clone(&source),
+        HandlerOptions {
+            max_inflight: 2,
+            ..opts("hang-many")
+        },
+    )?;
+
+    let faulters: Vec<_> = (1..=4)
+        .map(|p| {
+            let region = Arc::clone(&region);
+            std::thread::spawn(move || region.read_byte(p * PAGE))
+        })
+        .collect();
+    // Every fault is read off the descriptor although only two can be in
+    // flight; the rest queue behind the slots.
+    assert!(
+        wait_for(|| handler.stats().faults >= 4, Duration::from_secs(5)),
+        "the event loop kept reading while every slot was taken: {:?}",
+        handler.stats()
+    );
+    assert!(faulters.iter().all(|f| !f.is_finished()));
+    let started = Instant::now();
+    handler.stop()?;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "stop returned promptly"
+    );
+    for faulter in faulters {
+        assert_eq!(faulter.join().expect("faulting thread"), 0);
+    }
+    Ok(())
+}
+
+/// A source whose reads wait for the test to release them, then fill the
+/// page with a pattern.
+struct GatedSource {
+    size: u64,
+    entered: AtomicBool,
+    gate: tokio::sync::Notify,
+}
+
+impl PageSource for GatedSource {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read_page<'a>(
+        &'a self,
+        _ring: &'a AsyncIoRing,
+        _offset: u64,
+        dst: &'a mut [u8],
+    ) -> LocalBoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.entered.store(true, Ordering::SeqCst);
+            self.gate.notified().await;
+            dst.fill(0xAB);
+            Ok(())
+        })
+    }
+}
+
+#[test]
+fn a_remove_during_an_inflight_read_installs_a_zero_page() -> Result<()> {
+    let Some(uffd) = uffd_or_skip("a_remove_during_an_inflight_read_installs_a_zero_page") else {
+        return Ok(());
+    };
+    let size = MIB;
+    let region = Arc::new(AnonRegion::new(size)?);
+    let granted = region.register(&uffd, UFFD_FEATURE_EVENT_REMOVE)?;
+    if granted & UFFD_FEATURE_EVENT_REMOVE == 0 {
+        eprintln!(
+            "SKIPPED[uffd]: a_remove_during_an_inflight_read_installs_a_zero_page (no EVENT_REMOVE)"
+        );
+        return Ok(());
+    }
+    let source = Arc::new(GatedSource {
+        size: size as u64,
+        entered: AtomicBool::new(false),
+        gate: tokio::sync::Notify::new(),
+    });
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![region.mapping(0, PAGE as u64)],
+        Arc::clone(&source),
+        opts("remove-race"),
+    )?;
+
+    let p = 7;
+    let faulter = {
+        let region = Arc::clone(&region);
+        std::thread::spawn(move || region.read_byte(p * PAGE))
+    };
+    assert!(
+        wait_for(
+            || source.entered.load(Ordering::SeqCst),
+            Duration::from_secs(5)
+        ),
+        "the read started"
+    );
+    // The discard returns once the handler has read the REMOVE event.
+    region.discard(p * PAGE, PAGE)?;
+    assert!(
+        wait_for(|| handler.stats().removes >= 1, Duration::from_secs(5)),
+        "the REMOVE event reached the handler"
+    );
+    source.gate.notify_one();
+    let byte = faulter.join().expect("faulting thread");
+    assert_eq!(
+        byte, 0,
+        "the read that finished after the REMOVE did not land"
+    );
+    let stats = handler.stats();
+    assert_eq!(stats.pages_copied, 0);
+    assert_eq!(stats.pages_zeroed, 1);
+    handler.stop()?;
+    Ok(())
+}
+
+#[test]
+fn a_fault_outside_every_region_gets_a_zero_page_and_serving_goes_on() -> Result<()> {
+    let Some(uffd) =
+        uffd_or_skip("a_fault_outside_every_region_gets_a_zero_page_and_serving_goes_on")
+    else {
+        return Ok(());
+    };
+    let size = 2 * MIB;
+    let region = AnonRegion::new(size)?;
+    region.register(&uffd, 0)?;
+    let source = Arc::new(MemSource::patterned(MIB, PAGE, 0));
+    // The handshake covers the first half only; the kernel has the whole
+    // region registered.
+    let mut mapping = region.mapping(0, PAGE as u64);
+    mapping.size = MIB as u64;
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![mapping],
+        Arc::clone(&source),
+        opts("unmapped"),
+    )?;
+
+    let got = region.read(MIB + 5 * PAGE, PAGE);
+    assert!(got.iter().all(|b| *b == 0));
+    assert!(
+        wait_for(|| handler.stats().unmapped == 1, Duration::from_secs(5)),
+        "{:?}",
+        handler.stats()
+    );
+    assert!(handler.is_running());
+    assert_eq!(
+        region.read_byte(3 * PAGE + 2),
+        source.as_slice()[3 * PAGE + 2]
+    );
+    handler.stop()?;
+    Ok(())
+}
+
+#[test]
+fn a_read_that_hangs_is_retried_and_ends_the_handler_after_its_budget() -> Result<()> {
+    let Some(uffd) =
+        uffd_or_skip("a_read_that_hangs_is_retried_and_ends_the_handler_after_its_budget")
+    else {
+        return Ok(());
+    };
+    let size = MIB;
+    let region = Arc::new(AnonRegion::new(size)?);
+    region.register(&uffd, 0)?;
+    let source = Arc::new(HangingSource {
+        size: size as u64,
+        entered: AtomicBool::new(false),
+    });
+    let handler = UffdHandler::serve_fd(
+        uffd.into_owned_fd(),
+        vec![region.mapping(0, PAGE as u64)],
+        Arc::clone(&source),
+        HandlerOptions {
+            read_timeout: Duration::from_millis(100),
+            read_retry_budget: Duration::from_millis(600),
+            ..opts("hang-timeout")
+        },
+    )?;
+    let faulter = {
+        let region = Arc::clone(&region);
+        std::thread::spawn(move || region.read_byte(2 * PAGE))
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let err = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(10), handler.wait_exit()).await
+    })?;
+    let err = err.unwrap_or_default();
+    assert!(err.contains("timed out"), "{err}");
+    assert!(handler.stats().read_retries >= 1);
+    assert_eq!(faulter.join().expect("faulting thread"), 0);
+    assert!(handler.stop().is_err());
+    Ok(())
+}
+
+#[test]
+fn a_handshake_body_split_across_segments_is_reassembled() -> Result<()> {
+    let Some(uffd) = uffd_or_skip("a_handshake_body_split_across_segments_is_reassembled") else {
+        return Ok(());
+    };
+    use nix::sys::socket::{sendmsg, ControlMessage, MsgFlags, UnixAddr};
+    use std::io::{IoSlice, Write};
+    use std::os::fd::AsRawFd;
+
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("uffd.sock");
+    let listener = UnixListener::bind(&socket)?;
+    let size = MIB;
+    let region = AnonRegion::new(size)?;
+    region.register(&uffd, 0)?;
+    let source = Arc::new(MemSource::patterned(size, PAGE, 0));
+    let handler = UffdHandler::serve_socket(listener, Arc::clone(&source), opts("split"))?;
+
+    let mut stream = UnixStream::connect(&socket)?;
+    let body = serde_json::to_vec(&vec![region.mapping(0, PAGE as u64)])?;
+    let half = body.len() / 2;
+    let fds = [uffd.as_raw_fd()];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
+    let sent = sendmsg::<UnixAddr>(
+        stream.as_raw_fd(),
+        &[IoSlice::new(&body[..half])],
+        &cmsg,
+        MsgFlags::empty(),
+        None,
+    )?;
+    assert_eq!(sent, half);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(handler.state(), HandlerState::Starting);
+    stream.write_all(&body[half..])?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), handler.wait_serving()).await
+    })??;
+    drop(uffd);
+    assert_eq!(
+        region.read_byte(9 * PAGE + 1),
+        source.as_slice()[9 * PAGE + 1]
+    );
     handler.stop()?;
     Ok(())
 }

@@ -79,23 +79,31 @@ impl PageSource for OverlaybdSource {
         dst: &'a mut [u8],
     ) -> LocalBoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            // The image need not end on a page boundary; the tail past its
+            // size reads as zeros, the way an anonymous page would.
+            let size = self.image.size_bytes();
+            let avail = size.saturating_sub(offset).min(dst.len() as u64) as usize;
+            if avail < dst.len() {
+                dst[avail..].fill(0);
+            }
+            if avail == 0 {
+                return Ok(());
+            }
             let ctx = IoCtx::new(ring);
             let n = self
                 .image
-                .read_at_into_with_ctx(ctx, offset, dst)
+                .read_at_into_with_ctx(ctx, offset, &mut dst[..avail])
                 .await
                 .with_context(|| {
                     format!(
-                        "read {} bytes at {offset} from {}",
-                        dst.len(),
+                        "read {avail} bytes at {offset} from {}",
                         self.image_config_path.display()
                     )
                 })?;
-            if n != dst.len() {
+            if n != avail {
                 bail!(
-                    "short read at {offset} from {}: {n} of {} bytes",
-                    self.image_config_path.display(),
-                    dst.len()
+                    "short read at {offset} from {}: {n} of {avail} bytes",
+                    self.image_config_path.display()
                 );
             }
             Ok(())

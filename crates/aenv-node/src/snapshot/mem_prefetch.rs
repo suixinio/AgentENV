@@ -1,22 +1,34 @@
 //! The working-set list the uffd memory backend records on the first resume
-//! of a template snapshot and replays on every later one. It lives on the
-//! node under `{home_path}/mem-prefetch/` and travels with the snapshot: a
-//! node that has none downloads the snapshot's copy, and a node whose copy
-//! is not yet in the repository uploads it, so the list a fleet replays is
-//! the first one any node recorded.
+//! of a memory image and replays on every later one. It lives on the node
+//! under `{home_path}/mem-prefetch/` and travels with the image: a node that
+//! has none downloads the repository's copy, and a node whose copy is not yet
+//! in the repository uploads it, so the list a fleet replays is the first one
+//! any node recorded.
+//!
+//! One list serves a whole lineage. The indices are image offsets and a
+//! resume never resizes guest memory, so the set a template's first resume
+//! faulted is the set every pause row descended from it needs.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::snapshot::SnapshotId;
+use crate::snapshot::ManagedLayer;
 
-/// The artifact's name under the snapshot's repository prefix.
-pub const ARTIFACT_NAME: &str = "mem_prefetch.json";
+/// The bottom memory layer names the lineage: a template and every pause row
+/// descended from it stack on the same one. `None` for an image with no
+/// managed layers, which has nothing to key a list by.
+pub fn lineage_key(memory_layers: &[ManagedLayer]) -> Option<&str> {
+    memory_layers.first().map(|layer| layer.digest.as_str())
+}
 
-pub fn local_path(home_path: &Path, id: &SnapshotId) -> PathBuf {
-    home_path.join("mem-prefetch").join(format!("{id}.json"))
+pub fn local_path(home_path: &Path, lineage_key: &str) -> PathBuf {
+    let name: String = lineage_key
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    home_path.join("mem-prefetch").join(format!("{name}.json"))
 }
 
 /// Set once the local list is known to be in the repository, so a resume
@@ -111,6 +123,32 @@ mod tests {
 
     fn not_called<T>() -> impl FnOnce(PathBuf) -> std::future::Ready<Result<T>> {
         |_| panic!("not expected to be called")
+    }
+
+    fn layer(digest: &str) -> ManagedLayer {
+        ManagedLayer {
+            digest: digest.to_string(),
+            size: 1,
+            uuid: None,
+        }
+    }
+
+    #[test]
+    fn the_lineage_is_the_bottom_memory_layer() {
+        assert_eq!(lineage_key(&[]), None);
+        assert_eq!(
+            lineage_key(&[layer("sha256:base"), layer("sha256:pause")]),
+            Some("sha256:base")
+        );
+    }
+
+    #[test]
+    fn a_lineage_key_becomes_one_path_segment() {
+        let home = Path::new("/var/lib/agentenv");
+        assert_eq!(
+            local_path(home, "sha256:ab/cd"),
+            home.join("mem-prefetch").join("sha256-ab-cd.json")
+        );
     }
 
     #[tokio::test]

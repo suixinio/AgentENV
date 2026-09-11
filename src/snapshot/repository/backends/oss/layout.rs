@@ -14,6 +14,13 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
         format!("managed-layers/{digest}")
     }
 
+    /// A memory image lineage's working-set list. Keyed by the bottom memory
+    /// layer, which a template and every pause row descended from it share,
+    /// so a pause row resolves the list the template's first resume recorded.
+    pub fn mem_prefetch_key(base_memory_layer_digest: &str) -> String {
+        format!("mem-prefetch/{base_memory_layer_digest}.json")
+    }
+
     pub fn artifact_prefix(&self) -> String {
         format!("artifacts/{}/", self.snapshot_id)
     }

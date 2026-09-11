@@ -487,9 +487,9 @@ pub struct FirecrackerSnapshotConfig {
     /// `Some` is used for keeping the snapshot directory alive across multiple pause/resume cycles.
     #[serde(skip)]
     pub managed_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
-    /// Where the `uffd` memory backend keeps this snapshot's working-set list
-    /// on this node. `None` for a snapshot resumed at most once (a sandbox's
-    /// pause row) and for captures, which record nothing.
+    /// Where the `uffd` memory backend keeps this memory lineage's working-set
+    /// list on this node. `None` for captures, which record nothing, and for
+    /// an image with no managed memory layers to key one by.
     #[serde(skip)]
     pub mem_prefetch_path: Option<PathBuf>,
 }
@@ -574,18 +574,14 @@ impl FirecrackerSnapshotConfig {
             runtime_upper_mode: UpperMode::LogStructured,
         };
 
-        // A template is resumed many times and its first resume's working
-        // set pays off for every later one; a pause row is resumed once and
-        // then replaced, so a list for it would never be read.
-        let mem_prefetch_path = match snapshot.record().source {
-            crate::snapshot::SnapshotSource::Template { .. } => {
-                Some(crate::snapshot::mem_prefetch::local_path(
-                    &app_config.home_path,
-                    &snapshot.record().id,
-                ))
-            }
-            crate::snapshot::SnapshotSource::Sandbox { .. } => None,
-        };
+        // One list per memory-image lineage, not per snapshot: a pause row's
+        // own id is fresh every pause, so a list keyed by it would never be
+        // read, while the set the lineage's first resume faulted is what a
+        // pause row needs too. The daemon writes the file only when it is
+        // absent, so whichever resume arrives first records it.
+        let mem_prefetch_path =
+            crate::snapshot::mem_prefetch::lineage_key(&snapshot.committed().memory_layers)
+                .map(|key| crate::snapshot::mem_prefetch::local_path(&app_config.home_path, key));
         Ok(Self {
             common: snapshot_common,
             vm_state_path: manifest.vm_state.path.clone(),
@@ -957,27 +953,49 @@ mod tests {
         Ok(())
     }
 
+    fn committed_with_memory_layers(digests: &[&str]) -> CommittedSnapshot {
+        let mut committed = CommittedSnapshot::mock();
+        committed.memory_layers = digests
+            .iter()
+            .map(|digest| crate::snapshot::ManagedLayer {
+                digest: (*digest).to_string(),
+                size: 1,
+                uuid: None,
+            })
+            .collect();
+        committed
+    }
+
     #[test]
-    fn only_a_template_snapshot_gets_a_prefetch_list_under_the_home_path() -> Result<()> {
-        let template = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
-        let template_id = template.id.to_string();
+    fn a_template_and_a_pause_row_over_it_share_one_prefetch_list() -> Result<()> {
+        let expected = ConfigManager::global_config()
+            .home_path
+            .join("mem-prefetch")
+            .join("sha256-base.json");
+
+        let template = SnapshotRecord::mock_ready(committed_with_memory_layers(&["sha256:base"]));
         let snapshot = RunnableSnapshot::from_test_manifest(template, Vec::new());
         let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
-        assert_eq!(
-            config.mem_prefetch_path,
-            Some(
-                ConfigManager::global_config()
-                    .home_path
-                    .join("mem-prefetch")
-                    .join(format!("{template_id}.json"))
-            )
-        );
+        assert_eq!(config.mem_prefetch_path, Some(expected.clone()));
 
-        let mut paused = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        // The pause row stacks its own layer on the same base.
+        let mut paused =
+            SnapshotRecord::mock_ready(committed_with_memory_layers(&["sha256:base", "sha256:p1"]));
         paused.source = crate::snapshot::SnapshotSource::Sandbox {
             source_sandbox_id: "sbx-1".to_string(),
         };
         let snapshot = RunnableSnapshot::from_test_manifest(paused, Vec::new());
+        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
+        assert_eq!(config.mem_prefetch_path, Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn an_image_with_no_managed_memory_layers_gets_no_prefetch_list() -> Result<()> {
+        let snapshot = RunnableSnapshot::from_test_manifest(
+            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+            Vec::new(),
+        );
         let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
         assert_eq!(config.mem_prefetch_path, None);
         Ok(())

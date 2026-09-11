@@ -199,7 +199,8 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let cache_lease: Arc<dyn RuntimeArtifactLease> =
             Arc::new(CacheArtifactLease { _handles: handles });
 
-        self.sync_mem_prefetch_list(&snapshot, &layout).await;
+        self.sync_mem_prefetch_list(&snapshot, &committed.memory_layers)
+            .await;
         let runtime_manifest = hydrate_runtime_manifest(
             committed_manifest,
             vm_state_path,
@@ -217,24 +218,22 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
 // ── private helpers ───────────────────────────────────────────────────
 
 impl OssRuntimeResolver {
-    /// Brings the template's working-set list here or into the repository,
-    /// whichever side lacks it. Best effort: a resume runs without a list.
+    /// Brings this memory lineage's working-set list here or into the
+    /// repository, whichever side lacks it. Best effort: a resume runs
+    /// without a list.
     async fn sync_mem_prefetch_list(
         &self,
         snapshot: &SnapshotRecord,
-        layout: &OssSnapshotArtifactLayout<'_>,
+        memory_layers: &[crate::snapshot::ManagedLayer],
     ) {
-        if !matches!(
-            snapshot.source,
-            crate::snapshot::SnapshotSource::Template { .. }
-        ) {
+        let Some(lineage) = mem_prefetch::lineage_key(memory_layers) else {
             return;
-        }
+        };
         let local = mem_prefetch::local_path(
             &crate::cfg::ConfigManager::global_config().home_path,
-            &snapshot.id,
+            lineage,
         );
-        let key = layout.artifact_key(mem_prefetch::ARTIFACT_NAME);
+        let key = OssSnapshotArtifactLayout::mem_prefetch_key(lineage);
         let client = Arc::clone(&self.client);
         let outcome = mem_prefetch::sync(
             &local,

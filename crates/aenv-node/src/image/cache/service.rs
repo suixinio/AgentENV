@@ -248,7 +248,10 @@ impl ImageCacheService {
             .await
     }
 
-    #[cfg(test)]
+    /// Seeds a commit file whose digest and size the caller vouches for (a
+    /// layer this node just produced and uploaded) into the commit store,
+    /// under a hold so a concurrent sweep cannot take it out from under the
+    /// seed. Returns the cached path; an equal file already cached is reused.
     pub async fn import_hard_commit_trusted_descriptor(
         self: &Arc<Self>,
         source: &Path,

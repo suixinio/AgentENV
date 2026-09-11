@@ -1,6 +1,6 @@
 //! Node-local image storage ports used outside the image cache module.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,10 +55,18 @@ pub trait SourceImageEntry: Send {
     async fn write_metadata(&self, metadata: ImageResolutionMetadata) -> Result<PathBuf>;
 }
 
+#[async_trait]
 pub trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
     fn layer_location(&self, digest: &str, size: u64, has_remote: bool) -> OverlaybdLayerLocation;
 
     fn publishable_roots(&self) -> Vec<PathBuf>;
+
+    /// Keeps a copy of a layer this node produced and uploaded, so a resume
+    /// here opens it locally instead of refetching it. The remote copy is the
+    /// durable one: the local copy is cache, reclaimable like any other.
+    async fn adopt_layer(&self, _source: &Path, _digest: &str, _size: u64) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -138,6 +146,7 @@ impl SourceImageEntry for ImageCacheSourceImageEntry {
     }
 }
 
+#[async_trait]
 impl OverlaybdLayerStore for ImageCacheStore {
     fn layer_location(&self, digest: &str, size: u64, has_remote: bool) -> OverlaybdLayerLocation {
         self.cache
@@ -146,6 +155,13 @@ impl OverlaybdLayerStore for ImageCacheStore {
 
     fn publishable_roots(&self) -> Vec<PathBuf> {
         self.cache.allowed_overlaybd_publish_roots()
+    }
+
+    async fn adopt_layer(&self, source: &Path, digest: &str, size: u64) -> Result<()> {
+        self.cache
+            .import_hard_commit_trusted_descriptor(source, digest, size)
+            .await
+            .map(|_| ())
     }
 }
 

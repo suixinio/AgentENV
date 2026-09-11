@@ -66,6 +66,7 @@ impl OssBackend {
             Arc::new(import::OssSnapshotArtifactImporter::new(
                 Arc::clone(&client),
                 NormalizedOssConfig::new(config, snapshot_image_storage)?.snapshot_image_storage(),
+                Arc::clone(&store),
             )),
         ));
 

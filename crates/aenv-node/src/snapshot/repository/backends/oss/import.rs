@@ -21,12 +21,13 @@ use async_trait::async_trait;
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
 use overlaybd::dense_export;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::artifacts::OssSnapshotArtifactStore;
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::SnapshotImageStoragePolicy;
+use crate::image::cache::OverlaybdLayerStore;
 use crate::snapshot::repository::backends::common::acr::{
     AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
 };
@@ -46,15 +47,36 @@ pub struct OssSnapshotArtifactImporter {
     snapshot_image_storage: SnapshotImageStoragePolicy,
     acr_exporter: AcrDiskImageExporter,
     store: OssSnapshotArtifactStore,
+    /// Where uploaded layers are kept locally too, so a resume on this node
+    /// opens them without going back to object storage.
+    layers: Arc<dyn OverlaybdLayerStore>,
 }
 
 impl OssSnapshotArtifactImporter {
-    pub fn new(client: Arc<OssClient>, snapshot_image_storage: SnapshotImageStoragePolicy) -> Self {
+    pub fn new(
+        client: Arc<OssClient>,
+        snapshot_image_storage: SnapshotImageStoragePolicy,
+        layers: Arc<dyn OverlaybdLayerStore>,
+    ) -> Self {
         Self {
             store: OssSnapshotArtifactStore::new(Arc::clone(&client)),
             client,
             snapshot_image_storage,
             acr_exporter: AcrDiskImageExporter::new(),
+            layers,
+        }
+    }
+
+    /// Best effort: the upload is what the snapshot depends on, the local
+    /// copy only makes the next resume here faster.
+    async fn keep_local_copy(&self, path: &Path, digest: &str, size: u64) {
+        if let Err(error) = self.layers.adopt_layer(path, digest, size).await {
+            warn!(
+                digest,
+                path = %path.display(),
+                error = %format!("{error:#}"),
+                "keeping a local copy of an uploaded layer failed; resumes here will fetch it"
+            );
         }
     }
 
@@ -430,6 +452,8 @@ impl OssSnapshotArtifactImporter {
             })?;
         let oss_key = OssSnapshotArtifactLayout::managed_layer_key(&descriptor.digest);
         upload_managed_layer_if_missing(&self.client, &oss_key, &dense_path, artifact).await?;
+        self.keep_local_copy(&dense_path, &descriptor.digest, descriptor.size)
+            .await;
 
         Ok(ManagedLayer {
             digest: descriptor.digest,
@@ -459,6 +483,8 @@ impl OssSnapshotArtifactImporter {
             })?;
         let oss_key = OssSnapshotArtifactLayout::managed_layer_key(&descriptor.sha256);
         upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, artifact).await?;
+        self.keep_local_copy(&canonical, &descriptor.sha256, descriptor.size)
+            .await;
 
         Ok(ManagedLayer {
             digest: descriptor.sha256,
@@ -504,6 +530,7 @@ impl OssSnapshotArtifactImporter {
         // content digests and only validate the cheap size invariant here.
         let oss_key = OssSnapshotArtifactLayout::managed_layer_key(digest);
         upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, artifact).await?;
+        self.keep_local_copy(&canonical, digest, size).await;
 
         Ok(ManagedLayer {
             digest: digest.to_string(),
@@ -676,7 +703,107 @@ mod tests {
         OssSnapshotArtifactImporter::new(
             Arc::new(client),
             SnapshotImageStoragePolicy::ObjectStorage,
+            Arc::new(RecordingLayerStore::default()),
         )
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingLayerStore {
+        adopted: std::sync::Mutex<Vec<(std::path::PathBuf, String, u64)>>,
+    }
+
+    #[async_trait]
+    impl OverlaybdLayerStore for RecordingLayerStore {
+        fn layer_location(
+            &self,
+            digest: &str,
+            _size: u64,
+            _has_remote: bool,
+        ) -> crate::image::cache::OverlaybdLayerLocation {
+            crate::image::cache::OverlaybdLayerLocation::CacheDir(format!("cache/{digest}").into())
+        }
+
+        fn publishable_roots(&self) -> Vec<std::path::PathBuf> {
+            Vec::new()
+        }
+
+        async fn adopt_layer(&self, source: &Path, digest: &str, size: u64) -> anyhow::Result<()> {
+            self.adopted
+                .lock()
+                .unwrap()
+                .push((source.to_path_buf(), digest.to_string(), size));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_uploaded_layer_is_handed_to_the_layer_store_and_a_refusal_is_not_fatal() {
+        let layers = Arc::new(RecordingLayerStore::default());
+        let importer = OssSnapshotArtifactImporter::new(
+            Arc::new(
+                OssClient::new(
+                    "bucket".to_string(),
+                    "https://oss.example.com".to_string(),
+                    "region".to_string(),
+                    "prefix".to_string(),
+                    object_store_operator::CredentialSource::Anonymous,
+                )
+                .expect("oss client"),
+            ),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            Arc::clone(&layers) as Arc<dyn OverlaybdLayerStore>,
+        );
+        let temp = tempfile::tempdir().expect("tempdir");
+        let layer = temp.path().join("overlaybd.commit");
+        std::fs::write(&layer, b"layer").expect("write layer");
+
+        importer.keep_local_copy(&layer, "sha256:abc", 5).await;
+        assert_eq!(
+            layers.adopted.lock().unwrap().as_slice(),
+            &[(layer.clone(), "sha256:abc".to_string(), 5)]
+        );
+
+        #[derive(Debug)]
+        struct RefusingLayerStore;
+        #[async_trait]
+        impl OverlaybdLayerStore for RefusingLayerStore {
+            fn layer_location(
+                &self,
+                digest: &str,
+                _size: u64,
+                _has_remote: bool,
+            ) -> crate::image::cache::OverlaybdLayerLocation {
+                crate::image::cache::OverlaybdLayerLocation::CacheDir(
+                    format!("cache/{digest}").into(),
+                )
+            }
+            fn publishable_roots(&self) -> Vec<std::path::PathBuf> {
+                Vec::new()
+            }
+            async fn adopt_layer(
+                &self,
+                _source: &Path,
+                _digest: &str,
+                _size: u64,
+            ) -> anyhow::Result<()> {
+                anyhow::bail!("no room")
+            }
+        }
+        let importer = OssSnapshotArtifactImporter::new(
+            Arc::new(
+                OssClient::new(
+                    "bucket".to_string(),
+                    "https://oss.example.com".to_string(),
+                    "region".to_string(),
+                    "prefix".to_string(),
+                    object_store_operator::CredentialSource::Anonymous,
+                )
+                .expect("oss client"),
+            ),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            Arc::new(RefusingLayerStore),
+        );
+        importer.keep_local_copy(&layer, "sha256:abc", 5).await;
     }
 
     #[test]

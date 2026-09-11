@@ -12,7 +12,7 @@ use uvm_uffd::proto::{
     UFFD_FEATURE_MISSING_HUGETLBFS, UFFD_FEATURE_PAGEFAULT_FLAG_WP, UFFD_USER_MODE_ONLY,
 };
 use uvm_uffd::testing::{create_uffd_for_test, AnonRegion};
-use uvm_uffd::{dirty_ranges, DirtyRange};
+use uvm_uffd::{dirty_ranges, DirtyRange, DirtySource};
 use uvm_uffd::{
     send_handshake, HandlerOptions, HandlerState, LocalBoxFuture, MemSource, PageSource, Uffd,
     UffdHandler,
@@ -855,7 +855,11 @@ fn write_protected_pages_read_clean_and_a_write_shows_up_as_dirty() -> Result<()
     assert_eq!(region.read_byte(PAGE + 5), source.as_slice()[PAGE + 5]);
     assert!(region.read(4 * PAGE, PAGE).iter().all(|b| *b == 0));
     assert_eq!(handler.write_protect(), Some(true));
-    let dirty = dirty_ranges(pid, std::slice::from_ref(&mapping))?;
+    let dirty = dirty_ranges(
+        pid,
+        std::slice::from_ref(&mapping),
+        DirtySource::UffdWriteProtect,
+    )?;
     assert!(dirty.is_empty(), "read pages are clean: {dirty:?}");
 
     // The first write is a write-protect fault the handler resolves by
@@ -866,7 +870,11 @@ fn write_protected_pages_read_clean_and_a_write_shows_up_as_dirty() -> Result<()
     let stats = handler.stats();
     assert_eq!(stats.wp_faults, 2, "{stats:?}");
     assert_eq!(stats.pages_copied + stats.pages_zeroed, 2);
-    let dirty = dirty_ranges(pid, std::slice::from_ref(&mapping))?;
+    let dirty = dirty_ranges(
+        pid,
+        std::slice::from_ref(&mapping),
+        DirtySource::UffdWriteProtect,
+    )?;
     assert_eq!(
         dirty,
         vec![

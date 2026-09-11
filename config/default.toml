@@ -634,15 +634,18 @@ fill_concurrency = 4
 # overlaybd_global_config_path = "$AENV_HOME/overlaybd/mem-overlaybd-global.json"
 
 # Path snapshot memory is restored through. "block" mmaps a read-only device
-# built from the stacked memory layers; "uffd" has the ublk daemon answer
-# Firecracker's page faults over a Unix socket and creates no device. "uffd"
-# requires track_dirty_pages = true, which in turn is KVM-only.
+# built from the stacked memory layers MAP_PRIVATE, so sandboxes of one
+# snapshot share its clean pages in the page cache and the host can reclaim
+# them; "uffd" has the ublk daemon answer Firecracker's page faults over a
+# Unix socket, creates no device, and installs a private anonymous page per
+# VM. Either way a pause reads the written pages from the VMM's pagemap.
 # Override with AENV_MEMORY_SNAPSHOT_BACKEND.
 backend = "block"
 
-# EXPERIMENTAL: use Firecracker KVM dirty-page tracking instead of mincore.
-# It is disabled for PVM. Memory snapshot packaging always uses the direct
-# OverlayBD path. Override with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
+# EXPERIMENTAL: build Firecracker's KVM dirty-page bitmap. Both backends take
+# a pause's written pages from the VMM's pagemap and never read this bitmap,
+# so setting it only costs the tracking; it is disabled for PVM. Override with
+# AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
 track_dirty_pages = false
 
 # Boot new VMs with guest memory on 2 MiB hugetlbfs pages: one page fault

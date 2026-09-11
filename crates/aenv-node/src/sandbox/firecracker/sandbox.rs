@@ -61,10 +61,8 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// Inside the Firecracker work dir, so the path dies with the sandbox and two
 /// sandboxes never contend for one socket name.
 const MEM_UFFD_SOCKET_NAME: &str = "mem-uffd.sock";
-/// Firecracker's dirty-range shape, from the uffd-wp bits of the VMM's
-/// pagemap: the pages the guest wrote since they were installed.
-fn dirty_ranges_from_pagemap(pid: Pid, regions: &[MemoryUffdRegion]) -> Result<DirtyMemoryRanges> {
-    let mappings: Vec<uvm_uffd::GuestRegionUffdMapping> = regions
+fn uffd_mappings(regions: &[MemoryUffdRegion]) -> Vec<uvm_uffd::GuestRegionUffdMapping> {
+    regions
         .iter()
         .map(|r| uvm_uffd::GuestRegionUffdMapping {
             base_host_virt_addr: r.host_addr,
@@ -74,10 +72,19 @@ fn dirty_ranges_from_pagemap(pid: Pid, regions: &[MemoryUffdRegion]) -> Result<D
             page_size_kib: r.page_size,
             guest_phys_addr: 0,
         })
-        .collect();
+        .collect()
+}
+
+/// Firecracker's dirty-range shape, read from the VMM's pagemap: the pages
+/// the guest wrote since the snapshot was loaded, told apart by `source`.
+fn dirty_ranges_from_pagemap(
+    pid: Pid,
+    mappings: &[uvm_uffd::GuestRegionUffdMapping],
+    source: uvm_uffd::DirtySource,
+) -> Result<DirtyMemoryRanges> {
     let memory_size = mappings.iter().map(|m| m.end_offset()).max().unwrap_or(0);
     let pid = u32::try_from(pid.as_raw()).context("firecracker pid is negative")?;
-    let ranges = uvm_uffd::dirty_ranges(pid, &mappings)
+    let ranges = uvm_uffd::dirty_ranges(pid, mappings, source)
         .context("read the written pages from the VMM's pagemap")?;
     let to_i64 =
         |v: u64, what: &str| i64::try_from(v).with_context(|| format!("{what} overflows i64"));
@@ -95,6 +102,97 @@ fn dirty_ranges_from_pagemap(pid: Pid, regions: &[MemoryUffdRegion]) -> Result<D
             })
             .collect::<Result<Vec<_>>>()?,
     })
+}
+
+// What the VMM's pagemap says about pages the reference readout calls dirty
+// and this pause leaves out. `stale_anon` is the only count that means data
+// loss: a private copy still holding the guest's write. An absent or still
+// file-backed page carries exactly the image's bytes, so leaving it out drops
+// nothing -- the guest discarded it (the balloon punches holes) or never
+// diverged, while a KVM dirty log only remembers that a write once happened.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MissedPages {
+    absent: u32,
+    file_backed: u32,
+    stale_anon: u32,
+    swapped: u32,
+}
+
+impl std::fmt::Display for MissedPages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "absent={} file={} anon={} swap={}",
+            self.absent, self.file_backed, self.stale_anon, self.swapped
+        )
+    }
+}
+
+impl MissedPages {
+    fn loses_data(self) -> bool {
+        self.stale_anon > 0 || self.swapped > 0
+    }
+}
+
+fn missed_page_census(
+    pid: u32,
+    reference: &DirtyMemoryRanges,
+    missed: &[i64],
+) -> Result<MissedPages> {
+    use std::os::unix::fs::FileExt;
+    let pagemap = std::fs::File::open(format!("/proc/{pid}/pagemap"))
+        .with_context(|| format!("open pagemap for {pid}"))?;
+    let host_of = |offset: i64| -> Option<u64> {
+        reference.ranges.iter().find_map(|r| {
+            (offset >= r.image_offset && offset < r.image_offset + r.length)
+                .then(|| (r.base_host_virt_addr + (offset - r.image_offset)) as u64)
+        })
+    };
+    let mut census = MissedPages::default();
+    for offset in missed {
+        let Some(host) = host_of(*offset) else {
+            continue;
+        };
+        let mut buf = [0u8; 8];
+        if pagemap.read_exact_at(&mut buf, (host / 4096) * 8).is_err() {
+            continue;
+        }
+        let entry = u64::from_ne_bytes(buf);
+        if entry & (1 << 62) != 0 {
+            census.swapped += 1;
+        } else if entry & (1 << 63) == 0 {
+            census.absent += 1;
+        } else if entry & (1 << 61) != 0 {
+            census.file_backed += 1;
+        } else {
+            census.stale_anon += 1;
+        }
+    }
+    Ok(census)
+}
+
+// The pages in `ranges` that `reference` does not report, the reverse, and
+// what the pagemap says about that reverse set.
+fn compare_dirty_pages(
+    pid: u32,
+    ranges: &DirtyMemoryRanges,
+    reference: &DirtyMemoryRanges,
+) -> (u64, u64, MissedPages) {
+    let pages = |r: &DirtyMemoryRanges| -> std::collections::BTreeSet<i64> {
+        r.ranges
+            .iter()
+            .flat_map(|range| (range.image_offset..range.image_offset + range.length).step_by(4096))
+            .collect()
+    };
+    let ours = pages(ranges);
+    let theirs = pages(reference);
+    let missed: Vec<i64> = theirs.difference(&ours).copied().collect();
+    let census = missed_page_census(pid, reference, &missed).unwrap_or_default();
+    (
+        ours.difference(&theirs).count() as u64,
+        missed.len() as u64,
+        census,
+    )
 }
 
 /// `sun_path` is 108 bytes including the terminator.
@@ -1167,9 +1265,10 @@ impl FirecrackerSandbox {
         .context("convert dirty memory ranges to overlaybd layer")
     }
 
-    /// The pages written since this VM was restored: read from the VMM's
-    /// pagemap when it is served over userfaultfd with write protection, so
-    /// no KVM dirty log is needed; otherwise Firecracker's own readout.
+    /// The pages written since this VM was restored, read from the VMM's
+    /// pagemap under either memory backend, so no KVM dirty log is needed.
+    /// Falls back to Firecracker's own readout only when neither backend can
+    /// name the guest's regions.
     async fn dirty_memory_ranges(&self, pid: Pid) -> Result<DirtyMemoryRanges> {
         if let Some(serve) = &self.mem_uffd {
             let status = serve
@@ -1177,11 +1276,16 @@ impl FirecrackerSandbox {
                 .await
                 .context("query the memory userfaultfd server before capturing memory")?;
             if status.write_protect == Some(true) && !status.regions.is_empty() {
-                let regions = status.regions;
-                let ranges =
-                    tokio::task::spawn_blocking(move || dirty_ranges_from_pagemap(pid, &regions))
-                        .await
-                        .context("join the pagemap read")??;
+                let mappings = uffd_mappings(&status.regions);
+                let ranges = tokio::task::spawn_blocking(move || {
+                    dirty_ranges_from_pagemap(
+                        pid,
+                        &mappings,
+                        uvm_uffd::DirtySource::UffdWriteProtect,
+                    )
+                })
+                .await
+                .context("join the pagemap read")??;
                 info!(
                     serve_id = serve.serve_id(),
                     ranges = ranges.ranges.len(),
@@ -1191,6 +1295,73 @@ impl FirecrackerSandbox {
                 );
                 return Ok(ranges);
             }
+        }
+        if let Some(device) = &self.mem_ublk_device {
+            let backing = device.device_path().to_path_buf();
+            let raw_pid = u32::try_from(pid.as_raw()).context("firecracker pid is negative")?;
+            let (ranges, resident_bytes) = tokio::task::spawn_blocking(move || {
+                let mappings = uvm_uffd::guest_regions_backed_by(raw_pid, &backing)
+                    .context("read the guest memory regions from the VMM's maps")?;
+                if mappings.is_empty() {
+                    bail!(
+                        "the VMM maps no private region of {}, so its written pages cannot be read",
+                        backing.display()
+                    );
+                }
+                let written = dirty_ranges_from_pagemap(
+                    pid,
+                    &mappings,
+                    uvm_uffd::DirtySource::PrivateFileCow,
+                )?;
+                // What Firecracker's mincore readout would have copied, so the
+                // gap between the two is visible in the log of every pause.
+                let resident =
+                    uvm_uffd::dirty_ranges(raw_pid, &mappings, uvm_uffd::DirtySource::Resident)
+                        .map(|r| r.iter().map(|range| range.len).sum::<u64>())
+                        .unwrap_or_default();
+                anyhow::Ok((written, resident))
+            })
+            .await
+            .context("join the pagemap read")??;
+            info!(
+                ranges = ranges.ranges.len(),
+                bytes = ranges.ranges.iter().map(|r| r.length).sum::<i64>(),
+                resident_bytes,
+                "captured the written pages from the VMM's pagemap"
+            );
+            // track_dirty_pages buys nothing on this path, so when an operator
+            // sets it anyway, spend it on checking the predicate against the
+            // readout it would have used.
+            if ConfigManager::global_config()
+                .memory_snapshot
+                .track_dirty_pages
+            {
+                match self.fc_instance.get_dirty_memory_ranges().await {
+                    Ok(reference) => {
+                        let (only_pagemap, only_reference, census) =
+                            compare_dirty_pages(raw_pid, &ranges, &reference);
+                        if census.loses_data() {
+                            warn!(
+                                only_pagemap,
+                                only_reference,
+                                census = %census,
+                                "this pause drops pages whose private copy still holds a guest write"
+                            );
+                        } else {
+                            info!(
+                                only_pagemap,
+                                only_reference,
+                                census = %census,
+                                reference_bytes =
+                                    reference.ranges.iter().map(|r| r.length).sum::<i64>(),
+                                "every page this pause leaves out carries the image's own bytes"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "could not cross-check the pagemap predicate"),
+                }
+            }
+            return Ok(ranges);
         }
         self.fc_instance.get_dirty_memory_ranges().await
     }

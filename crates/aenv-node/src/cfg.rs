@@ -279,8 +279,10 @@ fn validate_memory_snapshot_options(config: &AppConfig) -> Result<()> {
         if memory.uffd.handshake_timeout_secs == 0 {
             bail!("invalid memory_snapshot.uffd config: handshake_timeout_secs must be > 0");
         }
-        // With write protection the written set comes from the VMM's pagemap
-        // and no KVM dirty log is involved, on KVM and PVM alike.
+        // Write protection is what marks a written page under this backend:
+        // every page userfaultfd installs is anonymous, so without the uffd-wp
+        // bit the only readout left is Firecracker's mincore overapproximation,
+        // which copies the whole faulted working set into each pause layer.
         if !memory.track_dirty_pages && !memory.uffd.write_protect {
             if config.virtualization_mode == VirtualizationMode::Pvm {
                 bail!(

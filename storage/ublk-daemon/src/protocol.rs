@@ -83,6 +83,11 @@ pub enum DaemonRequest {
         max_inflight: usize,
         #[serde(default = "default_uffd_read_retry_secs")]
         read_retry_secs: u64,
+        /// How long the server waits for Firecracker to connect and hand
+        /// over the descriptor before it gives up; a snapshot load that
+        /// takes longer than this fails at `QueryMemoryUffd`.
+        #[serde(default = "default_uffd_handshake_timeout_secs")]
+        handshake_timeout_secs: u64,
         /// The working-set list of this image: replayed once the handshake
         /// is done when it exists, recorded at stop when it does not.
         #[serde(default)]
@@ -105,6 +110,10 @@ const fn default_uffd_max_inflight() -> usize {
 }
 
 const fn default_uffd_read_retry_secs() -> u64 {
+    60
+}
+
+const fn default_uffd_handshake_timeout_secs() -> u64 {
     60
 }
 
@@ -134,6 +143,10 @@ pub struct MemoryUffdStats {
     pub removes: u64,
     #[serde(default)]
     pub prefaulted: u64,
+    /// Faults at addresses no handshake region covers, answered with a zero
+    /// page.
+    #[serde(default)]
+    pub unmapped: u64,
 }
 
 fn default_runtime_upper_mode() -> UpperMode {

@@ -1685,6 +1685,7 @@ mod live_device_tests {
         use std::fs::OpenOptions;
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
+        use uvm_ublk_daemon::MemoryUffdServeOptions;
         use uvm_uffd::testing::{create_uffd_for_test, AnonRegion};
         use uvm_uffd::{send_handshake, PrefetchList, Uffd};
 
@@ -1727,6 +1728,67 @@ mod live_device_tests {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             state
+        }
+
+        #[tokio::test]
+        async fn a_serve_that_never_gets_a_handshake_exits_within_its_timeout_and_stops_cleanly() {
+            let name =
+                "a_serve_that_never_gets_a_handshake_exits_within_its_timeout_and_stops_cleanly";
+            if !transport_reachable(name) {
+                return;
+            }
+            let fixture = image_fixture(IMAGE_SIZE).await;
+            let daemon = RunningDaemon::start(&fixture.global_config, None).await;
+            let socket_dir = tempfile::tempdir().unwrap();
+            let socket_path = socket_dir.path().join("mem.sock");
+            let serve_id = daemon
+                .client
+                .serve_memory_uffd(
+                    &fixture.image_config,
+                    &fixture.global_config,
+                    &socket_path,
+                    MemoryUffdServeOptions {
+                        max_inflight: 16,
+                        read_retry_secs: 5,
+                        handshake_timeout_secs: 1,
+                    },
+                    None,
+                )
+                .await
+                .expect("serve");
+            assert!(
+                socket_path.exists(),
+                "the socket is bound before anyone connects"
+            );
+
+            let mut state = MemoryUffdState::Starting;
+            for _ in 0..250 {
+                state = daemon
+                    .client
+                    .query_memory_uffd(serve_id)
+                    .await
+                    .expect("query")
+                    .0;
+                if matches!(state, MemoryUffdState::Exited { .. }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            match state {
+                MemoryUffdState::Exited { error: Some(error) } => {
+                    assert!(error.contains("no uffd handshake"), "{error}");
+                }
+                other => panic!("the server did not report its handshake timeout: {other:?}"),
+            }
+            // The exited server is still addressable until it is stopped,
+            // and stopping it is the ordinary path.
+            daemon
+                .client
+                .stop_memory_uffd(serve_id)
+                .await
+                .expect("stop an exited server");
+            assert!(!socket_path.exists(), "the socket is unlinked at stop");
+            assert!(daemon.client.query_memory_uffd(serve_id).await.is_err());
         }
 
         #[tokio::test]
@@ -1774,8 +1836,11 @@ mod live_device_tests {
                     &fixture.image_config,
                     &fixture.global_config,
                     &socket_path,
-                    16,
-                    5,
+                    MemoryUffdServeOptions {
+                        max_inflight: 16,
+                        read_retry_secs: 5,
+                        handshake_timeout_secs: 60,
+                    },
                     None,
                 )
                 .await
@@ -1854,8 +1919,11 @@ mod live_device_tests {
                             &fixture.image_config,
                             &fixture.global_config,
                             &socket_dir.path().join(name),
-                            16,
-                            5,
+                            MemoryUffdServeOptions {
+                                max_inflight: 16,
+                                read_retry_secs: 5,
+                                handshake_timeout_secs: 60,
+                            },
                             None,
                         )
                         .await
@@ -1922,8 +1990,11 @@ mod live_device_tests {
                     &fixture.image_config,
                     &fixture.global_config,
                     &socket_path,
-                    16,
-                    5,
+                    MemoryUffdServeOptions {
+                        max_inflight: 16,
+                        read_retry_secs: 5,
+                        handshake_timeout_secs: 60,
+                    },
                     Some(&prefetch_path),
                 )
                 .await
@@ -1976,8 +2047,11 @@ mod live_device_tests {
                     &fixture.image_config,
                     &fixture.global_config,
                     &socket_path,
-                    16,
-                    5,
+                    MemoryUffdServeOptions {
+                        max_inflight: 16,
+                        read_retry_secs: 5,
+                        handshake_timeout_secs: 60,
+                    },
                     Some(&prefetch_path),
                 )
                 .await
@@ -2055,8 +2129,11 @@ mod live_device_tests {
                     &fixture.image_config,
                     &fixture.global_config,
                     &socket_path,
-                    16,
-                    5,
+                    MemoryUffdServeOptions {
+                        max_inflight: 16,
+                        read_retry_secs: 5,
+                        handshake_timeout_secs: 60,
+                    },
                     None,
                 )
                 .await

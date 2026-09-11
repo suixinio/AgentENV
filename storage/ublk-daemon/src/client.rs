@@ -143,6 +143,15 @@ struct UblkDaemonClientInner {
     runtime_device_timeout: Duration,
 }
 
+/// The bounds a userfaultfd memory server runs with; see
+/// `[memory_snapshot.uffd]`.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryUffdServeOptions {
+    pub max_inflight: usize,
+    pub read_retry_secs: u64,
+    pub handshake_timeout_secs: u64,
+}
+
 impl UblkDaemonClient {
     /// Spawn the `uvm-ublk-daemon` process and wait for it to become ready.
     ///
@@ -579,16 +588,16 @@ impl UblkDaemonClient {
         image_config: &Path,
         global_config: &Path,
         socket_path: &Path,
-        max_inflight: usize,
-        read_retry_secs: u64,
+        options: MemoryUffdServeOptions,
         prefetch_path: Option<&Path>,
     ) -> Result<u32> {
         let request = DaemonRequest::ServeMemoryUffd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
             socket_path: socket_path.to_path_buf(),
-            max_inflight,
-            read_retry_secs,
+            max_inflight: options.max_inflight,
+            read_retry_secs: options.read_retry_secs,
+            handshake_timeout_secs: options.handshake_timeout_secs,
             prefetch_path: prefetch_path.map(Path::to_path_buf),
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {

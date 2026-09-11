@@ -21,11 +21,6 @@ use uvm_uffd::{
 use crate::protocol::{DaemonResponse, MemoryUffdState, MemoryUffdStats};
 use crate::server::ImageServiceCache;
 
-/// How long a server waits for Firecracker to connect and hand over the
-/// descriptor. A snapshot load that never reaches the socket must end the
-/// server rather than hold the image open forever.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Canonical key for a shared opened memory image: (image_config, global_config).
 type ImageKey = (PathBuf, PathBuf);
 
@@ -43,6 +38,8 @@ struct ActiveServe {
     cancel_watcher: oneshot::Sender<()>,
     socket_path: PathBuf,
     image_key: ImageKey,
+    /// The image size the prefetch list is keyed by.
+    image_size: u64,
     /// Where the working set is recorded at stop, unless a list exists.
     prefetch_path: Option<PathBuf>,
 }
@@ -53,6 +50,7 @@ pub(crate) struct ServeMemoryUffdRequest<'a> {
     pub(crate) socket_path: &'a Path,
     pub(crate) max_inflight: usize,
     pub(crate) read_retry_secs: u64,
+    pub(crate) handshake_timeout_secs: u64,
     pub(crate) prefetch_path: Option<&'a Path>,
 }
 
@@ -133,19 +131,27 @@ impl MemoryUffdServers {
         key: &ImageKey,
         image: Arc<ImageFile>,
     ) -> Result<u32> {
-        let listener = bind_handshake_socket(request.socket_path)?;
         let source = Arc::new(
             OverlaybdSource::from_opened_image(request.image_config.to_path_buf(), image)
                 .context("build the page source for the memory image")?,
         );
-        let serve_id = self.next_serve_id.fetch_add(1, Ordering::Relaxed);
+        let image_size = source.image().size_bytes();
+        let listener = bind_handshake_socket(request.socket_path)?;
+        let serve_id = loop {
+            let id = self.next_serve_id.fetch_add(1, Ordering::Relaxed);
+            // Zero is never a live server, and a wrapped counter must not
+            // land on one that still is.
+            if id != 0 && !self.serves.contains_key(&id) {
+                break id;
+            }
+        };
         let started = UffdHandler::serve_socket(
             listener,
             source,
             HandlerOptions {
                 max_inflight: request.max_inflight,
                 read_retry_budget: Duration::from_secs(request.read_retry_secs),
-                handshake_timeout: HANDSHAKE_TIMEOUT,
+                handshake_timeout: Duration::from_secs(request.handshake_timeout_secs),
                 name: format!("mem-{serve_id}"),
                 ..Default::default()
             },
@@ -172,23 +178,35 @@ impl MemoryUffdServers {
             async move {
                 let serve = async {
                     if let Some(list) = replay {
-                        replay_prefetch(serve_id, &handler, list).await;
+                        replay_prefetch(serve_id, &handler, list, image_size).await;
                     }
                     handler.wait_exit().await
                 };
                 tokio::select! {
                     exit = serve => match exit {
-                        Some(error) => tracing::error!(
-                            serve_id,
-                            image_config = %image_config.display(),
-                            error = %error,
-                            "memory uffd server exited with an error"
-                        ),
-                        None => tracing::info!(
-                            serve_id,
-                            image_config = %image_config.display(),
-                            "memory uffd server exited"
-                        ),
+                        Some(error) => {
+                            // The guest is unbacked from here on; the node
+                            // sees it at its next query. Loud on both
+                            // channels the node does not read.
+                            metrics::counter!("uffd_memory_server_exits_total", "outcome" => "error")
+                                .increment(1);
+                            tracing::error!(
+                                serve_id,
+                                image_config = %image_config.display(),
+                                error = %error,
+                                stats = ?handler.stats(),
+                                "memory uffd server exited with an error"
+                            )
+                        }
+                        None => {
+                            metrics::counter!("uffd_memory_server_exits_total", "outcome" => "ok")
+                                .increment(1);
+                            tracing::info!(
+                                serve_id,
+                                image_config = %image_config.display(),
+                                "memory uffd server exited"
+                            )
+                        }
                     },
                     _ = cancelled => {}
                 }
@@ -203,9 +221,11 @@ impl MemoryUffdServers {
                 cancel_watcher,
                 socket_path: request.socket_path.to_path_buf(),
                 image_key: key.clone(),
+                image_size,
                 prefetch_path: prefetch.map(|(path, _)| path),
             },
         );
+        metrics::gauge!("uffd_memory_servers").set(self.serves.len() as f64);
         tracing::info!(
             serve_id,
             image_config = %request.image_config.display(),
@@ -223,6 +243,7 @@ impl MemoryUffdServers {
             cancel_watcher,
             socket_path,
             image_key,
+            image_size,
             prefetch_path,
         } = serve;
 
@@ -231,8 +252,15 @@ impl MemoryUffdServers {
         let _ = cancel_watcher.send(());
         let _ = watcher.await;
         if let Some(path) = prefetch_path {
-            record_prefetch_list(serve_id, &handler, &path);
+            record_prefetch_list(serve_id, &handler, &path, image_size);
         }
+        let stats = handler.stats();
+        record_final_stats(&stats);
+        tracing::info!(serve_id, ?stats, "memory uffd server final counters");
+        // Stopping is asked for before the ownership check, so a handler
+        // some other reference still holds is told to stop rather than
+        // left serving a socket that is about to be unlinked.
+        handler.request_stop();
         match Arc::into_inner(handler) {
             Some(handler) => match tokio::task::spawn_blocking(move || handler.stop()).await {
                 Ok(Ok(())) => {}
@@ -264,6 +292,7 @@ impl MemoryUffdServers {
             }
         }
         self.release_image(&image_key);
+        metrics::gauge!("uffd_memory_servers").set(self.serves.len() as f64);
         tracing::info!(serve_id, "memory uffd server stopped");
     }
 
@@ -372,14 +401,37 @@ fn read_prefetch_list(path: &Path) -> Option<PrefetchList> {
     }
 }
 
+/// Adds a server's final counters to the daemon-wide totals the metrics
+/// endpoint exports.
+fn record_final_stats(stats: &StatsSnapshot) {
+    let totals = [
+        ("uffd_memory_faults_total", stats.faults),
+        ("uffd_memory_pages_copied_total", stats.pages_copied),
+        ("uffd_memory_pages_zeroed_total", stats.pages_zeroed),
+        ("uffd_memory_bytes_read_total", stats.bytes_read),
+        ("uffd_memory_read_retries_total", stats.read_retries),
+        ("uffd_memory_removes_total", stats.removes),
+        ("uffd_memory_prefaulted_total", stats.prefaulted),
+        ("uffd_memory_unmapped_faults_total", stats.unmapped),
+    ];
+    for (name, value) in totals {
+        metrics::counter!(name).increment(value);
+    }
+}
+
 /// Installs the recorded working set once the handshake has fixed the page
-/// size; a list for another page size is left alone.
-async fn replay_prefetch(serve_id: u32, handler: &UffdHandler, list: PrefetchList) {
+/// size; a list for another page size or image size is left alone.
+async fn replay_prefetch(
+    serve_id: u32,
+    handler: &UffdHandler,
+    list: PrefetchList,
+    image_size: u64,
+) {
     if handler.wait_serving().await.is_err() {
         return;
     }
     let page_size = handler.page_size().unwrap_or(0);
-    match list.pages_for(page_size) {
+    match list.pages_for(page_size, image_size) {
         Some(pages) => {
             tracing::info!(
                 serve_id,
@@ -393,19 +445,21 @@ async fn replay_prefetch(serve_id: u32, handler: &UffdHandler, list: PrefetchLis
         None => tracing::warn!(
             serve_id,
             recorded_page_size = list.page_size,
+            recorded_image_size = list.image_size,
             page_size,
-            "ignoring a memory prefetch list recorded for another page size"
+            image_size,
+            "ignoring a memory prefetch list recorded for another page size or image"
         ),
     }
 }
 
 /// Records the pages this server installed as the image's working set,
 /// unless a list exists already: the first resume of an image wins.
-fn record_prefetch_list(serve_id: u32, handler: &UffdHandler, path: &Path) {
+fn record_prefetch_list(serve_id: u32, handler: &UffdHandler, path: &Path, image_size: u64) {
     let Some(page_size) = handler.page_size() else {
         return;
     };
-    let list = PrefetchList::new(page_size, handler.faulted_pages());
+    let list = PrefetchList::new(page_size, image_size, handler.faulted_pages());
     if !list.is_worth_recording() {
         return;
     }
@@ -446,6 +500,7 @@ fn stats_of(stats: StatsSnapshot) -> MemoryUffdStats {
         copy_retries: stats.copy_retries,
         removes: stats.removes,
         prefaulted: stats.prefaulted,
+        unmapped: stats.unmapped,
     }
 }
 
@@ -482,6 +537,7 @@ mod tests {
             copy_retries: 8,
             removes: 9,
             prefaulted: 10,
+            unmapped: 11,
         };
         assert_eq!(
             stats_of(stats),
@@ -496,6 +552,7 @@ mod tests {
                 copy_retries: 8,
                 removes: 9,
                 prefaulted: 10,
+                unmapped: 11,
             }
         );
     }

@@ -6,8 +6,9 @@ pub mod server;
 pub mod transport;
 
 pub use client::{
-    CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, OverlaybdRuntimeDevice,
-    RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
+    CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, MemoryUffdServeOptions,
+    OverlaybdRuntimeDevice, RestackSnapshotTerminalFailure, UblkDaemonClient,
+    UblkDaemonSpawnConfig,
 };
 pub use protocol::{
     AccessMode, DaemonRequest, DaemonResponse, MemoryUffdState, MemoryUffdStats, ResizeToolSpec,

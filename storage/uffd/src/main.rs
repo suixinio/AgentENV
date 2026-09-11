@@ -125,6 +125,7 @@ async fn serve<S: PageSource>(
         max_inflight,
         ..HandlerOptions::default()
     };
+    let image_size = source.size();
     let handler = UffdHandler::serve_socket(listener, source, opts)?;
     println!("{}", socket.display());
     println!("ready");
@@ -139,16 +140,17 @@ async fn serve<S: PageSource>(
         };
         handler.wait_serving().await?;
         let page_size = handler.page_size().unwrap_or(0);
-        match list.pages_for(page_size) {
+        match list.pages_for(page_size, image_size) {
             Some(pages) => {
                 eprintln!("prefaulting {} pages from {}", pages.len(), path.display());
                 handler.prefault(pages.to_vec())
             }
             None => {
                 eprintln!(
-                    "ignoring {}: recorded for page size {}, serving {page_size}",
+                    "ignoring {}: recorded for page size {} and image size {}, serving {page_size} and {image_size}",
                     path.display(),
-                    list.page_size
+                    list.page_size,
+                    list.image_size
                 );
                 Ok(())
             }
@@ -169,7 +171,7 @@ async fn serve<S: PageSource>(
     let stats = handler.stats();
     if let Some(path) = prefetch.record_prefetch.as_deref() {
         if let Some(page_size) = handler.page_size() {
-            let list = PrefetchList::new(page_size, handler.faulted_pages());
+            let list = PrefetchList::new(page_size, image_size, handler.faulted_pages());
             if list.is_worth_recording() && list.write_if_absent(path)? {
                 eprintln!("recorded {} pages to {}", list.pages.len(), path.display());
             }

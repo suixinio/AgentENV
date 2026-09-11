@@ -202,6 +202,16 @@ where
         }
     }
 
+    // Binding a layer is the only use the cache can observe: overlaybd opens
+    // the commit file itself, so without this the GC would date every layer by
+    // when it was written and age out the parents a resume opens every time.
+    let bound_digests = materialized
+        .iter()
+        .filter(|lower| !lower.config.digest.is_empty())
+        .map(|lower| lower.config.digest.clone())
+        .collect::<Vec<_>>();
+    store.record_layers_used(&bound_digests).await;
+
     let first_repo_blob_url = materialized
         .iter()
         .find_map(|lower| lower.remote_repo_blob_url.as_deref());
@@ -304,9 +314,12 @@ mod tests {
     use super::*;
     use crate::snapshot::ExternalLayer;
 
-    #[derive(Debug)]
-    struct TestOverlaybdLayerStore;
+    #[derive(Debug, Default)]
+    struct TestOverlaybdLayerStore {
+        used: std::sync::Mutex<Vec<String>>,
+    }
 
+    #[async_trait::async_trait]
     impl OverlaybdLayerStore for TestOverlaybdLayerStore {
         fn layer_location(
             &self,
@@ -324,6 +337,13 @@ mod tests {
 
         fn publishable_roots(&self) -> Vec<PathBuf> {
             Vec::new()
+        }
+
+        async fn record_layers_used(&self, digests: &[String]) {
+            self.used
+                .lock()
+                .expect("record the bound layers")
+                .extend_from_slice(digests);
         }
     }
 
@@ -343,7 +363,7 @@ mod tests {
                 size: 20,
             }),
         ];
-        let store = TestOverlaybdLayerStore;
+        let store = TestOverlaybdLayerStore::default();
 
         materialize_image_config(
             &layers,
@@ -388,7 +408,7 @@ mod tests {
                 uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
             }),
         ];
-        let store = TestOverlaybdLayerStore;
+        let store = TestOverlaybdLayerStore::default();
 
         materialize_image_config(
             &layers,
@@ -424,5 +444,47 @@ mod tests {
         assert_eq!(cfg.lowers[1].uuid, "11111111-2222-3333-4444-555555555555");
         assert!(cfg.lowers.iter().all(|layer| layer.file.is_empty()));
         assert!(cfg.lowers.iter().all(|layer| !layer.dir.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn materialize_image_config_dates_every_layer_it_binds() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let destination = tempdir.path().join("image.json");
+        let layers = vec![
+            OverlaybdLayerRef::External(ExternalLayer {
+                digest: "sha256:base".to_string(),
+                repo_blob_url: "https://registry.example/v2/ns/image/blobs".to_string(),
+                size: 10,
+            }),
+            OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: "sha256:delta".to_string(),
+                size: 20,
+                uuid: None,
+            }),
+        ];
+        let store = TestOverlaybdLayerStore::default();
+
+        materialize_image_config(
+            &layers,
+            &destination,
+            "test",
+            Some("https://registry.example/v2/ns/image/blobs"),
+            &store,
+            None,
+            |_index, layer| async move {
+                Ok(LayerConfig {
+                    digest: layer.digest,
+                    size: layer.size,
+                    ..Default::default()
+                })
+            },
+        )
+        .await
+        .expect("materialize");
+
+        assert_eq!(
+            *store.used.lock().expect("read the bound layers"),
+            vec!["sha256:base".to_string(), "sha256:delta".to_string()]
+        );
     }
 }

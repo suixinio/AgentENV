@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::service::{HoldNamespace, ImageCacheService};
 use crate::cfg::{AppConfig, ConfigManager, NodeConfigExt};
@@ -67,6 +67,11 @@ pub trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
     async fn adopt_layer(&self, _source: &Path, _digest: &str, _size: u64) -> Result<()> {
         Ok(())
     }
+
+    /// Marks the layers a runtime image was just bound to as used now. Their
+    /// retention is measured from this, so a layer every resume opens outlives
+    /// one nothing has touched since it was written.
+    async fn record_layers_used(&self, _digests: &[String]) {}
 }
 
 #[derive(Clone)]
@@ -81,6 +86,7 @@ struct ImageCacheStore {
     cache: Arc<ImageCacheService>,
     gc_watermark: Option<(u64, u64)>,
     gc_min_age: Duration,
+    gc_commit_retention: Duration,
 }
 
 struct ImageCacheSourceImageEntry {
@@ -163,6 +169,12 @@ impl OverlaybdLayerStore for ImageCacheStore {
             .await
             .map(|_| ())
     }
+
+    async fn record_layers_used(&self, digests: &[String]) {
+        if let Err(error) = self.cache.record_overlaybd_layers_used(digests).await {
+            warn!(%error, "failed to date the layers a runtime image was bound to");
+        }
+    }
 }
 
 #[async_trait]
@@ -202,7 +214,12 @@ impl RuntimeImageRefs for ImageCacheStore {
             .collect();
         let summary = self
             .cache
-            .run_maintenance(running, self.gc_watermark, self.gc_min_age)
+            .run_maintenance(
+                running,
+                self.gc_watermark,
+                self.gc_min_age,
+                self.gc_commit_retention,
+            )
             .await?;
         info!(
             reclaimed = summary.collected,
@@ -228,6 +245,7 @@ pub fn local_image_services_from_app_config(config: &AppConfig) -> LocalImageSer
         cache,
         gc_watermark: gc.watermark_bytes(capacity_bytes),
         gc_min_age: gc.min_age,
+        gc_commit_retention: gc.commit_retention,
     }))
 }
 
@@ -248,10 +266,12 @@ pub fn test_local_image_services_from_service(
     cache: Arc<ImageCacheService>,
     gc_watermark: Option<(u64, u64)>,
     gc_min_age: Duration,
+    gc_commit_retention: Duration,
 ) -> LocalImageServices {
     services_from_store(Arc::new(ImageCacheStore {
         cache,
         gc_watermark,
         gc_min_age,
+        gc_commit_retention,
     }))
 }

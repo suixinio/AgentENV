@@ -85,6 +85,14 @@ pub struct ImageCacheGcConfig {
     /// Evict down to `capacity_gb` * this ratio once the high watermark trips.
     #[config(default = 0.70)]
     pub low_watermark_ratio: f64,
+    /// How long a commit nothing references is kept before the GC collects it,
+    /// counted from the last time this node bound it into a runtime image (its
+    /// file's mtime after a restart). A layer a pause uploaded has no referrer
+    /// the moment its sandbox is gone, and it is what a resume here opens
+    /// instead of fetching it back from object storage. Capacity eviction
+    /// ignores this floor; 0 collects on the next pass.
+    #[config(default = 86_400u64, env = "AENV_IMAGE_CACHE_COMMIT_RETENTION_SECS")]
+    pub commit_retention_secs: u64,
 }
 
 /// Derived image-cache paths and limits used by runtime components.
@@ -106,6 +114,9 @@ pub struct ResolvedImageCacheGcConfig {
     /// Validated to `0 < low_watermark_ratio <= high_watermark_ratio <= 1`.
     pub high_watermark_ratio: f64,
     pub low_watermark_ratio: f64,
+    /// Age floor below which an unreferenced commit is kept. `Duration::ZERO`
+    /// restores collect-on-sight.
+    pub commit_retention: Duration,
 }
 
 impl ResolvedImageCacheGcConfig {
@@ -149,6 +160,7 @@ impl ImageCacheConfig {
             min_age: Duration::from_secs(self.gc.min_age_secs),
             high_watermark_ratio: self.gc.high_watermark_ratio,
             low_watermark_ratio: self.gc.low_watermark_ratio,
+            commit_retention: Duration::from_secs(self.gc.commit_retention_secs),
         }
     }
 }

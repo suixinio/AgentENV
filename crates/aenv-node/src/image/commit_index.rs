@@ -114,6 +114,18 @@ pub fn digest_slug(digest: &str) -> String {
     sanitize_filename_component(&slug, MAX_DIGEST_SLUG_LEN)
 }
 
+/// The digest a commit directory name was built from, or `None` when the name
+/// does not round-trip through [`digest_slug`]. Sanitizing and truncating are
+/// lossy, and a guessed digest would name the wrong commit.
+pub fn digest_from_slug(slug: &str) -> Option<String> {
+    let (algo, hex) = slug.split_once('-')?;
+    if algo.is_empty() || hex.is_empty() {
+        return None;
+    }
+    let digest = format!("{algo}:{hex}");
+    (digest_slug(&digest) == slug).then_some(digest)
+}
+
 pub fn commit_dir(commit_store: &Path, digest: &str) -> PathBuf {
     commit_store.join(digest_slug(digest))
 }
@@ -365,6 +377,28 @@ mod tests {
     #[test]
     fn digest_slug_uses_algo_prefix() {
         assert_eq!(digest_slug("sha256:abc123"), "sha256-abc123");
+    }
+
+    #[test]
+    fn digest_from_slug_only_answers_for_a_name_it_can_round_trip() {
+        assert_eq!(
+            digest_from_slug("sha256-abc123").as_deref(),
+            Some("sha256:abc123")
+        );
+        assert_eq!(digest_from_slug("sha256-"), None);
+        assert_eq!(digest_from_slug("nodash"), None);
+
+        // What the commit-store scan relies on: an answer always names the
+        // directory it was read from, whatever the slug went through.
+        for name in [
+            digest_slug("sha256:abc123"),
+            digest_slug(&format!("sha256:{}", "a".repeat(MAX_DIGEST_SLUG_LEN * 2))),
+            digest_slug("no-colon-digest"),
+        ] {
+            if let Some(digest) = digest_from_slug(&name) {
+                assert_eq!(digest_slug(&digest), name);
+            }
+        }
     }
 
     #[test]

@@ -115,6 +115,7 @@ async fn a_running_sandbox_keeps_its_commit_pinned_after_its_source_config_was_e
         Arc::clone(&image_cache),
         None,
         Duration::from_secs(0),
+        Duration::ZERO,
     )
     .runtime_refs;
 
@@ -141,7 +142,7 @@ async fn a_running_sandbox_keeps_its_commit_pinned_after_its_source_config_was_e
         "the running set does not name the sandbox, so this test proves nothing"
     );
     let summary = image_cache
-        .run_maintenance(running, None, Duration::from_secs(0))
+        .run_maintenance(running, None, Duration::from_secs(0), Duration::ZERO)
         .await
         .expect("run gc");
 

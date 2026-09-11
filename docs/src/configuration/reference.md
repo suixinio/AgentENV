@@ -211,12 +211,15 @@ Node-local cache root for resolved and converted user images.
 ## `[image.cache.gc]`
 
 Background hard-commit garbage collection for the image cache. When enabled,
-each pass reconciles metadata from the on-disk source configs and then deletes
+each pass reconciles metadata from the on-disk source configs, adopts any
+commit file in the store this process has no record for, and then deletes
 hard-commit objects that are no longer rooted by source configs, held by
-image-cache leases, or referenced by the in-process running set. Committed
-snapshots are durable SnapshotRepository state and do not pin ImageCache
-commits. With `capacity_gb` set, GC first evicts least-recently-used source
-configs over the high watermark so hard-commit GC can reclaim what they unrooted.
+image-cache leases, or referenced by the in-process running set — once they are
+idle past `commit_retention_secs`. Committed snapshots are durable
+SnapshotRepository state and do not pin ImageCache commits. With `capacity_gb`
+set, GC first evicts least-recently-used source configs over the high watermark
+so hard-commit GC can reclaim what they unrooted, and then, if the store is
+still over it, the idlest unreferenced commits regardless of their retention.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -225,6 +228,7 @@ configs over the high watermark so hard-commit GC can reclaim what they unrooted
 | `min_age_secs` | integer | `600` | Minimum time since last use before a source config is eligible for capacity eviction (the LRU floor) |
 | `high_watermark_ratio` | float | `0.95` | Begin capacity eviction once local commit bytes exceed `capacity_gb` × this ratio. Clamped to `(0, 1]` |
 | `low_watermark_ratio` | float | `0.70` | Evict down to `capacity_gb` × this ratio once the high watermark trips. Clamped to `(0, high_watermark_ratio]` |
+| `commit_retention_secs` | integer | `86400` | How long a commit nothing references is kept, counted from the last time a runtime image was bound to it (its file's mtime across a restart). The memory layer a pause uploads loses its last referrer as soon as the sandbox is gone, and it is what a resume on this node opens instead of fetching it back from object storage. Capacity eviction ignores this floor; `0` collects on the next pass. Env: `AENV_IMAGE_CACHE_COMMIT_RETENTION_SECS` |
 
 Capacity-driven eviction runs only when `[image.cache].capacity_gb` is set;
 otherwise the GC still reclaims unreachable commits but performs no watermark

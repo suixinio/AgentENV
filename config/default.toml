@@ -113,8 +113,9 @@ capacity_gb = 100
 max_size_gb = 100
 
 [image.cache.gc]
-# Reconcile cache metadata and delete unreferenced hard commits in the
-# background. Capacity eviction removes least-recently-used source configs.
+# Reconcile cache metadata and delete unreferenced hard commits past their
+# retention in the background. Capacity eviction removes least-recently-used
+# source configs, then the idlest commits regardless of retention.
 enabled = true
 
 # GC interval in seconds (1800 = 30 minutes).
@@ -125,6 +126,13 @@ min_age_secs = 600
 high_watermark_ratio = 0.95
 # Evict down to this fraction of capacity_gb (0.70 = 70%).
 low_watermark_ratio = 0.70
+# How long a commit nothing references is kept, counted from the last time a
+# runtime image was bound to it (86400 = 24 hours). The memory layer a pause
+# uploads loses its last referrer as soon as the sandbox is gone, and it is
+# what a resume on this node opens instead of fetching it back from object
+# storage. Capacity eviction ignores this floor; 0 collects on the next pass.
+# Override with AENV_IMAGE_CACHE_COMMIT_RETENTION_SECS.
+commit_retention_secs = 86400
 
 # EXPERIMENTAL: P2P has not been tested in production. Keep it disabled in
 # production unless the deployment accepts that operational risk.

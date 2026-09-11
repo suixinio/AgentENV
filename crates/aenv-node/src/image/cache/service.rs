@@ -450,6 +450,7 @@ impl ImageCacheService {
         running: Vec<(String, Vec<PathBuf>)>,
         watermark: Option<(u64, u64)>,
         min_age: Duration,
+        commit_retention: Duration,
     ) -> Result<ImageCacheGcSummary> {
         let Some(&authority) = self.reclaim_authority.get() else {
             bail!("image cache maintenance ran before the startup reconcile");
@@ -462,7 +463,19 @@ impl ImageCacheService {
             false
         };
         let live_refs = self.live_refs_from_running(running).await?;
-        let report = self.run_gc(live_refs, !reconciled, authority).await?;
+        let mut report = self
+            .run_gc(live_refs.clone(), !reconciled, authority, commit_retention)
+            .await?;
+        if let Some((high, low)) = watermark {
+            self.evict_retained_commits_over_capacity(
+                high,
+                low,
+                &live_refs,
+                authority,
+                &mut report,
+            )
+            .await?;
+        }
         Ok(ImageCacheGcSummary::from_report(&report))
     }
 
@@ -490,12 +503,16 @@ impl ImageCacheService {
         Ok(refs)
     }
 
+    /// `retention` is the age floor below which an unreferenced commit is kept
+    /// as cache for the next resume. `None` drops the floor, which is what the
+    /// capacity pass does once the store is over budget.
     async fn check_collectable_hard_commit(
         &self,
         record: &HardCommitObjectRecord,
         config_referrers: Vec<ImageCacheConfigId>,
         live_refs: &ImageCacheLiveRuntimeRefs,
         ignore_owner: Option<&ImageCacheHoldOwner>,
+        retention: Option<Duration>,
     ) -> Result<HardCommitGcDecision> {
         let digest = record.digest.clone();
 
@@ -534,12 +551,15 @@ impl ImageCacheService {
                 ),
             }));
         };
-        if let Some(reason) = self.commit_file_block_reason(&file, record.size) {
-            return Ok(HardCommitGcDecision::Blocked(ImageCacheGcBlocked {
-                digest,
-                reason,
-            }));
-        }
+        let metadata = match self.verify_commit_file(&file, record.size) {
+            Ok(metadata) => metadata,
+            Err(reason) => {
+                return Ok(HardCommitGcDecision::Blocked(ImageCacheGcBlocked {
+                    digest,
+                    reason,
+                }))
+            }
+        };
 
         if let Some(owners) = live_refs.get(&digest) {
             if !owners.is_empty() {
@@ -548,6 +568,21 @@ impl ImageCacheService {
                     reason: ImageCacheGcBlockedReason::LiveRuntime {
                         owners: owners.clone(),
                     },
+                }));
+            }
+        }
+
+        if let Some(retention) = retention.filter(|floor| !floor.is_zero()) {
+            let last_used = self
+                .metadata_store()
+                .await?
+                .commit_last_used(&digest)
+                .await?;
+            let idle_secs = commit_idle_secs(last_used, &metadata);
+            if idle_secs < retention.as_secs() {
+                return Ok(HardCommitGcDecision::Blocked(ImageCacheGcBlocked {
+                    digest,
+                    reason: ImageCacheGcBlockedReason::Retained { idle_secs },
                 }));
             }
         }
@@ -575,43 +610,46 @@ impl ImageCacheService {
             .await
     }
 
-    fn commit_file_block_reason(
+    /// The commit file's metadata, or the reason it cannot be verified safe to
+    /// delete. The returned metadata also dates the commit for the retention
+    /// floor, so the check and the clock read the same stat.
+    fn verify_commit_file(
         &self,
         file: &Path,
         size: Option<u64>,
-    ) -> Option<ImageCacheGcBlockedReason> {
+    ) -> std::result::Result<std::fs::Metadata, ImageCacheGcBlockedReason> {
         if !path_is_inside(file, &self.commit_store) {
-            return Some(ImageCacheGcBlockedReason::Unverifiable(
+            return Err(ImageCacheGcBlockedReason::Unverifiable(
                 "commit file is outside the commit store".to_string(),
             ));
         }
         let metadata = match std::fs::symlink_metadata(file) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Some(ImageCacheGcBlockedReason::Unverifiable(
+                return Err(ImageCacheGcBlockedReason::Unverifiable(
                     "commit file is missing".to_string(),
                 ));
             }
             Err(error) => {
-                return Some(ImageCacheGcBlockedReason::Unverifiable(format!(
+                return Err(ImageCacheGcBlockedReason::Unverifiable(format!(
                     "stat commit file failed: {error}"
                 )));
             }
         };
         if !metadata.is_file() {
-            return Some(ImageCacheGcBlockedReason::Unverifiable(
+            return Err(ImageCacheGcBlockedReason::Unverifiable(
                 "commit path is not a regular file".to_string(),
             ));
         }
         if let Some(expected) = size {
             let actual = metadata.len();
             if actual != expected {
-                return Some(ImageCacheGcBlockedReason::Unverifiable(format!(
+                return Err(ImageCacheGcBlockedReason::Unverifiable(format!(
                     "commit file size mismatch: expected {expected}, got {actual}"
                 )));
             }
         }
-        None
+        Ok(metadata)
     }
 
     async fn delete_collectable_hard_commit(
@@ -655,10 +693,12 @@ impl ImageCacheService {
         live_refs: ImageCacheLiveRuntimeRefs,
         rebuild_metadata: bool,
         _authority: ReclaimAuthority,
+        commit_retention: Duration,
     ) -> Result<ImageCacheGcReport> {
         if rebuild_metadata {
             self.rebuild_metadata_from_configs().await?;
         }
+        self.adopt_unrecorded_commits().await;
 
         let metadata = self.metadata_store().await?;
         let config_referrers = metadata.hard_commit_config_referrer_map().await?;
@@ -670,7 +710,13 @@ impl ImageCacheService {
                 .cloned()
                 .unwrap_or_default();
             match self
-                .check_collectable_hard_commit(&record, referrers, &live_refs, None)
+                .check_collectable_hard_commit(
+                    &record,
+                    referrers,
+                    &live_refs,
+                    None,
+                    Some(commit_retention),
+                )
                 .await?
             {
                 HardCommitGcDecision::Blocked(blocked) => {
@@ -680,77 +726,13 @@ impl ImageCacheService {
                 HardCommitGcDecision::Collectable { .. } => {}
             }
 
-            let digest = record.digest.clone();
-            let hold = Self::acquire_operation_hold_for_hard_commits(
-                Arc::clone(self),
-                "gc",
-                [digest.as_str().to_string()],
+            self.collect_hard_commit(
+                &record.digest,
+                &live_refs,
+                Some(commit_retention),
+                &mut report,
             )
             .await?;
-
-            let result = async {
-                let fresh = self
-                    .metadata_store()
-                    .await?
-                    .get_hard_commit_object(&digest)
-                    .await?;
-
-                match fresh {
-                    None => report.blocked.push(ImageCacheGcBlocked {
-                        digest: digest.clone(),
-                        reason: ImageCacheGcBlockedReason::Unverifiable(
-                            "hard commit object record disappeared before delete".to_string(),
-                        ),
-                    }),
-                    Some(record) => {
-                        // Source-config publish is not serialized by the GC
-                        // operation hold, so refresh roots after taking the
-                        // hold and before deleting the commit.
-                        let fresh_referrers = self
-                            .metadata_store()
-                            .await?
-                            .hard_commit_config_referrers(&digest)
-                            .await?;
-                        match self
-                            .check_collectable_hard_commit(
-                                &record,
-                                fresh_referrers,
-                                &live_refs,
-                                Some(hold.owner()),
-                            )
-                            .await?
-                        {
-                            HardCommitGcDecision::Collectable { digest, file, size } => {
-                                match self.delete_collectable_hard_commit(&digest, &file).await {
-                                    Ok(()) => {
-                                        report.collected += 1;
-                                        report.freed_bytes += size.unwrap_or(0);
-                                    }
-                                    Err(error) => {
-                                        warn!(
-                                            digest = %digest,
-                                            error = %error,
-                                            "failed to delete collectable image cache commit"
-                                        );
-                                        report.blocked.push(ImageCacheGcBlocked {
-                                            digest,
-                                            reason: ImageCacheGcBlockedReason::DeleteFailed(
-                                                error.to_string(),
-                                            ),
-                                        });
-                                    }
-                                }
-                            }
-                            HardCommitGcDecision::Blocked(blocked) => report.blocked.push(blocked),
-                        }
-                    }
-                }
-                Ok::<(), anyhow::Error>(())
-            }
-            .await;
-
-            hold.release_best_effort("gc").await;
-            result?;
         }
 
         match self.reclaim_stale_indexes().await {
@@ -766,6 +748,222 @@ impl ImageCacheService {
         }
 
         Ok(report)
+    }
+
+    /// Take the GC hold, re-check the candidate under it, and delete. The
+    /// pre-check the caller ran is advisory: a source config can be published
+    /// between the two, and only this one decides.
+    async fn collect_hard_commit(
+        self: &Arc<Self>,
+        digest: &HardCommitId,
+        live_refs: &ImageCacheLiveRuntimeRefs,
+        retention: Option<Duration>,
+        report: &mut ImageCacheGcReport,
+    ) -> Result<()> {
+        let hold = Self::acquire_operation_hold_for_hard_commits(
+            Arc::clone(self),
+            "gc",
+            [digest.as_str().to_string()],
+        )
+        .await?;
+
+        let result = async {
+            let fresh = self
+                .metadata_store()
+                .await?
+                .get_hard_commit_object(digest)
+                .await?;
+
+            match fresh {
+                None => report.blocked.push(ImageCacheGcBlocked {
+                    digest: digest.clone(),
+                    reason: ImageCacheGcBlockedReason::Unverifiable(
+                        "hard commit object record disappeared before delete".to_string(),
+                    ),
+                }),
+                Some(record) => {
+                    // Source-config publish is not serialized by the GC
+                    // operation hold, so refresh roots after taking the
+                    // hold and before deleting the commit.
+                    let fresh_referrers = self
+                        .metadata_store()
+                        .await?
+                        .hard_commit_config_referrers(digest)
+                        .await?;
+                    match self
+                        .check_collectable_hard_commit(
+                            &record,
+                            fresh_referrers,
+                            live_refs,
+                            Some(hold.owner()),
+                            retention,
+                        )
+                        .await?
+                    {
+                        HardCommitGcDecision::Collectable { digest, file, size } => {
+                            match self.delete_collectable_hard_commit(&digest, &file).await {
+                                Ok(()) => {
+                                    report.collected += 1;
+                                    report.freed_bytes += size.unwrap_or(0);
+                                }
+                                Err(error) => {
+                                    warn!(
+                                        digest = %digest,
+                                        error = %error,
+                                        "failed to delete collectable image cache commit"
+                                    );
+                                    report.blocked.push(ImageCacheGcBlocked {
+                                        digest,
+                                        reason: ImageCacheGcBlockedReason::DeleteFailed(
+                                            error.to_string(),
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                        HardCommitGcDecision::Blocked(blocked) => report.blocked.push(blocked),
+                    }
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        hold.release_best_effort("gc").await;
+        result
+    }
+
+    /// Record every commit file in the store that this process has no object
+    /// for. A layer a pause adopted is referenced by no config and indexed by
+    /// nothing, so without this pass a restart hides it from the GC for good
+    /// and the retention floor would turn that into an unbounded leak.
+    async fn adopt_unrecorded_commits(&self) {
+        let Ok(metadata) = self.metadata_store().await else {
+            return;
+        };
+        let Ok(recorded) = metadata.list_hard_commit_objects().await else {
+            return;
+        };
+        // Claimed by path, not by digest: a slug the digest does not round-trip
+        // through would otherwise record a second object for a file a config
+        // already roots, and the GC would collect it out from under that config.
+        let claimed = recorded
+            .into_iter()
+            .filter_map(|record| record.file)
+            .collect::<BTreeSet<_>>();
+        let mut entries = match tokio::fs::read_dir(&self.commit_store).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                warn!(
+                    store = %self.commit_store.display(),
+                    %error,
+                    "failed to scan the commit store; commits it alone holds stay unmanaged"
+                );
+                return;
+            }
+        };
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    warn!(
+                        store = %self.commit_store.display(),
+                        %error,
+                        "failed to read the commit store"
+                    );
+                    return;
+                }
+            };
+            let Some(digest) = entry
+                .file_name()
+                .to_str()
+                .and_then(commit_index::digest_from_slug)
+            else {
+                continue;
+            };
+            let Ok(digest) = HardCommitId::new(digest) else {
+                continue;
+            };
+            if matches!(metadata.get_hard_commit_object(&digest).await, Ok(Some(_))) {
+                continue;
+            }
+            let file = entry.path().join(commit_index::OVERLAYBD_COMMIT_FILE);
+            if claimed.contains(&file) {
+                continue;
+            }
+            let Ok(file_metadata) = std::fs::symlink_metadata(&file) else {
+                continue;
+            };
+            if !file_metadata.is_file() {
+                continue;
+            }
+            if let Err(error) = metadata
+                .record_hard_commit_object(digest, Some(file), Some(file_metadata.len()))
+                .await
+            {
+                warn!(%error, "failed to record a commit found in the store");
+            }
+        }
+    }
+
+    /// Collect unreferenced commits oldest first, ignoring the retention floor,
+    /// until the store is back under the low watermark. Budget beats cache:
+    /// everything dropped here is recoverable from object storage.
+    async fn evict_retained_commits_over_capacity(
+        self: &Arc<Self>,
+        high_watermark_bytes: u64,
+        low_watermark_bytes: u64,
+        live_refs: &ImageCacheLiveRuntimeRefs,
+        _authority: ReclaimAuthority,
+        report: &mut ImageCacheGcReport,
+    ) -> Result<()> {
+        let (total_bytes, unreferenced) = self
+            .metadata_store()
+            .await?
+            .unreferenced_hard_commits()
+            .await?;
+        if total_bytes <= high_watermark_bytes {
+            return Ok(());
+        }
+
+        let mut candidates: Vec<(u64, HardCommitId, u64)> = unreferenced
+            .into_iter()
+            .filter_map(|commit| {
+                let file = commit.record.file.as_ref()?;
+                let file_metadata = std::fs::symlink_metadata(file).ok()?;
+                Some((
+                    commit_idle_secs(commit.last_used, &file_metadata),
+                    commit.record.digest,
+                    commit.record.size.unwrap_or(0),
+                ))
+            })
+            .collect();
+        // Idlest first, so the layer a resume touched most recently is the last
+        // one the budget takes.
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+
+        let mut remaining = total_bytes;
+        for (_, digest, size) in candidates {
+            if remaining <= low_watermark_bytes {
+                break;
+            }
+            let collected_before = report.collected;
+            self.collect_hard_commit(&digest, live_refs, None, report)
+                .await?;
+            if report.collected > collected_before {
+                remaining = remaining.saturating_sub(size);
+            }
+        }
+        info!(
+            total_bytes,
+            high_watermark_bytes,
+            low_watermark_bytes,
+            remaining_bytes = remaining,
+            "image cache evicted retained commits over the capacity budget"
+        );
+        Ok(())
     }
 
     async fn reclaim_stale_indexes(&self) -> Result<usize> {
@@ -1074,6 +1272,25 @@ impl ImageCacheService {
     pub fn allowed_overlaybd_publish_roots(&self) -> Vec<PathBuf> {
         vec![self.commit_store.clone()]
     }
+
+    /// Dates the commits a runtime image was just bound to, so the GC's
+    /// retention floor measures idleness and not age. Only commits the store
+    /// owns are dated; a `file=` outside it is the caller's to keep.
+    pub async fn record_overlaybd_layers_used(&self, digests: &[String]) -> Result<()> {
+        let owned = digests
+            .iter()
+            .filter(|digest| {
+                commit_index::commit_file(&self.commit_store, digest)
+                    .try_exists()
+                    .unwrap_or(false)
+            })
+            .filter_map(|digest| HardCommitId::new(digest).ok())
+            .collect::<Vec<_>>();
+        self.metadata_store()
+            .await?
+            .record_hard_commits_used(&owned)
+            .await
+    }
 }
 
 pub struct ImageCacheOperationHold {
@@ -1344,6 +1561,19 @@ enum HardCommitGcDecision {
     Blocked(ImageCacheGcBlocked),
 }
 
+/// Seconds since a commit was last bound into a runtime image. The recency this
+/// process observed wins; a commit it never bound is dated by its file, whose
+/// mtime a hard link carries over from the layer that produced it.
+fn commit_idle_secs(last_used: Option<u64>, metadata: &std::fs::Metadata) -> u64 {
+    let modified_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since_epoch| since_epoch.as_secs())
+        .unwrap_or(0);
+    unix_now_secs().saturating_sub(last_used.unwrap_or(0).max(modified_secs))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -1424,6 +1654,7 @@ mod tests {
                 ImageCacheLiveRuntimeRefs::new(),
                 true,
                 service.test_reclaim_authority().await,
+                Duration::ZERO,
             )
             .await
             .expect("run gc");
@@ -1629,7 +1860,7 @@ mod tests {
         service.ensure_layout().await.expect("layout");
 
         let error = service
-            .run_maintenance(Vec::new(), None, Duration::from_secs(0))
+            .run_maintenance(Vec::new(), None, Duration::from_secs(0), Duration::ZERO)
             .await
             .expect_err("maintenance must not delete before the startup reconcile");
         assert!(
@@ -1642,7 +1873,7 @@ mod tests {
             .await
             .expect("startup reconcile");
         service
-            .run_maintenance(Vec::new(), None, Duration::from_secs(0))
+            .run_maintenance(Vec::new(), None, Duration::from_secs(0), Duration::ZERO)
             .await
             .expect("maintenance runs once the startup reconcile ran");
     }
@@ -1701,6 +1932,7 @@ mod tests {
                 )]),
                 true,
                 service.test_reclaim_authority().await,
+                Duration::ZERO,
             )
             .await
             .expect("run gc");
@@ -1802,6 +2034,7 @@ mod tests {
                 ImageCacheLiveRuntimeRefs::new(),
                 true,
                 service.test_reclaim_authority().await,
+                Duration::ZERO,
             )
             .await
             .expect("run gc");
@@ -1943,6 +2176,7 @@ mod tests {
                 ImageCacheLiveRuntimeRefs::new(),
                 true,
                 service.test_reclaim_authority().await,
+                Duration::ZERO,
             )
             .await
             .expect("run gc");
@@ -1993,5 +2227,140 @@ mod tests {
             .await
             .expect("eviction");
         assert!(!config_path.exists());
+    }
+
+    fn backdate_commit(path: &Path, secs: u64) {
+        use nix::sys::time::{TimeVal, TimeValLike};
+
+        let when = TimeVal::seconds(unix_now_secs().saturating_sub(secs) as i64);
+        nix::sys::stat::utimes(path, &when, &when).expect("backdate the commit file");
+    }
+
+    async fn import_commit(
+        service: &Arc<ImageCacheService>,
+        temp: &TempDir,
+        digest: &str,
+        payload: &[u8],
+    ) -> PathBuf {
+        let source = temp
+            .path()
+            .join(format!("{}.commit", digest.replace(':', "-")));
+        std::fs::write(&source, payload).expect("write source commit");
+        service
+            .import_hard_commit_trusted_descriptor(&source, digest, payload.len() as u64)
+            .await
+            .expect("import the commit")
+    }
+
+    #[tokio::test]
+    async fn run_gc_keeps_an_unreferenced_commit_inside_its_retention() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let cached = import_commit(&service, &temp, "sha256:paused", b"paused memory").await;
+
+        let report = service
+            .run_gc(
+                ImageCacheLiveRuntimeRefs::new(),
+                true,
+                service.test_reclaim_authority().await,
+                Duration::from_secs(86_400),
+            )
+            .await
+            .expect("gc under the retention floor");
+
+        assert_eq!(report.collected, 0);
+        assert!(cached.exists());
+        assert!(matches!(
+            report.blocked.first().map(|blocked| &blocked.reason),
+            Some(ImageCacheGcBlockedReason::Retained { .. })
+        ));
+
+        let report = service
+            .run_gc(
+                ImageCacheLiveRuntimeRefs::new(),
+                true,
+                service.test_reclaim_authority().await,
+                Duration::ZERO,
+            )
+            .await
+            .expect("gc with no floor");
+
+        assert_eq!(report.collected, 1);
+        assert!(!cached.exists());
+    }
+
+    #[tokio::test]
+    async fn the_retention_clock_runs_from_the_last_binding_not_the_write() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let aged = import_commit(&service, &temp, "sha256:aged", b"aged layer").await;
+        let used = import_commit(&service, &temp, "sha256:used", b"used layer").await;
+        backdate_commit(&aged, 2 * 86_400);
+        backdate_commit(&used, 2 * 86_400);
+        service
+            .record_overlaybd_layers_used(&["sha256:used".to_string()])
+            .await
+            .expect("record the binding");
+
+        let report = service
+            .run_gc(
+                ImageCacheLiveRuntimeRefs::new(),
+                true,
+                service.test_reclaim_authority().await,
+                Duration::from_secs(86_400),
+            )
+            .await
+            .expect("gc");
+
+        assert_eq!(report.collected, 1);
+        assert!(
+            !aged.exists(),
+            "a layer nothing bound for two days is garbage"
+        );
+        assert!(
+            used.exists(),
+            "binding it resets the clock the floor measures"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_pressure_evicts_commits_the_retention_floor_would_keep() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let cached = import_commit(&service, &temp, "sha256:fresh", b"fresh layer").await;
+        service.startup_reconcile().await.expect("reconcile");
+
+        let summary = service
+            .run_maintenance(
+                Vec::new(),
+                Some((0, 0)),
+                Duration::ZERO,
+                Duration::from_secs(86_400),
+            )
+            .await
+            .expect("maintenance over the budget");
+
+        assert_eq!(summary.collected, 1);
+        assert!(!cached.exists());
+    }
+
+    #[tokio::test]
+    async fn run_gc_reaches_a_commit_this_process_has_no_record_for() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let orphan = write_commit_file(&service, "sha256:orphan", b"orphan layer");
+
+        let report = service
+            .run_gc(
+                ImageCacheLiveRuntimeRefs::new(),
+                true,
+                service.test_reclaim_authority().await,
+                Duration::ZERO,
+            )
+            .await
+            .expect("gc");
+
+        assert_eq!(report.collected, 1);
+        assert!(!orphan.exists());
     }
 }

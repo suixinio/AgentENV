@@ -28,6 +28,12 @@ pub enum ImageCacheGcBlockedReason {
     LiveRuntime {
         owners: Vec<ImageCacheHoldOwner>,
     },
+    /// Nothing references it, but it is younger than the retention floor: a
+    /// layer this node produced or last used recently is cache for the next
+    /// resume, not garbage. Capacity eviction overrides this.
+    Retained {
+        idle_secs: u64,
+    },
     /// Fail-closed: the candidate could not be verified safe to delete (missing
     /// or changed file, path outside the commit store, missing object record,
     /// failed stat, ...), so it is kept. The string carries the specific cause

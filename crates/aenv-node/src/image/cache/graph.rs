@@ -78,6 +78,10 @@ struct CacheGraph {
     hard_commits: BTreeMap<HardCommitId, HardCommitObjectRecord>,
     holds: BTreeMap<ImageCacheHoldOwner, BTreeSet<HardCommitId>>,
     last_used: BTreeMap<ImageCacheConfigId, u64>,
+    /// Recency this process observed for a commit, which outlives the config
+    /// that referenced it. A commit missing here falls back to its file's
+    /// mtime, so a restart still dates every commit in the store.
+    commit_last_used: BTreeMap<HardCommitId, u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -165,6 +169,15 @@ pub struct CapacityEvictionCandidate {
     pub last_used: u64,
 }
 
+/// A commit no source config references, paired with the recency this process
+/// observed. Holds and live runtime refs are not consulted here; the GC
+/// rechecks both under its own hold before deleting anything.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnreferencedHardCommit {
+    pub record: HardCommitObjectRecord,
+    pub last_used: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ParsedHardCommitRef {
     digest: HardCommitId,
@@ -209,6 +222,45 @@ impl ImageCacheMetadataStore {
         Ok(())
     }
 
+    /// Marks commits as used now, which is the LRU touch a runtime binding
+    /// gives a layer the cache owns. Digests with no record are still dated:
+    /// the GC's disk scan finds the file and reads the recency from here.
+    pub async fn record_hard_commits_used(&self, digests: &[HardCommitId]) -> Result<()> {
+        if digests.is_empty() {
+            return Ok(());
+        }
+        let now = unix_now_secs();
+        let mut state = self.state.write().await;
+        for digest in digests {
+            state.commit_last_used.insert(digest.clone(), now);
+        }
+        Ok(())
+    }
+
+    /// Every commit no source config references, with the total bytes of all
+    /// recorded commits so a caller can measure the store against a budget.
+    pub async fn unreferenced_hard_commits(&self) -> Result<(u64, Vec<UnreferencedHardCommit>)> {
+        let state = self.state.read().await;
+        let referenced: BTreeSet<HardCommitId> = state
+            .config_refs
+            .values()
+            .flat_map(|refs| refs.iter().cloned())
+            .collect();
+        let mut total_bytes = 0u64;
+        let mut unreferenced = Vec::new();
+        for record in state.hard_commits.values() {
+            total_bytes = total_bytes.saturating_add(record.size.unwrap_or(0));
+            if referenced.contains(&record.digest) {
+                continue;
+            }
+            unreferenced.push(UnreferencedHardCommit {
+                last_used: state.commit_last_used.get(&record.digest).copied(),
+                record: record.clone(),
+            });
+        }
+        Ok((total_bytes, unreferenced))
+    }
+
     pub async fn record_config_refs_from_config_path(&self, config_path: &Path) -> Result<()> {
         let config_id = ImageCacheConfigId::from_config_path(config_path)?;
         let hard_refs = load_cache_owned_hard_commit_refs(config_path)?;
@@ -240,7 +292,9 @@ impl ImageCacheMetadataStore {
     }
 
     pub async fn remove_hard_commit_object(&self, digest: &HardCommitId) -> Result<()> {
-        self.state.write().await.hard_commits.remove(digest);
+        let mut state = self.state.write().await;
+        state.hard_commits.remove(digest);
+        state.commit_last_used.remove(digest);
         Ok(())
     }
 
@@ -421,6 +475,16 @@ impl ImageCacheMetadataStore {
         state.config_refs = config_refs;
         state.last_used = last_used;
         Ok(())
+    }
+
+    pub async fn commit_last_used(&self, digest: &HardCommitId) -> Result<Option<u64>> {
+        Ok(self
+            .state
+            .read()
+            .await
+            .commit_last_used
+            .get(digest)
+            .copied())
     }
 
     pub async fn config_last_used(&self, config_id: &ImageCacheConfigId) -> Result<Option<u64>> {

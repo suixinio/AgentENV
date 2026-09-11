@@ -9,8 +9,8 @@ use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, MemoryUffdState,
-    MemoryUffdStats, RestackSnapshotStats,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, MemoryUffdRegion,
+    MemoryUffdState, MemoryUffdStats, RestackSnapshotStats,
 };
 use overlaybd::config::UpperMode;
 
@@ -141,6 +141,18 @@ struct UblkDaemonClientInner {
     /// Populated with the exit status description when the daemon dies.
     death_reason: Mutex<Option<String>>,
     runtime_device_timeout: Duration,
+}
+
+/// What `QueryMemoryUffd` answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryUffdStatus {
+    pub state: MemoryUffdState,
+    pub stats: MemoryUffdStats,
+    /// Whether the regions are write-protect registered; `None` before the
+    /// handshake.
+    pub write_protect: Option<bool>,
+    /// The handshake's regions; empty before it.
+    pub regions: Vec<MemoryUffdRegion>,
 }
 
 /// The bounds a userfaultfd memory server runs with; see
@@ -628,13 +640,20 @@ impl UblkDaemonClient {
     }
 
     /// The state and counters of a userfaultfd server.
-    pub async fn query_memory_uffd(
-        &self,
-        serve_id: u32,
-    ) -> Result<(MemoryUffdState, MemoryUffdStats)> {
+    pub async fn query_memory_uffd(&self, serve_id: u32) -> Result<MemoryUffdStatus> {
         let request = DaemonRequest::QueryMemoryUffd { serve_id };
         match self.call(request, DEFAULT_TIMEOUT).await? {
-            DaemonResponse::MemoryUffdStatus { state, stats } => Ok((state, stats)),
+            DaemonResponse::MemoryUffdStatus {
+                state,
+                stats,
+                write_protect,
+                regions,
+            } => Ok(MemoryUffdStatus {
+                state,
+                stats,
+                write_protect,
+                regions,
+            }),
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: query memory uffd serve_id={serve_id} failed terminally: {message}")
             }

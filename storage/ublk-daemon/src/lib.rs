@@ -7,12 +7,12 @@ pub mod transport;
 
 pub use client::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, MemoryUffdServeOptions,
-    OverlaybdRuntimeDevice, RestackSnapshotTerminalFailure, UblkDaemonClient,
+    MemoryUffdStatus, OverlaybdRuntimeDevice, RestackSnapshotTerminalFailure, UblkDaemonClient,
     UblkDaemonSpawnConfig,
 };
 pub use protocol::{
-    AccessMode, DaemonRequest, DaemonResponse, MemoryUffdState, MemoryUffdStats, ResizeToolSpec,
-    RestackSnapshotStats,
+    AccessMode, DaemonRequest, DaemonResponse, MemoryUffdRegion, MemoryUffdState, MemoryUffdStats,
+    ResizeToolSpec, RestackSnapshotStats,
 };
 pub use server::UblkDaemonServer;
 pub use transport::{nbd_transport_usable, Transport, TransportHandle};

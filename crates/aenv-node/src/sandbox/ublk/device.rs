@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, MemoryUffdServeOptions, MemoryUffdState, MemoryUffdStats,
+    CreateOverlaybdRuntimeDeviceRequest, MemoryUffdServeOptions, MemoryUffdStatus,
     RestackSnapshotStats, RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
@@ -598,10 +598,7 @@ impl UblkDeviceManager {
     /// itself faults while restoring device and vCPU state.
     /// The state and counters of a userfaultfd server by id, for callers
     /// that do not hold its handle.
-    pub async fn query_mem_uffd(
-        &self,
-        serve_id: u32,
-    ) -> Result<(MemoryUffdState, MemoryUffdStats)> {
+    pub async fn query_mem_uffd(&self, serve_id: u32) -> Result<MemoryUffdStatus> {
         self.require_client()?
             .query_memory_uffd(serve_id)
             .await
@@ -678,7 +675,7 @@ impl MemUffdServe {
     }
 
     /// The server's state and counters as the daemon sees them.
-    pub async fn query(&self) -> Result<(MemoryUffdState, MemoryUffdStats)> {
+    pub async fn query(&self) -> Result<MemoryUffdStatus> {
         UblkDeviceManager::global()
             .query_mem_uffd(self.serve_id)
             .await

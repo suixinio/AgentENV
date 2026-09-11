@@ -694,6 +694,12 @@ pub struct MemorySnapshotUffdConfig {
         env = "AENV_MEMORY_SNAPSHOT_UFFD_HANDSHAKE_TIMEOUT_SECS"
     )]
     pub handshake_timeout_secs: u64,
+    /// Expect the Firecracker build to register guest memory for write
+    /// protection, so the pages a pause captures are exactly those the guest
+    /// wrote (read from the VMM's pagemap) and no KVM dirty log is needed.
+    /// A resume on a build without the patch fails. Default: `true`.
+    #[config(default = true, env = "AENV_MEMORY_SNAPSHOT_UFFD_WRITE_PROTECT")]
+    pub write_protect: bool,
 }
 
 #[derive(Debug, Config, Clone)]

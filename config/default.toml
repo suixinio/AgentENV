@@ -677,6 +677,14 @@ read_retry_secs = 60
 # after the server starts. A cold snapshot load that takes longer than this
 # fails the resume. Must be positive.
 handshake_timeout_secs = 60
+# Expect Firecracker to register guest memory for userfaultfd write
+# protection, so a pause captures exactly the pages the guest wrote (read
+# from the VMM's pagemap) with no KVM dirty log; track_dirty_pages may then
+# stay false, on KVM and PVM alike. A resume on a Firecracker build without
+# the write-protect patch fails. Set to false to fall back to the KVM dirty
+# log, which then requires track_dirty_pages = true.
+# Override with AENV_MEMORY_SNAPSHOT_UFFD_WRITE_PROTECT.
+write_protect = true
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd

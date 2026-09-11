@@ -147,6 +147,19 @@ pub struct MemoryUffdStats {
     /// page.
     #[serde(default)]
     pub unmapped: u64,
+    /// Synchronous write-protect faults the handler resolved.
+    #[serde(default)]
+    pub wp_faults: u64,
+}
+
+/// One guest memory region from Firecracker's handshake.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryUffdRegion {
+    pub host_addr: u64,
+    pub size: u64,
+    /// Byte offset of the region in the memory image.
+    pub offset: u64,
+    pub page_size: u64,
 }
 
 fn default_runtime_upper_mode() -> UpperMode {
@@ -204,6 +217,14 @@ pub enum DaemonResponse {
     MemoryUffdStatus {
         state: MemoryUffdState,
         stats: MemoryUffdStats,
+        /// Whether the regions are registered for write protection, so the
+        /// written set can be read from the VMM's pagemap; `None` before
+        /// the handshake.
+        #[serde(default)]
+        write_protect: Option<bool>,
+        /// The handshake's regions; empty before it.
+        #[serde(default)]
+        regions: Vec<MemoryUffdRegion>,
     },
     RestackSnapshotCreated {
         descriptor: Option<LayerDescriptor>,
@@ -659,11 +680,26 @@ mod tests {
                 pages_zeroed: 1,
                 ..MemoryUffdStats::default()
             },
+            write_protect: Some(true),
+            regions: vec![MemoryUffdRegion {
+                host_addr: 0x7f00_0000_0000,
+                size: 1 << 30,
+                offset: 0,
+                page_size: 4096,
+            }],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
         match decoded {
-            DaemonResponse::MemoryUffdStatus { state, stats } => {
+            DaemonResponse::MemoryUffdStatus {
+                state,
+                stats,
+                write_protect,
+                regions,
+            } => {
+                assert_eq!(write_protect, Some(true));
+                assert_eq!(regions.len(), 1);
+                assert_eq!(regions[0].size, 1 << 30);
                 assert_eq!(
                     state,
                     MemoryUffdState::Exited {

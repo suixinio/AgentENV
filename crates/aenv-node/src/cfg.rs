@@ -279,7 +279,9 @@ fn validate_memory_snapshot_options(config: &AppConfig) -> Result<()> {
         if memory.uffd.handshake_timeout_secs == 0 {
             bail!("invalid memory_snapshot.uffd config: handshake_timeout_secs must be > 0");
         }
-        if !memory.track_dirty_pages {
+        // With write protection the written set comes from the VMM's pagemap
+        // and no KVM dirty log is involved, on KVM and PVM alike.
+        if !memory.track_dirty_pages && !memory.uffd.write_protect {
             if config.virtualization_mode == VirtualizationMode::Pvm {
                 bail!(
                     "memory_snapshot.backend=\"uffd\" needs memory_snapshot.track_dirty_pages=true, \
@@ -484,9 +486,22 @@ mod tests {
             memory_snapshot: MemorySnapshotConfig {
                 backend: MemorySnapshotBackend::Uffd,
                 track_dirty_pages,
+                uffd: MemorySnapshotUffdConfig {
+                    write_protect: false,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn uffd_with_write_protection_needs_no_kvm_dirty_log_on_either_mode() {
+        for mode in [VirtualizationMode::Kvm, VirtualizationMode::Pvm] {
+            let mut config = uffd_config(mode, false);
+            config.memory_snapshot.uffd.write_protect = true;
+            validate_memory_snapshot_options(&config).unwrap_or_else(|err| panic!("{mode}: {err}"));
         }
     }
 

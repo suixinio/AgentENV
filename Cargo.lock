@@ -277,6 +277,7 @@ dependencies = [
  "uuid",
  "uvm-ublk",
  "uvm-ublk-daemon",
+ "uvm-uffd",
  "warm-pool",
  "which 8.0.2",
 ]

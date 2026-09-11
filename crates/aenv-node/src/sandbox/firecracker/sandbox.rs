@@ -5,11 +5,13 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
+use firecracker_client::models::DirtyMemoryRanges;
 use nix::libc;
+use nix::unistd::Pid;
 use tempfile::TempDir;
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
-use uvm_ublk_daemon::{CreateOverlaybdRuntimeDeviceRequest, MemoryUffdState};
+use uvm_ublk_daemon::{CreateOverlaybdRuntimeDeviceRequest, MemoryUffdRegion, MemoryUffdState};
 
 use super::config::{
     create_firecracker_work_dir, FirecrackerCommonConfig, FirecrackerRuntimePolicy,
@@ -59,6 +61,42 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// Inside the Firecracker work dir, so the path dies with the sandbox and two
 /// sandboxes never contend for one socket name.
 const MEM_UFFD_SOCKET_NAME: &str = "mem-uffd.sock";
+/// Firecracker's dirty-range shape, from the uffd-wp bits of the VMM's
+/// pagemap: the pages the guest wrote since they were installed.
+fn dirty_ranges_from_pagemap(pid: Pid, regions: &[MemoryUffdRegion]) -> Result<DirtyMemoryRanges> {
+    let mappings: Vec<uvm_uffd::GuestRegionUffdMapping> = regions
+        .iter()
+        .map(|r| uvm_uffd::GuestRegionUffdMapping {
+            base_host_virt_addr: r.host_addr,
+            size: r.size,
+            offset: r.offset,
+            page_size: r.page_size,
+            page_size_kib: r.page_size,
+            guest_phys_addr: 0,
+        })
+        .collect();
+    let memory_size = mappings.iter().map(|m| m.end_offset()).max().unwrap_or(0);
+    let pid = u32::try_from(pid.as_raw()).context("firecracker pid is negative")?;
+    let ranges = uvm_uffd::dirty_ranges(pid, &mappings)
+        .context("read the written pages from the VMM's pagemap")?;
+    let to_i64 =
+        |v: u64, what: &str| i64::try_from(v).with_context(|| format!("{what} overflows i64"));
+    Ok(DirtyMemoryRanges {
+        page_size: 4096,
+        memory_size: to_i64(memory_size, "memory size")?,
+        ranges: ranges
+            .into_iter()
+            .map(|r| {
+                Ok(firecracker_client::models::DirtyMemoryRange::new(
+                    to_i64(r.host_addr, "host address")?,
+                    to_i64(r.image_offset, "image offset")?,
+                    to_i64(r.len, "range length")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
 /// `sun_path` is 108 bytes including the terminator.
 const MAX_UNIX_SOCKET_PATH_LEN: usize = 108;
 /// How often a resumed VM's fault server is asked whether it still serves.
@@ -70,20 +108,23 @@ const MEM_UFFD_MONITOR_FAILURES: u32 = 3;
 /// answering: with the descriptor closed every later fault is a plain zero
 /// page, and the next pause would capture those zeros as guest memory. The
 /// task runs until the sandbox stops it.
-fn spawn_mem_uffd_monitor(serve_id: u32, pid: nix::unistd::Pid) -> tokio::task::JoinHandle<()> {
+fn spawn_mem_uffd_monitor(serve_id: u32, pid: Pid) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut failures = 0u32;
         loop {
             tokio::time::sleep(MEM_UFFD_MONITOR_INTERVAL).await;
             let reason = match UblkDeviceManager::global().query_mem_uffd(serve_id).await {
-                Ok((MemoryUffdState::Serving | MemoryUffdState::Starting, _)) => {
-                    failures = 0;
-                    continue;
-                }
-                Ok((MemoryUffdState::Exited { error }, stats)) => format!(
-                    "memory userfaultfd server exited ({}); stats: {stats:?}",
-                    error.unwrap_or_else(|| "no error reported".to_string())
-                ),
+                Ok(status) => match status.state {
+                    MemoryUffdState::Serving | MemoryUffdState::Starting => {
+                        failures = 0;
+                        continue;
+                    }
+                    MemoryUffdState::Exited { error } => format!(
+                        "memory userfaultfd server exited ({}); stats: {:?}",
+                        error.unwrap_or_else(|| "no error reported".to_string()),
+                        status.stats
+                    ),
+                },
                 Err(err) => {
                     failures += 1;
                     if failures < MEM_UFFD_MONITOR_FAILURES {
@@ -1115,7 +1156,7 @@ impl FirecrackerSandbox {
         // `vm_state.bin` now represents this paused VM state. Any later
         // error aborts this direct snapshot attempt and is propagated to
         // the lifecycle caller for recovery.
-        let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
+        let dirty_ranges = self.dirty_memory_ranges(firecracker_pid).await?;
         convert_dirty_memory_to_overlaybd(
             firecracker_pid,
             &dirty_ranges,
@@ -1124,6 +1165,27 @@ impl FirecrackerSandbox {
         )
         .await
         .context("convert dirty memory ranges to overlaybd layer")
+    }
+
+    /// The pages written since this VM was restored: read from the VMM's
+    /// pagemap when it is served over userfaultfd with write protection, so
+    /// no KVM dirty log is needed; otherwise Firecracker's own readout.
+    async fn dirty_memory_ranges(&self, pid: Pid) -> Result<DirtyMemoryRanges> {
+        if let Some(serve) = &self.mem_uffd {
+            let status = serve
+                .query()
+                .await
+                .context("query the memory userfaultfd server before capturing memory")?;
+            if status.write_protect == Some(true) && !status.regions.is_empty() {
+                let regions = status.regions;
+                return tokio::task::spawn_blocking(move || {
+                    dirty_ranges_from_pagemap(pid, &regions)
+                })
+                .await
+                .context("join the pagemap read")?;
+            }
+        }
+        self.fc_instance.get_dirty_memory_ranges().await
     }
 
     /// Resume a paused sandbox in-place.
@@ -1997,18 +2059,28 @@ impl FirecrackerSandbox {
             .mem_uffd
             .as_ref()
             .context("memory userfaultfd server was not started for this resume")?;
-        let (state, stats) = serve
+        let status = serve
             .query()
             .await
             .context("query the memory userfaultfd server after snapshot load")?;
-        match state {
+        match status.state {
             MemoryUffdState::Serving => {
                 debug!(
                     serve_id = serve.serve_id(),
-                    faults = stats.faults,
-                    pages_copied = stats.pages_copied,
+                    faults = status.stats.faults,
+                    pages_copied = status.stats.pages_copied,
+                    write_protect = ?status.write_protect,
                     "memory userfaultfd server is serving the restored VM"
                 );
+                let memory = &crate::cfg::ConfigManager::global_config().memory_snapshot;
+                if memory.uffd.write_protect && status.write_protect == Some(false) {
+                    bail!(
+                        "memory_snapshot.uffd.write_protect=true but this Firecracker build did not \
+                         register guest memory for write protection (serve_id={}); use a build with \
+                         the write-protect patch, or set write_protect=false with track_dirty_pages=true",
+                        serve.serve_id()
+                    );
+                }
                 Ok(())
             }
             MemoryUffdState::Starting => bail!(

@@ -18,7 +18,7 @@ use uvm_uffd::{
     HandlerOptions, HandlerState, OverlaybdSource, PrefetchList, StatsSnapshot, UffdHandler,
 };
 
-use crate::protocol::{DaemonResponse, MemoryUffdState, MemoryUffdStats};
+use crate::protocol::{DaemonResponse, MemoryUffdRegion, MemoryUffdState, MemoryUffdStats};
 use crate::server::ImageServiceCache;
 
 /// Canonical key for a shared opened memory image: (image_config, global_config).
@@ -111,6 +111,18 @@ impl MemoryUffdServers {
         Ok(DaemonResponse::MemoryUffdStatus {
             state: state_of(serve.handler.state()),
             stats: stats_of(serve.handler.stats()),
+            write_protect: serve.handler.write_protect(),
+            regions: serve
+                .handler
+                .regions()
+                .into_iter()
+                .map(|m| MemoryUffdRegion {
+                    host_addr: m.base_host_virt_addr,
+                    size: m.size,
+                    offset: m.offset,
+                    page_size: m.page_size(),
+                })
+                .collect(),
         })
     }
 
@@ -501,6 +513,7 @@ fn stats_of(stats: StatsSnapshot) -> MemoryUffdStats {
         removes: stats.removes,
         prefaulted: stats.prefaulted,
         unmapped: stats.unmapped,
+        wp_faults: stats.wp_faults,
     }
 }
 
@@ -538,6 +551,7 @@ mod tests {
             removes: 9,
             prefaulted: 10,
             unmapped: 11,
+            wp_faults: 12,
         };
         assert_eq!(
             stats_of(stats),
@@ -553,6 +567,7 @@ mod tests {
                 removes: 9,
                 prefaulted: 10,
                 unmapped: 11,
+                wp_faults: 12,
             }
         );
     }

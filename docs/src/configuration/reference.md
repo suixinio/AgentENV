@@ -752,7 +752,7 @@ the default path on every startup.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
-| `backend` | string | `"block"` | Path snapshot memory is restored through: `block` mmaps a read-only device (ublk or nbd per `[ublk].transport`) built from the stacked memory layers, `uffd` has the ublk daemon answer Firecracker's page faults over a Unix socket and creates no device. `uffd` requires `track_dirty_pages = true`, which is refused under PVM, so `uffd` is KVM-only. |
+| `backend` | string | `"block"` | Path snapshot memory is restored through: `block` mmaps a read-only device (ublk or nbd per `[ublk].transport`) built from the stacked memory layers, `uffd` has the ublk daemon answer Firecracker's page faults over a Unix socket and creates no device. `uffd` takes dirty pages from userfaultfd write protection (`[memory_snapshot.uffd].write_protect`, the default) and then needs no KVM dirty log; with `write_protect = false` it requires `track_dirty_pages = true`, which is refused under PVM. |
 | `track_dirty_pages` | bool | `false` | Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true` to enable it. |
 | `huge_pages` | bool | `false` | Boot new VMs with guest memory on 2 MiB hugetlbfs pages, so one resume fault covers 2 MiB. Fixed at boot and recorded in every snapshot of the VM; such a snapshot restores only through `backend = "uffd"`, and a node that receives one must be able to hand out 2 MiB pages (`--setup-host` sets `vm.nr_overcommit_hugepages` to cover RAM; a boot-time `vm.nr_hugepages` reservation is the operator's, and is what survives memory fragmentation). Requires `backend = "uffd"`. |
 | `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
@@ -773,11 +773,13 @@ Settings that apply only when `[memory_snapshot].backend = "uffd"`.
 | `max_inflight` | integer | `64` | Faults the daemon resolves concurrently for one VM; the queue behind it is bounded by the same number. Must be greater than zero |
 | `read_retry_secs` | integer | `60` | How long one faulting read retries the memory image before the handler gives up and exits, which fails the sandbox and leaves the guest unbacked. Keep it above the overlaybd registry request timeout (30 s per request) with room for its retries. Must be greater than zero |
 | `handshake_timeout_secs` | integer | `60` | How long the daemon waits for Firecracker to connect to the fault socket after the server starts; a snapshot load that takes longer fails the resume. Must be greater than zero |
+| `write_protect` | bool | `true` | Expect the Firecracker build to register guest memory for userfaultfd write protection: a pause then captures exactly the pages the guest wrote, read from the VMM's pagemap, and `track_dirty_pages` may stay `false` on KVM and PVM alike. A resume on a build without the write-protect patch fails. `false` falls back to the KVM dirty log, which requires `track_dirty_pages = true`. |
 
 Environment variable override:
 
 - `AENV_MEMORY_SNAPSHOT_UFFD_MAX_INFLIGHT`
 - `AENV_MEMORY_SNAPSHOT_UFFD_HANDSHAKE_TIMEOUT_SECS`
+- `AENV_MEMORY_SNAPSHOT_UFFD_WRITE_PROTECT`
 - `AENV_MEMORY_SNAPSHOT_UFFD_READ_RETRY_SECS`
 
 ## `[memory_snapshot.background_download]`

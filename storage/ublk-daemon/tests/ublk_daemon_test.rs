@@ -781,6 +781,8 @@ mod client_tests {
                 DaemonRequest::QueryMemoryUffd { .. } => DaemonResponse::MemoryUffdStatus {
                     state: MemoryUffdState::Serving,
                     stats: MemoryUffdStats::default(),
+                    write_protect: None,
+                    regions: Vec::new(),
                 },
             }
         }))
@@ -1721,7 +1723,11 @@ mod live_device_tests {
         ) -> MemoryUffdState {
             let mut state = MemoryUffdState::Starting;
             for _ in 0..250 {
-                state = client.query_memory_uffd(serve_id).await.expect("query").0;
+                state = client
+                    .query_memory_uffd(serve_id)
+                    .await
+                    .expect("query")
+                    .state;
                 if state == wanted {
                     return state;
                 }
@@ -1768,7 +1774,7 @@ mod live_device_tests {
                     .query_memory_uffd(serve_id)
                     .await
                     .expect("query")
-                    .0;
+                    .state;
                 if matches!(state, MemoryUffdState::Exited { .. }) {
                     break;
                 }
@@ -1878,11 +1884,16 @@ mod live_device_tests {
                 assert_eq!(&got, content, "page {index} came back with other bytes");
             }
 
-            let (_, stats) = daemon
+            let status = daemon
                 .client
                 .query_memory_uffd(serve_id)
                 .await
                 .expect("query the counters");
+            // The test registered MISSING only, and the handler says so.
+            assert_eq!(status.write_protect, Some(false));
+            assert_eq!(status.regions.len(), 1);
+            assert_eq!(status.regions[0].size, region.len() as u64);
+            let stats = status.stats;
             assert!(
                 stats.pages_copied > 0 && stats.faults >= pages.len() as u64,
                 "{stats:?}"
@@ -2077,7 +2088,7 @@ mod live_device_tests {
                     .query_memory_uffd(serve_id)
                     .await
                     .expect("query")
-                    .1;
+                    .stats;
                 if stats.prefaulted as usize == pages.len() {
                     break;
                 }
@@ -2094,11 +2105,12 @@ mod live_device_tests {
             })
             .await
             .expect("read the prefaulted pages");
-            let (_, after) = daemon
+            let after = daemon
                 .client
                 .query_memory_uffd(serve_id)
                 .await
-                .expect("query");
+                .expect("query")
+                .stats;
             assert_eq!(
                 after.faults, stats.faults,
                 "prefaulted pages are present and do not fault"

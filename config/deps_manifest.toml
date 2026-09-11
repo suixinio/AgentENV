@@ -1,5 +1,5 @@
 [firecracker.kvm]
-version = "1.15.1-patch-v1"
+version = "1.15.1-patch-v3"
 url = "https://github.com/suixinio/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
 
 [firecracker.pvm]
